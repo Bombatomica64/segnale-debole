@@ -4,14 +4,20 @@
 //! - `Q` **5G OVERLOAD** (>= 3 bars): EMP shockwave, stun, knockback, optional
 //!   chain lightning (EMP Overcharge).
 //! - Airplane Mode Phase: dash shockwave (upgrade).
+//! - Sub-GHz Penetration: Ping projects a pulsing floor route to the Tower.
+//! - Store & Forward: blackout-kill packets discharge as arcs at 3+ bars.
+//! - Emergency Callback: ping-marked Fiend kills unlock an any-signal Overload.
+//! - Missed Call: Ping at 0 bars drops a ringing decoy handset that lures Imps.
 
 use bevy::prelude::*;
 
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::{take_flag, BotControl};
 use crate::enemies::{damage_enemy, Enemy, EnemyAssets, EnemyKind, PingMarked, FIEND_FIELD_RADIUS};
-use crate::fx::{overlay_layer, spawn_beam, spawn_burst, spawn_flash_light, spawn_lightning, spawn_shockwave, BurstColor, FxAssets, HudFeed};
-use crate::level::{DemonJammer, LevelGrid};
+use crate::fx::{overlay_layer, spawn_beam, Fx, FxFade, FxMotion, spawn_burst, spawn_flash_light, spawn_lightning, spawn_shockwave, BurstColor, FxAssets, HudFeed};
+use crate::fx::additive_glow;
+use crate::level::{DemonJammer, LevelEntity, LevelGrid};
+use crate::physics::sample_floor_height;
 use crate::player::{CursorCaptured, Player};
 use crate::signal::SignalState;
 use crate::state::PlayerModifiers;
@@ -31,6 +37,19 @@ pub const CHAIN_RANGE: f32 = 14.0;
 pub const CHAIN_MAX: usize = 3;
 pub const DASH_SHOCK_RADIUS: f32 = 5.5;
 pub const DASH_SHOCK_DAMAGE: f32 = 28.0;
+/// Sub-GHz route: breadcrumb nodes along the BFS path to the Tower.
+pub const ROUTE_MAX_STEPS: usize = 14;
+pub const ROUTE_LIFE: f32 = 5.0;
+/// Store & Forward.
+pub const STORE_FORWARD_MAX_PACKETS: u8 = 3;
+pub const STORE_FORWARD_DAMAGE: f32 = 20.0;
+pub const STORE_FORWARD_RANGE: f32 = 22.0;
+pub const STORE_FORWARD_MIN_BARS: u8 = 3;
+/// Emergency Callback window.
+pub const CALLBACK_SECS: f32 = 6.0;
+/// Missed Call decoy.
+pub const DECOY_SECS: f32 = 2.5;
+pub const DECOY_LURE_RADIUS: f32 = 18.0;
 
 /// Phone app cooldowns and animation timers (reset every floor).
 #[derive(Resource, Debug, Clone, Default, PartialEq)]
@@ -43,7 +62,32 @@ pub struct PhoneApps {
     pub cast_anim: f32,
     /// Dev/screenshot hook: cast Ping Scan once regardless of input.
     pub force_ping: bool,
+    /// Store & Forward packets queued by natural 0-bar kills (0..=3).
+    pub queued_packets: u8,
+    /// Emergency Callback: seconds left on the any-signal 5G Overload.
+    pub callback_timer: f32,
 }
+
+/// Sub-GHz route node: pulsing floor beacon on the path to the Tower.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct RouteBreadcrumb {
+    /// Route index (drives the travelling pulse).
+    pub index: usize,
+}
+
+/// Missed Call: ringing decoy handset that lures nearby Imps.
+#[derive(Component, Debug, Clone)]
+pub struct DecoyHandset {
+    pub timer: f32,
+}
+
+/// Decoy parts animated by [`tick_decoys`].
+#[derive(Component, Debug, Clone)]
+pub struct DecoyScreen(pub Handle<StandardMaterial>);
+#[derive(Component, Debug, Clone, Copy)]
+pub struct DecoyRing;
+#[derive(Component, Debug, Clone, Copy)]
+pub struct DecoyLight;
 
 pub fn ping_radius(bars: u8) -> f32 {
     24.0 + 6.0 * bars as f32
@@ -92,6 +136,144 @@ impl PhoneApps {
         self.ping_active_timer = (self.ping_active_timer - dt).max(0.0);
         self.overload_flash_timer = (self.overload_flash_timer - dt).max(0.0);
         self.cast_anim = (self.cast_anim - dt * 2.0).max(0.0);
+        self.callback_timer = (self.callback_timer - dt).max(0.0);
+    }
+
+    /// Store & Forward: queue one blackout packet (capped). Returns the new count.
+    pub fn queue_packet(&mut self) -> u8 {
+        self.queued_packets = (self.queued_packets + 1).min(STORE_FORWARD_MAX_PACKETS);
+        self.queued_packets
+    }
+
+    /// Emergency Callback armed and the Overload is off cooldown.
+    pub fn callback_ready(&self) -> bool {
+        self.callback_timer > 0.0 && self.overload_cooldown <= 0.0
+    }
+}
+
+/// Bars the 5G Overload gate sees: an armed Emergency Callback satisfies it.
+pub fn overload_gate_bars(bars: u8, callback_timer: f32) -> u8 {
+    if callback_timer > 0.0 { bars.max(OVERLOAD_MIN_BARS) } else { bars }
+}
+
+/// Store & Forward targets: one per packet, nearest first, cycling over the
+/// in-range targets when there are fewer targets than packets.
+pub fn packet_targets(distances: &[(usize, f32)], packets: u8, range: f32) -> Vec<usize> {
+    let mut inr: Vec<(usize, f32)> = distances.iter().copied().filter(|(_, d)| *d <= range).collect();
+    inr.sort_by(|a, b| a.1.total_cmp(&b.1));
+    if inr.is_empty() {
+        return Vec::new();
+    }
+    (0..packets as usize).map(|i| inr[i % inr.len()].0).collect()
+}
+
+/// Ping Scan with Sub-GHz: the next `max_steps` cells of the walkable route
+/// from `from` toward the Tower (start cell excluded).
+pub fn tower_route(grid: &LevelGrid, from: IVec2, max_steps: usize) -> Vec<IVec2> {
+    grid.walk_route(from, grid.tower).map(|r| r.into_iter().skip(1).take(max_steps).collect()).unwrap_or_default()
+}
+
+fn spawn_route_breadcrumbs(commands: &mut Commands, fx: &FxAssets, materials: &mut Assets<StandardMaterial>, grid: &LevelGrid, cells: &[IVec2]) {
+    let cyan = Color::srgb(0.2, 1.0, 0.95);
+    for (i, &c) in cells.iter().enumerate() {
+        let mut p = grid.cell_center(c);
+        p.y = sample_floor_height(grid, p.x, p.z).unwrap_or(p.y) + 0.06;
+        // Short glowing post + flat pulsing floor disc.
+        spawn_beam(commands, fx, materials, p, 0.45, 0.32, ROUTE_LIFE, cyan, false);
+        let mat = additive_glow(cyan, 0.75);
+        let emissive = mat.emissive;
+        let handle = materials.add(mat);
+        let scale = Vec3::new(0.55, 0.05, 0.55);
+        commands.spawn((
+            LevelEntity,
+            RouteBreadcrumb { index: i },
+            Fx::new(ROUTE_LIFE, FxMotion::Hold, scale),
+            FxFade { material: handle.clone(), alpha: 0.75, emissive },
+            Mesh3d(fx.ring.clone()),
+            MeshMaterial3d(handle),
+            Transform::from_translation(p).with_scale(scale),
+        ));
+    }
+}
+
+/// Travelling pulse along the Sub-GHz route (toward the Tower).
+fn animate_breadcrumbs(time: Res<Time>, mut q: Query<(&RouteBreadcrumb, &Fx, &mut Transform)>) {
+    let t = time.elapsed_secs();
+    for (b, fx, mut tf) in &mut q {
+        let wave = ((t * 7.0 - b.index as f32 * 0.7).sin() * 0.5 + 0.5).powi(2);
+        let s = 1.0 + wave * 0.7;
+        tf.scale = Vec3::new(fx.base_scale.x * s, fx.base_scale.y, fx.base_scale.z * s);
+    }
+}
+
+fn spawn_decoy(commands: &mut Commands, fx: &FxAssets, materials: &mut Assets<StandardMaterial>, pos: Vec3) -> Entity {
+    let body = materials.add(StandardMaterial { base_color: Color::srgb(0.05, 0.06, 0.07), perceptual_roughness: 0.35, metallic: 0.6, ..default() });
+    let screen = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.7, 0.15),
+        emissive: LinearRgba::rgb(6.0, 3.6, 0.6),
+        unlit: true,
+        ..default()
+    });
+    let ring = materials.add(additive_glow(Color::srgb(1.0, 0.75, 0.2), 0.7));
+    commands
+        .spawn((
+            LevelEntity,
+            DecoyHandset { timer: DECOY_SECS },
+            Transform::from_translation(pos),
+            Visibility::default(),
+            children![
+                (Mesh3d(fx.cube.clone()), MeshMaterial3d(body), Transform::from_scale(Vec3::new(0.34, 0.06, 0.66))),
+                (DecoyScreen(screen.clone()), Mesh3d(fx.cube.clone()), MeshMaterial3d(screen), Transform::from_xyz(0.0, 0.035, 0.0).with_scale(Vec3::new(0.28, 0.02, 0.56))),
+                (DecoyRing, Mesh3d(fx.ring.clone()), MeshMaterial3d(ring), Transform::from_xyz(0.0, -0.15, 0.0).with_scale(Vec3::new(0.6, 0.1, 0.6))),
+                (
+                    DecoyLight,
+                    PointLight { color: Color::srgb(1.0, 0.7, 0.2), intensity: 250_000.0, range: 9.0, shadow_maps_enabled: false, ..default() },
+                    Transform::from_xyz(0.0, 0.5, 0.0),
+                ),
+            ],
+        ))
+        .id()
+}
+
+/// Missed Call decoys: vibrate, blink amber/cyan, pulse the ring, expire.
+#[allow(clippy::type_complexity)]
+pub fn tick_decoys(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut decoys: Query<(Entity, &mut DecoyHandset, &mut Transform, &Children)>,
+    screens: Query<&DecoyScreen>,
+    mut rings: Query<&mut Transform, (With<DecoyRing>, Without<DecoyHandset>)>,
+    mut lights: Query<&mut PointLight, With<DecoyLight>>,
+) {
+    let dt = time.delta_secs();
+    for (e, mut d, mut tf, children) in &mut decoys {
+        d.timer -= dt;
+        if d.timer <= 0.0 {
+            commands.entity(e).try_despawn();
+            continue;
+        }
+        let age = DECOY_SECS - d.timer;
+        // Ringing buzz: rapid yaw wobble in bursts.
+        let buzz = if (age * 2.5).fract() < 0.6 { (age * 70.0).sin() * 0.16 } else { 0.0 };
+        tf.rotation = Quat::from_rotation_y(buzz);
+        let cyan_phase = (age * 6.0) as u32 % 2 == 1;
+        for c in children.iter() {
+            if let Ok(s) = screens.get(c)
+                && let Some(mut m) = materials.get_mut(&s.0)
+            {
+                m.emissive = if cyan_phase { LinearRgba::rgb(0.6, 4.5, 6.0) } else { LinearRgba::rgb(6.0, 3.6, 0.6) };
+            }
+            if let Ok(mut r) = rings.get_mut(c) {
+                let k = (age * 1.8).fract();
+                let s = 0.5 + k * 2.4;
+                r.scale = Vec3::new(s, 0.1, s);
+            }
+            if let Ok(mut l) = lights.get_mut(c) {
+                l.intensity = 120_000.0 + 260_000.0 * ((age * 12.0).sin() * 0.5 + 0.5);
+                l.color = if cyan_phase { Color::srgb(0.3, 0.95, 1.0) } else { Color::srgb(1.0, 0.7, 0.2) };
+            }
+        }
     }
 }
 
@@ -122,7 +304,7 @@ fn phone_apps(
     ea: Res<EnemyAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
-    players: Query<&Transform, With<Player>>,
+    (players, decoys): (Query<&Transform, With<Player>>, Query<Entity, With<DecoyHandset>>),
     mut enemies: Query<(Entity, &mut Enemy, &GlobalTransform, Option<&mut PingMarked>)>,
     mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
     mut bot: Option<ResMut<BotControl>>,
@@ -133,7 +315,23 @@ fn phone_apps(
 
     // ---- PING SCAN ----
     let bot_ping = take_flag(&mut bot, |b| &mut b.ping);
-    if (captured.0 && mouse.just_pressed(MouseButton::Right)) || std::mem::take(&mut apps.force_ping) || bot_ping {
+    let ping_pressed = (captured.0 && mouse.just_pressed(MouseButton::Right)) || std::mem::take(&mut apps.force_ping) || bot_ping;
+    if ping_pressed && signal.bars == 0 && mods.missed_call {
+        // ---- MISSED CALL decoy (0 bars) ----
+        if apps.ping_cooldown > 0.0 {
+            sfx.play(SfxEvent::Denied);
+            feed.toast(format!("MISSED CALL: {:.1}s", apps.ping_cooldown), Color::srgb(1.0, 0.5, 0.2));
+        } else {
+            for d in &decoys {
+                commands.entity(d).try_despawn();
+            }
+            spawn_decoy(&mut commands, &fx, &mut materials, ptf.translation + Vec3::Y * 0.25);
+            apps.ping_cooldown = ping_cooldown(&mods);
+            apps.cast_anim = 1.0;
+            sfx.play(SfxEvent::Ping);
+            feed.toast(format!("MISSED CALL DECOY DEPLOYED ({DECOY_SECS:.1}s)"), Color::srgb(1.0, 0.75, 0.2));
+        }
+    } else if ping_pressed {
         match app_block_reason(signal.bars, PING_MIN_BARS, apps.ping_cooldown) {
             Some(why) => {
                 sfx.play(SfxEvent::Denied);
@@ -185,13 +383,17 @@ fn phone_apps(
                     }
                 }
                 feed.toast(format!("PING: {marked} DEMONS / {jcount} JAMMERS"), Color::srgb(0.3, 0.95, 1.0));
+                if mods.sub_ghz_route {
+                    let route = tower_route(&grid, grid.world_to_cell(ptf.translation), ROUTE_MAX_STEPS);
+                    spawn_route_breadcrumbs(&mut commands, &fx, &mut materials, &grid, &route);
+                }
             }
         }
     }
 
     // ---- 5G OVERLOAD ----
     if keys.just_pressed(KeyCode::KeyQ) || take_flag(&mut bot, |b| &mut b.overload) {
-        match app_block_reason(signal.bars, OVERLOAD_MIN_BARS, apps.overload_cooldown) {
+        match app_block_reason(overload_gate_bars(signal.bars, apps.callback_timer), OVERLOAD_MIN_BARS, apps.overload_cooldown) {
             Some(why) => {
                 sfx.play(SfxEvent::Denied);
                 let fiend_near = enemies
@@ -202,6 +404,10 @@ fn phone_apps(
             None => {
                 let radius = emp_radius(&mods);
                 let dmg = emp_damage(&mods);
+                if apps.callback_timer > 0.0 {
+                    apps.callback_timer = 0.0;
+                    feed.toast("EMERGENCY CALLBACK: 5G OVERLOAD FIRED", Color::srgb(1.0, 0.85, 0.25));
+                }
                 apps.overload_cooldown = OVERLOAD_COOLDOWN;
                 apps.overload_flash_timer = 0.8;
                 apps.cast_anim = 1.0;
@@ -260,6 +466,47 @@ fn phone_apps(
     }
 }
 
+/// Store & Forward: once back at 3+ bars, every queued blackout packet fires
+/// a 20-damage arc at the nearest demons within range.
+#[allow(clippy::too_many_arguments)]
+pub fn store_and_forward_discharge(
+    mut commands: Commands,
+    signal: Res<SignalState>,
+    mods: Res<PlayerModifiers>,
+    mut apps: ResMut<PhoneApps>,
+    fx: Res<FxAssets>,
+    (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
+    players: Query<&Transform, With<Player>>,
+    mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
+) {
+    if apps.queued_packets == 0 || signal.bars < STORE_FORWARD_MIN_BARS {
+        return;
+    }
+    let Ok(ptf) = players.single() else { return };
+    let src = ptf.translation + Vec3::Y * 1.2;
+    let dists: Vec<(usize, f32)> = enemies
+        .iter()
+        .enumerate()
+        .filter(|(_, (e, _, _))| e.is_alive())
+        .map(|(i, (e, g, _))| (i, e.center(g.translation()).distance(src)))
+        .collect();
+    let targets = packet_targets(&dists, apps.queued_packets, STORE_FORWARD_RANGE);
+    if targets.is_empty() {
+        return;
+    }
+    let mut list: Vec<_> = enemies.iter_mut().collect();
+    for &i in &targets {
+        let (en, g, mark) = &mut list[i];
+        damage_enemy(en, STORE_FORWARD_DAMAGE, mark.is_some(), &mods);
+        let c = en.center(g.translation());
+        spawn_lightning(&mut commands, &fx, src, c);
+    }
+    sfx.play(SfxEvent::Overload);
+    feed.hit(false);
+    feed.toast(format!("STORE & FORWARD: {} ARCS FIRED!", targets.len()), Color::srgb(0.55, 0.75, 1.0));
+    apps.queued_packets = 0;
+}
+
 /// Airplane Mode Phase: dashing releases a static shockwave.
 #[allow(clippy::too_many_arguments)]
 fn dash_shockwave(
@@ -302,7 +549,11 @@ impl Plugin for AppsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PhoneApps>()
             .add_systems(Update, reset_apps.run_if(resource_exists_and_changed::<LevelGrid>).in_set(crate::state::GameSet::World))
-            .add_systems(Update, (phone_apps, dash_shockwave).chain().in_set(CombatDamage).run_if(resource_exists::<LevelGrid>));
+            .add_systems(
+                Update,
+                (phone_apps, dash_shockwave, store_and_forward_discharge).chain().in_set(CombatDamage).run_if(resource_exists::<LevelGrid>),
+            )
+            .add_systems(Update, (tick_decoys, animate_breadcrumbs).in_set(crate::state::GameSet::World));
     }
 }
 
@@ -340,6 +591,34 @@ mod tests {
         let idx: Vec<usize> = picks.iter().map(|p| p.1).collect();
         assert_eq!(idx, vec![2, 0, 3]);
         assert!(chain_targets(&[], &cands, 3, 14.0).is_empty());
+    }
+
+    #[test]
+    fn callback_opens_overload_gate() {
+        assert_eq!(overload_gate_bars(0, 0.0), 0);
+        assert_eq!(overload_gate_bars(0, 2.0), OVERLOAD_MIN_BARS);
+        assert_eq!(overload_gate_bars(5, 2.0), 5);
+        assert_eq!(app_block_reason(overload_gate_bars(0, 3.0), OVERLOAD_MIN_BARS, 0.0), None);
+        assert!(app_block_reason(overload_gate_bars(0, 3.0), OVERLOAD_MIN_BARS, 4.0).is_some(), "cooldown still applies");
+        let mut a = PhoneApps { callback_timer: CALLBACK_SECS, ..default() };
+        assert!(a.callback_ready());
+        a.overload_cooldown = 1.0;
+        assert!(!a.callback_ready());
+        a.tick(CALLBACK_SECS);
+        assert_eq!(a.callback_timer, 0.0);
+    }
+
+    #[test]
+    fn packets_cap_and_cycle_targets() {
+        let mut a = PhoneApps::default();
+        for _ in 0..5 {
+            a.queue_packet();
+        }
+        assert_eq!(a.queued_packets, STORE_FORWARD_MAX_PACKETS);
+        let d = [(0, 30.0), (1, 5.0), (2, 12.0)];
+        assert_eq!(packet_targets(&d, 3, STORE_FORWARD_RANGE), vec![1, 2, 1]);
+        assert_eq!(packet_targets(&[(4, 8.0)], 3, STORE_FORWARD_RANGE), vec![4, 4, 4]);
+        assert!(packet_targets(&[(0, 30.0)], 3, STORE_FORWARD_RANGE).is_empty());
     }
 
     #[test]

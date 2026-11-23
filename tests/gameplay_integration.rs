@@ -13,7 +13,9 @@
 use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 
-use segnale_debole::apps::{PhoneApps, PING_COOLDOWN};
+use segnale_debole::apps::{
+    tower_route, DecoyHandset, PhoneApps, RouteBreadcrumb, CALLBACK_SECS, PING_COOLDOWN, ROUTE_MAX_STEPS, STORE_FORWARD_DAMAGE,
+};
 use segnale_debole::bot_input::BotControl;
 use segnale_debole::playtest_bot::{PlaytestBot, PlaytestBotPlugin, BOT_TIMEOUT_SECS};
 use segnale_debole::{build_headless_test_app, HeadlessGamePlugin};
@@ -22,7 +24,7 @@ use segnale_debole::extraction::ExtractionState;
 use segnale_debole::level::{jammer_count_for_floor, Cell, DemonJammer, LevelGrid, SignalTower};
 use segnale_debole::physics::has_line_of_sight;
 use segnale_debole::player::{Player, PLAYER_EYE_HEIGHT};
-use segnale_debole::signal::{SignalState, TOWER_RING_RADIUS};
+use segnale_debole::signal::{bars_from_strength, SignalState, TOWER_RING_RADIUS};
 use segnale_debole::state::{start_run, AppState, PlayerModifiers, RunStats, UpgradeId, FINAL_FLOOR};
 use segnale_debole::upgrades::{apply_upgrade, UpgradeChoices};
 use segnale_debole::weapons::{Pickup, Weapon, WeaponState, PLASMA_DAMAGE};
@@ -727,4 +729,256 @@ fn sos_supply_drops_and_jammer_fiend_alert_beacon() {
     let feed = app.world().resource::<HudFeed>().clone();
     assert!(format!("{feed:?}").contains("UPLINK JAMMED - KILL THE JAMMER FIEND!"), "jammed alert shown");
     assert!(count::<Fx>(&mut app) > fx_before, "X-ray beacon spawned on the fiend");
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 6: reworked + signature "Segnale debole" upgrades
+// ---------------------------------------------------------------------------
+
+/// Teleport next to Demon Jammers until the *natural* (pre-antenna) signal is
+/// a 0-bar blackout. Returns the player's cell.
+fn find_blackout(app: &mut App) -> IVec2 {
+    let g = grid(app);
+    for &j in &g.jammers {
+        for r in 1..=2 {
+            for o in [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y] {
+                let c = j + o * r;
+                if !matches!(g.cell(c), Cell::Floor { .. } | Cell::AtriumFloor) || !g.is_reachable(g.spawn, c) {
+                    continue;
+                }
+                teleport(app, g.cell_center(c), g.cell_center(j) + Vec3::Y * 1.3);
+                step(app, 2);
+                if bars_from_strength(signal(app).natural_raw_strength) == 0 {
+                    return c;
+                }
+            }
+        }
+    }
+    panic!("no natural 0-bar blackout cell next to any jammer");
+}
+
+/// A cell `k` straight walkable steps away from `from` (same direction), with
+/// a matching floor height so a demon can walk the line directly.
+fn straight_cell(g: &LevelGrid, from: IVec2, k: i32) -> Option<IVec2> {
+    [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y].into_iter().find_map(|o| {
+        let ok = (0..k).all(|i| g.in_bounds(from + o * (i + 1)) && g.can_walk(from + o * (i + 1), from + o * i) && g.can_walk(from + o * i, from + o * (i + 1)));
+        ok.then_some(from + o * k)
+    })
+}
+
+fn kill(app: &mut App, e: Entity) {
+    app.world_mut().get_mut::<Enemy>(e).unwrap().hp = 0.0;
+}
+
+#[test]
+fn high_capacity_cell_leaves_fire_rate_alone() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 51);
+    install(&mut app, UpgradeId::HighCapacityCell);
+    let m = app.world().resource::<PlayerModifiers>().clone();
+    assert_eq!(m.fire_rate_mult, 1.0);
+    assert!((m.pickup_mult - 1.3).abs() < 1e-6);
+    let p = player(&mut app);
+    assert_eq!((p.max_shells, p.max_plasma), (68, 270));
+}
+
+#[test]
+fn sub_ghz_ping_projects_floor_route_to_tower() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 52);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    // Antenna guarantees >= 1 bar for Ping at spawn.
+    install(&mut app, UpgradeId::CopperAntenna);
+    step(&mut app, 3);
+    assert!(signal(&app).bars >= 1);
+
+    // Plain Ping: no route.
+    bot(&mut app).ping = true;
+    step(&mut app, 2);
+    assert_eq!(count::<RouteBreadcrumb>(&mut app), 0, "no route without Sub-GHz");
+    app.world_mut().resource_mut::<PhoneApps>().ping_cooldown = 0.0;
+
+    install(&mut app, UpgradeId::SubGhzPenetration);
+    let g = grid(&app);
+    let me = g.world_to_cell(player_feet(&mut app));
+    let expect = tower_route(&g, me, ROUTE_MAX_STEPS);
+    assert!(!expect.is_empty(), "spawn has a route to the tower");
+    bot(&mut app).ping = true;
+    step(&mut app, 2);
+    assert_eq!(count::<RouteBreadcrumb>(&mut app), expect.len());
+    assert!(expect.len() <= ROUTE_MAX_STEPS);
+    // Every breadcrumb sits on a route cell, and the first one is adjacent.
+    let mut q = app.world_mut().query::<(&RouteBreadcrumb, &Transform)>();
+    let mut crumbs: Vec<(usize, IVec2)> = q.iter(app.world()).map(|(b, tf)| (b.index, g.world_to_cell(tf.translation))).collect();
+    crumbs.sort_by_key(|c| c.0);
+    let cells: Vec<IVec2> = crumbs.iter().map(|c| c.1).collect();
+    assert_eq!(cells, expect);
+    assert_eq!((cells[0] - me).abs().element_sum(), 1);
+    // Breadcrumbs fade out after ~5 s.
+    step(&mut app, 6 * FPS);
+    assert_eq!(count::<RouteBreadcrumb>(&mut app), 0);
+}
+
+#[test]
+fn firewall_daemon_regen_stops_while_jammed() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 21);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    install(&mut app, UpgradeId::FirewallDaemon);
+    trigger_uplink(&mut app);
+    with_player(&mut app, |p| p.armor = 0.0);
+    for _ in 0..FPS {
+        cull_kind(&mut app, EnemyKind::JammerFiend, None);
+        step(&mut app, 1);
+    }
+    let a1 = player(&mut app).armor;
+    assert!(a1 > 4.0, "regen while SOS advances in the ring: {a1}");
+
+    // A spared, stunned Jammer Fiend in the ring jams the uplink: no armor farm.
+    let g = grid(&app);
+    let me = ring_cell(&g);
+    let far = g.tower - (me - g.tower);
+    let fiend = spawn_demon(&mut app, EnemyKind::JammerFiend, spawn_pos_for(EnemyKind::JammerFiend, &g, far));
+    for _ in 0..20 {
+        app.world_mut().get_mut::<Enemy>(fiend).unwrap().stun_timer = 1.0e3;
+        step(&mut app, 1);
+    }
+    assert!(matches!(extraction(&app), ExtractionState::Uploading { jammed: true, .. }));
+    with_player(&mut app, |p| p.armor = 0.0);
+    for _ in 0..FPS {
+        cull_kind(&mut app, EnemyKind::JammerFiend, Some(fiend));
+        step(&mut app, 1);
+    }
+    assert!(matches!(extraction(&app), ExtractionState::Uploading { jammed: true, .. }));
+    assert_eq!(player(&mut app).armor, 0.0, "no Firewall regen while jammed");
+}
+
+#[test]
+fn store_and_forward_queues_blackout_packets_and_fires_arcs() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    // Copper Antenna owners still earn packets: the natural signal is what counts.
+    install(&mut app, UpgradeId::CopperAntenna);
+    install(&mut app, UpgradeId::StoreAndForward);
+    let dz = find_blackout(&mut app);
+    let s = signal(&app);
+    assert!(s.bars >= 1, "antenna floor lifts the displayed bars");
+    assert_eq!(bars_from_strength(s.natural_raw_strength), 0);
+    let g = grid(&app);
+    for i in 0..4 {
+        let imp = spawn_demon(&mut app, EnemyKind::Imp, spawn_pos_for(EnemyKind::Imp, &g, dz));
+        step(&mut app, 1);
+        kill(&mut app, imp);
+        step(&mut app, 2);
+        assert_eq!(app.world().resource::<PhoneApps>().queued_packets, (i + 1).min(3), "kill {i}");
+    }
+    // Still in the blackout: nothing fires.
+    step(&mut app, 10);
+    assert_eq!(app.world().resource::<PhoneApps>().queued_packets, 3);
+
+    // Two stunned demons near the tower; walk back into 3+ bars.
+    let me = ring_cell(&g);
+    let out = g.tower + (me - g.tower) * 3;
+    let a = spawn_demon(&mut app, EnemyKind::HellBaron, spawn_pos_for(EnemyKind::HellBaron, &g, out));
+    let b = spawn_demon(&mut app, EnemyKind::HellBaron, spawn_pos_for(EnemyKind::HellBaron, &g, g.tower + (me - g.tower) * 4));
+    step(&mut app, 1);
+    for e in [a, b] {
+        app.world_mut().get_mut::<Enemy>(e).unwrap().stun_timer = 1.0e3;
+    }
+    let hp0 = enemy(&app, a).unwrap().hp + enemy(&app, b).unwrap().hp;
+    teleport(&mut app, g.cell_center(me), g.tower_world());
+    step(&mut app, 3);
+    assert!(signal(&app).bars >= 3);
+    assert_eq!(app.world().resource::<PhoneApps>().queued_packets, 0, "packets discharged");
+    let hp1 = enemy(&app, a).unwrap().hp + enemy(&app, b).unwrap().hp;
+    assert!((hp0 - hp1 - 3.0 * STORE_FORWARD_DAMAGE).abs() < 1e-3, "3 arcs x 20 dmg, dealt {}", hp0 - hp1);
+    // Nearest target takes the cycled extra packet.
+    assert!(enemy(&app, a).unwrap().hp < enemy(&app, b).unwrap().hp);
+}
+
+#[test]
+fn emergency_callback_unlocks_any_signal_overload() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    install(&mut app, UpgradeId::EmergencyCallback);
+    let dz = find_blackout(&mut app);
+    assert_eq!(signal(&app).bars, 0);
+    let g = grid(&app);
+
+    // Normally the Overload is gated at 0 bars.
+    bot(&mut app).overload = true;
+    step(&mut app, 2);
+    assert_eq!(app.world().resource::<PhoneApps>().overload_cooldown, 0.0, "0 bars: denied");
+
+    // An unmarked fiend kill does nothing.
+    let f1 = spawn_demon(&mut app, EnemyKind::JammerFiend, spawn_pos_for(EnemyKind::JammerFiend, &g, dz));
+    step(&mut app, 1);
+    kill(&mut app, f1);
+    step(&mut app, 2);
+    assert_eq!(app.world().resource::<PhoneApps>().callback_timer, 0.0);
+
+    // A ping-marked fiend kill arms the callback.
+    let f2 = spawn_demon(&mut app, EnemyKind::JammerFiend, spawn_pos_for(EnemyKind::JammerFiend, &g, dz));
+    step(&mut app, 1);
+    app.world_mut().entity_mut(f2).insert(PingMarked { timer: 5.0, ring: None });
+    kill(&mut app, f2);
+    step(&mut app, 2);
+    let cb = app.world().resource::<PhoneApps>().callback_timer;
+    assert!(cb > CALLBACK_SECS - 0.2 && cb <= CALLBACK_SECS, "callback armed: {cb}");
+    assert_eq!(signal(&app).bars, 0, "still no signal");
+
+    bot(&mut app).overload = true;
+    step(&mut app, 2);
+    let apps = app.world().resource::<PhoneApps>().clone();
+    assert!(apps.overload_cooldown > 0.0, "any-signal 5G Overload fired at 0 bars");
+    assert_eq!(apps.callback_timer, 0.0, "callback consumed");
+}
+
+#[test]
+fn missed_call_decoy_lures_imp_away_from_player() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    install(&mut app, UpgradeId::MissedCall);
+    let dz = find_blackout(&mut app);
+    assert_eq!(signal(&app).bars, 0);
+    let g = grid(&app);
+
+    bot(&mut app).ping = true;
+    step(&mut app, 2);
+    assert_eq!(count::<DecoyHandset>(&mut app), 1, "decoy deployed at 0 bars");
+    assert!(app.world().resource::<PhoneApps>().ping_cooldown > 0.0);
+    let decoy = {
+        let mut q = app.world_mut().query_filtered::<&Transform, With<DecoyHandset>>();
+        q.single(app.world()).unwrap().translation
+    };
+
+    // Imp 3 cells from the decoy; the player retreats to spawn, far away.
+    let imp_cell = straight_cell(&g, dz, 3).or_else(|| straight_cell(&g, dz, 2)).expect("straight open line from blackout cell");
+    let imp = spawn_demon(&mut app, EnemyKind::Imp, spawn_pos_for(EnemyKind::Imp, &g, imp_cell));
+    teleport(&mut app, g.spawn_world(), g.tower_world());
+    step(&mut app, 1);
+    let flat = |a: Vec3, b: Vec3| Vec2::new(a.x - b.x, a.z - b.z).length();
+    let d0 = flat(app.world().get::<Transform>(imp).unwrap().translation, decoy);
+    let p0 = flat(app.world().get::<Transform>(imp).unwrap().translation, player_feet(&mut app));
+    assert!(p0 > d0 + 6.0, "player is clearly elsewhere");
+    for _ in 0..(1.5 * FPS as f32) as usize {
+        godmode(&mut app);
+        step(&mut app, 1);
+    }
+    let d1 = flat(app.world().get::<Transform>(imp).unwrap().translation, decoy);
+    println!("imp->decoy {d0:.2} -> {d1:.2} (player {p0:.2} away)");
+    assert!(d1 < d0 - 2.0 || d1 < 1.6, "imp drawn to the decoy: {d0} -> {d1}");
+    assert!(enemy(&app, imp).unwrap().alerted);
+
+    // The decoy rings for 2.5 s, then hangs up.
+    step(&mut app, 2 * FPS);
+    assert_eq!(count::<DecoyHandset>(&mut app), 0);
 }

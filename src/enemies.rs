@@ -15,7 +15,8 @@ use crate::fx::{spawn_burst, BurstColor, FxAssets, HudFeed};
 use crate::level::{Cell, DemonJammer, LevelEntity, LevelGrid, RampDir, SignalTower, CEILING_HEIGHT};
 use crate::physics::{count_wall_occlusions, has_line_of_sight, raycast_grid, resolve_player_movement, sample_floor_height, PLAYER_RADIUS};
 use crate::player::{Player, PLAYER_EYE_HEIGHT};
-use crate::signal::{active_jammer_fields, compute_signal_at, JammerField, SignalState};
+use crate::apps::{DecoyHandset, PhoneApps, CALLBACK_SECS, DECOY_LURE_RADIUS, STORE_FORWARD_MAX_PACKETS};
+use crate::signal::{active_jammer_fields, bars_from_strength, compute_signal_at, JammerField, SignalState};
 use crate::state::{GameSet, PlayerModifiers, RunStats};
 use crate::weapons::{spawn_pickup, PickupAssets, PickupKind};
 
@@ -824,6 +825,7 @@ fn enemy_ai(
     mut enemies: Query<(Entity, &mut Enemy, &mut Transform, &GlobalTransform), Without<Player>>,
     jammers: Query<(&DemonJammer, &GlobalTransform)>,
     tower: Query<&SignalTower>,
+    decoys: Query<&GlobalTransform, (With<DecoyHandset>, Without<Enemy>)>,
     freeze: Option<Res<crate::dev::DevFreezeAi>>,
 ) {
     if freeze.is_some() {
@@ -843,6 +845,7 @@ fn enemy_ai(
     let tower_ref = grid.tower_world() + Vec3::Y * 1.5;
     let beacon = tower.single().map(|t| t.beacon).unwrap_or(tower_ref);
     let neutral = PlayerModifiers::default();
+    let decoy = decoys.iter().next().map(|g| g.translation());
 
     for (entity, mut e, mut tf, _) in &mut enemies {
         if !e.is_alive() {
@@ -891,6 +894,29 @@ fn enemy_ai(
             } else {
                 tf.translation = fly_move(&grid, pos, vel * dt, e.stats.radius);
             }
+            e.velocity = vel;
+            continue;
+        }
+
+        // Missed Call: a ringing decoy pulls nearby Imps away from the player.
+        if let Some(dpos) = decoy_lure(e.kind, pos, decoy) {
+            e.alerted = true;
+            let to_d = Vec3::new(dpos.x - pos.x, 0.0, dpos.z - pos.z);
+            let dir = if to_d.length() > e.stats.radius + 0.4 { to_d.normalize_or_zero() } else { Vec3::ZERO };
+            let face = to_d.normalize_or_zero();
+            if face != Vec3::ZERO {
+                let want = Quat::from_rotation_y(crate::level::yaw_facing(Vec2::new(face.x, face.z)));
+                tf.rotation = tf.rotation.slerp(want, (dt * 10.0).min(1.0));
+            }
+            let speed = e.move_speed();
+            let k = (dt * 8.0).min(1.0);
+            let mut vel = e.velocity;
+            vel.x += (dir.x * speed - vel.x) * k;
+            vel.z += (dir.z * speed - vel.z) * k;
+            let r = resolve_player_movement(&grid, pos, vel + Vec3::new(kb.x, 0.0, kb.z), dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT);
+            tf.translation = r.pos;
+            vel.y = r.vel.y;
+            e.grounded = r.grounded;
             e.velocity = vel;
             continue;
         }
@@ -1019,6 +1045,13 @@ fn enemy_ai(
             sfx.play(SfxEvent::EnemyFire);
         }
     }
+}
+
+/// Missed Call lure target for a demon at `pos`: only Imps within
+/// [`DECOY_LURE_RADIUS`] of an active decoy are drawn to it.
+pub fn decoy_lure(kind: EnemyKind, pos: Vec3, decoy: Option<Vec3>) -> Option<Vec3> {
+    let d = decoy?;
+    (kind == EnemyKind::Imp && Vec2::new(d.x - pos.x, d.z - pos.z).length() <= DECOY_LURE_RADIUS).then_some(d)
 }
 
 /// Flying movement with per-axis wall sliding.
@@ -1233,11 +1266,12 @@ fn enemy_deaths(
     mut run: ResMut<RunStats>,
     mut sfx: ResMut<SfxQueue>,
     mut feed: ResMut<HudFeed>,
+    mut apps: ResMut<PhoneApps>,
     mut players: Query<&mut Player>,
-    enemies: Query<(Entity, &Enemy, &Transform)>,
+    enemies: Query<(Entity, &Enemy, &Transform, Option<&PingMarked>)>,
 ) {
     let mut rng = rand::rng();
-    for (entity, e, tf) in &enemies {
+    for (entity, e, tf, marked) in &enemies {
         if e.is_alive() {
             continue;
         }
@@ -1264,6 +1298,17 @@ fn enemy_deaths(
         {
             p.heal(mods.siphon_heal);
             feed.toast(format!("SIGNAL SIPHON +{} HP", mods.siphon_heal as i32), Color::srgb(0.3, 1.0, 0.7));
+        }
+        // Store & Forward: natural (pre-antenna) 0-bar blackout kills queue packets.
+        if mods.store_and_forward && bars_from_strength(signal.natural_raw_strength) == 0 {
+            let n = apps.queue_packet();
+            feed.toast(format!("PACKET QUEUED ({n}/{STORE_FORWARD_MAX_PACKETS})"), Color::srgb(0.6, 0.5, 1.0));
+        }
+        // Emergency Callback: a ping-marked Jammer Fiend's death opens the line.
+        if mods.emergency_callback && e.kind == EnemyKind::JammerFiend && marked.is_some() {
+            apps.callback_timer = CALLBACK_SECS;
+            feed.alert("EMERGENCY CALLBACK! ANY-SIGNAL 5G EMP READY (6s)", Color::srgb(1.0, 0.85, 0.2), 2.5);
+            feed.toast("EMERGENCY CALLBACK! ANY-SIGNAL 5G EMP READY (6s)", Color::srgb(1.0, 0.85, 0.2));
         }
         // Drops.
         let ground = tf.translation.with_y(tf.translation.y - if e.kind.flying() { 2.0 } else { 0.0 });
@@ -1432,6 +1477,16 @@ mod tests {
             }
         }
         assert_eq!(c, target);
+    }
+
+    #[test]
+    fn decoy_lures_only_nearby_imps() {
+        let d = Some(Vec3::new(10.0, 0.25, 0.0));
+        assert_eq!(decoy_lure(EnemyKind::Imp, Vec3::ZERO, d), d);
+        assert_eq!(decoy_lure(EnemyKind::Imp, Vec3::ZERO, None), None);
+        assert_eq!(decoy_lure(EnemyKind::Imp, Vec3::new(40.0, 0.0, 0.0), d), None);
+        assert_eq!(decoy_lure(EnemyKind::Cacodemon, Vec3::ZERO, d), None);
+        assert_eq!(decoy_lure(EnemyKind::HellBaron, Vec3::ZERO, d), None);
     }
 
     #[test]

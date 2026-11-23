@@ -18,7 +18,7 @@ use crate::fx::HudFeed;
 use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::SignalState;
 use crate::state::{complete_floor, start_run, AppState, GameSet, PlayerModifiers, RunStats, FINAL_FLOOR};
-use crate::upgrades::{draft_upgrades, pick_upgrade, UpgradeChoices};
+use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeChoices};
 use crate::weapons::{Weapon, WeaponState};
 
 pub const COLOR_BG: Color = Color::srgb(0.07, 0.01, 0.01);
@@ -146,7 +146,7 @@ fn spawn_main_menu(mut commands: Commands) {
 // ---------------------------------------------------------------------------
 
 /// "APP STORE // FIRMWARE DOWNLOAD": three upgrade cards (click or 1/2/3).
-pub fn spawn_app_store(mut commands: Commands, run: Res<RunStats>, choices: Res<UpgradeChoices>) {
+pub fn spawn_app_store(mut commands: Commands, run: Res<RunStats>, mods: Res<PlayerModifiers>, choices: Res<UpgradeChoices>) {
     let root = commands.spawn(screen_root(AppState::UpgradeSelect, COLOR_STORE_BG)).id();
     let phone = commands
         .spawn((
@@ -225,6 +225,20 @@ pub fn spawn_app_store(mut commands: Commands, run: Res<RunStats>, choices: Res<
                 text(id.name(), 24.0, COLOR_TEXT),
                 (Node { max_width: Val::Px(296.0), ..default() }, children![text(id.description(), 19.0, COLOR_DIM)]),
                 text(tag, 14.0, COLOR_SIGNAL_AMBER),
+                (
+                    Node {
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(8.0)),
+                        max_width: Val::Px(298.0),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgb(0.15, 0.55, 0.6)),
+                    BackgroundColor(Color::srgb(0.01, 0.06, 0.07)),
+                    children![text("NEXT RANK", 11.0, COLOR_SIGNAL_AMBER), text(next_rank_preview(*id, &mods), 14.0, COLOR_CYAN)],
+                ),
                 (
                     Node { padding: UiRect::axes(Val::Px(22.0), Val::Px(6.0)), border_radius: BorderRadius::all(Val::Px(10.0)), ..default() },
                     BackgroundColor(Color::srgb(0.08, 0.55, 0.5)),

@@ -321,6 +321,29 @@ impl LevelGrid {
         dist
     }
 
+    /// Shortest walkable cell route `from -> to` (both ends included), built on
+    /// [`Self::walk_distances`] by backtracking from `to`. `None` = unreachable.
+    pub fn walk_route(&self, from: IVec2, to: IVec2) -> Option<Vec<IVec2>> {
+        if !self.in_bounds(to) {
+            return None;
+        }
+        let dist = self.walk_distances(from);
+        let mut d = dist[self.idx(to)]?;
+        let mut route = vec![to];
+        let mut c = to;
+        while d > 0 {
+            c = RampDir::ALL
+                .map(RampDir::offset)
+                .into_iter()
+                .map(|o| c + o)
+                .find(|&p| self.in_bounds(p) && dist[self.idx(p)] == Some(d - 1) && self.can_walk(p, c))?;
+            d -= 1;
+            route.push(c);
+        }
+        route.reverse();
+        Some(route)
+    }
+
     pub fn is_reachable(&self, from: IVec2, to: IVec2) -> bool {
         self.in_bounds(to) && self.walk_distances(from)[self.idx(to)].is_some()
     }
@@ -1050,6 +1073,23 @@ mod tests {
             assert!(!g.is_roof_open(g.spawn));
             assert!(!g.cell(g.spawn).is_wall());
         }
+    }
+
+    #[test]
+    fn walk_route_is_shortest_and_contiguous() {
+        for seed in 0..6u64 {
+            let g = generate_level(1, seed);
+            let route = g.walk_route(g.spawn, g.tower).expect("spawn reaches tower");
+            assert_eq!(route.first(), Some(&g.spawn));
+            assert_eq!(route.last(), Some(&g.tower));
+            assert_eq!(route.len() as u32 - 1, g.walk_distances(g.spawn)[g.idx(g.tower)].unwrap());
+            for w in route.windows(2) {
+                assert!(g.can_walk(w[0], w[1]), "step {:?} -> {:?}", w[0], w[1]);
+            }
+        }
+        let g = generate_level(1, 3);
+        assert!(g.walk_route(g.spawn, IVec2::ZERO).is_none(), "border wall is unreachable");
+        assert_eq!(g.walk_route(g.spawn, g.spawn), Some(vec![g.spawn]));
     }
 
     #[test]

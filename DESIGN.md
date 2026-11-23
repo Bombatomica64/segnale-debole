@@ -41,16 +41,20 @@ Each run descends/ascends through increasingly hostile Mars Bunker Sectors (**Fl
 ### Phase 3: EXTRACT & DOWNLOAD ("App Store" Roguelike Upgrades)
 1. At **100% SOS Uplink**, an orbital beam locks onto the tower, vaporizing remaining demons and extracting you to the next sector.
 2. With full 5-bar reception during extraction, your phone opens the **FIRMWARE / APP DOWNLOAD** screen — choose **1 of 3 randomized Roguelike Upgrades**:
-   - **Dual-SIM Barrels:** Shotgun fires +3 extra pellets with tighter choke.
-   - **5G Overclock:** At 4–5 bars, fire rate +35% and move speed +25%.
-   - **External Copper Antenna:** +1.25 minimum baseline signal bars everywhere (resists Dead Zones).
-   - **Signal Siphon App:** Killing demons inside ≥3-bar zones restores +8 HP.
-   - **Firewall Daemon:** +40 Max Armor and regenerates Armor while uploading SOS.
-   - **Packet Sniffer:** Ping Scan cooldown halved and marks enemies for +35% bonus crit damage for 5s.
-   - **EMP Overcharge:** 5G Overload blast radius +40%, higher damage, chains to nearby demons.
-   - **Airplane Mode Phase:** Dash (`Shift`) grants brief invulnerability + leaves a static shockwave.
-   - **High-Capacity Cell:** +35% max ammo, +15% faster weapon fire rate, +30% pickups.
-   - **Sub-GHz Penetration:** Wall signal attenuation reduced by 45% (better signal through bunker walls).
+   Each card shows a live **NEXT:** line previewing exactly what the next rank changes (e.g. `8 -> 11 pellets`, `Min 0 -> 1 bar`, `4.0s -> 2.0s ping, +35% dmg`). 13 upgrades; stackable ones (S) can be re-bought, toggles (T) are drafted again only when the pool runs dry.
+   - **Dual-SIM Barrels (S):** Shotgun fires +3 pellets with a 25% tighter choke.
+   - **5G Overclock (S):** At 4–5 bars, fire rate +35% and move speed +25%.
+   - **External Copper Antenna (S):** +1.25 minimum signal bars everywhere (capped at 4.0); resists Dead Zones.
+   - **Signal Siphon App (S):** While you have 3+ bars, demon kills restore +8 HP.
+   - **Firewall Daemon (S):** +40 armor & max armor; regenerates 6/s while the SOS advances in the Signal Ring (in ring **and not jammed** — a spared Jammer Fiend is not an armor farm).
+   - **Packet Sniffer (S):** Ping cooldown halved; ping-marked demons take +35% bonus damage.
+   - **EMP Overcharge (T):** 5G Overload radius +40%, damage +35%, chains to 3 nearby demons.
+   - **Airplane Mode Phase (T):** Dash grants invulnerability, a static shockwave, and -15% dash cooldown.
+   - **High-Capacity Cell (S):** Ammo caps +35%; all pickups +30% fuller. (No fire-rate bonus: that is 5G Overclock's niche.)
+   - **Sub-GHz Penetration (S):** Walls attenuate 55% less (multiplicative per rank); every Ping Scan also projects a pulsing cyan **floor route** — the next 14 cells of the shortest walkable BFS path to the Tower (5 s) — so you can follow it around bunker walls.
+   - **Store & Forward (T):** Kills during a *natural* 0-bar blackout (measured before the Copper Antenna floor, so antenna owners still qualify) queue up to 3 packets, shown as glowing pips on the phone's status bar. Reaching 3+ bars discharges every packet as a 20-damage lightning arc at the nearest demons within 22 m (cycling over targets; ping marks apply).
+   - **Emergency Callback (T):** Killing a ping-marked Jammer Fiend unlocks one any-signal 5G Overload for 6 s (cooldown still applies). The phone's `Q EMP` tile flashes gold **CALL!**.
+   - **Missed Call (T):** Pressing Ping at 0 bars drops a ringing, vibrating decoy handset (shares the Ping cooldown, one active at a time) that pulls every Imp within 18 m toward it for 2.5 s. The `RMB PNG` tile reads amber **DECOY** when ready.
 
 ---
 
@@ -118,7 +122,7 @@ src/
 ├── weapons.rs         # Pump Shotgun (hitscan pellets) + Plasma Repeater (3D projectiles), viewmodel recoil/bob, pickups
 ├── enemies.rs         # Static Imp, Dead-Zone Cacodemon, Jammer Fiend, Hell Baron AI, projectiles, hit-flash, death bursts
 ├── extraction.rs      # SOS Countdown state machine, alarm lighting, demon wave spawner, extraction beam
-├── upgrades.rs        # Roguelike upgrade pool (10 upgrades), stat modifiers, App Store 1-of-3 selection
+├── upgrades.rs        # Roguelike upgrade pool (13 upgrades), next-rank previews, stat modifiers, App Store 1-of-3 selection
 ├── hud.rs             # Dual-wield left-hand Phone diegetic UI + right-hand weapon overlay + Doom HUD + Dead-Zone glitch FX + menus
 └── audio.rs           # Procedural retro synth SFX generator (gated under `audio` feature, no-op stub otherwise)
 ```
@@ -130,3 +134,4 @@ src/
 - **Milestone 1 (Foundation & World):** Cargo project (`bevy 0.20.1`), procedural retro textures, 3D multi-level Mars bunker labyrinth with ramps/catwalks/atrium, Doom FPS controller & collision, Signal Field solver (Tower + Jammers + wall attenuation), basic HUD readout + unit tests.
 - **Milestone 2 (Combat, Phone & Roguelike Extraction):** Dual-wield Phone & Gun viewmodels, Shotgun + Plasma Repeater, Ping Scan & 5G Overload apps, 4 Demon archetypes with AI & projectiles, SOS Countdown rush + alarm lighting, 10 Roguelike App Store upgrades, Dead-Zone glitch FX, menus/game-over/victory flow, procedural SFX, and comprehensive tests.
 - **Milestone 3 (Polish & Verification):** Playability audit, game-feel tuning (hitstop, recoil, FOV kick on dash, screen flash, signal readability), full `cargo test` + `cargo build --release` check.
+- **Milestone 6 (Upgrade Reworks & Signature Upgrades):** High-Capacity Cell narrowed (no fire rate), Sub-GHz floor route on Ping, Firewall regen only while un-jammed, clearer card text + live next-rank previews, and three blackout-themed signature upgrades (Store & Forward, Emergency Callback, Missed Call) with phone OLED indicators and headless ECS tests.

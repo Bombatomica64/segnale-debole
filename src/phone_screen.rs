@@ -48,6 +48,12 @@ pub struct PhoneScreenSnapshot {
     pub sos_in_ring: bool,
     pub sos_extracting: bool,
     pub time: f32,
+    /// Store & Forward blackout packets waiting to fire (0..=3).
+    pub queued_packets: u8,
+    /// Emergency Callback armed and the Overload is off cooldown.
+    pub callback_ready: bool,
+    /// Missed Call: Ping at 0 bars would drop a decoy right now.
+    pub decoy_ready: bool,
 }
 
 impl Default for PhoneScreenSnapshot {
@@ -71,6 +77,9 @@ impl Default for PhoneScreenSnapshot {
             sos_in_ring: false,
             sos_extracting: false,
             time: 0.0,
+            queued_packets: 0,
+            callback_ready: false,
+            decoy_ready: false,
         }
     }
 }
@@ -145,6 +154,9 @@ fn update_phone_screen(
         sos_in_ring,
         sos_extracting,
         time: time.elapsed_secs(),
+        queued_packets: apps.queued_packets,
+        callback_ready: apps.callback_ready(),
+        decoy_ready: signal.bars == 0 && mods.missed_call && apps.ping_cooldown <= 0.0,
     };
     if let Some(data) = img.data.as_mut() {
         render_phone_screen(data, &snap);
@@ -339,6 +351,13 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     };
     let carrier_c = if s.sos_jammed { red } else { accent };
     g.text(6, 7, carrier, 1, carrier_c);
+    // Store & Forward packet pips (electric cyan/violet, pulsing).
+    for i in 0..s.queued_packets.min(3) as i32 {
+        let pulse = ((s.time * 6.0 + i as f32).sin() * 0.5 + 0.5) > 0.5;
+        let c = if pulse { [120, 235, 255] } else { [190, 110, 255] };
+        g.rect(58 + i * 9, 7, 7, 7, c);
+        g.rect_outline(57 + i * 9, 6, 9, 9, [60, 40, 120]);
+    }
     // Bold bar count + battery top-right.
     g.text(90, 5, &format!("{}/5", s.bars), 2, bright);
     g.rect_outline(134, 6, 18, 10, dim);
@@ -447,7 +466,10 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     }
 
     // ---- 5. Chunky At-a-Glance App Tiles (y = 170..212) ----
-    draw_app_tile(
+    if s.decoy_ready {
+        draw_special_tile(&mut g, 5, 170, 73, 42, "RMB PNG", "DECOY", [44, 26, 4], [255, 196, 48], [255, 214, 90], s.time);
+    } else {
+        draw_app_tile(
         &mut g,
         5,
         170,
@@ -459,8 +481,12 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         s.ping_cd,
         s.ping_max_cd,
         s.ping_flash > 0.0,
-    );
-    draw_app_tile(
+        );
+    }
+    if s.callback_ready {
+        draw_special_tile(&mut g, 82, 170, 73, 42, "Q  EMP", "CALL!", [40, 34, 6], [255, 222, 70], [120, 250, 255], s.time);
+    } else {
+        draw_app_tile(
         &mut g,
         82,
         170,
@@ -472,7 +498,8 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         s.overload_cd,
         s.overload_max_cd,
         s.overload_flash > 0.0,
-    );
+        );
+    }
 
     // ---- 6. Bold Bottom SOS Status Bar (y = 216..236) ----
     g.rect(5, 216, 150, 20, [8, 14, 18]);
@@ -523,6 +550,17 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     if s.ping_flash > 0.0 || s.overload_flash > 0.0 {
         g.rect_thick_outline(1, 1, SCREEN_W as i32 - 2, SCREEN_H as i32 - 2, cyan);
     }
+}
+
+/// Highlighted upgrade-override tile (Missed Call DECOY / Emergency Callback CALL!).
+#[allow(clippy::too_many_arguments)]
+fn draw_special_tile(g: &mut ScreenBuf<'_>, x: i32, y: i32, w: i32, h: i32, title: &str, status: &str, bg: [u8; 3], border: [u8; 3], status_c: [u8; 3], time: f32) {
+    let blink = (time * 8.0).sin() > 0.0;
+    g.rect(x, y, w, h, bg);
+    g.rect(x + 3, y + h - 8, w - 6, 5, if blink { border } else { status_c });
+    g.rect_thick_outline(x, y, w, h, if blink { border } else { status_c });
+    g.text(x + 6, y + 5, title, 1, [255, 245, 220]);
+    g.text(x + 6, y + 17, status, 2, status_c);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -655,5 +693,47 @@ mod tests {
         );
         assert_ne!(dead, full);
         assert!(full.as_chunks::<4>().0.iter().all(|px| px[3] == 255));
+    }
+
+    fn render(s: &PhoneScreenSnapshot) -> Vec<u8> {
+        let mut buf = vec![0u8; (SCREEN_W * SCREEN_H * 4) as usize];
+        render_phone_screen(&mut buf, s);
+        buf
+    }
+
+    fn px(buf: &[u8], x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * SCREEN_W + x) * 4) as usize;
+        [buf[i], buf[i + 1], buf[i + 2]]
+    }
+
+    /// Clean (non-dead-zone) baseline so static snow never touches the probes.
+    fn calm(bars: u8) -> PhoneScreenSnapshot {
+        PhoneScreenSnapshot { bars, in_dead_zone: false, time: 0.1, ..Default::default() }
+    }
+
+    #[test]
+    fn packet_pips_glow_in_status_bar() {
+        let none = render(&calm(0));
+        for n in 1..=3u8 {
+            let b = render(&PhoneScreenSnapshot { queued_packets: n, ..calm(0) });
+            for i in 0..3u32 {
+                let lit = px(&b, 61 + i * 9, 10) != px(&none, 61 + i * 9, 10);
+                assert_eq!(lit, i < n as u32, "{n} packets, pip {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn callback_and_decoy_override_tiles() {
+        // Without the upgrade states: Q tile is blocked (red) at 1 bar.
+        let base = render(&calm(1));
+        let call = render(&PhoneScreenSnapshot { callback_ready: true, ..calm(1) });
+        assert_ne!(base[..], call[..], "callback tile differs");
+        // Tile background turns electric gold.
+        assert_eq!(px(&call, 150, 200), [40, 34, 6]);
+        let zero = render(&calm(0));
+        let decoy = render(&PhoneScreenSnapshot { decoy_ready: true, ..calm(0) });
+        assert_eq!(px(&decoy, 70, 200), [44, 26, 4], "DECOY tile is amber");
+        assert_ne!(px(&zero, 70, 200), [44, 26, 4]);
     }
 }

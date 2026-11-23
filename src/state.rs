@@ -40,8 +40,8 @@ pub enum GameSet {
     Ui,
 }
 
-/// The ten roguelike "App Store" upgrades. Milestone 1 only defines the data;
-/// Milestone 2's `upgrades.rs` applies them to [`PlayerModifiers`].
+/// The thirteen roguelike "App Store" upgrades. `upgrades.rs` applies them to
+/// [`PlayerModifiers`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UpgradeId {
     DualSimBarrels,
@@ -54,10 +54,13 @@ pub enum UpgradeId {
     AirplaneModePhase,
     HighCapacityCell,
     SubGhzPenetration,
+    StoreAndForward,
+    EmergencyCallback,
+    MissedCall,
 }
 
 impl UpgradeId {
-    pub const ALL: [UpgradeId; 10] = [
+    pub const ALL: [UpgradeId; 13] = [
         UpgradeId::DualSimBarrels,
         UpgradeId::FiveGOverclock,
         UpgradeId::CopperAntenna,
@@ -68,6 +71,9 @@ impl UpgradeId {
         UpgradeId::AirplaneModePhase,
         UpgradeId::HighCapacityCell,
         UpgradeId::SubGhzPenetration,
+        UpgradeId::StoreAndForward,
+        UpgradeId::EmergencyCallback,
+        UpgradeId::MissedCall,
     ];
 
     pub fn name(self) -> &'static str {
@@ -82,6 +88,9 @@ impl UpgradeId {
             UpgradeId::AirplaneModePhase => "Airplane Mode Phase",
             UpgradeId::HighCapacityCell => "High-Capacity Cell",
             UpgradeId::SubGhzPenetration => "Sub-GHz Penetration",
+            UpgradeId::StoreAndForward => "Store & Forward",
+            UpgradeId::EmergencyCallback => "Emergency Callback",
+            UpgradeId::MissedCall => "Missed Call",
         }
     }
 
@@ -90,13 +99,16 @@ impl UpgradeId {
             UpgradeId::DualSimBarrels => "Shotgun fires +3 pellets with a tighter choke.",
             UpgradeId::FiveGOverclock => "At 4-5 bars: +35% fire rate, +25% move speed.",
             UpgradeId::CopperAntenna => "+1.25 minimum signal bars everywhere.",
-            UpgradeId::SignalSiphon => "Kills inside >=3-bar zones restore +8 HP.",
-            UpgradeId::FirewallDaemon => "+40 max armor; armor regenerates while uploading.",
-            UpgradeId::PacketSniffer => "Ping cooldown halved; pinged demons take +35% damage.",
+            UpgradeId::SignalSiphon => "While you have 3+ bars, demon kills restore +8 HP.",
+            UpgradeId::FirewallDaemon => "+40 armor & max armor; regenerates 6/s while SOS advances in the ring.",
+            UpgradeId::PacketSniffer => "Ping cooldown halved; marked demons take +35% bonus damage.",
             UpgradeId::EmpOvercharge => "5G Overload radius +40%, more damage, chains.",
-            UpgradeId::AirplaneModePhase => "Dash grants invulnerability and a static shockwave.",
-            UpgradeId::HighCapacityCell => "+35% max ammo, +15% fire rate, +30% pickups.",
-            UpgradeId::SubGhzPenetration => "Wall signal attenuation reduced by 45%.",
+            UpgradeId::AirplaneModePhase => "Dash grants invuln, a static shockwave, and -15% cooldown.",
+            UpgradeId::HighCapacityCell => "Ammo caps +35%; all pickups +30% fuller.",
+            UpgradeId::SubGhzPenetration => "Walls attenuate 55% less; Ping projects a floor route to the Tower.",
+            UpgradeId::StoreAndForward => "Kills in natural 0-bar blackouts queue up to 3 packets; hitting 3+ bars fires 20-dmg arcs.",
+            UpgradeId::EmergencyCallback => "Kill a ping-marked Jammer Fiend to unlock 1 any-signal 5G Overload for 6s.",
+            UpgradeId::MissedCall => "Pressing Ping at 0 bars drops a ringing decoy handset drawing nearby Imps for 2.5s.",
         }
     }
 }
@@ -129,6 +141,14 @@ pub struct PlayerModifiers {
     pub dash_cooldown_mult: f32,
     pub ammo_capacity_mult: f32,
     pub pickup_mult: f32,
+    /// Sub-GHz Penetration: Ping Scan projects a walkable floor route to the Tower.
+    pub sub_ghz_route: bool,
+    /// Store & Forward: natural 0-bar kills queue packets discharged at 3+ bars.
+    pub store_and_forward: bool,
+    /// Emergency Callback: ping-marked Jammer Fiend kills unlock an any-signal Overload.
+    pub emergency_callback: bool,
+    /// Missed Call: Ping at 0 bars drops a ringing decoy handset that lures Imps.
+    pub missed_call: bool,
 }
 
 impl Default for PlayerModifiers {
@@ -155,6 +175,10 @@ impl Default for PlayerModifiers {
             dash_cooldown_mult: 1.0,
             ammo_capacity_mult: 1.0,
             pickup_mult: 1.0,
+            sub_ghz_route: false,
+            store_and_forward: false,
+            emergency_callback: false,
+            missed_call: false,
         }
     }
 }

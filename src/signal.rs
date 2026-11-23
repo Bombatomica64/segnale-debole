@@ -32,6 +32,9 @@ pub struct JammerField {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalReading {
     pub raw_strength: f32,
+    /// Strength clamped to `0..=5` *before* the Copper Antenna floor: the
+    /// "natural" signal (Store & Forward blackout detection).
+    pub natural_raw_strength: f32,
     pub bars: u8,
     pub dbm: i32,
     pub in_dead_zone: bool,
@@ -42,6 +45,8 @@ pub struct SignalReading {
 #[derive(Resource, Debug, Clone, PartialEq)]
 pub struct SignalState {
     pub raw_strength: f32,
+    /// Raw strength before `min_signal_floor` (see [`SignalReading`]).
+    pub natural_raw_strength: f32,
     pub bars: u8,
     pub dbm: i32,
     pub in_dead_zone: bool,
@@ -58,6 +63,7 @@ impl Default for SignalState {
     fn default() -> Self {
         SignalState {
             raw_strength: 0.0,
+            natural_raw_strength: 0.0,
             bars: 0,
             dbm: DBM_MIN,
             in_dead_zone: true,
@@ -117,9 +123,10 @@ pub fn compute_signal_at(
         raw *= WALL_ATTENUATION.powf(effective_walls);
     }
     raw -= jammer_suppression(pos, jammers);
+    let natural = raw.clamp(0.0, MAX_BARS);
     raw = raw.max(modifiers.min_signal_floor).clamp(0.0, MAX_BARS);
     let bars = bars_from_strength(raw);
-    SignalReading { raw_strength: raw, bars, dbm: dbm_from_strength(raw), in_dead_zone: bars <= 1, near_tower }
+    SignalReading { raw_strength: raw, natural_raw_strength: natural, bars, dbm: dbm_from_strength(raw), in_dead_zone: bars <= 1, near_tower }
 }
 
 /// 5G Overclock fire-rate multiplier (only at >= 4 bars).
@@ -181,6 +188,7 @@ fn update_signal(
     let forward = ptf.rotation * Vec3::NEG_Z;
     *state = SignalState {
         raw_strength: r.raw_strength,
+        natural_raw_strength: r.natural_raw_strength,
         bars: r.bars,
         dbm: r.dbm,
         in_dead_zone: r.in_dead_zone,
@@ -270,6 +278,10 @@ mod tests {
         let r = compute_signal_at(p, tower, &[jam], 12, &antenna);
         assert_eq!(r.bars, 1);
         assert!((r.raw_strength - 1.25).abs() < 1e-6);
+        // The natural (pre-antenna) signal still reads as a blackout.
+        assert_eq!(r.natural_raw_strength, 0.0);
+        assert_eq!(bars_from_strength(r.natural_raw_strength), 0);
+        assert_eq!(base.natural_raw_strength, base.raw_strength);
     }
 
     #[test]

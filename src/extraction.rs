@@ -59,6 +59,11 @@ pub fn upload_duration(floor: u32) -> f32 {
 }
 
 /// Upload speed multiplier.
+/// Firewall Daemon armor regen runs only while the SOS advances in the ring.
+pub fn firewall_regen_active(in_ring: bool, jammed: bool) -> bool {
+    in_ring && !jammed
+}
+
 pub fn upload_rate(in_ring: bool, jammed: bool) -> f32 {
     if jammed {
         0.0
@@ -307,7 +312,9 @@ fn update_extraction(
                     }
                 }
             }
-            if ring && mods.armor_regen_while_uploading > 0.0 {
+            // Firewall Daemon: only while the SOS actually advances (in ring, not
+            // jammed) - no farming armor off a deliberately spared Jammer Fiend.
+            if firewall_regen_active(ring, jam) && mods.armor_regen_while_uploading > 0.0 {
                 player.armor = (player.armor + mods.armor_regen_while_uploading * dt).min(player.max_armor);
             }
             let _ = in_ring;
@@ -468,6 +475,14 @@ mod tests {
         assert_eq!(upload_rate(false, false), OUTSIDE_RING_RATE);
         assert_eq!(upload_rate(true, true), 0.0);
         assert_eq!(upload_rate(false, true), 0.0);
+    }
+
+    #[test]
+    fn firewall_regen_only_while_sos_advances_in_ring() {
+        assert!(firewall_regen_active(true, false));
+        assert!(!firewall_regen_active(true, true), "a living Jammer Fiend is not an armor farm");
+        assert!(!firewall_regen_active(false, false));
+        assert!(!firewall_regen_active(false, true));
     }
 
     #[test]

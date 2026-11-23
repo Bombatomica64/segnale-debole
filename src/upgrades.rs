@@ -6,8 +6,13 @@ use bevy::prelude::*;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
+use crate::apps::{
+    emp_radius, ping_cooldown, CALLBACK_SECS, DECOY_LURE_RADIUS, DECOY_SECS, STORE_FORWARD_DAMAGE, STORE_FORWARD_MAX_PACKETS,
+};
 use crate::bot_input::BotControl;
-use crate::player::Player;
+use crate::player::{Player, DASH_COOLDOWN};
+use crate::signal::bars_from_strength;
+use crate::weapons::SHOTGUN_PELLETS;
 use crate::state::{AppState, PlayerModifiers, RunStats, UpgradeId};
 
 pub const BASE_MAX_SHELLS: u32 = 50;
@@ -19,8 +24,15 @@ pub struct UpgradeChoices(pub Vec<UpgradeId>);
 
 impl UpgradeId {
     /// Non-stackable upgrades only toggle behaviour; re-buying is pointless.
-    pub fn stackable(self) -> bool {
-        !matches!(self, UpgradeId::AirplaneModePhase | UpgradeId::EmpOvercharge)
+    pub fn is_stackable(self) -> bool {
+        !matches!(
+            self,
+            UpgradeId::AirplaneModePhase
+                | UpgradeId::EmpOvercharge
+                | UpgradeId::StoreAndForward
+                | UpgradeId::EmergencyCallback
+                | UpgradeId::MissedCall
+        )
     }
 
     /// Short "app icon" glyph for the store card.
@@ -36,6 +48,9 @@ impl UpgradeId {
             UpgradeId::AirplaneModePhase => "[>>]",
             UpgradeId::HighCapacityCell => "[BAT]",
             UpgradeId::SubGhzPenetration => "[GHz]",
+            UpgradeId::StoreAndForward => "[PKT+]",
+            UpgradeId::EmergencyCallback => "[CALL]",
+            UpgradeId::MissedCall => "[DECOY]",
         }
     }
 }
@@ -43,7 +58,7 @@ impl UpgradeId {
 /// Draft 3 distinct upgrades, skipping owned non-stackables when the pool allows.
 pub fn draft_choices(owned: &[UpgradeId], rng: &mut impl Rng) -> Vec<UpgradeId> {
     let (mut fresh, mut stale): (Vec<UpgradeId>, Vec<UpgradeId>) =
-        UpgradeId::ALL.into_iter().partition(|u| u.stackable() || !owned.contains(u));
+        UpgradeId::ALL.into_iter().partition(|u| u.is_stackable() || !owned.contains(u));
     fresh.shuffle(rng);
     stale.shuffle(rng);
     fresh.into_iter().chain(stale).take(3).collect()
@@ -84,17 +99,80 @@ pub fn apply_upgrade(id: UpgradeId, mods: &mut PlayerModifiers, player: &mut Pla
         }
         UpgradeId::HighCapacityCell => {
             mods.ammo_capacity_mult *= 1.35;
-            mods.fire_rate_mult *= 1.15;
             mods.pickup_mult *= 1.3;
             player.max_shells = (BASE_MAX_SHELLS as f32 * mods.ammo_capacity_mult).round() as u32;
             player.max_plasma = (BASE_MAX_PLASMA as f32 * mods.ammo_capacity_mult).round() as u32;
         }
         UpgradeId::SubGhzPenetration => {
-            // 45% less attenuation, multiplicative when stacked.
-            mods.wall_penetration = 1.0 - (1.0 - mods.wall_penetration) * 0.55;
+            // 55% less attenuation, multiplicative when stacked.
+            mods.wall_penetration = 1.0 - (1.0 - mods.wall_penetration) * 0.45;
+            mods.sub_ghz_route = true;
         }
+        UpgradeId::StoreAndForward => mods.store_and_forward = true,
+        UpgradeId::EmergencyCallback => mods.emergency_callback = true,
+        UpgradeId::MissedCall => mods.missed_call = true,
     }
     run.upgrades.push(id);
+}
+
+/// Short "what the next rank gives you" line for an App Store card, computed
+/// from the current modifiers (so stacked ranks preview the real next step).
+pub fn next_rank_preview(id: UpgradeId, mods: &PlayerModifiers) -> String {
+    let mut after = mods.clone();
+    let mut scratch = Player::default();
+    apply_upgrade(id, &mut after, &mut scratch, &mut RunStats::default());
+    let pct = |x: f32| (x * 100.0).round() as i32;
+    let owned_toggle = |on: bool| (!id.is_stackable() && on).then(|| "Already installed".to_string());
+    match id {
+        UpgradeId::DualSimBarrels => {
+            format!("{} -> {} pellets", SHOTGUN_PELLETS + mods.extra_pellets, SHOTGUN_PELLETS + after.extra_pellets)
+        }
+        UpgradeId::FiveGOverclock => format!("+{}% -> +{}% fire @4-5 bars", pct(mods.overclock_bonus), pct(after.overclock_bonus)),
+        UpgradeId::CopperAntenna => {
+            let (a, b) = (bars_from_strength(mods.min_signal_floor), bars_from_strength(after.min_signal_floor));
+            if a == b && mods.min_signal_floor >= after.min_signal_floor {
+                format!("Min {a} bars (MAX)")
+            } else {
+                format!("Min {a} -> {b} bar{}", if b == 1 { "" } else { "s" })
+            }
+        }
+        UpgradeId::SignalSiphon => format!("+{} -> +{} HP per kill", mods.siphon_heal as i32, after.siphon_heal as i32),
+        UpgradeId::FirewallDaemon => format!(
+            "+{} -> +{} armor, {} -> {}/s",
+            mods.max_armor_bonus as i32,
+            after.max_armor_bonus as i32,
+            mods.armor_regen_while_uploading as i32,
+            after.armor_regen_while_uploading as i32
+        ),
+        UpgradeId::PacketSniffer => format!(
+            "{:.1}s -> {:.1}s ping, +{}% dmg",
+            ping_cooldown(mods),
+            ping_cooldown(&after),
+            pct(after.ping_mark_damage_bonus)
+        ),
+        UpgradeId::EmpOvercharge => owned_toggle(mods.emp_chains)
+            .unwrap_or_else(|| format!("EMP {:.0}m -> {:.0}m, chains x3", emp_radius(mods), emp_radius(&after))),
+        UpgradeId::AirplaneModePhase => owned_toggle(mods.dash_invulnerable).unwrap_or_else(|| {
+            format!("Dash {:.1}s -> {:.1}s + invuln", DASH_COOLDOWN * mods.dash_cooldown_mult, DASH_COOLDOWN * after.dash_cooldown_mult)
+        }),
+        UpgradeId::HighCapacityCell => {
+            let cap = |m: &PlayerModifiers| (BASE_MAX_SHELLS as f32 * m.ammo_capacity_mult).round() as u32;
+            format!("{} -> {} shells, +{}% pickups", cap(mods), cap(&after), pct(after.pickup_mult - 1.0))
+        }
+        UpgradeId::SubGhzPenetration => format!(
+            "Wall loss {}% -> {}% + route",
+            pct(1.0 - mods.wall_penetration),
+            pct(1.0 - after.wall_penetration)
+        ),
+        UpgradeId::StoreAndForward => owned_toggle(mods.store_and_forward)
+            .unwrap_or_else(|| format!("Max {STORE_FORWARD_MAX_PACKETS} blackout packets, {STORE_FORWARD_DAMAGE:.0} dmg")),
+        UpgradeId::EmergencyCallback => {
+            owned_toggle(mods.emergency_callback).unwrap_or_else(|| format!("{CALLBACK_SECS:.0}s any-signal EMP window"))
+        }
+        UpgradeId::MissedCall => {
+            owned_toggle(mods.missed_call).unwrap_or_else(|| format!("{DECOY_SECS:.1}s decoy, {DECOY_LURE_RADIUS:.0}m Imp lure"))
+        }
+    }
 }
 
 /// Field repairs between floors: +25 HP, +15 armor, ammo topped up to >= 50%.
@@ -174,11 +252,16 @@ mod tests {
     #[test]
     fn draft_avoids_owned_non_stackables() {
         let mut rng = StdRng::seed_from_u64(9);
-        let owned = [UpgradeId::AirplaneModePhase, UpgradeId::EmpOvercharge];
+        let owned = [
+            UpgradeId::AirplaneModePhase,
+            UpgradeId::EmpOvercharge,
+            UpgradeId::StoreAndForward,
+            UpgradeId::EmergencyCallback,
+            UpgradeId::MissedCall,
+        ];
         for _ in 0..200 {
             let c = draft_choices(&owned, &mut rng);
-            assert!(!c.contains(&UpgradeId::AirplaneModePhase));
-            assert!(!c.contains(&UpgradeId::EmpOvercharge));
+            assert!(owned.iter().all(|o| !c.contains(o)), "{c:?}");
         }
         // Stackables can still be offered again.
         let owned = [UpgradeId::DualSimBarrels];
@@ -187,7 +270,8 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_upgrades_apply() {
+    fn all_thirteen_upgrades_apply() {
+        assert_eq!(UpgradeId::ALL.len(), 13);
         for id in UpgradeId::ALL {
             let (mut m, mut p, mut r) = fresh();
             let before = m.clone();
@@ -234,14 +318,80 @@ mod tests {
         apply_upgrade(UpgradeId::HighCapacityCell, &mut m, &mut p, &mut r);
         assert_eq!(p.max_shells, 68);
         assert_eq!(p.max_plasma, 270);
-        assert!((m.fire_rate_mult - 1.15).abs() < 1e-6);
-        assert!(m.pickup_mult > 1.0);
+        assert_eq!(m.fire_rate_mult, 1.0, "High-Capacity Cell no longer touches fire rate");
+        assert!((m.pickup_mult - 1.3).abs() < 1e-6);
 
+        assert!(!m.sub_ghz_route);
         apply_upgrade(UpgradeId::SubGhzPenetration, &mut m, &mut p, &mut r);
-        assert!((m.wall_penetration - 0.45).abs() < 1e-6);
+        assert!((m.wall_penetration - 0.55).abs() < 1e-6);
+        assert!(m.sub_ghz_route);
         apply_upgrade(UpgradeId::SubGhzPenetration, &mut m, &mut p, &mut r);
-        assert!(m.wall_penetration > 0.45 && m.wall_penetration < 1.0);
-        assert_eq!(r.upgrades.len(), 11);
+        // 1 - 0.45^2 = 0.7975
+        assert!((m.wall_penetration - 0.7975).abs() < 1e-5);
+
+        apply_upgrade(UpgradeId::StoreAndForward, &mut m, &mut p, &mut r);
+        apply_upgrade(UpgradeId::EmergencyCallback, &mut m, &mut p, &mut r);
+        apply_upgrade(UpgradeId::MissedCall, &mut m, &mut p, &mut r);
+        assert!(m.store_and_forward && m.emergency_callback && m.missed_call);
+        assert_eq!(r.upgrades.len(), 14);
+    }
+
+    #[test]
+    fn high_capacity_cell_keeps_fire_rate_neutral() {
+        let (mut m, mut p, mut r) = fresh();
+        for _ in 0..3 {
+            apply_upgrade(UpgradeId::HighCapacityCell, &mut m, &mut p, &mut r);
+        }
+        assert_eq!(m.fire_rate_mult, 1.0);
+        assert!(m.ammo_capacity_mult > 2.4);
+    }
+
+    #[test]
+    fn non_stackables_are_the_five_toggles() {
+        let toggles: Vec<UpgradeId> = UpgradeId::ALL.into_iter().filter(|u| !u.is_stackable()).collect();
+        assert_eq!(
+            toggles,
+            vec![
+                UpgradeId::EmpOvercharge,
+                UpgradeId::AirplaneModePhase,
+                UpgradeId::StoreAndForward,
+                UpgradeId::EmergencyCallback,
+                UpgradeId::MissedCall
+            ]
+        );
+        for id in UpgradeId::ALL {
+            assert!(!id.icon().is_empty() && !id.name().is_empty() && !id.description().is_empty());
+        }
+    }
+
+    #[test]
+    fn next_rank_previews_are_meaningful() {
+        let m = PlayerModifiers::default();
+        for id in UpgradeId::ALL {
+            let p = next_rank_preview(id, &m);
+            assert!(p.len() >= 10 && p.len() <= 30, "{id:?}: {p:?} ({} chars)", p.len());
+            assert_ne!(p, "Already installed", "{id:?} fresh preview");
+        }
+        assert_eq!(next_rank_preview(UpgradeId::DualSimBarrels, &m), "8 -> 11 pellets");
+        assert_eq!(next_rank_preview(UpgradeId::CopperAntenna, &m), "Min 0 -> 1 bar");
+        assert_eq!(next_rank_preview(UpgradeId::PacketSniffer, &m), "4.0s -> 2.0s ping, +35% dmg");
+        assert_eq!(next_rank_preview(UpgradeId::StoreAndForward, &m), "Max 3 blackout packets, 20 dmg");
+        assert_eq!(next_rank_preview(UpgradeId::SubGhzPenetration, &m), "Wall loss 100% -> 45% + route");
+        assert_eq!(next_rank_preview(UpgradeId::HighCapacityCell, &m), "50 -> 68 shells, +30% pickups");
+        assert_eq!(next_rank_preview(UpgradeId::FirewallDaemon, &m), "+0 -> +40 armor, 0 -> 6/s");
+
+        // Ranks stack: the preview follows the current modifiers.
+        let (mut m2, mut p, mut r) = fresh();
+        apply_upgrade(UpgradeId::DualSimBarrels, &mut m2, &mut p, &mut r);
+        apply_upgrade(UpgradeId::CopperAntenna, &mut m2, &mut p, &mut r);
+        apply_upgrade(UpgradeId::MissedCall, &mut m2, &mut p, &mut r);
+        assert_eq!(next_rank_preview(UpgradeId::DualSimBarrels, &m2), "11 -> 14 pellets");
+        assert_eq!(next_rank_preview(UpgradeId::CopperAntenna, &m2), "Min 1 -> 2 bars");
+        assert_eq!(next_rank_preview(UpgradeId::MissedCall, &m2), "Already installed");
+        for _ in 0..4 {
+            apply_upgrade(UpgradeId::CopperAntenna, &mut m2, &mut p, &mut r);
+        }
+        assert_eq!(next_rank_preview(UpgradeId::CopperAntenna, &m2), "Min 4 bars (MAX)");
     }
 
     #[test]
