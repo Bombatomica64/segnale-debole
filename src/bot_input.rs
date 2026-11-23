@@ -5,7 +5,7 @@
 //! When present, the real gameplay systems (`player`, `weapons`, `apps`,
 //! `extraction`, `upgrades`) read it alongside keyboard/mouse input, so the bot
 //! exercises exactly the same physics, weapons, apps and state machine a human
-//! does. Held inputs (`wish_dir`, `fire`, `jump`) stay set until cleared;
+//! does. Held inputs (`wish_dir`, `strafe_axes`, `fire`, `jump`) stay set until cleared;
 //! one-shot inputs (`dash`, `ping`, `overload`, `interact`, `switch_weapon`,
 //! `pick_upgrade`) are consumed by the system that handles them.
 
@@ -18,6 +18,10 @@ pub struct BotControl {
     /// Desired horizontal move direction in world space (normalized by the
     /// player controller; zero = no movement intent).
     pub wish_dir: Vec3,
+    /// Held local movement keys like WASD (`x` = right/D, `y` = forward/W,
+    /// each -1..1), so automated play can air-strafe and air-steer exactly
+    /// like a keyboard. Ignored while `wish_dir` is set.
+    pub strafe_axes: Vec2,
     /// Absolute look yaw (radians, 0 = facing -Z) applied before movement.
     pub look_yaw: Option<f32>,
     /// Absolute look pitch (radians, + = up).
@@ -44,6 +48,7 @@ impl BotControl {
     /// Release every held input (one-shots are left untouched).
     pub fn release_all(&mut self) {
         self.wish_dir = Vec3::ZERO;
+        self.strafe_axes = Vec2::ZERO;
         self.fire = false;
         self.jump = false;
     }

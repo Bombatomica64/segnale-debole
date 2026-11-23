@@ -1,6 +1,14 @@
-//! Doom-speed FPS controller: mouse look, strafe-running, jump, Airplane Mode
-//! dash, view bob, hazard damage. The `Player` entity's translation is the feet
-//! position and its rotation holds the yaw; the child `PlayerCamera` holds pitch.
+//! Quake / CPMA boomer-shooter FPS controller: mouse look, Quake ground
+//! friction + acceleration, CPMA-style air-strafing and air control, hold-Space
+//! auto-hop (bunny hopping) with jump buffer and coyote time, Airplane Mode
+//! dash (which carries into a bhop), view bob / speed FOV / strafe roll and
+//! hazard damage. The `Player` entity's translation is the feet position and
+//! its rotation holds the yaw; the child `PlayerCamera` holds pitch + roll.
+//!
+//! The horizontal velocity model is split into pure, unit-tested helpers
+//! ([`apply_ground_friction`], [`accelerate`], [`air_accelerate`],
+//! [`apply_air_control`], [`apply_air_drag`]); [`move_player`] only wires
+//! input, timers, dash and jump around them.
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::pbr::{DistanceFog, FogFalloff};
@@ -16,9 +24,8 @@ use crate::signal::{overclock_move_factor, SignalState};
 use crate::state::{AppState, GameSet, PlayerModifiers};
 
 pub const PLAYER_EYE_HEIGHT: f32 = 1.6;
+/// Base run speed (m/s) before upgrades / 5G Overclock.
 pub const MOVE_SPEED: f32 = 11.0;
-pub const GROUND_ACCEL: f32 = 16.0;
-pub const AIR_ACCEL: f32 = 3.0;
 pub const DASH_SPEED: f32 = 30.0;
 pub const DASH_DURATION: f32 = 0.16;
 pub const DASH_COOLDOWN: f32 = 2.0;
@@ -26,6 +33,67 @@ pub const MOUSE_SENSITIVITY: f32 = 0.0022;
 pub const HAZARD_DAMAGE: f32 = 10.0;
 pub const HAZARD_TICK: f32 = 0.5;
 pub const BASE_FOV_DEG: f32 = 85.0;
+
+// --- Quake / CPMA movement tuning -------------------------------------------
+
+/// Quake `sv_friction`: fraction of speed shed per second on the ground.
+pub const GROUND_FRICTION: f32 = 8.0;
+/// Quake `sv_stopspeed`: below this, friction acts as if moving this fast
+/// (so slow drifts stop crisply instead of decaying forever).
+pub const STOP_SPEED: f32 = 3.5;
+/// Quake `sv_accelerate` on the ground.
+pub const GROUND_ACCEL: f32 = 12.0;
+/// VQ3-style air acceleration (forward / diagonal strafe-jumping).
+pub const AIR_ACCEL: f32 = 2.4;
+/// CPMA `strafeaccelerate`: pure A/D air-strafing.
+pub const AIR_STRAFE_ACCEL: f32 = 70.0;
+/// CPMA `wishspeed` cap while pure air-strafing (m/s, at base speed).
+pub const AIR_STRAFE_WISH_SPEED: f32 = 2.8;
+/// CPMA `aircontrol` (W-only air steering). Applied to the unit heading, so
+/// the turn rate is speed-independent (CPMA's 150 normalized by its 320 ups).
+pub const AIR_CONTROL: f32 = 0.4;
+/// Horizontal air speed (m/s, at base speed) below which there is no drag.
+pub const AIR_DRAG_START: f32 = 22.0;
+/// Quadratic air-drag coefficient above [`AIR_DRAG_START`]: `k * excess^2` m/s^2
+/// (1.9 m/s^2 at 30 m/s, 3 m/s^2 at 32 m/s, 5.9 m/s^2 at 36 m/s). Peak 60 Hz
+/// air-strafe gain at 32 m/s is ~3.7 m/s^2, so skilled chains settle ~33 m/s.
+pub const AIR_DRAG_K: f32 = 0.03;
+/// Soft-capped air speed ceiling (m/s, at base speed).
+pub const MAX_AIR_SPEED: f32 = 36.0;
+/// Absolute air speed ceiling regardless of upgrades (physics stability).
+pub const AIR_SPEED_HARD_CAP: f32 = 48.0;
+/// Grace period to still jump after running off a ledge.
+pub const COYOTE_TIME: f32 = 0.10;
+/// A `Space` tap this early before landing still hops on touchdown.
+pub const JUMP_BUFFER_TIME: f32 = 0.12;
+/// Bhop chain breaks after standing on the ground this long without jumping.
+pub const BHOP_RESET_TIME: f32 = 0.12;
+/// A hop extends the chain above `base_max_speed *` this.
+pub const BHOP_CHAIN_SPEED: f32 = 1.05;
+/// The chain breaks below `base_max_speed *` this.
+pub const BHOP_BREAK_SPEED: f32 = 0.95;
+/// Chained hops above `base_max_speed *` this play the kinetic bhop chirp.
+pub const BHOP_SFX_SPEED: f32 = 1.15;
+/// Maximum strafe camera roll (radians, ~1.4 deg).
+pub const MAX_STRAFE_TILT: f32 = 0.025;
+/// Strafe roll damping rate (1/s).
+pub const STRAFE_TILT_RATE: f32 = 9.0;
+/// Extra FOV at [`SPEED_FOV_FULL`] horizontal speed.
+pub const SPEED_FOV_MAX_DEG: f32 = 14.0;
+/// Horizontal speed (m/s) at which the speed FOV is fully widened.
+pub const SPEED_FOV_FULL: f32 = 32.0;
+/// FOV kick while an Airplane Mode dash is active.
+pub const DASH_FOV_DEG: f32 = 12.0;
+/// Cap on the combined speed + dash FOV bonus.
+pub const MAX_FOV_BONUS_DEG: f32 = 18.0;
+/// Longest movement substep (s): every frame is split into uniform substeps of
+/// at most 1/120 s, so 30 / 60 / 120 / 144 Hz play converges to the same speed.
+pub const MOVE_SUBSTEP_DT: f32 = 1.0 / 120.0;
+/// Extra air drag above the (Overclock-scaled) air speed ceiling, relative to
+/// the normal quadratic drag: speed bleeds smoothly down to a lowered ceiling.
+pub const OVER_CAP_DRAG_MULT: f32 = 2.5;
+/// Minimum bleed (m/s^2) while above the air speed ceiling.
+pub const OVER_CAP_MIN_BLEED: f32 = 6.0;
 
 #[derive(Component, Debug, Clone)]
 pub struct Player {
@@ -44,6 +112,9 @@ pub struct Player {
     pub invuln_timer: f32,
     pub velocity: Vec3,
     pub yaw: f32,
+    /// Yaw at the end of the previous `move_player` (mouse turns are spread
+    /// across that frame's movement substeps).
+    pub prev_yaw: f32,
     pub pitch: f32,
     pub grounded: bool,
     pub hazard_timer: f32,
@@ -52,6 +123,16 @@ pub struct Player {
     pub since_damage: f32,
     /// True on the frame a dash begins (Airplane Mode shockwave hook).
     pub dash_started: bool,
+    /// Seconds left to still jump after leaving the ground.
+    pub coyote_timer: f32,
+    /// Seconds left on a buffered `Space` tap.
+    pub jump_buffer_timer: f32,
+    /// Consecutive speed-carrying hops (HUD `BHOP xN`).
+    pub bhop_chain: u32,
+    /// Seconds continuously grounded.
+    pub ground_time: f32,
+    /// Damped strafe camera roll (radians; negative = leaning right).
+    pub strafe_tilt: f32,
 }
 
 impl Default for Player {
@@ -70,12 +151,18 @@ impl Default for Player {
             invuln_timer: 0.0,
             velocity: Vec3::ZERO,
             yaw: 0.0,
+            prev_yaw: 0.0,
             pitch: 0.0,
             grounded: false,
             hazard_timer: 0.0,
             bob_phase: 0.0,
             since_damage: 999.0,
             dash_started: false,
+            coyote_timer: 0.0,
+            jump_buffer_timer: 0.0,
+            bhop_chain: 0,
+            ground_time: 0.0,
+            strafe_tilt: 0.0,
         }
     }
 }
@@ -148,7 +235,7 @@ impl Plugin for PlayerPlugin {
 
 /// Fresh run player with the starter chip's vitals (Survey OS 85 HP, Faraday +25 armor).
 pub fn new_run_player(chip: StarterChip, yaw: f32) -> Player {
-    let mut p = Player { yaw, ..default() };
+    let mut p = Player { yaw, prev_yaw: yaw, ..default() };
     chip.apply_to_player(&mut p);
     p
 }
@@ -191,15 +278,36 @@ fn ensure_player(mut commands: Commands, grid: Option<Res<LevelGrid>>, loadout: 
         }
 }
 
-/// New floor: put the existing player at the airlock.
-fn snap_player_to_spawn(grid: Res<LevelGrid>, mut q: Query<(&mut Player, &mut Transform)>) {
+/// New floor: put the existing player at the airlock, standing still with a
+/// level, un-bobbed, base-FOV camera (no speed FOV / bob carried over).
+#[allow(clippy::type_complexity)]
+fn snap_player_to_spawn(
+    grid: Res<LevelGrid>,
+    mut q: Query<(&mut Player, &mut Transform), Without<PlayerCamera>>,
+    mut cams: Query<(&mut Transform, &mut Projection), With<PlayerCamera>>,
+) {
     for (mut p, mut tf) in &mut q {
         tf.translation = grid.spawn_world();
         p.yaw = grid.spawn_yaw;
+        p.prev_yaw = p.yaw;
         p.pitch = 0.0;
         p.velocity = Vec3::ZERO;
+        p.grounded = true;
         p.dash_timer = 0.0;
+        p.coyote_timer = 0.0;
+        p.jump_buffer_timer = 0.0;
+        p.bhop_chain = 0;
+        p.ground_time = 0.0;
+        p.strafe_tilt = 0.0;
+        p.bob_phase = 0.0;
         tf.rotation = Quat::from_rotation_y(p.yaw);
+    }
+    for (mut cam, mut proj) in &mut cams {
+        cam.translation = Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
+        cam.rotation = Quat::IDENTITY;
+        if let Projection::Perspective(pp) = proj.as_mut() {
+            pp.fov = BASE_FOV_DEG.to_radians();
+        }
     }
 }
 
@@ -263,8 +371,26 @@ fn mouse_look(
     }
     tf.rotation = Quat::from_rotation_y(p.yaw);
     if let Ok(mut cam) = cams.single_mut() {
-        cam.rotation = Quat::from_rotation_x(p.pitch);
+        cam.rotation = camera_rotation(p.pitch, p.strafe_tilt);
     }
+}
+
+/// Head camera local rotation: pitch, then roll about the view axis.
+pub fn camera_rotation(pitch: f32, roll: f32) -> Quat {
+    Quat::from_rotation_x(pitch) * Quat::from_rotation_z(roll)
+}
+
+/// Live world-space eye pose from the player body `Transform` (feet + yaw) and
+/// the child `PlayerCamera` local `Transform` (eye height, bob, pitch, roll).
+/// Unlike `GlobalTransform` (propagated in `PostUpdate`), this already
+/// reflects this frame's `mouse_look` / `move_player` / `view_bob`.
+pub fn live_eye_pose(body: &Transform, cam_local: &Transform) -> Transform {
+    body.mul_transform(*cam_local)
+}
+
+/// Frame-rate-independent exponential smoothing factor for a damping `rate` (1/s).
+pub fn smooth_factor(rate: f32, dt: f32) -> f32 {
+    1.0 - (-rate * dt).exp()
 }
 
 /// WASD intent in world space (unit length or zero) for a given yaw.
@@ -273,6 +399,165 @@ pub fn wish_direction(yaw: f32, forward: f32, right: f32) -> Vec3 {
     let f = rot * Vec3::NEG_Z;
     let r = rot * Vec3::X;
     (f * forward + r * right).normalize_or_zero()
+}
+
+// ---------------------------------------------------------------------------
+// Quake / CPMA horizontal movement (pure helpers, XZ plane as `Vec2(x, z)`)
+// ---------------------------------------------------------------------------
+
+/// Upgrade / Overclock multiplier relative to the stock run speed.
+pub fn speed_scale(base_max_speed: f32) -> f32 {
+    (base_max_speed / MOVE_SPEED).max(0.25)
+}
+
+/// Quake `PM_Friction`: shed `max(speed, STOP_SPEED) * GROUND_FRICTION` m/s per
+/// second, never reversing direction.
+pub fn apply_ground_friction(vel_xz: Vec2, dt: f32) -> Vec2 {
+    let speed = vel_xz.length();
+    if speed < 1e-4 {
+        return Vec2::ZERO;
+    }
+    let drop = speed.max(STOP_SPEED) * GROUND_FRICTION * dt;
+    vel_xz * ((speed - drop).max(0.0) / speed)
+}
+
+/// Quake `PM_Accelerate`: add speed along `wish_dir` only until the velocity's
+/// projection on it reaches `wish_speed` (perpendicular speed is untouched,
+/// which is what makes strafe-jumping gain speed).
+pub fn accelerate(vel_xz: Vec2, wish_dir: Vec2, wish_speed: f32, accel: f32, dt: f32) -> Vec2 {
+    if wish_dir == Vec2::ZERO {
+        return vel_xz;
+    }
+    let current_speed = vel_xz.dot(wish_dir);
+    let add_speed = wish_speed - current_speed;
+    if add_speed <= 0.0 {
+        return vel_xz;
+    }
+    vel_xz + wish_dir * (accel * wish_speed * dt).min(add_speed)
+}
+
+/// Airborne acceleration. Pure A/D (`pure_strafe`) uses the CPMA strafe curve
+/// (huge accel, tiny wish speed: turning the mouse while strafing curves the
+/// trajectory and builds speed); anything else uses VQ3 air accel.
+/// At or above the air speed ceiling it can still bend the path, but never
+/// adds speed.
+pub fn air_accelerate(vel_xz: Vec2, wish_dir: Vec2, pure_strafe: bool, base_max_speed: f32, dt: f32) -> Vec2 {
+    let v = if pure_strafe {
+        let wish_speed = (AIR_STRAFE_WISH_SPEED * speed_scale(base_max_speed)).min(base_max_speed);
+        accelerate(vel_xz, wish_dir, wish_speed, AIR_STRAFE_ACCEL, dt)
+    } else {
+        accelerate(vel_xz, wish_dir, base_max_speed, AIR_ACCEL, dt)
+    };
+    let speed = vel_xz.length();
+    if speed >= air_speed_cap(base_max_speed) && v.length() > speed {
+        return v.normalize_or_zero() * speed;
+    }
+    v
+}
+
+/// CPMA `PM_Aircontrol` (W only, airborne): rotate the heading toward
+/// `wish_dir` while preserving speed. Only steers while moving forward
+/// (`dot > 0`); the pull grows with `dot^2`, so small corrections are crisp
+/// and backwards input does nothing.
+pub fn apply_air_control(vel_xz: Vec2, wish_dir: Vec2, dt: f32) -> Vec2 {
+    let speed = vel_xz.length();
+    if speed < 1e-3 || wish_dir == Vec2::ZERO {
+        return vel_xz;
+    }
+    let dir = vel_xz / speed;
+    let dot = dir.dot(wish_dir);
+    if dot <= 0.0 {
+        return vel_xz;
+    }
+    let k = 32.0 * AIR_CONTROL * dot * dot * dt;
+    (dir + wish_dir * k).normalize_or(dir) * speed
+}
+
+/// Air speed limits: free below `AIR_DRAG_START`, soft quadratic drag above it.
+/// Above the soft ceiling ([`air_speed_cap`]) speed is not snapped down: it
+/// bleeds smoothly ([`OVER_CAP_DRAG_MULT`] x the drag, at least
+/// [`OVER_CAP_MIN_BLEED`] m/s^2) until it settles on the ceiling, so losing a
+/// 5G Overclock bar mid-hop eases 45 -> 36 m/s instead of a one-frame snap.
+/// [`AIR_SPEED_HARD_CAP`] is the only immediate clamp. All thresholds scale
+/// with upgrades / 5G Overclock.
+pub fn apply_air_drag(vel_xz: Vec2, base_max_speed: f32, dt: f32) -> Vec2 {
+    let scale = speed_scale(base_max_speed);
+    let start = AIR_DRAG_START * scale;
+    let cap = air_speed_cap(base_max_speed);
+    let raw = vel_xz.length();
+    let speed = raw.min(AIR_SPEED_HARD_CAP);
+    if speed <= start {
+        return vel_xz;
+    }
+    let excess = speed - start;
+    let drag = AIR_DRAG_K / scale * excess * excess;
+    let slowed = if speed > cap {
+        (speed - (drag * OVER_CAP_DRAG_MULT).max(OVER_CAP_MIN_BLEED) * dt).max(cap)
+    } else {
+        (speed - drag * dt).max(start)
+    };
+    vel_xz * (slowed / raw)
+}
+
+/// Hard horizontal air speed ceiling for a given base run speed.
+pub fn air_speed_cap(base_max_speed: f32) -> f32 {
+    (MAX_AIR_SPEED * speed_scale(base_max_speed)).min(AIR_SPEED_HARD_CAP)
+}
+
+/// One tick of horizontal movement (no dash): Quake friction + accel on the
+/// ground, CPMA air strafe / air control + soft drag in the air.
+pub fn step_horizontal(vel_xz: Vec2, wish_dir: Vec2, input: MoveInput, grounded: bool, base_max_speed: f32, dt: f32) -> Vec2 {
+    if grounded {
+        let v = apply_ground_friction(vel_xz, dt);
+        return accelerate(v, wish_dir, base_max_speed, GROUND_ACCEL, dt);
+    }
+    let mut v = air_accelerate(vel_xz, wish_dir, input.pure_strafe(), base_max_speed, dt);
+    if input.air_control() {
+        v = apply_air_control(v, wish_dir, dt);
+    }
+    apply_air_drag(v, base_max_speed, dt)
+}
+
+/// Local movement keys for one tick (`forward`: W/S, `right`: D/A, each -1..1).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MoveInput {
+    pub forward: f32,
+    pub right: f32,
+}
+
+impl MoveInput {
+    /// Holding only A or D: CPMA air-strafe.
+    pub fn pure_strafe(self) -> bool {
+        self.forward == 0.0 && self.right != 0.0
+    }
+
+    /// Holding only W: CPMA air control.
+    pub fn air_control(self) -> bool {
+        self.forward > 0.0 && self.right == 0.0
+    }
+}
+
+/// Dash velocity along `dir`: at least `DASH_SPEED`, but never slower than the
+/// current horizontal speed in *any* direction (up to `AIR_SPEED_HARD_CAP`), so
+/// a 90 deg Airplane Mode dash redirects a full-speed bhop around a corner.
+pub fn dash_velocity(vel_xz: Vec2, dir: Vec2) -> Vec2 {
+    dir * DASH_SPEED.max(vel_xz.length()).min(AIR_SPEED_HARD_CAP)
+}
+
+/// Target strafe roll (radians): leans into the strafe key / sideways drift,
+/// stronger in the air. Negative = lean right.
+pub fn strafe_tilt_target(input_right: f32, side_speed_frac: f32, grounded: bool) -> f32 {
+    let side = (input_right.clamp(-1.0, 1.0) * 0.65 + side_speed_frac.clamp(-1.0, 1.0) * 0.35).clamp(-1.0, 1.0);
+    -side * MAX_STRAFE_TILT * if grounded { 0.6 } else { 1.0 }
+}
+
+/// Extra FOV (degrees) for horizontal speed and an active dash: speed widens
+/// up to +14 deg at 32 m/s, blended with the +12 deg dash kick, capped at +18.
+pub fn fov_bonus_deg(horizontal_speed: f32, dashing: bool) -> f32 {
+    let t = ((horizontal_speed - MOVE_SPEED) / (SPEED_FOV_FULL - MOVE_SPEED)).clamp(0.0, 1.0);
+    let speed_fov = SPEED_FOV_MAX_DEG * t;
+    let dash_fov = if dashing { DASH_FOV_DEG } else { 0.0 };
+    (speed_fov.max(dash_fov) + 0.25 * speed_fov.min(dash_fov)).min(MAX_FOV_BONUS_DEG)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -291,64 +576,132 @@ fn move_player(
     let dt = time.delta_secs().min(1.0 / 20.0);
 
     let axis = |pos: KeyCode, neg: KeyCode| (keys.pressed(pos) as i32 - keys.pressed(neg) as i32) as f32;
-    let fwd = axis(KeyCode::KeyW, KeyCode::KeyS) + axis(KeyCode::ArrowUp, KeyCode::ArrowDown);
-    let right = axis(KeyCode::KeyD, KeyCode::KeyA);
-    let mut wish = wish_direction(p.yaw, fwd.clamp(-1.0, 1.0), right);
+    let mut input = MoveInput {
+        forward: (axis(KeyCode::KeyW, KeyCode::KeyS) + axis(KeyCode::ArrowUp, KeyCode::ArrowDown)).clamp(-1.0, 1.0),
+        right: axis(KeyCode::KeyD, KeyCode::KeyA),
+    };
     if let Some(b) = &bot
-        && b.wish_dir != Vec3::ZERO
+        && b.strafe_axes != Vec2::ZERO
     {
-        wish = Vec3::new(b.wish_dir.x, 0.0, b.wish_dir.z).normalize_or_zero();
+        input = MoveInput { forward: b.strafe_axes.y.clamp(-1.0, 1.0), right: b.strafe_axes.x.clamp(-1.0, 1.0) };
     }
     let bot_jump = bot.as_ref().is_some_and(|b| b.jump);
+    let bot_wish = bot.as_ref().map(|b| b.wish_dir).unwrap_or(Vec3::ZERO);
+    if bot_wish != Vec3::ZERO {
+        // World-space bot intent: no local keys, so no strafe / air-control curves.
+        input = MoveInput::default();
+    }
+    // 5G Overclock: faster in strong signal.
+    let base_max_speed = MOVE_SPEED * modifiers.move_speed_mult * overclock_move_factor(signal.bars, &modifiers);
 
     p.dash_cooldown = (p.dash_cooldown - dt).max(0.0);
     p.invuln_timer = (p.invuln_timer - dt).max(0.0);
     p.since_damage += dt;
-
-    let mut vel = p.velocity;
-    p.dash_started = false;
+    // Edge inputs fire on the first substep only; held keys act on every one.
+    let space_tap = keys.just_pressed(KeyCode::Space);
     let shift = keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight) || take_flag(&mut bot, |b| &mut b.dash);
-    if shift && p.dash_ready() {
-        let dir = if wish != Vec3::ZERO { wish } else { Quat::from_rotation_y(p.yaw) * Vec3::NEG_Z };
-        p.dash_timer = DASH_DURATION;
-        p.dash_started = true;
-        sfx.play(SfxEvent::Dash);
-        p.dash_cooldown = DASH_COOLDOWN * modifiers.dash_cooldown_mult;
-        if modifiers.dash_invulnerable {
-            p.invuln_timer = p.invuln_timer.max(DASH_DURATION + 0.25);
-        }
-        vel.x = dir.x * DASH_SPEED;
-        vel.z = dir.z * DASH_SPEED;
-        vel.y = vel.y.max(0.0);
-    }
+    let space_held = keys.pressed(KeyCode::Space) || bot_jump;
+    p.dash_started = false;
 
-    if p.dash_timer > 0.0 {
-        p.dash_timer -= dt;
-    } else {
-        // 5G Overclock: faster in strong signal.
-        let speed = MOVE_SPEED * modifiers.move_speed_mult * overclock_move_factor(signal.bars, &modifiers);
-        let target = wish * speed;
-        let accel = if p.grounded { GROUND_ACCEL } else { AIR_ACCEL };
-        let k = (accel * dt).min(1.0);
-        let h = Vec2::new(vel.x, vel.z).lerp(Vec2::new(target.x, target.z), k);
+    // Uniform substeps of at most `MOVE_SUBSTEP_DT` (the epsilon keeps an
+    // exact 60 Hz frame at two substeps despite float rounding).
+    let substeps = ((dt / MOVE_SUBSTEP_DT - 1e-3).ceil().max(1.0)) as u32;
+    let sub_dt = dt / substeps as f32;
+    for i in 0..substeps {
+        // Spread this frame's mouse turn across the substeps.
+        let yaw_i = p.prev_yaw + (p.yaw - p.prev_yaw) * ((i + 1) as f32 / substeps as f32);
+        let wish = if bot_wish != Vec3::ZERO {
+            Vec3::new(bot_wish.x, 0.0, bot_wish.z).normalize_or_zero()
+        } else {
+            wish_direction(yaw_i, input.forward, input.right)
+        };
+        let wish_xz = Vec2::new(wish.x, wish.z);
+
+        p.jump_buffer_timer = (p.jump_buffer_timer - sub_dt).max(0.0);
+        if i == 0 && space_tap {
+            p.jump_buffer_timer = JUMP_BUFFER_TIME;
+        }
+        p.coyote_timer = if p.grounded { COYOTE_TIME } else { (p.coyote_timer - sub_dt).max(0.0) };
+
+        let mut vel = p.velocity;
+        if i == 0 && shift && p.dash_ready() {
+            // The dash is a one-shot: aim it with the latest view, not the
+            // first substep's interpolated yaw.
+            let dash_wish = if bot_wish != Vec3::ZERO { wish } else { wish_direction(p.yaw, input.forward, input.right) };
+            let dir = if dash_wish != Vec3::ZERO { dash_wish } else { Quat::from_rotation_y(p.yaw) * Vec3::NEG_Z };
+            p.dash_timer = DASH_DURATION;
+            p.dash_started = true;
+            sfx.play(SfxEvent::Dash);
+            p.dash_cooldown = DASH_COOLDOWN * modifiers.dash_cooldown_mult;
+            if modifiers.dash_invulnerable {
+                p.invuln_timer = p.invuln_timer.max(DASH_DURATION + 0.25);
+            }
+            let dv = dash_velocity(Vec2::new(vel.x, vel.z), Vec2::new(dir.x, dir.z));
+            vel.x = dv.x;
+            vel.z = dv.y;
+            vel.y = vel.y.max(0.0);
+        }
+
+        // Jump BEFORE friction: a hop on the landing substep never touches the
+        // ground friction, so hold-Space bunny hopping keeps 100% of its speed.
+        let wants_jump = space_held || p.jump_buffer_timer > 0.0;
+        let can_jump = p.grounded || p.coyote_timer > 0.0;
+        if wants_jump && can_jump {
+            vel.y = JUMP_VELOCITY;
+            p.grounded = false;
+            p.coyote_timer = 0.0;
+            p.jump_buffer_timer = 0.0;
+            // Dash-to-bhop: cancel the burst but keep its full horizontal speed.
+            p.dash_timer = 0.0;
+            let speed = Vec2::new(vel.x, vel.z).length();
+            if speed > base_max_speed * BHOP_CHAIN_SPEED {
+                p.bhop_chain += 1;
+            }
+            // The chirp celebrates the same linked-hop milestone as the HUD `BHOP x2+` stamp.
+            let chained = p.bhop_chain >= 2 && speed > base_max_speed * BHOP_SFX_SPEED;
+            sfx.play(if chained { SfxEvent::Bhop } else { SfxEvent::Jump });
+        }
+
+        let h = Vec2::new(vel.x, vel.z);
+        let h = if p.dash_timer > 0.0 {
+            // Dash burst: velocity locked; when it ends airborne the speed is kept.
+            p.dash_timer -= sub_dt;
+            h
+        } else {
+            step_horizontal(h, wish_xz, input, p.grounded, base_max_speed, sub_dt)
+        };
         vel.x = h.x;
         vel.z = h.y;
-    }
 
-    if (keys.pressed(KeyCode::Space) || bot_jump) && p.grounded {
-        vel.y = JUMP_VELOCITY;
-        sfx.play(SfxEvent::Jump);
-    }
+        let r = resolve_player_movement(&grid, tf.translation, vel, sub_dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, p.grounded);
+        tf.translation = r.pos;
+        p.velocity = r.vel;
+        p.grounded = r.grounded;
+        // Touching the ground anywhere in the step (even a catwalk edge crossed
+        // at 30 m/s) keeps the coyote window, so a buffered / held hop fires.
+        if r.grounded || r.touched_ground {
+            p.coyote_timer = COYOTE_TIME;
+        }
+        if r.on_hazard {
+            p.hazard_timer -= sub_dt;
+        } else {
+            p.hazard_timer = 0.0;
+        }
 
-    let r = resolve_player_movement(&grid, tf.translation, vel, dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT);
-    tf.translation = r.pos;
-    p.velocity = r.vel;
-    p.grounded = r.grounded;
-    if r.on_hazard {
-        p.hazard_timer -= dt;
-    } else {
-        p.hazard_timer = 0.0;
+        // Bhop chain bookkeeping.
+        p.ground_time = if r.grounded { p.ground_time + sub_dt } else { 0.0 };
+        let speed = Vec2::new(r.vel.x, r.vel.z).length();
+        if (r.grounded && p.ground_time > BHOP_RESET_TIME) || speed < base_max_speed * BHOP_BREAK_SPEED {
+            p.bhop_chain = 0;
+        }
     }
+    p.prev_yaw = p.yaw;
+
+    // Strafe roll toward the strafe key / sideways drift (applied by `view_bob`).
+    let right_xz = Vec2::new(p.yaw.cos(), -p.yaw.sin());
+    let side_frac = Vec2::new(p.velocity.x, p.velocity.z).dot(right_xz) / base_max_speed.max(1.0);
+    let target = strafe_tilt_target(input.right, side_frac, p.grounded);
+    p.strafe_tilt += (target - p.strafe_tilt) * smooth_factor(STRAFE_TILT_RATE, dt);
 }
 
 fn view_bob(
@@ -369,12 +722,13 @@ fn view_bob(
         PLAYER_EYE_HEIGHT + p.bob_phase.sin().abs() * 0.07 * amp,
         0.0,
     );
-    let k = (time.delta_secs() * 14.0).min(1.0);
-    cam.translation = cam.translation.lerp(target, k);
-    // FOV kick while dashing.
+    cam.translation = cam.translation.lerp(target, smooth_factor(14.0, time.delta_secs()));
+    // Pitch from mouse look + damped strafe roll, composed in one place.
+    cam.rotation = camera_rotation(p.pitch, p.strafe_tilt);
+    // FOV widens with speed, kicks while dashing.
     if let Projection::Perspective(pp) = proj.as_mut() {
-        let want = if p.dash_timer > 0.0 { BASE_FOV_DEG + 12.0 } else { BASE_FOV_DEG };
-        pp.fov += (want.to_radians() - pp.fov) * (time.delta_secs() * 10.0).min(1.0);
+        let want = BASE_FOV_DEG + fov_bonus_deg(speed, p.dash_timer > 0.0);
+        pp.fov += (want.to_radians() - pp.fov) * smooth_factor(10.0, time.delta_secs());
     }
 }
 
@@ -428,5 +782,496 @@ mod tests {
         assert!((r - Vec3::X).length() < 1e-5);
         let diag = wish_direction(0.0, 1.0, 1.0);
         assert!((diag.length() - 1.0).abs() < 1e-5);
+    }
+
+    // --- Quake / CPMA movement --------------------------------------------
+
+    const DT: f32 = 1.0 / 60.0;
+
+    fn xz(v: Vec3) -> Vec2 {
+        Vec2::new(v.x, v.z)
+    }
+
+    /// Wish direction (XZ) for local keys at `yaw`.
+    fn wish_xz(yaw: f32, input: MoveInput) -> Vec2 {
+        xz(wish_direction(yaw, input.forward, input.right))
+    }
+
+    #[test]
+    fn pure_air_strafe_with_mouse_sweep_builds_speed() {
+        let d = MoveInput { forward: 0.0, right: 1.0 };
+        assert!(d.pure_strafe() && !d.air_control());
+        // Airborne at run speed facing -Z, hold D and sweep the mouse right at
+        // a human ~145 deg/s for 2.5 s (about three and a half hops of air).
+        let mut yaw = 0.0f32;
+        let mut v = Vec2::new(0.0, -MOVE_SPEED);
+        let mut prev = v.length();
+        for i in 0..150 {
+            yaw -= 2.5 * DT;
+            v = step_horizontal(v, wish_xz(yaw, d), d, false, MOVE_SPEED, DT);
+            if i > 5 {
+                assert!(v.length() >= prev - 1e-4, "strafe lost speed at tick {i}");
+            }
+            prev = v.length();
+        }
+        assert!(v.length() > 16.0, "air-strafe only reached {} m/s", v.length());
+        // The trajectory curved with the mouse: velocity now points well right of -Z.
+        assert!(v.x > 0.0);
+
+        // Holding D without turning only drifts sideways: no free speed.
+        let mut v = Vec2::new(0.0, -MOVE_SPEED);
+        for _ in 0..150 {
+            v = step_horizontal(v, wish_xz(0.0, d), d, false, MOVE_SPEED, DT);
+        }
+        assert!(v.length() < MOVE_SPEED + 0.5, "{}", v.length());
+    }
+
+    #[test]
+    fn diagonal_strafe_jumping_also_gains_speed() {
+        // W+D with the mouse turning right (VQ3 strafe-jump).
+        let wd = MoveInput { forward: 1.0, right: 1.0 };
+        assert!(!wd.pure_strafe() && !wd.air_control());
+        let mut yaw = 0.0f32;
+        let mut v = Vec2::new(0.0, -MOVE_SPEED);
+        for _ in 0..150 {
+            yaw -= 1.2 * DT;
+            v = step_horizontal(v, wish_xz(yaw, wd), wd, false, MOVE_SPEED, DT);
+        }
+        assert!(v.length() > MOVE_SPEED + 1.0, "diagonal strafe reached {}", v.length());
+    }
+
+    #[test]
+    fn cpma_air_control_redirects_heading_and_keeps_speed() {
+        let w = MoveInput { forward: 1.0, right: 0.0 };
+        assert!(w.air_control());
+        // Flying north at 15 m/s, the view turns 40 deg right; hold only W.
+        let yaw = -40f32.to_radians();
+        let wish = wish_xz(yaw, w);
+        let mut v = Vec2::new(0.0, -15.0);
+        for _ in 0..30 {
+            v = step_horizontal(v, wish, w, false, MOVE_SPEED, DT);
+        }
+        assert!((v.length() - 15.0).abs() < 1e-3, "speed changed to {}", v.length());
+        let angle = v.normalize().angle_to(wish).abs().to_degrees();
+        assert!(angle < 4.0, "still {angle} deg off after 0.5 s");
+        // Smooth, not a snap: one tick turns only a few degrees.
+        let one = apply_air_control(Vec2::new(0.0, -15.0), wish, DT);
+        let turned = one.normalize().angle_to(Vec2::NEG_Y).abs().to_degrees();
+        assert!(turned > 0.5 && turned < 8.0, "turned {turned} deg in one tick");
+        // Never steers backwards.
+        assert_eq!(apply_air_control(Vec2::new(0.0, -15.0), Vec2::Y, DT), Vec2::new(0.0, -15.0));
+    }
+
+    #[test]
+    fn ground_friction_is_crisp_and_ground_accel_snappy() {
+        // Idle: from run speed to a dead stop in under 0.3 s, never reversing.
+        let mut v = Vec2::new(MOVE_SPEED, 0.0);
+        for _ in 0..18 {
+            v = step_horizontal(v, Vec2::ZERO, MoveInput::default(), true, MOVE_SPEED, DT);
+            assert!(v.x >= 0.0);
+        }
+        assert_eq!(v, Vec2::ZERO, "ice-skating: {v:?}");
+        assert_eq!(apply_ground_friction(Vec2::ZERO, DT), Vec2::ZERO);
+        // Run: from rest to ~full speed in 0.25 s, settling exactly at run speed.
+        let w = MoveInput { forward: 1.0, right: 0.0 };
+        let mut v = Vec2::ZERO;
+        for _ in 0..15 {
+            v = step_horizontal(v, Vec2::NEG_Y, w, true, MOVE_SPEED, DT);
+        }
+        assert!(v.length() > MOVE_SPEED * 0.95, "{}", v.length());
+        for _ in 0..60 {
+            v = step_horizontal(v, Vec2::NEG_Y, w, true, MOVE_SPEED, DT);
+        }
+        assert!((v.length() - MOVE_SPEED).abs() < 1e-3, "{}", v.length());
+        // Quake accel never pushes past the wish speed along the wish dir.
+        assert_eq!(accelerate(Vec2::new(0.0, -20.0), Vec2::NEG_Y, MOVE_SPEED, GROUND_ACCEL, DT), Vec2::new(0.0, -20.0));
+    }
+
+    #[test]
+    fn soft_air_drag_settles_high_speed_and_respects_ceilings() {
+        // Free below 22 m/s.
+        assert_eq!(apply_air_drag(Vec2::new(21.9, 0.0), MOVE_SPEED, DT), Vec2::new(21.9, 0.0));
+        // Gentle above: 30 m/s keeps > 28 m/s after a full second, settles toward 22.
+        let mut v = Vec2::new(30.0, 0.0);
+        let mut prev = 30.0;
+        for i in 0..240 {
+            v = apply_air_drag(v, MOVE_SPEED, DT);
+            assert!(v.length() <= prev && v.length() >= AIR_DRAG_START);
+            prev = v.length();
+            if i == 59 {
+                assert!(v.length() > 28.0, "too draggy: {}", v.length());
+            }
+        }
+        assert!(v.length() < 27.0, "{}", v.length());
+        // The absolute physics-safety ceiling is the only immediate clamp.
+        assert!(apply_air_drag(Vec2::new(0.0, 90.0), MOVE_SPEED, DT).length() <= AIR_SPEED_HARD_CAP + 1e-3);
+        // 5G Overclock (+25%) scales the drag start and the ceiling up...
+        let oc = MOVE_SPEED * 1.25;
+        assert_eq!(apply_air_drag(Vec2::new(27.0, 0.0), oc, DT), Vec2::new(27.0, 0.0));
+        assert!((air_speed_cap(oc) - 45.0).abs() < 1e-3);
+        assert!(apply_air_drag(Vec2::new(0.0, 90.0), oc, DT).length() > MAX_AIR_SPEED + 8.0);
+        // ...but never past the absolute physics-safety ceiling.
+        assert_eq!(air_speed_cap(MOVE_SPEED * 2.0), AIR_SPEED_HARD_CAP);
+        assert!(apply_air_drag(Vec2::new(0.0, 90.0), MOVE_SPEED * 2.0, DT).length() <= AIR_SPEED_HARD_CAP + 1e-3);
+    }
+
+    #[test]
+    fn overclock_drop_bleeds_speed_smoothly_onto_the_lower_ceiling() {
+        // Overclocked hop at its 45 m/s ceiling, then the signal drops a bar
+        // (ceiling back to 36 m/s): no one-frame snap, a smooth bleed instead.
+        let mut v = Vec2::new(0.0, -45.0);
+        let mut prev = 45.0;
+        let mut settled_at = None;
+        for i in 0..120 {
+            v = apply_air_drag(v, MOVE_SPEED, DT);
+            let s = v.length();
+            assert!(s <= prev + 1e-5, "tick {i}: {s}");
+            assert!(prev - s < 1.0, "snapped {prev} -> {s} in one tick");
+            if settled_at.is_none() && s <= MAX_AIR_SPEED + 1e-3 {
+                settled_at = Some(i);
+            }
+            prev = s;
+        }
+        let settled_at = settled_at.expect("never settled on the ceiling");
+        assert!((10..=45).contains(&settled_at), "settled after {settled_at} ticks");
+        // Gentle minimum bleed just above the ceiling.
+        let just_over = apply_air_drag(Vec2::new(MAX_AIR_SPEED + 0.5, 0.0), MOVE_SPEED, DT).x;
+        assert!(just_over < MAX_AIR_SPEED + 0.5 - OVER_CAP_MIN_BLEED * DT + 1e-4);
+        // Air-strafing at / above the ceiling bends the path but adds no speed.
+        let d = MoveInput { forward: 0.0, right: 1.0 };
+        let fast = Vec2::new(0.0, -40.0);
+        let bent = air_accelerate(fast, Vec2::X, d.pure_strafe(), MOVE_SPEED, DT);
+        assert!(bent.length() <= fast.length() + 1e-4 && bent.x > 0.0, "{bent:?}");
+        // Below the ceiling it still gains.
+        let slow = Vec2::new(0.0, -15.0);
+        assert!(air_accelerate(slow, Vec2::X, true, MOVE_SPEED, DT).length() > slow.length());
+    }
+
+    #[test]
+    fn dash_never_slows_a_faster_bhop() {
+        assert_eq!(dash_velocity(Vec2::new(0.0, -5.0), Vec2::NEG_Y), Vec2::new(0.0, -DASH_SPEED));
+        assert_eq!(dash_velocity(Vec2::new(0.0, -40.0), Vec2::NEG_Y), Vec2::new(0.0, -40.0));
+        // A 90 deg side dash redirects the full bhop speed around the corner.
+        assert_eq!(dash_velocity(Vec2::new(40.0, 0.0), Vec2::NEG_Y), Vec2::new(0.0, -40.0));
+        assert_eq!(dash_velocity(Vec2::new(-33.0, 0.0), Vec2::Y), Vec2::new(0.0, 33.0));
+        // Never past the physics-safety ceiling.
+        assert_eq!(dash_velocity(Vec2::new(90.0, 0.0), Vec2::NEG_Y), Vec2::new(0.0, -AIR_SPEED_HARD_CAP));
+    }
+
+    #[test]
+    fn live_eye_pose_and_exponential_smoothing() {
+        let body = Transform::from_xyz(10.0, 2.4, -3.0).with_rotation(Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+        let cam = Transform::from_xyz(0.0, PLAYER_EYE_HEIGHT, 0.0).with_rotation(camera_rotation(0.2, 0.0));
+        let eye = live_eye_pose(&body, &cam);
+        assert!((eye.translation - Vec3::new(10.0, 2.4 + PLAYER_EYE_HEIGHT, -3.0)).length() < 1e-5);
+        // Yaw -90 deg faces +X; pitch tilts it up.
+        let fwd = eye.rotation * Vec3::NEG_Z;
+        assert!(fwd.x > 0.9 && fwd.y > 0.15 && fwd.z.abs() < 1e-4, "{fwd:?}");
+        // Smoothing composes across frame rates: two half steps == one full step.
+        let a = smooth_factor(10.0, 1.0 / 30.0);
+        let half = smooth_factor(10.0, 1.0 / 60.0);
+        assert!((a - (1.0 - (1.0 - half) * (1.0 - half))).abs() < 1e-6);
+        assert!(smooth_factor(10.0, 10.0) <= 1.0 && smooth_factor(10.0, 0.0) == 0.0);
+    }
+
+    #[test]
+    fn fov_bonus_blends_speed_and_dash() {
+        assert_eq!(fov_bonus_deg(0.0, false), 0.0);
+        assert_eq!(fov_bonus_deg(MOVE_SPEED, false), 0.0);
+        assert!((fov_bonus_deg(SPEED_FOV_FULL, false) - SPEED_FOV_MAX_DEG).abs() < 1e-4);
+        assert!(fov_bonus_deg(20.0, false) > 4.0 && fov_bonus_deg(20.0, false) < 8.0);
+        assert_eq!(fov_bonus_deg(0.0, true), DASH_FOV_DEG);
+        assert!((fov_bonus_deg(SPEED_FOV_FULL, true) - (SPEED_FOV_MAX_DEG + 0.25 * DASH_FOV_DEG)).abs() < 1e-4);
+        assert!(fov_bonus_deg(1000.0, true) <= MAX_FOV_BONUS_DEG);
+    }
+
+    #[test]
+    fn strafe_tilt_leans_into_the_strafe_and_stays_subtle() {
+        assert!(strafe_tilt_target(1.0, 0.0, false) < 0.0, "D leans right (negative roll)");
+        assert!(strafe_tilt_target(-1.0, 0.0, false) > 0.0);
+        assert_eq!(strafe_tilt_target(0.0, 0.0, true), 0.0);
+        assert!((strafe_tilt_target(5.0, 5.0, false).abs() - MAX_STRAFE_TILT).abs() < 1e-6);
+        assert!(strafe_tilt_target(1.0, 1.0, true).abs() < strafe_tilt_target(1.0, 1.0, false).abs());
+        // Pitch survives the roll: the view axis still points where the mouse aims.
+        let fwd = camera_rotation(0.3, MAX_STRAFE_TILT) * Vec3::NEG_Z;
+        assert!((fwd - Quat::from_rotation_x(0.3) * Vec3::NEG_Z).length() < 1e-5);
+    }
+
+    // --- `move_player` harness (real system, manual clock + keys) ----------
+
+    fn harness(rows: &[&str], feet: Vec3, vel: Vec3) -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<PlayerModifiers>()
+            .init_resource::<SignalState>()
+            .init_resource::<SfxQueue>()
+            .insert_resource(LevelGrid::from_ascii(rows))
+            .add_systems(Update, move_player);
+        app.world_mut().spawn((Player { velocity: vel, grounded: feet.y.abs() < 1e-3, ..default() }, Transform::from_translation(feet)));
+        app
+    }
+
+    /// One 60 Hz tick; `just_pressed` lasts exactly one tick like real input.
+    fn tick(app: &mut App) -> Player {
+        tick_dt(app, DT)
+    }
+
+    fn tick_dt(app: &mut App, dt: f32) -> Player {
+        app.world_mut().resource_mut::<Time>().advance_by(std::time::Duration::from_secs_f32(dt));
+        app.update();
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().clear();
+        hp(app)
+    }
+
+    fn hp(app: &mut App) -> Player {
+        app.world_mut().query::<&Player>().single(app.world()).unwrap().clone()
+    }
+
+    fn keys(app: &mut App) -> Mut<'_, ButtonInput<KeyCode>> {
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>()
+    }
+
+    fn sfx(app: &mut App) -> Vec<SfxEvent> {
+        std::mem::take(&mut app.world_mut().resource_mut::<SfxQueue>().0)
+    }
+
+    /// 88 m east-west corridor.
+    const CORRIDOR: [&str; 3] = ["######################", "#....................#", "######################"];
+
+    #[test]
+    fn hold_space_auto_hop_keeps_full_speed_across_landings() {
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 0.0, 6.0), Vec3::new(20.0, 0.0, 0.0));
+        keys(&mut app).press(KeyCode::Space);
+        let mut hops = 0;
+        let mut sounds = Vec::new();
+        for _ in 0..150 {
+            // Landing and re-hopping can share one frame (substeps), so count
+            // hops as vertical velocity turning upwards.
+            let prev_vy = hp(&mut app).velocity.y;
+            let p = tick(&mut app);
+            if prev_vy <= 0.0 && p.velocity.y > 0.0 {
+                hops += 1;
+            }
+            sounds.extend(sfx(&mut app));
+            assert!(xz(p.velocity).length() > 20.0 - 1e-3, "landing friction ate speed: {}", xz(p.velocity).length());
+        }
+        assert!(hops >= 3, "only {hops} hops");
+        let p = hp(&mut app);
+        assert!(p.bhop_chain >= 3, "chain {}", p.bhop_chain);
+        // First hop (chain x1) is a plain jump; from `BHOP x2` on, the chirp.
+        let hops_sfx: Vec<_> = sounds.iter().filter(|s| matches!(s, SfxEvent::Jump | SfxEvent::Bhop)).collect();
+        assert_eq!(hops_sfx.first(), Some(&&SfxEvent::Jump), "{sounds:?}");
+        assert!(hops_sfx[1..].iter().all(|s| **s == SfxEvent::Bhop) && hops_sfx.len() >= 3, "{sounds:?}");
+
+        // Letting go: the player lands, friction bites and the chain breaks.
+        keys(&mut app).release(KeyCode::Space);
+        for _ in 0..90 {
+            tick(&mut app);
+        }
+        let p = hp(&mut app);
+        assert!(p.grounded && xz(p.velocity).length() < 1.0 && p.bhop_chain == 0, "{p:?}");
+    }
+
+    /// Hop once at 20 m/s and fall until about `ticks_before_land` ticks remain, then tap Space.
+    fn buffered_landing(ticks_before_land: u32) -> Player {
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 0.0, 6.0), Vec3::new(20.0, 0.0, 0.0));
+        keys(&mut app).press(KeyCode::Space);
+        tick(&mut app);
+        keys(&mut app).release(KeyCode::Space);
+        // Airtime is 2 * 8 / 22 s ~= 43.6 ticks.
+        let air_ticks = (2.0 * JUMP_VELOCITY / crate::physics::GRAVITY / DT) as u32;
+        for _ in 0..air_ticks - ticks_before_land {
+            tick(&mut app);
+        }
+        assert!(!hp(&mut app).grounded);
+        keys(&mut app).press(KeyCode::Space);
+        tick(&mut app);
+        keys(&mut app).release(KeyCode::Space);
+        // Run through the landing; return the state 0.15 s after touchdown.
+        for _ in 0..(ticks_before_land + 9) {
+            tick(&mut app);
+        }
+        hp(&mut app)
+    }
+
+    #[test]
+    fn jump_buffer_hops_on_touchdown_without_friction() {
+        // Tapped ~0.08 s before landing: hops straight off the floor at full speed.
+        let p = buffered_landing(5);
+        assert!(!p.grounded && p.velocity.y > 0.0, "buffered hop did not fire: {p:?}");
+        assert!(xz(p.velocity).length() > 20.0 - 1e-3);
+        // Tapped ~0.25 s early: outside the 0.12 s buffer, so the player lands
+        // and ground friction bleeds speed.
+        let p = buffered_landing(15);
+        assert!(p.grounded, "{p:?}");
+        assert!(xz(p.velocity).length() < 18.0, "{}", xz(p.velocity).length());
+    }
+
+    /// Run east off a 2.4 m catwalk edge; tap Space `ticks_after` ticks after leaving it.
+    fn coyote_jump(ticks_after: u32) -> (Player, Player) {
+        let rows = ["##########", "#^^^.....#", "##########"];
+        let mut app = harness(&rows, Vec3::new(9.0, crate::level::CATWALK_HEIGHT, 6.0), Vec3::new(8.0, 0.0, 0.0));
+        with(&mut app, |p| p.grounded = true);
+        // Facing -Z (yaw 0), D runs east toward the edge.
+        keys(&mut app).press(KeyCode::KeyD);
+        let mut guard = 0;
+        while hp(&mut app).grounded {
+            tick(&mut app);
+            guard += 1;
+            assert!(guard < 120, "never left the catwalk");
+        }
+        for _ in 0..ticks_after {
+            tick(&mut app);
+        }
+        let before = hp(&mut app);
+        keys(&mut app).press(KeyCode::Space);
+        let after = tick(&mut app);
+        (before, after)
+    }
+
+    fn with(app: &mut App, f: impl FnOnce(&mut Player)) {
+        let mut q = app.world_mut().query::<&mut Player>();
+        f(&mut q.single_mut(app.world_mut()).unwrap());
+    }
+
+    #[test]
+    fn coyote_time_allows_a_late_jump_but_never_a_double_jump() {
+        // 4 ticks (~0.067 s) after running off the edge: still jumps.
+        let (before, after) = coyote_jump(4);
+        assert!(before.velocity.y < 0.0 && after.velocity.y > JUMP_VELOCITY - 1.0, "coyote jump refused: {after:?}");
+        // 8 ticks (~0.13 s): too late.
+        let (before, after) = coyote_jump(8);
+        assert!(after.velocity.y < before.velocity.y, "jumped after coyote time: {after:?}");
+
+        // Holding Space after a jump never re-jumps mid-air.
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 0.0, 6.0), Vec3::ZERO);
+        keys(&mut app).press(KeyCode::Space);
+        let mut last_vy = tick(&mut app).velocity.y;
+        assert!(last_vy > 0.0);
+        for _ in 0..30 {
+            let p = tick(&mut app);
+            assert!(p.velocity.y < last_vy, "double jump at vy {}", p.velocity.y);
+            assert_eq!(p.coyote_timer, 0.0);
+            last_vy = p.velocity.y;
+        }
+    }
+
+    #[test]
+    fn dash_into_jump_carries_dash_speed_into_the_air() {
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 0.0, 6.0), Vec3::ZERO);
+        with(&mut app, |p| {
+            p.yaw = -std::f32::consts::FRAC_PI_2; // face +X
+            p.prev_yaw = p.yaw;
+        });
+        keys(&mut app).press(KeyCode::ShiftLeft);
+        keys(&mut app).press(KeyCode::Space);
+        let p = tick(&mut app);
+        assert!(p.dash_started && p.dash_timer == 0.0, "dash not cancelled into the hop: {p:?}");
+        assert!(p.velocity.y > 0.0 && (xz(p.velocity).length() - DASH_SPEED).abs() < 0.1, "{p:?}");
+        assert!(p.bhop_chain >= 1);
+        keys(&mut app).release(KeyCode::ShiftLeft);
+        keys(&mut app).release(KeyCode::Space);
+        for _ in 0..20 {
+            tick(&mut app);
+        }
+        let p = hp(&mut app);
+        assert!(!p.grounded && xz(p.velocity).length() > 28.5, "dash speed bled: {}", xz(p.velocity).length());
+    }
+
+    #[test]
+    fn dash_ending_mid_air_keeps_its_speed() {
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 0.0, 6.0), Vec3::ZERO);
+        with(&mut app, |p| {
+            p.yaw = -std::f32::consts::FRAC_PI_2;
+            p.prev_yaw = p.yaw;
+        });
+        keys(&mut app).press(KeyCode::Space);
+        tick(&mut app);
+        keys(&mut app).release(KeyCode::Space);
+        tick(&mut app);
+        keys(&mut app).press(KeyCode::ShiftLeft);
+        let p = tick(&mut app);
+        assert!(p.dash_timer > 0.0 && !p.grounded);
+        for _ in 0..12 {
+            tick(&mut app);
+        }
+        let p = hp(&mut app);
+        assert!(p.dash_timer <= 0.0 && !p.grounded, "{p:?}");
+        assert!(xz(p.velocity).length() > 29.0, "dash end clamped speed to {}", xz(p.velocity).length());
+    }
+
+    /// Hold Space + D in a 64 m arena and sweep the view right at 2.5 rad/s
+    /// for 4 s, sampled at `hz`. Returns the final horizontal speed.
+    fn strafe_replay(hz: f32) -> f32 {
+        let wall = "#".repeat(18);
+        let row = format!("#{}#", ".".repeat(16));
+        let rows: Vec<&str> = std::iter::once(wall.as_str()).chain(std::iter::repeat_n(row.as_str(), 16)).chain(std::iter::once(wall.as_str())).collect();
+        let mut app = harness(&rows, Vec3::new(36.0, 0.0, 36.0), Vec3::new(0.0, 0.0, -MOVE_SPEED));
+        keys(&mut app).press(KeyCode::Space);
+        keys(&mut app).press(KeyCode::KeyD);
+        let frames = (4.0 * hz).round() as u32;
+        let dt = 1.0 / hz;
+        for f in 1..=frames {
+            // `mouse_look` sets the yaw for the end of the frame.
+            let t = f as f32 * dt;
+            with(&mut app, |p| p.yaw = -2.5 * t);
+            let p = tick_dt(&mut app, dt);
+            // Held keys: `clear()` keeps them pressed; re-press to be explicit.
+            keys(&mut app).press(KeyCode::Space);
+            keys(&mut app).press(KeyCode::KeyD);
+            assert!(p.velocity.is_finite());
+        }
+        xz(hp(&mut app).velocity).length()
+    }
+
+    #[test]
+    fn movement_converges_across_frame_rates() {
+        let speeds: Vec<f32> = [30.0, 60.0, 120.0, 144.0].into_iter().map(strafe_replay).collect();
+        let (lo, hi) = speeds.iter().fold((f32::MAX, f32::MIN), |(lo, hi), s| (lo.min(*s), hi.max(*s)));
+        println!("30/60/120/144 Hz air-strafe speeds: {speeds:?}");
+        assert!(lo > MOVE_SPEED + 3.0, "scenario never built speed: {speeds:?}");
+        assert!(hi - lo < 1.0, "frame rate changes the outcome: {speeds:?}");
+    }
+
+    #[test]
+    fn fast_touchdown_on_a_catwalk_edge_still_hops() {
+        // Dropping onto the catwalk 0.15 m past its edge at 30 m/s: the feet
+        // touch down and leave again inside one 1/120 s substep. Holding Space,
+        // the touchdown keeps the coyote window and the hop fires.
+        let rows = ["###########", "#^^^......#", "###########"];
+        let feet = Vec3::new(16.15, crate::level::CATWALK_HEIGHT + 0.01, 6.0);
+        let mut app = harness(&rows, feet, Vec3::new(30.0, -3.0, 0.0));
+        keys(&mut app).press(KeyCode::Space);
+        let p = tick(&mut app);
+        assert!(p.velocity.y > JUMP_VELOCITY - 1.0, "touchdown at the edge lost the hop: {p:?}");
+        assert!(xz(p.velocity).length() > 29.9, "{p:?}");
+    }
+
+    #[test]
+    fn floor_transition_resets_camera_feel_and_motion() {
+        let mut app = App::new();
+        app.insert_resource(LevelGrid::from_ascii(&CORRIDOR)).add_systems(Update, snap_player_to_spawn);
+        app.world_mut()
+            .spawn((
+                Player { velocity: Vec3::new(30.0, 4.0, 0.0), grounded: false, bob_phase: 3.0, prev_yaw: 2.0, bhop_chain: 4, ..default() },
+                Transform::from_xyz(50.0, 3.0, 6.0),
+            ))
+            .with_children(|c| {
+                c.spawn((
+                    PlayerCamera,
+                    Projection::Perspective(PerspectiveProjection { fov: 100f32.to_radians(), ..default() }),
+                    Transform::from_xyz(0.03, PLAYER_EYE_HEIGHT + 0.06, 0.0).with_rotation(camera_rotation(0.4, 0.02)),
+                ));
+            });
+        app.update();
+        let p = hp(&mut app);
+        assert!(p.grounded && p.velocity == Vec3::ZERO && p.bob_phase == 0.0 && p.bhop_chain == 0 && p.prev_yaw == p.yaw, "{p:?}");
+        let mut q = app.world_mut().query_filtered::<(&Transform, &Projection), With<PlayerCamera>>();
+        let (cam, proj) = q.single(app.world()).unwrap();
+        assert_eq!(cam.translation, Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0));
+        assert_eq!(cam.rotation, Quat::IDENTITY);
+        let Projection::Perspective(pp) = proj else { panic!() };
+        assert!((pp.fov - BASE_FOV_DEG.to_radians()).abs() < 1e-6);
     }
 }

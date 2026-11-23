@@ -21,6 +21,8 @@ pub enum SfxEvent {
     Plasma,
     Dash,
     Jump,
+    /// Chained bunny hop above base speed (kinetic chirp, brighter than `Jump`).
+    Bhop,
     Hurt,
     Ping,
     Overload,
@@ -38,11 +40,12 @@ pub enum SfxEvent {
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 18] = [
+    pub const ALL: [SfxEvent; 19] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
         SfxEvent::Jump,
+        SfxEvent::Bhop,
         SfxEvent::Hurt,
         SfxEvent::Ping,
         SfxEvent::Overload,
@@ -63,7 +66,7 @@ impl SfxEvent {
     pub fn volume(self) -> f32 {
         match self {
             SfxEvent::Hit | SfxEvent::EnemyFire | SfxEvent::Pickup | SfxEvent::WeaponSwap => 0.45,
-            SfxEvent::Plasma | SfxEvent::Jump => 0.5,
+            SfxEvent::Plasma | SfxEvent::Jump | SfxEvent::Bhop => 0.5,
             _ => 0.75,
         }
     }
@@ -172,6 +175,13 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
         SfxEvent::Jump => render(0.14, |_, t, _| {
             let p = o.step(220.0 + 400.0 * t);
             square(p) * 0.35 * env(t, 0.05, 1.0)
+        }),
+        SfxEvent::Bhop => render(0.13, |ts, t, n| {
+            // Noise tick + fast upward square/triangle chirp, an octave above `Jump`.
+            let p = o.step(520.0 + 1500.0 * t.sqrt());
+            let shimmer = tri(o2.step(1040.0 + 2200.0 * t)) * 0.18;
+            let tick = if ts < 0.005 { n.next() * 0.45 } else { 0.0 };
+            (square(p) * 0.3 + shimmer + tick) * env(t, 0.03, 1.8)
         }),
         SfxEvent::Hurt => render(0.3, |_, t, n| {
             let p = o.step(240.0 - 150.0 * t);
@@ -362,5 +372,6 @@ mod tests {
     fn synthesis_is_deterministic_and_sfx_differ() {
         assert_eq!(synthesize_wav(SfxEvent::Shotgun), synthesize_wav(SfxEvent::Shotgun));
         assert_ne!(synthesize_wav(SfxEvent::Shotgun), synthesize_wav(SfxEvent::Plasma));
+        assert_ne!(synthesize_wav(SfxEvent::Jump), synthesize_wav(SfxEvent::Bhop));
     }
 }

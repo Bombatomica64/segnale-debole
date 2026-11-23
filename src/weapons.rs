@@ -25,7 +25,7 @@ use crate::level::{Cell, DemonJammer, JammerCore, LevelEntity, LevelGrid};
 use crate::meta::{HandsetSkin, RunLoadout, SkinSlot};
 use crate::phone_screen::PhoneScreenTexture;
 use crate::physics::raycast_grid;
-use crate::player::{CursorCaptured, Player, PlayerCamera};
+use crate::player::{live_eye_pose, smooth_factor, CursorCaptured, Player, PlayerCamera};
 use crate::signal::{overclock_factor, SignalState};
 use crate::state::{GameSet, PlayerModifiers, RunStats};
 
@@ -772,8 +772,23 @@ fn sync_overlay_fov(main: Query<&Projection, (With<PlayerCamera>, Without<Overla
     }
 }
 
+/// Damping rate (1/s) of the viewmodel walk-bob amplitude.
+const VIEWMODEL_BOB_RATE: f32 = 8.0;
+
+/// Target viewmodel walk-bob amplitude: speed-scaled on the ground, faint in the air.
+pub fn viewmodel_bob_target(grounded: bool, horizontal_speed: f32) -> f32 {
+    if grounded { (horizontal_speed / crate::player::MOVE_SPEED).min(1.3) } else { 0.15 }
+}
+
+/// Damp the bob amplitude toward its target, so a one-frame bhop touchdown
+/// barely moves it instead of spiking the gun for a frame.
+pub fn damp_bob_amp(current: f32, target: f32, dt: f32) -> f32 {
+    current + (target - current) * smooth_factor(VIEWMODEL_BOB_RATE, dt)
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn animate_viewmodels(
+    mut bob_amp: Local<f32>,
     time: Res<Time>,
     ws: Res<WeaponState>,
     apps: Res<PhoneApps>,
@@ -795,7 +810,8 @@ fn animate_viewmodels(
     let Ok(p) = players.single() else { return };
     let t = time.elapsed_secs();
     let speed = Vec2::new(p.velocity.x, p.velocity.z).length();
-    let amp = if p.grounded { (speed / crate::player::MOVE_SPEED).min(1.3) } else { 0.15 };
+    *bob_amp = damp_bob_amp(*bob_amp, viewmodel_bob_target(p.grounded, speed), time.delta_secs());
+    let amp = *bob_amp;
     let bob = Vec3::new((p.bob_phase * 0.5).cos() * 0.011 * amp, -(p.bob_phase.sin().abs()) * 0.013 * amp, 0.0)
         + Vec3::new(0.0, (t * 1.6).sin() * 0.0025, 0.0);
     let half = SWAP_SECS * 0.5;
@@ -895,15 +911,18 @@ fn fire_weapons(
     mut ws: ResMut<WeaponState>,
     (fx, bolts): (Res<FxAssets>, Res<BoltAssets>),
     (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
-    cams: Query<&GlobalTransform, With<PlayerCamera>>,
-    mut players: Query<&mut Player>,
+    cams: Query<&Transform, With<PlayerCamera>>,
+    mut players: Query<(&mut Player, &Transform), Without<PlayerCamera>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
     mut bot: Option<ResMut<BotControl>>,
 ) {
     let dt = time.delta_secs();
-    let Ok(mut player) = players.single_mut() else { return };
-    let Ok(cam) = cams.single() else { return };
+    let Ok((mut player, body)) = players.single_mut() else { return };
+    let Ok(cam_local) = cams.single() else { return };
+    // This frame's eye pose (moved + turned earlier in `Update`), not last
+    // frame's `GlobalTransform`.
+    let cam = live_eye_pose(body, cam_local);
     ws.cooldown = (ws.cooldown - dt).max(0.0);
     ws.swap_timer = (ws.swap_timer - dt).max(0.0);
     ws.recoil = (ws.recoil - dt * 5.0).max(0.0);
@@ -957,8 +976,8 @@ fn fire_weapons(
     ws.force_fire = false;
     ws.cooldown = fire_cooldown(ws.current, &mods, signal.bars);
 
-    let origin = cam.translation();
-    let rot = cam.rotation();
+    let origin = cam.translation;
+    let rot = cam.rotation;
     let fwd = rot * Vec3::NEG_Z;
     let muzzle = origin + rot * Vec3::new(0.2, -0.17, -0.85);
 
@@ -1219,6 +1238,23 @@ mod tests {
             "#....#...#", //
             "##########",
         ])
+    }
+
+    #[test]
+    fn viewmodel_bob_is_damped_across_single_frame_landings() {
+        let dt = 1.0 / 60.0;
+        // Steady bhop: airborne amplitude, then a one-frame touchdown at 30 m/s.
+        let mut amp = viewmodel_bob_target(false, 30.0);
+        let air = amp;
+        amp = damp_bob_amp(amp, viewmodel_bob_target(true, 30.0), dt);
+        assert!(amp - air < 0.2, "one-frame landing spiked the bob from {air} to {amp}");
+        amp = damp_bob_amp(amp, viewmodel_bob_target(false, 30.0), dt);
+        assert!(amp < 0.4);
+        // Sustained running still converges on the full amplitude.
+        for _ in 0..120 {
+            amp = damp_bob_amp(amp, viewmodel_bob_target(true, 30.0), dt);
+        }
+        assert!((amp - 1.3).abs() < 0.01, "{amp}");
     }
 
     #[test]

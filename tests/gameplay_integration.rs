@@ -36,11 +36,11 @@ use segnale_debole::meta::{
 use segnale_debole::phone_screen::{PhoneScreenTexture, SCREEN_W, SPOOF_CYAN};
 use segnale_debole::level::{jammer_count_for_floor, Cell, DemonJammer, LevelGrid, SignalTower};
 use segnale_debole::physics::has_line_of_sight;
-use segnale_debole::player::{hazard_damage, Player, PLAYER_EYE_HEIGHT};
+use segnale_debole::player::{hazard_damage, Player, PlayerCamera, BASE_FOV_DEG, DASH_SPEED, MOVE_SPEED, PLAYER_EYE_HEIGHT};
 use segnale_debole::signal::{bars_from_strength, SignalState, TOWER_RING_RADIUS};
 use segnale_debole::state::{complete_floor, start_run, AppState, PlayerModifiers, RunStats, UpgradeId, FINAL_FLOOR};
 use segnale_debole::upgrades::{apply_upgrade, UpgradeChoices};
-use segnale_debole::weapons::{Pickup, PhoneSkin, PhoneSkinPart, Weapon, WeaponState, PLASMA_DAMAGE};
+use segnale_debole::weapons::{Pickup, PhoneSkin, PhoneSkinPart, PlayerProjectile, Weapon, WeaponState, PLASMA_DAMAGE};
 
 const FPS: usize = 60;
 
@@ -641,6 +641,162 @@ fn autonomous_playtest_bot_clears_floor1_headless() {
         assert!(passed, "seed {seed}: autonomous playtest failed:\n{json}");
         assert!(json.contains("\"would_have_died\": 0,"), "seed {seed}: bot absorbed a fatal blow:\n{json}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Quake / CPMA movement
+// ---------------------------------------------------------------------------
+
+/// Swap the floor for a 64 m open arena (every production system keeps
+/// running; the floor-change hooks re-stage pickups / extraction) and stand
+/// the player in the middle facing -Z. Returns the arena center.
+fn open_arena(app: &mut App) -> Vec3 {
+    let wall = "#".repeat(18);
+    let row = format!("#{}#", ".".repeat(16));
+    let rows: Vec<&str> = std::iter::once(wall.as_str()).chain(std::iter::repeat_n(row.as_str(), 16)).chain(std::iter::once(wall.as_str())).collect();
+    app.world_mut().insert_resource(LevelGrid::from_ascii(&rows));
+    step(app, 2);
+    despawn_all_enemies(app);
+    let c = Vec3::new(36.0, 0.0, 36.0);
+    teleport(app, c, c + Vec3::new(0.0, PLAYER_EYE_HEIGHT, -10.0));
+    step(app, 10);
+    assert!(player(app).grounded);
+    c
+}
+
+fn camera_fov_deg(app: &mut App) -> f32 {
+    let mut q = app.world_mut().query_filtered::<&Projection, With<PlayerCamera>>();
+    match q.single(app.world()).expect("player camera") {
+        Projection::Perspective(pp) => pp.fov.to_degrees(),
+        other => panic!("unexpected projection {other:?}"),
+    }
+}
+
+fn horizontal_speed(p: &Player) -> f32 {
+    Vec2::new(p.velocity.x, p.velocity.z).length()
+}
+
+/// Hold Space + D and sweep the mouse right: CPMA air-strafing over chained
+/// zero-friction landing hops builds speed far past the run speed, counts the
+/// chain and widens the camera FOV.
+#[test]
+fn bunny_hop_air_strafe_chain_builds_speed_and_widens_fov() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 2026);
+    godmode(&mut app);
+    open_arena(&mut app);
+    // Run forward to full speed first.
+    bot(&mut app).strafe_axes = Vec2::new(0.0, 1.0);
+    step(&mut app, FPS / 2);
+    let p = player(&mut app);
+    assert!(p.grounded && (horizontal_speed(&p) - MOVE_SPEED).abs() < 0.3, "run speed {}", horizontal_speed(&p));
+    let fov_at_run = camera_fov_deg(&mut app);
+    assert!((fov_at_run - BASE_FOV_DEG).abs() < 0.5, "fov {fov_at_run}");
+
+    {
+        let mut b = bot(&mut app);
+        b.jump = true;
+        b.strafe_axes = Vec2::new(1.0, 0.0);
+    }
+    let mut yaw = 0.0f32;
+    // Movement substeps can land and re-hop inside one frame, so a hop is
+    // counted when vertical velocity turns upward.
+    let (mut max_chain, mut hops, mut prev_vy) = (0, 0, 0.0f32);
+    for _ in 0..4 * FPS {
+        yaw -= 2.5 / FPS as f32;
+        bot(&mut app).look_yaw = Some(yaw);
+        step(&mut app, 1);
+        let p = player(&mut app);
+        if prev_vy <= 0.0 && p.velocity.y > 0.0 {
+            hops += 1;
+        }
+        prev_vy = p.velocity.y;
+        max_chain = max_chain.max(p.bhop_chain);
+    }
+    let p = player(&mut app);
+    let speed = horizontal_speed(&p);
+    println!("bhop: {hops} hops, chain {max_chain}, {speed:.1} m/s, fov {:.1}", camera_fov_deg(&mut app));
+    assert!(hops >= 4, "only {hops} hops");
+    assert!(speed > 16.0, "air-strafe chain only reached {speed} m/s");
+    assert!(max_chain >= 2 && p.bhop_chain >= 2, "chain {max_chain} / {}", p.bhop_chain);
+    assert!(camera_fov_deg(&mut app) > BASE_FOV_DEG + 5.0, "fov {}", camera_fov_deg(&mut app));
+    assert!(p.hp >= p.max_hp, "took damage while hopping");
+
+    // Release everything: friction stops the player and the chain breaks.
+    bot(&mut app).release_all();
+    step(&mut app, FPS);
+    let p = player(&mut app);
+    assert!(p.grounded && horizontal_speed(&p) < 0.5 && p.bhop_chain == 0, "{p:?}");
+}
+
+/// Dash + jump on the same tick launches the full Airplane Mode burst into a hop.
+#[test]
+fn dash_into_jump_carries_dash_speed_mid_air() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 7);
+    godmode(&mut app);
+    open_arena(&mut app);
+    assert!(player(&mut app).dash_ready());
+    {
+        let mut b = bot(&mut app);
+        b.dash = true;
+        b.jump = true;
+    }
+    step(&mut app, 1);
+    let p = player(&mut app);
+    assert!(p.dash_started || p.dash_cooldown > 0.0, "dash never fired");
+    assert!(p.dash_timer == 0.0 && p.velocity.y > 0.0, "dash not converted into a hop: {p:?}");
+    assert!((horizontal_speed(&p) - DASH_SPEED).abs() < 0.2, "{}", horizontal_speed(&p));
+    bot(&mut app).jump = false;
+    step(&mut app, FPS / 5);
+    let p = player(&mut app);
+    assert!(!p.grounded, "landed too early");
+    assert!(horizontal_speed(&p) > DASH_SPEED - 1.5, "dash speed bled mid-air: {}", horizontal_speed(&p));
+    assert!(camera_fov_deg(&mut app) > BASE_FOV_DEG + 8.0, "fov {}", camera_fov_deg(&mut app));
+}
+
+/// Moving + turning and firing in the same update shoots from this frame's
+/// eye pose (body `Transform` x camera local `Transform`), not from last
+/// frame's `GlobalTransform` (only propagated in `PostUpdate`).
+#[test]
+fn shots_fire_from_this_frames_moved_and_turned_eye() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 11);
+    godmode(&mut app);
+    let c = open_arena(&mut app);
+    bot(&mut app).switch_weapon = Some(Weapon::Plasma);
+    step(&mut app, FPS);
+    assert_eq!(app.world().resource::<WeaponState>().current, Weapon::Plasma);
+    assert_eq!(count::<PlayerProjectile>(&mut app), 0);
+
+    // One update: the body is relocated 14 m and runs east at 20 m/s, the view
+    // turns 90 deg from -Z to +X, and the trigger is pulled.
+    let moved = c + Vec3::new(-12.0, 0.0, 8.0);
+    {
+        let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
+        let (mut p, mut tf) = q.single_mut(app.world_mut()).unwrap();
+        tf.translation = moved;
+        p.velocity = Vec3::new(20.0, 0.0, 0.0);
+    }
+    {
+        let mut b = bot(&mut app);
+        b.look_yaw = Some(-std::f32::consts::FRAC_PI_2);
+        b.look_pitch = Some(0.0);
+        b.fire = true;
+    }
+    step(&mut app, 1);
+    bot(&mut app).fire = false;
+
+    let mut q = app.world_mut().query::<(&PlayerProjectile, &Transform)>();
+    let bolts: Vec<(Vec3, Vec3)> = q.iter(app.world()).map(|(b, tf)| (b.vel, tf.translation)).collect();
+    assert_eq!(bolts.len(), 1, "exactly one plasma bolt");
+    let (vel, pos) = bolts[0];
+    let eye = player_feet(&mut app) + Vec3::Y * PLAYER_EYE_HEIGHT;
+    let heading = vel.normalize();
+    assert!(heading.dot(Vec3::X) > 0.97, "bolt flew along last frame's heading: {heading:?}");
+    assert!((pos - eye).length() < 2.5, "bolt spawned {:.1} m from this frame's eye ({pos:?} vs {eye:?})", (pos - eye).length());
+    let stale_eye = c + Vec3::Y * PLAYER_EYE_HEIGHT;
+    assert!((pos - stale_eye).length() > 10.0, "bolt spawned at last frame's eye");
 }
 
 /// An adjacent walkable atrium cell pair (player, target) away from the pedestal.

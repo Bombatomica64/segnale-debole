@@ -13,7 +13,7 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
 
 ## Controls
 - `WASD` — Move | `Mouse` — Look (`Click` capture, `Esc` / `P` pause menu)
-- `Space` — Jump | `Shift` — Airplane Mode Dash
+- `Space` — Jump (hold to bunny hop; `A`/`D` + mouse turn to air-strafe) | `Shift` — Airplane Mode Dash (`Shift`+`Space` = dash-hop)
 - `LMB` — Fire | `1` / `2` / `Tab` / `Wheel` — Switch Shotgun / Plasma Repeater
 - `RMB` — **Ping Scan** (1+ bar) | `Q` — **5G Overload EMP** (3+ bars)
 - `E` — Trigger SOS Uplink at the 5-bar Signal Tower

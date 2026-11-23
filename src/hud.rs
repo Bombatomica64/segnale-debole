@@ -1,6 +1,6 @@
 //! Menus (main / App Store upgrade select / pause / game over / victory) and
 //! the in-game HUD: status + SOS uplink bar, crosshair hitmarker, killfeed
-//! toasts, HP / armor / stamina vitals, weapon & ammo deck and a subtle
+//! toasts, VEL speedometer + HP / armor / stamina vitals, weapon & ammo deck and a subtle
 //! Dead-Zone edge frame. Signal bars, radar and phone apps live on the 3D
 //! phone screen (`phone_screen.rs`), not here.
 //!
@@ -28,7 +28,7 @@ use crate::state::{complete_floor, AppState, GameSet, PlayerModifiers, RunStats,
 use crate::ui_kit::{
     hard_shadow, hazard_strip, hero_title, hud_plate, inset_border, keycap, plate_border, plate_rect, punk_button, punk_screen_root,
     punk_screen_root_tinted, recessed_bezel, screen_rails, section_crate, signal_bars, stamped_tag, stencil_title, stencil_title_layers,
-    terminal_chassis, tiled_image, ButtonStyle, PunkButtonColors, Tape, UiKitPlugin, UiKitTextures, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_MID, PUNK_RED, STEEL_BORDER, STEEL_LIGHT,
+    terminal_chassis, tiled_image, ButtonStyle, PunkButtonColors, Tape, UiKitPlugin, UiKitTextures, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_DARK, IRON_MID, PUNK_RED, STEEL_BORDER, STEEL_LIGHT,
 };
 use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeChoices};
 use crate::weapons::{Weapon, WeaponState};
@@ -115,7 +115,11 @@ impl Plugin for HudPlugin {
             .add_systems(OnEnter(AppState::Victory), spawn_victory.after(record_victory))
             .add_systems(Update, (menu_buttons, menu_keys).run_if(not(in_state(AppState::Playing))))
             .add_systems(Update, upgrade_cards.run_if(in_state(AppState::UpgradeSelect)))
-            .add_systems(Update, (update_hud, update_hud_boxes, pause_input, debug_skip_floor).in_set(GameSet::Ui));
+            .init_resource::<VelGauge>()
+            .add_systems(
+                Update,
+                (track_vel_gauge.before(update_hud).before(update_hud_boxes), update_hud, update_hud_boxes, pause_input, debug_skip_floor).in_set(GameSet::Ui),
+            );
     }
 }
 
@@ -167,7 +171,7 @@ pub type KeyBind = (&'static [&'static str], &'static str);
 
 /// Field-manual rows: `(category, bindings)`.
 pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
-    ("MOVE", &[(&["WASD"], "move"), (&["MOUSE"], "look"), (&["SPACE"], "jump"), (&["SHIFT"], "airplane-mode dash")]),
+    ("MOVE", &[(&["WASD"], "move"), (&["MOUSE"], "look"), (&["SPACE"], "jump / hold to bhop"), (&["SHIFT"], "airplane-mode dash")]),
     ("FIGHT", &[(&["LMB"], "fire"), (&["1", "2", "TAB", "WHEEL"], "switch shotgun / plasma")]),
     ("PHONE", &[(&["RMB"], "ping scan (1+ bar)"), (&["Q"], "5G overload EMP (3+ bars)"), (&["E"], "SOS uplink at the tower")]),
     ("SYSTEM", &[(&["CLICK"], "capture mouse"), (&["ESC", "P"], "pause"), (&["F9"], "debug: skip floor")]),
@@ -888,7 +892,8 @@ fn menu_keys(
 // - top-left: floor + kills/jammers panel
 // - top-center: status panel (+ SOS uplink bar while uploading), alert below
 // - top-right: killfeed toasts, each on its own backing chip
-// - bottom-center: vitals panel (HP / ARMOR / STAMINA bars)
+// - bottom-center: vitals panel (HP / ARMOR / STAMINA bars), the docked VEL
+//   telemetry strip above it (with its stamped `BHOP xN` tag) and the prompt
 // - bottom-right: weapon & ammo deck (active card, shell pips or plasma bar,
 //   slot chips, 5G overclock pill)
 // - edges: subtle dark-red Dead-Zone frame (no scanlines across the view)
@@ -960,6 +965,155 @@ pub fn lit_pips(cur: u32, max: u32, pips: u8) -> u8 {
     ((cur as f32 / max as f32 * pips as f32).ceil() as u8).min(pips)
 }
 
+/// Top of the VEL momentum track (m/s); the readout badge snaps solid here.
+pub const VEL_GAUGE_MAX: f32 = 32.0;
+/// Segments in the VEL momentum track (2 m/s each).
+pub const VEL_SEGMENTS: u8 = 16;
+/// Hysteresis (m/s) before the VEL gauge drops back a tier / un-snaps the badge.
+pub const VEL_HYSTERESIS: f32 = 0.5;
+/// Width (px) of the docked VEL strip and the vitals plate under it.
+const VEL_PLATE_WIDTH: f32 = 312.0;
+
+/// Momentum band of the VEL gauge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpeedTier {
+    /// Below 12 m/s: walking / plain running.
+    #[default]
+    Walk,
+    /// 12..20 m/s: first hops.
+    Flow,
+    /// 20..28 m/s: a real bhop chain.
+    Surge,
+    /// 28+ m/s: dash-carry territory.
+    Redline,
+}
+
+/// Speed band: `< 12` walk, `12..20` flow, `20..28` surge, `>= 28` redline
+/// (the bands line up with the tachometer's zone breaks).
+pub fn speed_tier(speed: f32) -> SpeedTier {
+    if speed >= 28.0 {
+        SpeedTier::Redline
+    } else if speed >= 20.0 {
+        SpeedTier::Surge
+    } else if speed >= 12.0 {
+        SpeedTier::Flow
+    } else {
+        SpeedTier::Walk
+    }
+}
+
+/// [`speed_tier`] with [`VEL_HYSTERESIS`]: climbs a tier as soon as the
+/// threshold is reached, but only drops once speed is half a m/s below it, so
+/// the rail / readout / stamp never flicker while hovering at 12 / 20 / 28.
+pub fn speed_tier_hysteresis(prev: SpeedTier, speed: f32) -> SpeedTier {
+    let raw = speed_tier(speed);
+    if raw >= prev { raw } else { speed_tier(speed + VEL_HYSTERESIS).min(prev) }
+}
+
+/// Readout badge snapped solid at [`VEL_GAUGE_MAX`]+, with the same hysteresis.
+pub fn vel_maxed_hysteresis(prev: bool, speed: f32) -> bool {
+    speed >= VEL_GAUGE_MAX || (prev && speed >= VEL_GAUGE_MAX - VEL_HYSTERESIS)
+}
+
+/// VEL accent per tier, always steady (no strobing): muted ash, arc cyan,
+/// acid green, hazard yellow.
+pub fn speed_color(tier: SpeedTier) -> Color {
+    match tier {
+        SpeedTier::Walk => ASH_DIM,
+        SpeedTier::Flow => ARC_CYAN,
+        SpeedTier::Surge => ACID_GREEN,
+        SpeedTier::Redline => HAZARD_YELLOW,
+    }
+}
+
+/// Fixed tachometer zone of segment `i` (2 m/s each): ash 0-12, cyan 12-20,
+/// green 20-28, hazard yellow 28-32.
+pub fn segment_zone_color(i: u8) -> Color {
+    match i {
+        0..=5 => ASH_DIM,
+        6..=9 => ARC_CYAN,
+        10..=13 => ACID_GREEN,
+        _ => HAZARD_YELLOW,
+    }
+}
+
+/// Segment fill: lit segments at full zone color, unlit ones keep a faint
+/// (16%) zone tint so the tachometer scale is always legible.
+pub fn segment_color(i: u8, lit: u8) -> Color {
+    segment_zone_color(i).with_alpha(if i < lit { 1.0 } else { 0.16 })
+}
+
+/// Extra right margin after segments 5 / 9 / 13: 4 px zone breaks at 12, 20, 28 m/s.
+pub fn segment_zone_break(i: u8) -> bool {
+    matches!(i, 5 | 9 | 13)
+}
+
+/// Momentum track fill `0..=1` over `0..VEL_GAUGE_MAX` m/s.
+pub fn speed_fill(speed: f32) -> f32 {
+    fraction(speed, VEL_GAUGE_MAX)
+}
+
+/// Lit segments of the momentum track (any motion lights at least one).
+pub fn speed_segments(speed: f32) -> u8 {
+    if speed < 0.05 { 0 } else { ((speed_fill(speed) * VEL_SEGMENTS as f32).ceil() as u8).clamp(1, VEL_SEGMENTS) }
+}
+
+/// Constant-width integer VEL readout, e.g. `18 m/s`, ` 5 m/s`.
+pub fn speed_label(speed: f32) -> String {
+    format!("{:>2.0} m/s", speed.max(0.0))
+}
+
+/// Stamped chain tag atop the VEL strip: `BHOP x2`, `BHOP x3`, ... (none below 2).
+pub fn bhop_chain_label(chain: u32) -> Option<String> {
+    (chain >= 2).then(|| format!("BHOP x{chain}"))
+}
+
+/// Debounced VEL gauge state shared by the HUD text and box updaters.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
+pub struct VelGauge {
+    /// Horizontal speed this frame (m/s).
+    pub speed: f32,
+    /// Hysteresis-filtered tier (rail, readout and stamp color).
+    pub tier: SpeedTier,
+    /// Readout badge snapped solid hazard yellow (32+ m/s).
+    pub maxed: bool,
+}
+
+impl VelGauge {
+    /// Advance with this frame's horizontal speed.
+    pub fn update(&mut self, speed: f32) {
+        self.speed = speed;
+        self.tier = speed_tier_hysteresis(self.tier, speed);
+        self.maxed = vel_maxed_hysteresis(self.maxed, speed);
+    }
+
+    pub fn color(&self) -> Color {
+        speed_color(self.tier)
+    }
+
+    /// Readout text color: ink on the solid badge, bone while walking, tier color otherwise.
+    pub fn value_color(&self) -> Color {
+        if self.maxed {
+            INK_BLACK
+        } else if self.tier == SpeedTier::Walk {
+            BONE_TEXT
+        } else {
+            self.color()
+        }
+    }
+
+    /// Readout badge background: solid hazard yellow at 32+ m/s, clear below.
+    pub fn badge_color(&self) -> Color {
+        if self.maxed { HAZARD_YELLOW } else { Color::NONE }
+    }
+}
+
+fn track_vel_gauge(mut gauge: ResMut<VelGauge>, players: Query<&Player>) {
+    if let Ok(p) = players.single() {
+        gauge.update(Vec2::new(p.velocity.x, p.velocity.z).length());
+    }
+}
+
 /// The 5G overclock damage bonus is live.
 pub fn overclock_active(bars: u8, bonus: f32) -> bool {
     bars >= 4 && bonus > 0.0
@@ -998,6 +1152,10 @@ enum HudText {
     Status,
     Prompt,
     Alert,
+    /// VEL speedometer readout.
+    VelValue,
+    /// `BHOP xN` chain stamp.
+    VelChain,
     Toast(u8),
     Hitmarker,
     UplinkLabel,
@@ -1025,6 +1183,16 @@ enum HudBox {
     ToastChip(u8),
     /// Square bullet between the chip label and the contract tags.
     LoadoutDot,
+    /// Docked VEL telemetry strip above the vitals plate (tier-colored rail).
+    VelPlate,
+    /// Framed bracket track around the VEL tachometer segments.
+    VelTrack,
+    /// Readout badge (snaps solid hazard yellow at 32+ m/s).
+    VelValueBadge,
+    /// Stamped `BHOP xN` tag bolted atop the VEL strip (hidden below x2).
+    VelChainTag,
+    /// One segment of the VEL tachometer.
+    VelSeg(u8),
     HpFill,
     ArmorFill,
     StaminaFill,
@@ -1117,6 +1285,74 @@ fn spawn_bar(commands: &mut Commands, parent: Entity, label: &str, label_color: 
     if height >= 12.0 {
         spawn_ruler(commands, block);
     }
+}
+
+/// Docked VEL telemetry strip (31 px) bolted 4 px above the vitals plate:
+/// `VEL [tachometer] 18 m/s`. The tachometer is 16 fixed 9 px segments
+/// (2 m/s each) in four fixed zones with 4 px breaks at 12 / 20 / 28 m/s,
+/// framed by a tier-colored bracket track. A stamped `BHOP xN` tag sits on
+/// top of the strip, flush with its left rail.
+fn spawn_vel_plate(commands: &mut Commands, root: Entity) {
+    let plate = commands
+        .spawn((
+            ChildOf(root),
+            HudBox::VelPlate,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(50.0),
+                margin: UiRect::left(Val::Px(-VEL_PLATE_WIDTH / 2.0)),
+                width: Val::Px(VEL_PLATE_WIDTH),
+                // 14 px screen margin + 120 px vitals plate + 4 px gap.
+                bottom: Val::Px(138.0),
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(5.0)),
+                border: plate_rect((4.0, 1.0, 1.0, 2.0)),
+                ..default()
+            },
+            plate_border(ASH_DIM, STEEL_BORDER.with_alpha(0.45)),
+            BackgroundColor(IRON_DARK.with_alpha(0.8)),
+        ))
+        .id();
+    commands.spawn((ChildOf(plate), text("VEL", 12.0, ASH_DIM)));
+    let track = commands
+        .spawn((ChildOf(plate), HudBox::VelTrack, bar_track(Val::Px(187.0), 12.0, ASH_DIM, Display::Flex)))
+        .id();
+    commands.entity(track).entry::<Node>().and_modify(|mut n| n.flex_shrink = 0.0);
+    for i in 0..VEL_SEGMENTS {
+        let gap = if i + 1 == VEL_SEGMENTS { 0.0 } else if segment_zone_break(i) { 4.0 } else { 2.0 };
+        commands.spawn((
+            ChildOf(track),
+            HudBox::VelSeg(i),
+            Node { width: Val::Px(9.0), height: Val::Px(7.0), flex_grow: 0.0, flex_shrink: 0.0, margin: UiRect::right(Val::Px(gap)), ..default() },
+            BackgroundColor(segment_color(i, 0)),
+        ));
+    }
+    commands.spawn((
+        ChildOf(plate),
+        HudBox::VelValueBadge,
+        Node { margin: UiRect::left(Val::Auto), padding: UiRect::axes(Val::Px(2.0), Val::Px(0.0)), flex_shrink: 0.0, ..default() },
+        BackgroundColor(Color::NONE),
+        children![(HudText::VelValue, text(speed_label(0.0), 15.0, BONE_TEXT))],
+    ));
+    // Stamped chain tag, sitting on top of the 31 px strip (138 + 31 + 2).
+    commands.spawn((
+        ChildOf(root),
+        HudBox::VelChainTag,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            left: Val::Percent(50.0),
+            margin: UiRect::left(Val::Px(-VEL_PLATE_WIDTH / 2.0)),
+            bottom: Val::Px(171.0),
+            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+            border: UiRect::bottom(Val::Px(2.0)),
+            ..default()
+        },
+        BorderColor::all(INK_BLACK.with_alpha(0.85)),
+        BackgroundColor(ASH_DIM),
+        children![(HudText::VelChain, text("", 11.0, INK_BLACK))],
+    ));
 }
 
 fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
@@ -1249,7 +1485,8 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
         Node {
             position_type: PositionType::Absolute,
             width: Val::Percent(100.0),
-            bottom: Val::Px(150.0),
+            // Clears the vitals plate, the docked VEL strip and its BHOP stamp.
+            bottom: Val::Px(200.0),
             justify_content: JustifyContent::Center,
             ..default()
         },
@@ -1279,6 +1516,10 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
             children![(HudText::Toast(i), text("", 15.0, COLOR_TEXT))],
         ));
     }
+
+    // Bottom-center: VEL telemetry strip docked above the vitals panel.
+    commands.insert_resource(VelGauge::default());
+    spawn_vel_plate(&mut commands, root);
 
     // Bottom-center: vitals panel.
     let vitals = commands
@@ -1413,6 +1654,7 @@ fn update_hud(
     ws: Res<WeaponState>,
     ext: Res<ExtractionState>,
     loadout: Res<RunLoadout>,
+    gauge: Res<VelGauge>,
     players: Query<&Player>,
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
 ) {
@@ -1450,6 +1692,8 @@ fn update_hud(
                 Some(a) => (a.text.clone(), a.color.with_alpha(if (t * 8.0).sin() > -0.3 { 1.0 } else { 0.35 })),
                 None => (String::new(), Color::NONE),
             },
+            HudText::VelValue => (speed_label(gauge.speed), gauge.value_color()),
+            HudText::VelChain => (bhop_chain_label(p.bhop_chain).unwrap_or_default(), INK_BLACK),
             HudText::UplinkLabel => match *ext {
                 ExtractionState::Uploading { progress, jammed: true, .. } => {
                     (format!("UPLINK JAMMED! KILL THE JAMMER FIEND  {:.0}%", progress * 100.0), COLOR_SIGNAL_RED.with_alpha(if (t * 10.0).sin() > 0.0 { 1.0 } else { 0.4 }))
@@ -1528,6 +1772,7 @@ fn update_hud_boxes(
     ws: Res<WeaponState>,
     mods: Res<PlayerModifiers>,
     loadout: Res<RunLoadout>,
+    gauge: Res<VelGauge>,
     players: Query<&Player>,
     mut boxes: Query<(&HudBox, &mut Node, &mut BackgroundColor, Option<&mut BorderColor>)>,
 ) {
@@ -1538,6 +1783,8 @@ fn update_hud_boxes(
     let (cur, max) = ammo(p, ws.current);
     let lit = lit_pips(p.ammo_shells, p.max_shells, SHELL_PIPS);
     let stamina = stamina_fill(p.dash_cooldown, DASH_COOLDOWN * mods.dash_cooldown_mult);
+    let vel_lit = speed_segments(gauge.speed);
+    let tier_color = gauge.color();
     let toast_look = |i: u8| feed.toasts.iter().rev().nth(i as usize).map(|toast| ((toast.timer / 0.6).min(1.0), toast.color));
     for (b, mut node, mut bg, border) in &mut boxes {
         let set_border = |c: BorderColor| {
@@ -1586,6 +1833,14 @@ fn update_hud_boxes(
                 bg.0 = PANEL_BG.with_alpha(0.8 * a);
                 set_border(plate_border(c.with_alpha(a), PANEL_EDGE.with_alpha(0.45 * a)));
             }
+            HudBox::VelPlate => set_border(plate_border(tier_color, STEEL_BORDER.with_alpha(0.45))),
+            HudBox::VelTrack => set_border(BorderColor { left: tier_color, right: tier_color.with_alpha(0.55), top: TRACK_BORDER, bottom: INK_BLACK }),
+            HudBox::VelValueBadge => bg.0 = gauge.badge_color(),
+            HudBox::VelChainTag => {
+                set_display(&mut node, bhop_chain_label(p.bhop_chain).is_some());
+                bg.0 = tier_color;
+            }
+            HudBox::VelSeg(i) => bg.0 = segment_color(i, vel_lit),
             HudBox::HpFill => {
                 let f = fraction(p.hp, p.max_hp);
                 node.width = Val::Percent(f * 100.0);
@@ -1693,6 +1948,116 @@ mod tests {
         assert_eq!(lit_pips(0, 50, SHELL_PIPS), 0);
         assert_eq!(lit_pips(80, 50, SHELL_PIPS), 10);
         assert_eq!(lit_pips(5, 0, SHELL_PIPS), 0);
+    }
+
+    #[test]
+    fn vel_gauge_tiers_fill_and_labels() {
+        assert_eq!(speed_tier(0.0), SpeedTier::Walk);
+        assert_eq!(speed_tier(11.0), SpeedTier::Walk);
+        assert_eq!(speed_tier(11.99), SpeedTier::Walk);
+        assert_eq!(speed_tier(12.0), SpeedTier::Flow);
+        assert_eq!(speed_tier(19.99), SpeedTier::Flow);
+        assert_eq!(speed_tier(20.0), SpeedTier::Surge);
+        assert_eq!(speed_tier(27.99), SpeedTier::Surge);
+        assert_eq!(speed_tier(28.0), SpeedTier::Redline);
+        assert_eq!(speed_tier(48.0), SpeedTier::Redline);
+        // Steady tier colors: no strobing anywhere, including 32+ m/s.
+        assert_eq!(speed_color(SpeedTier::Walk), ASH_DIM);
+        assert_eq!(speed_color(SpeedTier::Flow), ARC_CYAN);
+        assert_eq!(speed_color(SpeedTier::Surge), ACID_GREEN);
+        assert_eq!(speed_color(SpeedTier::Redline), HAZARD_YELLOW);
+
+        assert_eq!(speed_fill(0.0), 0.0);
+        assert!((speed_fill(16.0) - 0.5).abs() < 1e-6);
+        assert_eq!(speed_fill(VEL_GAUGE_MAX), 1.0);
+        assert_eq!(speed_fill(45.0), 1.0);
+        assert_eq!(speed_segments(0.0), 0);
+        assert_eq!(speed_segments(0.5), 1);
+        assert_eq!(speed_segments(11.0), 6);
+        assert_eq!(speed_segments(32.0), VEL_SEGMENTS);
+        assert_eq!(speed_segments(99.0), VEL_SEGMENTS);
+
+        // Constant-width integer readout.
+        assert_eq!(speed_label(18.43), "18 m/s");
+        assert_eq!(speed_label(0.0), " 0 m/s");
+        assert_eq!(speed_label(-0.01), " 0 m/s");
+        assert_eq!(speed_label(5.2), " 5 m/s");
+        assert_eq!(speed_label(31.96), "32 m/s");
+        assert_eq!(speed_label(9.4).len(), speed_label(47.9).len());
+        assert_eq!(bhop_chain_label(0), None);
+        assert_eq!(bhop_chain_label(1), None);
+        assert_eq!(bhop_chain_label(2).as_deref(), Some("BHOP x2"));
+        assert_eq!(bhop_chain_label(12).as_deref(), Some("BHOP x12"));
+        assert!(bhop_chain_label(7).unwrap().is_ascii() && speed_label(23.4).is_ascii());
+    }
+
+    #[test]
+    fn vel_tachometer_zones_line_up_with_tiers_and_fit_the_track() {
+        // Fixed zones: 6 ash (0-12), 4 cyan (12-20), 4 green (20-28), 2 yellow (28-32).
+        let zones: Vec<Color> = (0..VEL_SEGMENTS).map(segment_zone_color).collect();
+        assert_eq!(zones.iter().filter(|c| **c == ASH_DIM).count(), 6);
+        assert_eq!(zones.iter().filter(|c| **c == ARC_CYAN).count(), 4);
+        assert_eq!(zones.iter().filter(|c| **c == ACID_GREEN).count(), 4);
+        assert_eq!(zones.iter().filter(|c| **c == HAZARD_YELLOW).count(), 2);
+        // Each segment's zone is the tier of the speed range it covers.
+        for i in 0..VEL_SEGMENTS {
+            let mid = (i as f32 + 0.5) * VEL_GAUGE_MAX / VEL_SEGMENTS as f32;
+            assert_eq!(segment_zone_color(i), speed_color(speed_tier(mid)), "segment {i}");
+        }
+        // Zone breaks fall exactly at the tier thresholds (12 / 20 / 28 m/s).
+        for i in 0..VEL_SEGMENTS - 1 {
+            let edge = (i + 1) as f32 * VEL_GAUGE_MAX / VEL_SEGMENTS as f32;
+            assert_eq!(segment_zone_break(i), [12.0, 20.0, 28.0].contains(&edge), "segment {i}");
+        }
+        // Lit = full zone color; unlit keeps a faint 16% tint of its zone.
+        assert_eq!(segment_color(7, 8), ARC_CYAN);
+        assert_eq!(segment_color(7, 7), ARC_CYAN.with_alpha(0.16));
+        assert_eq!(segment_color(0, 0).alpha(), 0.16);
+        // 16 x 9 px segments + 15 x 2 px gaps + 3 x 2 px extra breaks fill the
+        // 187 px track's 180 px interior (3+2 px border, 1+1 px padding).
+        let breaks = (0..VEL_SEGMENTS).filter(|i| segment_zone_break(*i)).count() as f32;
+        assert_eq!(VEL_SEGMENTS as f32 * 9.0 + (VEL_SEGMENTS - 1) as f32 * 2.0 + breaks * 2.0, 187.0 - 5.0 - 2.0);
+    }
+
+    #[test]
+    fn vel_gauge_hysteresis_never_flickers_at_tier_edges() {
+        // Climbing is immediate.
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Walk, 12.0), SpeedTier::Flow);
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Walk, 29.0), SpeedTier::Redline);
+        // Hovering just under a threshold keeps the higher tier...
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Flow, 11.6), SpeedTier::Flow);
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Surge, 19.7), SpeedTier::Surge);
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Redline, 27.6), SpeedTier::Redline);
+        // ...until half a m/s below it, dropping only as far as speed says.
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Flow, 11.4), SpeedTier::Walk);
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Redline, 19.7), SpeedTier::Surge);
+        assert_eq!(speed_tier_hysteresis(SpeedTier::Redline, 5.0), SpeedTier::Walk);
+
+        // Speed jittering +-0.3 m/s around each threshold: the tier and the
+        // 32 m/s badge snap change at most once.
+        for edge in [12.0, 20.0, 28.0, VEL_GAUGE_MAX] {
+            let mut g = VelGauge::default();
+            g.update(edge - 2.0);
+            let mut tier_flips = 0;
+            let mut badge_flips = 0;
+            for k in 0..60 {
+                let (tier, maxed) = (g.tier, g.maxed);
+                g.update(edge + if k % 2 == 0 { 0.3 } else { -0.3 });
+                tier_flips += (g.tier != tier) as u32;
+                badge_flips += (g.maxed != maxed) as u32;
+            }
+            assert!(tier_flips <= 1 && badge_flips <= 1, "flicker at {edge}: {tier_flips} / {badge_flips}");
+        }
+
+        // Solid snap at 32+: hazard badge with ink text, steady every frame.
+        let mut g = VelGauge::default();
+        g.update(33.0);
+        assert!(g.maxed && g.badge_color() == HAZARD_YELLOW && g.value_color() == INK_BLACK);
+        assert_eq!(g.color(), HAZARD_YELLOW);
+        g.update(30.0);
+        assert!(!g.maxed && g.badge_color() == Color::NONE && g.value_color() == HAZARD_YELLOW);
+        g.update(4.0);
+        assert_eq!((g.tier, g.value_color(), g.color()), (SpeedTier::Walk, BONE_TEXT, ASH_DIM));
     }
 
     #[test]

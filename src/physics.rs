@@ -24,6 +24,9 @@ pub struct MoveResult {
     pub on_hazard: bool,
     pub hit_wall: bool,
     pub hit_ceiling: bool,
+    /// Some collision substep stood on / landed on the ground, even if the
+    /// player left it again before the end of the tick (fast catwalk edges).
+    pub touched_ground: bool,
 }
 
 /// Floor height at a world XZ position (`None` inside walls / out of bounds).
@@ -37,11 +40,27 @@ fn cell_of(x: f32, z: f32) -> IVec2 {
     IVec2::new((x / CELL_SIZE).floor() as i32, (z / CELL_SIZE).floor() as i32)
 }
 
+/// Footprint radius (fraction of the collision radius) sampled for ground.
+const FOOTPRINT: f32 = 0.85;
+
 /// Highest floor under the player's footprint that is standable from `feet`
-/// (i.e. not more than `step_height` above it).
+/// (i.e. not more than `step_height` above it). Nine samples: the center plus
+/// four cardinal and four diagonal points on a `0.85 * radius` circle, so
+/// grazing a catwalk corner diagonally supports the player like face-on contact.
 fn ground_under(grid: &LevelGrid, p: Vec3, radius: f32, step_height: f32) -> Option<f32> {
-    let r = radius * 0.7;
-    let offsets = [Vec2::ZERO, Vec2::new(r, 0.0), Vec2::new(-r, 0.0), Vec2::new(0.0, r), Vec2::new(0.0, -r)];
+    let r = radius * FOOTPRINT;
+    let d = r * std::f32::consts::FRAC_1_SQRT_2;
+    let offsets = [
+        Vec2::ZERO,
+        Vec2::new(r, 0.0),
+        Vec2::new(-r, 0.0),
+        Vec2::new(0.0, r),
+        Vec2::new(0.0, -r),
+        Vec2::new(d, d),
+        Vec2::new(d, -d),
+        Vec2::new(-d, d),
+        Vec2::new(-d, -d),
+    ];
     let mut best: Option<f32> = None;
     for o in offsets {
         if let Some(h) = sample_floor_height(grid, p.x + o.x, p.z + o.y)
@@ -52,10 +71,69 @@ fn ground_under(grid: &LevelGrid, p: Vec3, radius: f32, step_height: f32) -> Opt
     best
 }
 
+/// Distinct horizontal contact normals of one collision substep (allocation-free).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ContactPlanes {
+    normals: [Vec2; 8],
+    len: usize,
+}
+
+impl ContactPlanes {
+    /// Record a unit normal unless an (almost) identical one is already known.
+    pub fn add(&mut self, n: Vec2) {
+        if self.len < self.normals.len() && !self.as_slice().iter().any(|m| m.dot(n) > 0.999) {
+            self.normals[self.len] = n;
+            self.len += 1;
+        }
+    }
+
+    pub fn as_slice(&self) -> &[Vec2] {
+        &self.normals[..self.len]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Remove the component of `v` going into the plane with unit normal `n`.
+fn clip_plane(v: Vec2, n: Vec2) -> Vec2 {
+    let into = v.dot(n);
+    if into < 0.0 { v - n * into } else { v }
+}
+
+/// Quake `PM_SlideMove` crease rule in the horizontal plane: clip `v` against
+/// each blocking plane in turn (never against an averaged normal). If clipping
+/// against a second, non-parallel plane drives the velocity back into the
+/// first one, the player is wedged in an inside corner: the only free
+/// direction is the vertical crease, so horizontal velocity becomes zero
+/// (instead of bouncing backwards out of the corner).
+pub fn clip_velocity_to_planes(v: Vec2, planes: &[Vec2]) -> Vec2 {
+    const EPS: f32 = -1e-4;
+    let mut v = v;
+    for (i, &ni) in planes.iter().enumerate() {
+        if v.dot(ni) >= EPS {
+            continue;
+        }
+        let mut c = clip_plane(v, ni);
+        for (j, &nj) in planes.iter().enumerate() {
+            if j == i || c.dot(nj) >= EPS {
+                continue;
+            }
+            c = clip_plane(c, nj);
+            if c.dot(ni) < EPS {
+                return Vec2::ZERO;
+            }
+        }
+        v = c;
+    }
+    v
+}
+
 /// Push a circle at `xz` out of every blocking cell and pillar.
-/// Returns the corrected position and the accumulated push normal (zero if none).
-fn push_out(grid: &LevelGrid, mut xz: Vec2, feet: f32, radius: f32, step_height: f32) -> (Vec2, Vec2) {
-    let mut normal_sum = Vec2::ZERO;
+/// Returns the corrected position and every distinct push normal.
+fn push_out(grid: &LevelGrid, mut xz: Vec2, feet: f32, radius: f32, step_height: f32) -> (Vec2, ContactPlanes) {
+    let mut planes = ContactPlanes::default();
     for _ in 0..3 {
         let mut moved = false;
         let min = cell_of(xz.x - radius, xz.y - radius);
@@ -100,7 +178,7 @@ fn push_out(grid: &LevelGrid, mut xz: Vec2, feet: f32, radius: f32, step_height:
                 };
                 let target = if dist > 1e-5 { closest + n * radius } else { xz + n * (radius + m_face(xz, lo, hi, n)) };
                 xz = target;
-                normal_sum += n;
+                planes.add(n);
                 moved = true;
             }
         }
@@ -111,7 +189,7 @@ fn push_out(grid: &LevelGrid, mut xz: Vec2, feet: f32, radius: f32, step_height:
             if dist < min_d {
                 let n = if dist > 1e-5 { d / dist } else { Vec2::X };
                 xz = *p + n * min_d;
-                normal_sum += n;
+                planes.add(n);
                 moved = true;
             }
         }
@@ -119,7 +197,7 @@ fn push_out(grid: &LevelGrid, mut xz: Vec2, feet: f32, radius: f32, step_height:
             break;
         }
     }
-    (xz, normal_sum.normalize_or_zero())
+    (xz, planes)
 }
 
 /// Distance from `xz` to the face of `[lo,hi]` in direction `n` (center-inside case).
@@ -137,6 +215,11 @@ fn m_face(xz: Vec2, lo: Vec2, hi: Vec2, n: Vec2) -> f32 {
 
 /// Integrate one physics step: gravity, wall sliding, ramp/step tracking,
 /// ceiling bump and hazard detection. Jumping = caller sets `vel.y` while grounded.
+///
+/// `was_grounded` is whether the body stood on the ground at the start of the
+/// step: only a grounded body is glued down small drops (ramp descent / step
+/// down); an airborne one falls freely onto whatever is below.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_player_movement(
     grid: &LevelGrid,
     pos: Vec3,
@@ -145,33 +228,37 @@ pub fn resolve_player_movement(
     radius: f32,
     height: f32,
     step_height: f32,
+    was_grounded: bool,
 ) -> MoveResult {
     let mut vel = vel;
     vel.y -= GRAVITY * dt;
+    // Substep so no tick moves more than half a radius horizontally (no wall
+    // tunneling at bhop + dash + overclock speeds) or half a step vertically
+    // (a fast fall at a low frame rate cannot skip through a catwalk top).
     let horiz_len = Vec2::new(vel.x, vel.z).length() * dt;
-    let steps = ((horiz_len / (radius * 0.5)).ceil() as u32).clamp(1, 32);
+    let vert_len = vel.y.abs() * dt;
+    let steps = ((horiz_len / (radius * 0.5)).max(vert_len / (step_height * 0.5).max(0.05)).ceil() as u32).clamp(1, 32);
     let sub_dt = dt / steps as f32;
 
     let mut p = pos;
     let mut grounded = false;
     let mut hit_wall = false;
     let mut hit_ceiling = false;
+    let mut touched_ground = false;
+    // Grounded at the start of the current substep.
+    let mut on_ground = was_grounded;
 
     for _ in 0..steps {
         // Horizontal.
         let target = Vec2::new(p.x + vel.x * sub_dt, p.z + vel.z * sub_dt);
-        let (xz, n) = push_out(grid, target, p.y, radius, step_height);
+        let (xz, planes) = push_out(grid, target, p.y, radius, step_height);
         p.x = xz.x;
         p.z = xz.y;
-        if n != Vec2::ZERO {
+        if !planes.is_empty() {
             hit_wall = true;
-            let v = Vec2::new(vel.x, vel.z);
-            let into = v.dot(n);
-            if into < 0.0 {
-                let slid = v - n * into;
-                vel.x = slid.x;
-                vel.z = slid.y;
-            }
+            let slid = clip_velocity_to_planes(Vec2::new(vel.x, vel.z), planes.as_slice());
+            vel.x = slid.x;
+            vel.z = slid.y;
         }
 
         // Vertical.
@@ -183,7 +270,7 @@ pub fn resolve_player_movement(
                 p.y = g;
                 vel.y = vel.y.max(0.0);
                 grounded = vel.y <= 0.0;
-            } else if vel.y <= 0.0 && p.y - g <= step_height * 0.5 + (-vel.y * sub_dt) {
+            } else if on_ground && vel.y <= 0.0 && p.y - g <= step_height * 0.5 + (-vel.y * sub_dt) {
                 // Small drop while walking (ramp descent / step down): stick to ground.
                 p.y = g;
                 vel.y = 0.0;
@@ -201,10 +288,12 @@ pub fn resolve_player_movement(
                 }
                 hit_ceiling = true;
             }
+        touched_ground |= grounded;
+        on_ground = grounded;
     }
 
     let on_hazard = grounded && matches!(grid.cell(cell_of(p.x, p.z)), Cell::HazardPit);
-    MoveResult { pos: p, vel, grounded, on_hazard, hit_wall, hit_ceiling }
+    MoveResult { pos: p, vel, grounded, on_hazard, hit_wall, hit_ceiling, touched_ground }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,9 +471,9 @@ mod tests {
     fn sim(grid: &LevelGrid, mut pos: Vec3, vel_xz: Vec2, secs: f32) -> MoveResult {
         let dt = 1.0 / 60.0;
         let mut vel = Vec3::new(vel_xz.x, 0.0, vel_xz.y);
-        let mut r = MoveResult { pos, vel, grounded: false, on_hazard: false, hit_wall: false, hit_ceiling: false };
+        let mut r = MoveResult { pos, vel, grounded: pos.y.abs() < 1e-4, on_hazard: false, hit_wall: false, hit_ceiling: false, touched_ground: false };
         for _ in 0..(secs / dt) as u32 {
-            r = resolve_player_movement(grid, pos, vel, dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT);
+            r = resolve_player_movement(grid, pos, vel, dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, r.grounded);
             pos = r.pos;
             vel = Vec3::new(vel_xz.x, r.vel.y, vel_xz.y);
         }
@@ -446,6 +535,158 @@ mod tests {
         assert!(r.pos.y.abs() < 1e-3);
     }
 
+    /// Step `secs` at `dt` with a constant horizontal velocity (vertical from physics).
+    fn run(grid: &LevelGrid, pos: Vec3, vel: Vec3, dt: f32, secs: f32, mut each: impl FnMut(&MoveResult)) -> MoveResult {
+        let mut r = MoveResult { pos, vel, grounded: false, on_hazard: false, hit_wall: false, hit_ceiling: false, touched_ground: false };
+        for _ in 0..(secs / dt).round() as u32 {
+            r = resolve_player_movement(grid, r.pos, r.vel, dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, r.grounded);
+            each(&r);
+        }
+        r
+    }
+
+    #[test]
+    fn no_tunneling_at_peak_bhop_speed_walls_corners_pillars_ledges() {
+        let g = test_grid();
+        for dt in [1.0 / 60.0, 1.0 / 30.0, 1.0 / 20.0] {
+            // Straight into the north wall.
+            let r = run(&g, center(1, 1), Vec3::new(0.0, 0.0, -48.0), dt, 0.5, |_| {});
+            assert!(r.pos.z >= CELL_SIZE + PLAYER_RADIUS - 1e-3, "wall z = {} (dt {dt})", r.pos.z);
+            // Diagonally into the north-west room corner.
+            let r = run(&g, center(1, 3), Vec3::new(-34.0, 0.0, -34.0), dt, 0.5, |_| {});
+            assert!(r.pos.x >= CELL_SIZE + PLAYER_RADIUS - 1e-3 && r.pos.z >= CELL_SIZE + PLAYER_RADIUS - 1e-3, "corner {:?} (dt {dt})", r.pos);
+            // Into the inner wall block (2,2) from the west, slightly off-axis.
+            let r = run(&g, center(1, 2) + Vec3::Z * 0.7, Vec3::new(48.0, 0.0, 3.0), dt, 0.3, |_| {});
+            assert!(r.pos.x <= 2.0 * CELL_SIZE - PLAYER_RADIUS + 1e-3, "block x = {} (dt {dt})", r.pos.x);
+            // Into the side of the 2.4 m catwalk ledge (6,1) from the south.
+            let r = run(&g, center(6, 3), Vec3::new(0.0, 0.0, -48.0), dt, 0.4, |_| {});
+            assert!(r.pos.z >= 2.0 * CELL_SIZE + PLAYER_RADIUS - 1e-3, "ledge z = {} (dt {dt})", r.pos.z);
+            assert!(r.pos.y.abs() < 1e-3, "stayed on the floor below the ledge");
+            // Through a thin pillar.
+            let mut gp = test_grid();
+            gp.pillars.push(Vec2::new(20.0, 14.0));
+            gp.pillar_radii.push(0.3);
+            let r = run(&gp, Vec3::new(14.0, 0.0, 14.0), Vec3::new(48.0, 0.0, 0.0), dt, 0.3, |_| {});
+            assert!(r.pos.x <= 20.0 - 0.7 + 1e-3, "pillar x = {} (dt {dt})", r.pos.x);
+        }
+    }
+
+    #[test]
+    fn fast_fall_at_low_frame_rate_lands_on_catwalk() {
+        let g = test_grid();
+        // A >1 m drop in one 20 FPS tick used to skip past the catwalk top when
+        // the tick started just above it (the player then fell inside the block).
+        for above in [0.05, 0.3, 0.8, 1.2] {
+            let start = center(6, 1) + Vec3::Y * (CATWALK_HEIGHT + above);
+            let r = run(&g, start, Vec3::new(0.0, -20.0, 0.0), 1.0 / 20.0, 0.5, |_| {});
+            assert!(r.grounded);
+            assert!((r.pos.y - CATWALK_HEIGHT).abs() < 1e-3, "fell through the catwalk from +{above}: y = {}", r.pos.y);
+        }
+    }
+
+    #[test]
+    fn ramp_climb_and_jump_launch_at_bhop_speed_without_snagging() {
+        // Long east-rising ramp run: floor, ramp (x 20..24), catwalk (x 24..36).
+        let g = LevelGrid::from_ascii(&[
+            "##########", //
+            "#....E^^^#", //
+            "##########",
+        ]);
+        let dt = 1.0 / 60.0;
+        // Running up the ramp at 30 m/s: no wall contact, no horizontal loss,
+        // feet glued to the ramp surface, onto the catwalk.
+        let r = run(&g, center(1, 1), Vec3::new(30.0, 0.0, 0.0), dt, 0.75, |r| {
+            assert!(!r.hit_wall, "snagged at x = {}", r.pos.x);
+            assert!((r.vel.x - 30.0).abs() < 1e-4);
+            let floor = sample_floor_height(&g, r.pos.x, r.pos.z).unwrap();
+            // Feet ride the highest point of the 0.85r footprint (0.6 slope * 0.34 m).
+            assert!((r.pos.y - floor).abs() < 0.25, "left the ramp at x = {}: y {} vs {floor}", r.pos.x, r.pos.y);
+        });
+        assert!(r.pos.x > 26.0 && (r.pos.y - CATWALK_HEIGHT).abs() < 1e-3 && r.grounded, "{r:?}");
+
+        // Bunny hop launched at the ramp foot: the upward velocity survives the
+        // ramp riding up under the player and the hop clears onto the catwalk.
+        let mut max_vy_drop: f32 = 0.0;
+        let mut last_vy = JUMP_VELOCITY;
+        let r = run(&g, Vec3::new(19.0, 0.0, 6.0), Vec3::new(30.0, JUMP_VELOCITY, 0.0), dt, 0.45, |r| {
+            assert!(!r.hit_wall, "snagged at x = {}", r.pos.x);
+            assert!((r.vel.x - 30.0).abs() < 1e-4);
+            if !r.grounded {
+                max_vy_drop = max_vy_drop.max(last_vy - r.vel.y);
+                last_vy = r.vel.y;
+            }
+        });
+        assert!(max_vy_drop <= GRAVITY * dt + 1e-3, "vertical velocity snapped down by {max_vy_drop}");
+        assert!(r.pos.x > 30.0 && r.pos.y > CATWALK_HEIGHT - 1e-3, "{r:?}");
+    }
+
+    #[test]
+    fn inside_corner_clips_per_plane_and_never_bounces_back() {
+        // Pure crease rule: two perpendicular walls stop horizontal motion
+        // instead of averaging the normals into a backwards kick.
+        assert_eq!(clip_velocity_to_planes(Vec2::new(-30.0, -6.0), &[Vec2::X, Vec2::Y]), Vec2::ZERO);
+        assert_eq!(clip_velocity_to_planes(Vec2::new(-30.0, -6.0), &[Vec2::Y, Vec2::X]), Vec2::ZERO);
+        // One wall: slide along it.
+        assert_eq!(clip_velocity_to_planes(Vec2::new(-30.0, -6.0), &[Vec2::X]), Vec2::new(0.0, -6.0));
+        // Obtuse (135 deg) inside corner: slides along the second wall, never back.
+        let diag = Vec2::new(1.0, 1.0).normalize();
+        let v = clip_velocity_to_planes(Vec2::new(-30.0, -6.0), &[Vec2::X, diag]);
+        assert!(v.dot(Vec2::X) >= -1e-3 && v.dot(diag) >= -1e-3, "{v:?}");
+        // Moving away from both walls is untouched.
+        assert_eq!(clip_velocity_to_planes(Vec2::new(5.0, 2.0), &[Vec2::X, Vec2::Y]), Vec2::new(5.0, 2.0));
+
+        // Integrated: asymmetric bhop-speed impact into the north-west room
+        // corner (walls at x = 4 and z = 4), both contacts in one substep.
+        let g = test_grid();
+        for dt in [1.0 / 144.0, 1.0 / 60.0, 1.0 / 20.0] {
+            let start = Vec3::new(4.45, 0.0, 4.45);
+            let mut r = MoveResult { pos: start, vel: Vec3::new(-30.0, 0.0, -6.0), grounded: true, on_hazard: false, hit_wall: false, hit_ceiling: false, touched_ground: false };
+            let mut hit = false;
+            for _ in 0..10 {
+                r = resolve_player_movement(&g, r.pos, r.vel, dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, r.grounded);
+                hit |= r.hit_wall;
+                assert!(r.vel.x <= 1e-3 && r.vel.z <= 1e-3, "corner bounced the player back: {:?} (dt {dt})", r.vel);
+                assert!(r.pos.x >= CELL_SIZE + PLAYER_RADIUS - 1e-3 && r.pos.z >= CELL_SIZE + PLAYER_RADIUS - 1e-3, "{:?}", r.pos);
+            }
+            assert!(hit);
+        }
+    }
+
+    #[test]
+    fn airborne_descent_is_not_snapped_onto_a_catwalk_early() {
+        let g = test_grid();
+        let dt = 1.0 / 60.0;
+        // Falling slowly 0.2 m above the catwalk top: still airborne after a tick...
+        let start = center(6, 1) + Vec3::Y * (CATWALK_HEIGHT + 0.2);
+        let r = resolve_player_movement(&g, start, Vec3::new(0.0, -1.0, 0.0), dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, false);
+        assert!(!r.grounded && !r.touched_ground && r.pos.y > CATWALK_HEIGHT + 0.1, "{r:?}");
+        // ...while a walking (grounded) body still glues down small drops.
+        let r = resolve_player_movement(&g, start, Vec3::new(0.0, -1.0, 0.0), dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, true);
+        assert!(r.grounded && (r.pos.y - CATWALK_HEIGHT).abs() < 1e-4, "{r:?}");
+    }
+
+    #[test]
+    fn fast_catwalk_edge_crossing_reports_touchdown() {
+        // Catwalk x 4..16; landing at 30 m/s 0.15 m past its edge touches down
+        // and runs off again inside one 1/120 s substep.
+        let g = LevelGrid::from_ascii(&["###########", "#^^^......#", "###########"]);
+        let start = Vec3::new(16.15, CATWALK_HEIGHT + 0.01, 6.0);
+        let r = resolve_player_movement(&g, start, Vec3::new(30.0, -3.0, 0.0), 1.0 / 120.0, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, false);
+        assert!(!r.grounded && r.touched_ground, "{r:?}");
+        assert!(r.pos.y > CATWALK_HEIGHT - 0.1, "{r:?}");
+    }
+
+    #[test]
+    fn diagonal_footprint_grazes_a_catwalk_corner() {
+        // Single catwalk cell [4,8] x [4,8]; feet just past its south-east
+        // corner on the diagonal: only the diagonal footprint sample is on it.
+        let g = LevelGrid::from_ascii(&["#####", "#^..#", "#...#", "#####"]);
+        let feet = Vec3::new(8.2, CATWALK_HEIGHT, 8.2);
+        assert_eq!(ground_under(&g, feet, PLAYER_RADIUS, PLAYER_STEP_HEIGHT), Some(CATWALK_HEIGHT));
+        let r = resolve_player_movement(&g, feet, Vec3::ZERO, 1.0 / 60.0, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, true);
+        assert!(r.grounded && (r.pos.y - CATWALK_HEIGHT).abs() < 1e-4, "{r:?}");
+    }
+
     #[test]
     fn gravity_jump_and_ceiling_bump() {
         let g = test_grid();
@@ -454,8 +695,10 @@ mod tests {
         let mut vel = Vec3::new(0.0, JUMP_VELOCITY, 0.0);
         let mut max_y: f32 = 0.0;
         let mut landed = false;
+        let mut grounded = true;
         for i in 0..120 {
-            let r = resolve_player_movement(&g, pos, vel, dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT);
+            let r = resolve_player_movement(&g, pos, vel, dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, grounded);
+            grounded = r.grounded;
             pos = r.pos;
             vel = r.vel;
             max_y = max_y.max(pos.y);
@@ -468,7 +711,7 @@ mod tests {
         let apex = JUMP_VELOCITY * JUMP_VELOCITY / (2.0 * GRAVITY);
         assert!((max_y - apex).abs() < 0.2, "apex {max_y} vs {apex}");
         // Huge upward velocity bumps the ceiling.
-        let r = resolve_player_movement(&g, center(1, 1), Vec3::new(0.0, 400.0, 0.0), dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT);
+        let r = resolve_player_movement(&g, center(1, 1), Vec3::new(0.0, 400.0, 0.0), dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, true);
         assert!(r.hit_ceiling);
         assert!((r.pos.y + PLAYER_HEIGHT - crate::level::CEILING_HEIGHT).abs() < 1e-3);
         assert!(r.vel.y <= 0.0);

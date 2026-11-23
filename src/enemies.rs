@@ -27,6 +27,10 @@ pub const FIEND_FIELD_STRENGTH: f32 = 2.5;
 /// Static Enrage speed multiplier (Imps inside Dead Zones).
 pub const ENRAGE_SPEED_MULT: f32 = 1.35;
 pub const ENRAGE_FIRE_MULT: f32 = 0.65;
+/// Demons never jump, so walkers always count as grounded for the physics
+/// step: they stay glued to ramp descents / step-downs (only the player's
+/// airborne snap-down is gated on `was_grounded`).
+const WALKER_GLUE: bool = true;
 /// Crisp, brief hit-flash so demons never look washed out.
 pub const HIT_FLASH_SECS: f32 = 0.08;
 
@@ -895,7 +899,7 @@ fn enemy_ai(
             e.stun_timer -= dt;
             let mut vel = Vec3::new(kb.x, e.velocity.y, kb.z);
             if !e.kind.flying() {
-                let r = resolve_player_movement(&grid, pos, vel, dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT);
+                let r = resolve_player_movement(&grid, pos, vel, dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT, WALKER_GLUE);
                 tf.translation = r.pos;
                 vel = r.vel;
                 e.grounded = r.grounded;
@@ -921,7 +925,7 @@ fn enemy_ai(
             let mut vel = e.velocity;
             vel.x += (dir.x * speed - vel.x) * k;
             vel.z += (dir.z * speed - vel.z) * k;
-            let r = resolve_player_movement(&grid, pos, vel + Vec3::new(kb.x, 0.0, kb.z), dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT);
+            let r = resolve_player_movement(&grid, pos, vel + Vec3::new(kb.x, 0.0, kb.z), dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT, WALKER_GLUE);
             tf.translation = r.pos;
             vel.y = r.vel.y;
             e.grounded = r.grounded;
@@ -999,7 +1003,7 @@ fn enemy_ai(
             let step = (vel + kb) * dt;
             tf.translation = fly_move(&grid, pos, step, e.stats.radius);
         } else {
-            let r = resolve_player_movement(&grid, pos, vel + Vec3::new(kb.x, 0.0, kb.z), dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT);
+            let r = resolve_player_movement(&grid, pos, vel + Vec3::new(kb.x, 0.0, kb.z), dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT, WALKER_GLUE);
             tf.translation = r.pos;
             vel.y = r.vel.y;
             e.grounded = r.grounded;
