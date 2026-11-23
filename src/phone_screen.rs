@@ -12,13 +12,16 @@ use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use crate::apps::{app_block_reason, ping_cooldown, PhoneApps, OVERLOAD_COOLDOWN, OVERLOAD_MIN_BARS, PING_MIN_BARS};
+use crate::apps::{app_block_reason, overload_cooldown, ping_cooldown, PhoneApps, OVERLOAD_MIN_BARS, PING_MIN_BARS};
 use crate::extraction::ExtractionState;
 use crate::signal::SignalState;
 use crate::state::{GameSet, PlayerModifiers};
 
 pub const SCREEN_W: u32 = 160;
 pub const SCREEN_H: u32 = 240;
+/// Carrier-label colors for the Signal Spoofer / Jammer Hijack overrides.
+pub const SPOOF_CYAN: [u8; 3] = [90, 255, 255];
+pub const HIJACK_EMERALD: [u8; 3] = [70, 255, 160];
 
 /// Handle to the live RGBA8 phone OLED texture + redraw throttle timer.
 #[derive(Resource, Clone)]
@@ -54,6 +57,10 @@ pub struct PhoneScreenSnapshot {
     pub callback_ready: bool,
     /// Missed Call: Ping at 0 bars would drop a decoy right now.
     pub decoy_ready: bool,
+    /// Signal Spoofer active: carrier label reads "SPOOF" in bright cyan.
+    pub spoof_active: bool,
+    /// Standing in a Jammer Hijack hotspot: carrier label reads "HIJK".
+    pub hijack_boost: bool,
 }
 
 impl Default for PhoneScreenSnapshot {
@@ -80,6 +87,8 @@ impl Default for PhoneScreenSnapshot {
             queued_packets: 0,
             callback_ready: false,
             decoy_ready: false,
+            spoof_active: false,
+            hijack_boost: false,
         }
     }
 }
@@ -146,7 +155,7 @@ fn update_phone_screen(
         ping_cd: apps.ping_cooldown,
         ping_max_cd: ping_cooldown(&mods).max(0.1),
         overload_cd: apps.overload_cooldown,
-        overload_max_cd: OVERLOAD_COOLDOWN,
+        overload_max_cd: overload_cooldown(&mods).max(0.1),
         ping_flash: apps.ping_active_timer,
         overload_flash: apps.overload_flash_timer,
         sos_progress,
@@ -157,6 +166,8 @@ fn update_phone_screen(
         queued_packets: apps.queued_packets,
         callback_ready: apps.callback_ready(),
         decoy_ready: signal.bars == 0 && mods.missed_call && apps.ping_cooldown <= 0.0,
+        spoof_active: apps.spoof_active(),
+        hijack_boost: signal.hotspot_boosted,
     };
     if let Some(data) = img.data.as_mut() {
         render_phone_screen(data, &snap);
@@ -340,7 +351,11 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     // ---- 1. Top Status Bar (y = 0..22) ----
     g.rect(0, 0, SCREEN_W as i32, 22, [10, 20, 24]);
     g.line(0, 22, SCREEN_W as i32 - 1, 22, [38, 66, 74]);
-    let carrier = if s.sos_jammed {
+    let carrier = if s.spoof_active {
+        "SPOOF"
+    } else if s.hijack_boost {
+        "HIJK"
+    } else if s.sos_jammed {
         "JAMMED"
     } else if s.bars >= 4 {
         "5G LOCK"
@@ -349,7 +364,15 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     } else {
         "NO SVC"
     };
-    let carrier_c = if s.sos_jammed { red } else { accent };
+    let carrier_c = if s.spoof_active {
+        SPOOF_CYAN
+    } else if s.hijack_boost {
+        HIJACK_EMERALD
+    } else if s.sos_jammed {
+        red
+    } else {
+        accent
+    };
     g.text(6, 7, carrier, 1, carrier_c);
     // Store & Forward packet pips (electric cyan/violet, pulsing).
     for i in 0..s.queued_packets.min(3) as i32 {
@@ -721,6 +744,27 @@ mod tests {
                 assert_eq!(lit, i < n as u32, "{n} packets, pip {i}");
             }
         }
+    }
+
+    /// Pixels of the carrier label area (status bar, left of the packet pips).
+    fn carrier_pixels(buf: &[u8]) -> Vec<[u8; 3]> {
+        (6..15).flat_map(|y| (6..56).map(move |x| px(buf, x, y))).collect()
+    }
+
+    #[test]
+    fn spoof_and_hijack_carrier_labels() {
+        let base = render(&calm(0));
+        let spoof = render(&PhoneScreenSnapshot { spoof_active: true, ..calm(4) });
+        assert!(carrier_pixels(&spoof).contains(&SPOOF_CYAN), "SPOOF drawn in bright cyan");
+        assert!(!carrier_pixels(&base).contains(&SPOOF_CYAN));
+        let plain4 = render(&calm(4));
+        assert_ne!(carrier_pixels(&spoof), carrier_pixels(&plain4), "label differs from 5G LOCK");
+        let hijack = render(&PhoneScreenSnapshot { hijack_boost: true, ..calm(5) });
+        assert!(carrier_pixels(&hijack).contains(&HIJACK_EMERALD), "HIJK badge drawn in emerald");
+        assert!(!carrier_pixels(&hijack).contains(&SPOOF_CYAN));
+        // Spoof wins when both are active.
+        let both = render(&PhoneScreenSnapshot { spoof_active: true, hijack_boost: true, ..calm(5) });
+        assert_eq!(carrier_pixels(&both), carrier_pixels(&render(&PhoneScreenSnapshot { spoof_active: true, ..calm(5) })));
     }
 
     #[test]

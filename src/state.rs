@@ -1,12 +1,15 @@
 //! Global game state machine, per-run statistics and roguelike modifier stubs.
 //!
 //! Flow: `MainMenu -> Playing -> (UpgradeSelect -> Playing)* -> Victory`, with
-//! `GameOver` reachable from `Playing`. Floor transitions go through
+//! `GameOver` reachable from `Playing`. The pre-run screens `Loadout` and
+//! `ContractsFeats` are reachable from `MainMenu`, `GameOver` and `Victory`
+//! and launch runs directly (they tear the previous run down like `MainMenu`). Floor transitions go through
 //! [`RunStats::advance_floor`], which tells the caller where to go next; the level
 //! module rebuilds the labyrinth automatically on the next `OnEnter(Playing)`
 //! whenever `RunStats::floor` differs from the floor of the current `LevelGrid`.
 
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// Last floor of a standard run. Clearing it means victory.
 pub const FINAL_FLOOR: u32 = 5;
@@ -16,9 +19,22 @@ pub enum AppState {
     #[default]
     MainMenu,
     Playing,
+    /// In-run pause overlay (freezes simulation while keeping the 3D scene alive).
+    Paused,
     UpgradeSelect,
     GameOver,
     Victory,
+    /// Pre-run loadout editor (starter chip, handset skin, App Store catalog).
+    Loadout,
+    /// Carrier contracts toggles, lifetime stats and the feats list.
+    ContractsFeats,
+}
+
+impl AppState {
+    /// Pre-run screens where no run is alive (player and level torn down).
+    pub fn is_pre_run(self) -> bool {
+        matches!(self, AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats)
+    }
 }
 
 /// Ordered system sets for everything that runs every frame while `Playing`.
@@ -40,9 +56,10 @@ pub enum GameSet {
     Ui,
 }
 
-/// The thirteen roguelike "App Store" upgrades. `upgrades.rs` applies them to
+/// The fifteen roguelike "App Store" upgrades: 10 core apps + 5 signature
+/// apps licensed by feats (see `meta.rs`). `upgrades.rs` applies them to
 /// [`PlayerModifiers`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum UpgradeId {
     DualSimBarrels,
     FiveGOverclock,
@@ -57,10 +74,12 @@ pub enum UpgradeId {
     StoreAndForward,
     EmergencyCallback,
     MissedCall,
+    SignalSpoofer,
+    JammerHijack,
 }
 
 impl UpgradeId {
-    pub const ALL: [UpgradeId; 13] = [
+    pub const ALL: [UpgradeId; 15] = [
         UpgradeId::DualSimBarrels,
         UpgradeId::FiveGOverclock,
         UpgradeId::CopperAntenna,
@@ -74,6 +93,8 @@ impl UpgradeId {
         UpgradeId::StoreAndForward,
         UpgradeId::EmergencyCallback,
         UpgradeId::MissedCall,
+        UpgradeId::SignalSpoofer,
+        UpgradeId::JammerHijack,
     ];
 
     pub fn name(self) -> &'static str {
@@ -91,6 +112,8 @@ impl UpgradeId {
             UpgradeId::StoreAndForward => "Store & Forward",
             UpgradeId::EmergencyCallback => "Emergency Callback",
             UpgradeId::MissedCall => "Missed Call",
+            UpgradeId::SignalSpoofer => "Signal Spoofer",
+            UpgradeId::JammerHijack => "Jammer Hijack",
         }
     }
 
@@ -109,6 +132,8 @@ impl UpgradeId {
             UpgradeId::StoreAndForward => "Kills in natural 0-bar blackouts queue up to 3 packets; hitting 3+ bars fires 20-dmg arcs.",
             UpgradeId::EmergencyCallback => "Kill a ping-marked Jammer Fiend to unlock 1 any-signal 5G Overload for 6s.",
             UpgradeId::MissedCall => "Pressing Ping at 0 bars drops a ringing decoy handset drawing nearby Imps for 2.5s.",
+            UpgradeId::SignalSpoofer => "Dash in a 0-1 bar Dead Zone to spoof 4 bars for 2.5s (6s cooldown).",
+            UpgradeId::JammerHijack => "Destroying a Jammer or Fiend creates a 5-bar Signal Hotspot for 8s.",
         }
     }
 }
@@ -149,6 +174,26 @@ pub struct PlayerModifiers {
     pub emergency_callback: bool,
     /// Missed Call: Ping at 0 bars drops a ringing decoy handset that lures Imps.
     pub missed_call: bool,
+    /// 5G Overload cooldown multiplier (Faraday Case chip).
+    pub emp_cooldown_mult: f32,
+    /// Incoming enemy damage multiplier while in a 0-1 bar Dead Zone (Faraday Case).
+    pub dead_zone_damage_mult: f32,
+    /// Signal Spoofer: dashing at 0-1 bars spoofs 4 bars for a few seconds.
+    pub signal_spoofer: bool,
+    /// Jammer Hijack: destroyed Jammers / Fiends leave a 5-bar hotspot.
+    pub jammer_hijack: bool,
+    /// Roaming Charges contract: Jammer / Fiend suppression radius multiplier.
+    pub jammer_radius_mult: f32,
+    /// Roaming Charges contract: exponent on the per-wall attenuation (more loss).
+    pub wall_attenuation_exp: f32,
+    /// Priority Jamming contract: extra Jammer Fiend pressure during the SOS.
+    pub priority_jamming: bool,
+    /// Overtime Uplink contract: SOS uplink duration multiplier.
+    pub upload_duration_mult: f32,
+    /// Overtime Uplink contract: Demon Rush wave interval multiplier.
+    pub wave_interval_mult: f32,
+    /// Low-Battery Mode contract: no HP field repair between floors.
+    pub skip_floor_heal: bool,
 }
 
 impl Default for PlayerModifiers {
@@ -179,6 +224,16 @@ impl Default for PlayerModifiers {
             store_and_forward: false,
             emergency_callback: false,
             missed_call: false,
+            emp_cooldown_mult: 1.0,
+            dead_zone_damage_mult: 1.0,
+            signal_spoofer: false,
+            jammer_hijack: false,
+            jammer_radius_mult: 1.0,
+            wall_attenuation_exp: 1.0,
+            priority_jamming: false,
+            upload_duration_mult: 1.0,
+            wave_interval_mult: 1.0,
+            skip_floor_heal: false,
         }
     }
 }
@@ -203,6 +258,18 @@ pub struct RunStats {
     /// Base seed of the run; each floor derives its own labyrinth seed from it.
     pub run_seed: u64,
     pub upgrades: Vec<UpgradeId>,
+    /// Non-vaporized kills scored in a natural 0-bar blackout.
+    pub blackout_kills: u32,
+    /// Jammer Fiends killed (not vaporized by the extraction beam).
+    pub fiends_killed: u32,
+    /// SOS uplinks completed (orbital extraction finished).
+    pub sos_completed: u32,
+    /// Floors cleared this run (including the final one on victory).
+    pub floors_cleared: u32,
+    /// The run was already folded into the profile (GameOver / Victory).
+    pub run_recorded: bool,
+    /// F9 debug floor skip was used during this run (disqualifies profile recording).
+    pub debug_skipped: bool,
 }
 
 impl Default for RunStats {
@@ -214,6 +281,12 @@ impl Default for RunStats {
             time_elapsed: 0.0,
             run_seed: 0x5E6_A1E,
             upgrades: Vec::new(),
+            blackout_kills: 0,
+            fiends_killed: 0,
+            sos_completed: 0,
+            floors_cleared: 0,
+            run_recorded: false,
+            debug_skipped: false,
         }
     }
 }
@@ -236,6 +309,7 @@ impl RunStats {
 
     /// Mark the current floor cleared. Returns where the game should go next.
     pub fn advance_floor(&mut self) -> FloorAdvance {
+        self.floors_cleared += 1;
         if self.floor >= FINAL_FLOOR {
             FloorAdvance::Victory
         } else {
@@ -246,7 +320,8 @@ impl RunStats {
 }
 
 /// Begin a fresh run (main menu "START", playtest bot, tests): new seed,
-/// neutral modifiers, straight into `Playing` on Floor 1.
+/// neutral modifiers, straight into `Playing` on Floor 1. Meta loadouts
+/// (starter chip, contracts, catalog) go through `meta::start_run_with_loadout`.
 pub fn start_run(run: &mut RunStats, mods: &mut PlayerModifiers, next: &mut NextState<AppState>, seed: u64) {
     run.start_new_run(seed);
     *mods = PlayerModifiers::default();
@@ -304,6 +379,7 @@ mod tests {
         }
         assert_eq!(run.advance_floor(), FloorAdvance::Victory);
         assert_eq!(run.floor, FINAL_FLOOR);
+        assert_eq!(run.floors_cleared, FINAL_FLOOR, "victory counts the final floor");
     }
 
     #[test]

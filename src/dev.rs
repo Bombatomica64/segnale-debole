@@ -11,17 +11,28 @@
 //!   saves a storyboard + `playtest_report.json` and exits 0 (pass) / 1 (fail).
 //!   `SEGNALE_BOT_SEED` picks the run seed, `SEGNALE_BOT_DT` the fixed sim step
 //!   per frame (default 1/30 s; `0` = real time).
+//! - `SEGNALE_META_SHOTS=<dir>`: meta-progression screenshot tour on an
+//!   in-memory showcase profile (jam demo on, Survey OS + 5G Chrome Gold, two
+//!   signature apps drafted, ROAM + PRIO contracts, 3 feats, lifetime stats):
+//!   `01_main_menu.png`, `02_loadout.png`, `03_contracts_feats.png`,
+//!   `04_in_hand_gold.png` (live Floor 1 spawn), `04b_pause_menu.png`,
+//!   `05_victory_unlocks.png` (a staged earned Floor 5 win) and
+//!   `06_game_over.png` (a separate staged Floor 2 death with its own
+//!   summary), then exits. Never touches the on-disk profile.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 use crate::apps::PhoneApps;
+use crate::meta::{
+    start_run_with_loadout, CarrierContract, FeatId, HandsetSkin, LifetimeStats, PlayerProfile, ProfileStore, RunLoadout, StarterChip,
+};
 use crate::enemies::{spawn_enemy, EnemyAssets, EnemyKind};
 use crate::extraction::ExtractionState;
 use crate::level::{yaw_facing, LevelGrid};
 use crate::physics::sample_floor_height;
 use crate::player::Player;
-use crate::state::{complete_floor, AppState, GameSet, PlayerModifiers, RunStats};
+use crate::state::{complete_floor, AppState, GameSet, PlayerModifiers, RunStats, UpgradeId, FINAL_FLOOR};
 use crate::weapons::{Weapon, WeaponState};
 
 /// Screenshot staging only: freezes demon AI so a posed shot stays posed.
@@ -42,6 +53,20 @@ impl Plugin for DevPlugin {
     fn build(&self, app: &mut App) {
         if let Ok(dir) = std::env::var("SEGNALE_BOT_TEST") {
             app.add_plugins(crate::playtest_bot::PlaytestBotPlugin::from_env(dir));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_META_SHOTS") {
+            let showcase = meta_showcase_profile();
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.profile = showcase;
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(showcase));
+                }
+            }
+            app.insert_resource(MetaShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, meta_shots_tour.after(GameSet::Ui));
             return;
         }
         let shots = std::env::var("SEGNALE_SHOTS").ok();
@@ -218,5 +243,169 @@ fn screenshot_store(mut commands: Commands, time: Res<Time>, cfg: Res<DevConfig>
     }
     if *t > 3.0 {
         exit.write(AppExit::Success);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_META_SHOTS
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct MetaShots {
+    dir: String,
+    stage: u32,
+    /// Seconds since the current stage began.
+    timer: f32,
+}
+
+/// The showcase profile: jam demo on, Survey OS + 5G Chrome Gold equipped,
+/// Signal Spoofer + Jammer Hijack drafted into the 10-card catalog, ROAM +
+/// PRIO contracts signed, 3 earned feats and populated lifetime stats.
+pub fn meta_showcase_profile() -> PlayerProfile {
+    let mut p = PlayerProfile::default();
+    p.unlocked_feats.extend([FeatId::FirstExtraction, FeatId::SignalScout, FeatId::JammerHunter]);
+    p.set_jam_demo_unlock_all(true);
+    p.equip_chip(StarterChip::SurveyOs);
+    p.equip_skin(HandsetSkin::ChromeGold);
+    for id in [UpgradeId::CopperAntenna, UpgradeId::HighCapacityCell, UpgradeId::SignalSpoofer, UpgradeId::JammerHijack] {
+        p.toggle_catalog_app(id);
+    }
+    p.toggle_contract(CarrierContract::RoamingCharges);
+    p.toggle_contract(CarrierContract::PriorityJamming);
+    p.stats = LifetimeStats {
+        runs_played: 11,
+        victories: 0,
+        best_floor: 4,
+        total_kills: 486,
+        total_jammers: 23,
+        total_fiends: 3,
+        total_blackout_kills: 7,
+        total_sos_completed: 2,
+        fastest_victory_secs: None,
+        max_contracts_cleared: 0,
+    };
+    p
+}
+
+fn meta_shot(commands: &mut Commands, dir: &str, name: &str) {
+    let path = format!("{dir}/{name}");
+    info!("dev: meta screenshot -> {path}");
+    commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+}
+
+/// Main menu -> Loadout -> Contracts & Feats -> live Floor 1 -> Pause ->
+/// Victory -> a separate Floor 2 Game Over.
+#[allow(clippy::too_many_arguments)]
+fn meta_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<MetaShots>,
+    state: Res<State<AppState>>,
+    store: Res<ProfileStore>,
+    (mut run, mut mods, mut loadout): (ResMut<RunStats>, ResMut<PlayerModifiers>, ResMut<RunLoadout>),
+    mut players: Query<&mut Player>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    cfg.timer += time.delta_secs();
+    for mut p in &mut players {
+        p.invuln_timer = 999.0;
+        p.hp = p.max_hp;
+    }
+    let dir = cfg.dir.clone();
+    let st = *state.get();
+    let t = cfg.timer;
+    let advance = match (cfg.stage, st) {
+        (0, AppState::MainMenu) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "01_main_menu.png");
+            true
+        }
+        (1, AppState::MainMenu) if t > 0.7 => {
+            next.set(AppState::Loadout);
+            true
+        }
+        (2, AppState::Loadout) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "02_loadout.png");
+            true
+        }
+        (3, AppState::Loadout) if t > 0.7 => {
+            next.set(AppState::ContractsFeats);
+            true
+        }
+        (4, AppState::ContractsFeats) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "03_contracts_feats.png");
+            true
+        }
+        (5, AppState::ContractsFeats) if t > 0.7 => {
+            commands.insert_resource(DevFreezeAi);
+            start_run_with_loadout(&mut run, &mut mods, &mut loadout, store.profile.build_loadout(), &mut next, 1234);
+            true
+        }
+        (6, AppState::Playing) if t > 4.0 => {
+            meta_shot(&mut commands, &dir, "04_in_hand_gold.png");
+            true
+        }
+        (7, AppState::Playing) if t > 0.8 => {
+            next.set(AppState::Paused);
+            true
+        }
+        (8, AppState::Paused) if t > 1.2 => {
+            meta_shot(&mut commands, &dir, "04b_pause_menu.png");
+            true
+        }
+        (9, AppState::Paused) if t > 0.7 => {
+            // Stage a fast earned contract victory (non-demo) so the Victory
+            // screenshot showcases real newly-unlocked feats and rewards.
+            loadout.jam_demo = false;
+            run.floor = FINAL_FLOOR;
+            run.floors_cleared = FINAL_FLOOR - 1;
+            run.kills = 97;
+            run.jammers_destroyed = 6;
+            run.fiends_killed = 2;
+            run.blackout_kills = 3;
+            run.sos_completed = 5;
+            run.time_elapsed = 512.0;
+            run.upgrades = vec![UpgradeId::FiveGOverclock, UpgradeId::SignalSpoofer, UpgradeId::JammerHijack, UpgradeId::EmpOvercharge];
+            complete_floor(&mut run, &mut next);
+            true
+        }
+        (10, AppState::Victory) if t > 2.0 => {
+            meta_shot(&mut commands, &dir, "05_victory_unlocks.png");
+            true
+        }
+        (11, AppState::Victory) if t > 1.0 => {
+            // A separate, genuinely lost run (not the victory replayed): died on
+            // Floor 2 after one uplink, with a single app installed. It is
+            // recorded like any real death, so NO SERVICE shows its own
+            // summary and its own (empty) unlock list.
+            *run = RunStats {
+                floor: 2,
+                floors_cleared: 1,
+                kills: 23,
+                jammers_destroyed: 2,
+                blackout_kills: 1,
+                sos_completed: 1,
+                time_elapsed: 191.0,
+                upgrades: vec![UpgradeId::PacketSniffer],
+                run_seed: 1234,
+                ..default()
+            };
+            loadout.jam_demo = false;
+            next.set(AppState::GameOver);
+            true
+        }
+        (12, AppState::GameOver) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "06_game_over.png");
+            true
+        }
+        (13, AppState::GameOver) if t > 1.5 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
     }
 }

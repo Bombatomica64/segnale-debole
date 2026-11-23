@@ -11,23 +11,36 @@
 //! clearing demons, granting god mode where survival is not under test).
 
 use bevy::ecs::system::RunSystemOnce;
+use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
+use bevy::input::ButtonState;
 use bevy::prelude::*;
 
 use segnale_debole::apps::{
-    tower_route, DecoyHandset, PhoneApps, RouteBreadcrumb, CALLBACK_SECS, PING_COOLDOWN, ROUTE_MAX_STEPS, STORE_FORWARD_DAMAGE,
+    tower_route, DecoyHandset, HijackedHotspot, PhoneApps, RouteBreadcrumb, CALLBACK_SECS, HIJACK_SECS, PING_COOLDOWN, ROUTE_MAX_STEPS,
+    SIGNAL_SPOOF_SECS, STORE_FORWARD_DAMAGE,
 };
 use segnale_debole::bot_input::BotControl;
 use segnale_debole::playtest_bot::{PlaytestBot, PlaytestBotPlugin, BOT_TIMEOUT_SECS};
 use segnale_debole::{build_headless_test_app, HeadlessGamePlugin};
-use segnale_debole::enemies::{garrison_size, spawn_enemy, spawn_pos_for, Enemy, EnemyAssets, EnemyKind, PingMarked, ENRAGE_SPEED_MULT};
-use segnale_debole::extraction::ExtractionState;
+use segnale_debole::enemies::{
+    garrison_size, spawn_enemy, spawn_enemy_projectile, spawn_pos_for, Enemy, EnemyAssets, EnemyKind, PingMarked, ENRAGE_SPEED_MULT,
+};
+use segnale_debole::extraction::{upload_duration, ExtractionState};
+use segnale_debole::fx::{BurstColor, FxAssets, HudFeed};
+use segnale_debole::hud::HudPlugin;
+use segnale_debole::meta_ui::{commit_meta_edit, EditOutcome, MetaCard, MetaTarget, NO_UNLOCKS_LINE};
+use segnale_debole::meta::{
+    load_profile, start_run_with_loadout, CarrierContract, FeatId, HandsetSkin, PlayerProfile, ProfileStore, RunLoadout, SkinSlot,
+    StarterChip,
+};
+use segnale_debole::phone_screen::{PhoneScreenTexture, SCREEN_W, SPOOF_CYAN};
 use segnale_debole::level::{jammer_count_for_floor, Cell, DemonJammer, LevelGrid, SignalTower};
 use segnale_debole::physics::has_line_of_sight;
-use segnale_debole::player::{Player, PLAYER_EYE_HEIGHT};
+use segnale_debole::player::{hazard_damage, Player, PLAYER_EYE_HEIGHT};
 use segnale_debole::signal::{bars_from_strength, SignalState, TOWER_RING_RADIUS};
-use segnale_debole::state::{start_run, AppState, PlayerModifiers, RunStats, UpgradeId, FINAL_FLOOR};
+use segnale_debole::state::{complete_floor, start_run, AppState, PlayerModifiers, RunStats, UpgradeId, FINAL_FLOOR};
 use segnale_debole::upgrades::{apply_upgrade, UpgradeChoices};
-use segnale_debole::weapons::{Pickup, Weapon, WeaponState, PLASMA_DAMAGE};
+use segnale_debole::weapons::{Pickup, PhoneSkin, PhoneSkinPart, Weapon, WeaponState, PLASMA_DAMAGE};
 
 const FPS: usize = 60;
 
@@ -68,6 +81,11 @@ fn run_stats(app: &App) -> RunStats {
 fn player(app: &mut App) -> Player {
     let mut q = app.world_mut().query::<&Player>();
     q.single(app.world()).expect("exactly one player").clone()
+}
+
+fn player_pos(app: &mut App) -> Vec3 {
+    let mut q = app.world_mut().query_filtered::<&Transform, With<Player>>();
+    q.single(app.world()).expect("exactly one player").translation
 }
 
 fn with_player(app: &mut App, f: impl FnOnce(&mut Player)) {
@@ -981,4 +999,844 @@ fn missed_call_decoy_lures_imp_away_from_player() {
     // The decoy rings for 2.5 s, then hangs up.
     step(&mut app, 2 * FPS);
     assert_eq!(count::<DecoyHandset>(&mut app), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Meta-progression: loadouts, contracts, signature apps, feats
+// ---------------------------------------------------------------------------
+
+/// Same as the main menu "START" with a profile loadout.
+fn begin_run_with(app: &mut App, loadout: RunLoadout, seed: u64) {
+    app.world_mut()
+        .run_system_once(
+            move |mut run: ResMut<RunStats>, mut mods: ResMut<PlayerModifiers>, mut cur: ResMut<RunLoadout>, mut next: ResMut<NextState<AppState>>| {
+                start_run_with_loadout(&mut run, &mut mods, &mut cur, loadout.clone(), &mut next, seed);
+            },
+        )
+        .unwrap();
+    step(app, 3);
+    assert_eq!(app_state(app), AppState::Playing);
+}
+
+fn chip_loadout(chip: StarterChip) -> RunLoadout {
+    RunLoadout { chip, ..default() }
+}
+
+fn contract_loadout(contracts: &[CarrierContract]) -> RunLoadout {
+    RunLoadout { contracts: contracts.to_vec(), ..default() }
+}
+
+fn profile(app: &App) -> ProfileStore {
+    app.world().resource::<ProfileStore>().clone()
+}
+
+/// Fire a 20-damage demon bolt straight into the player's chest; returns HP lost.
+fn take_bolt(app: &mut App) -> f32 {
+    with_player(app, |p| {
+        p.invuln_timer = 0.0;
+        p.armor = 0.0;
+        p.hp = p.max_hp;
+    });
+    let hp0 = player(app).hp;
+    let feet = player_feet(app);
+    app.world_mut()
+        .run_system_once(move |mut commands: Commands, fx: Res<FxAssets>| {
+            spawn_enemy_projectile(&mut commands, &fx, feet + Vec3::new(0.4, 0.9, 0.0), Vec3::new(-20.0, 0.0, 0.0), 20.0, 0.3, BurstColor::Fire);
+        })
+        .unwrap();
+    step(app, 2);
+    hp0 - player(app).hp
+}
+
+/// Fast-forward the current floor's SOS (uplink jumps to 90%) until the
+/// floor completes. God mode; Jammer Fiends culled.
+fn fast_clear_floor(app: &mut App) {
+    godmode(app);
+    trigger_uplink(app);
+    if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
+        *progress = 0.9;
+    }
+    let mut guard = 0;
+    while app_state(app) == AppState::Playing {
+        godmode(app);
+        cull_kind(app, EnemyKind::JammerFiend, None);
+        step(app, 1);
+        guard += 1;
+        assert!(guard < 15 * FPS, "floor never completed");
+    }
+}
+
+fn die(app: &mut App) {
+    with_player(app, |p| {
+        p.invuln_timer = 0.0;
+        p.armor = 0.0;
+        p.apply_damage(1.0e6);
+    });
+    step(app, 2);
+    assert_eq!(app_state(app), AppState::GameOver);
+}
+
+fn back_to_menu(app: &mut App) {
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::MainMenu);
+    step(app, 2);
+    assert_eq!(app_state(app), AppState::MainMenu);
+}
+
+#[test]
+fn starter_chips_set_vitals_cooldowns_and_dead_zone_armor() {
+    // Survey OS: 85 / 85 HP, faster ping, wall penetration.
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, chip_loadout(StarterChip::SurveyOs), 61);
+    let p = player(&mut app);
+    assert_eq!((p.hp, p.max_hp), (85.0, 85.0), "Survey OS starts at 85/85");
+    let m = app.world().resource::<PlayerModifiers>().clone();
+    assert!((m.ping_cooldown_mult - 0.70).abs() < 1e-6 && (m.wall_penetration - 0.25).abs() < 1e-6);
+    assert_eq!(app.world().resource::<RunLoadout>().chip, StarterChip::SurveyOs);
+
+    // Overclock Radio: overclock from Floor 1, weaker pickups.
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, chip_loadout(StarterChip::OverclockRadio), 61);
+    let m = app.world().resource::<PlayerModifiers>().clone();
+    assert!((m.overclock_bonus - 0.20).abs() < 1e-6 && (m.overclock_move_bonus - 0.15).abs() < 1e-6);
+    assert!((m.pickup_mult - 0.75).abs() < 1e-6);
+    assert_eq!(player(&mut app).max_hp, 100.0);
+
+    // Faraday Case: 50 armor, -25% damage in Dead Zones, slower 5G Overload.
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, chip_loadout(StarterChip::FaradayCase), 41);
+    assert_eq!(player(&mut app).armor, 50.0);
+    despawn_all_enemies(&mut app);
+    find_blackout(&mut app);
+    assert!(signal(&app).in_dead_zone);
+    let lost_dz = take_bolt(&mut app);
+    assert!((lost_dz - 15.0).abs() < 1e-3, "Faraday: 20 dmg -> 15 in a Dead Zone (lost {lost_dz})");
+    let g = grid(&app);
+    teleport(&mut app, g.cell_center(ring_cell(&g)), g.tower_world());
+    step(&mut app, 3);
+    assert!(!signal(&app).in_dead_zone);
+    let lost_ring = take_bolt(&mut app);
+    assert!((lost_ring - 20.0).abs() < 1e-3, "full damage outside Dead Zones (lost {lost_ring})");
+    bot(&mut app).overload = true;
+    step(&mut app, 2);
+    let cd = app.world().resource::<PhoneApps>().overload_cooldown;
+    assert!(cd > 12.3 && cd <= 12.5, "Faraday +25% Overload cooldown: {cd}");
+
+    // Stock UAC in the same Dead Zone takes full damage.
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    despawn_all_enemies(&mut app);
+    find_blackout(&mut app);
+    assert!((take_bolt(&mut app) - 20.0).abs() < 1e-3);
+    assert_eq!(player(&mut app).armor, 0.0);
+}
+
+#[test]
+fn priority_jamming_and_overtime_uplink_reshape_the_sos() {
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, contract_loadout(&[CarrierContract::PriorityJamming, CarrierContract::OvertimeUplink]), 21);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    trigger_uplink(&mut app);
+    step(&mut app, 1);
+    let fiends = {
+        let mut q = app.world_mut().query::<&Enemy>();
+        q.iter(app.world()).filter(|e| e.kind == EnemyKind::JammerFiend && e.is_alive()).count()
+    };
+    assert_eq!(fiends, 1, "Priority Jamming: a Jammer Fiend crashes the uplink at once");
+    match extraction(&app) {
+        ExtractionState::Uploading { duration, .. } => {
+            assert!((duration - upload_duration(1) * 1.35).abs() < 1e-3, "Overtime: +35% uplink ({duration})")
+        }
+        other => panic!("not uploading: {other:?}"),
+    }
+    let m = app.world().resource::<PlayerModifiers>().clone();
+    assert!((m.wave_interval_mult - 0.8).abs() < 1e-6 && m.priority_jamming);
+
+    // Without contracts: no fiend at uplink start, standard duration.
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 21);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    trigger_uplink(&mut app);
+    step(&mut app, 1);
+    assert_eq!(count::<Enemy>(&mut app), 0);
+    assert!(matches!(extraction(&app), ExtractionState::Uploading { duration, .. } if (duration - upload_duration(1)).abs() < 1e-3));
+}
+
+#[test]
+fn roaming_charges_harshen_the_signal_field() {
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, contract_loadout(&[CarrierContract::RoamingCharges]), 7);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    let m = app.world().resource::<PlayerModifiers>().clone();
+    assert!((m.jammer_radius_mult - 1.3).abs() < 1e-6 && (m.wall_attenuation_exp - 1.2).abs() < 1e-6);
+    // Sample the walled spawn and a spot near a jammer, harsh vs relaxed.
+    let g = grid(&app);
+    let j = g.jammers[0];
+    let near_jammer = [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y]
+        .into_iter()
+        .flat_map(|o| (3..=5).map(move |r| j + o * r))
+        .find(|c| matches!(g.cell(*c), Cell::Floor { .. }) && g.is_reachable(g.spawn, *c))
+        .expect("floor near a jammer");
+    let mut stricter = 0;
+    for feet in [g.spawn_world(), g.cell_center(near_jammer)] {
+        teleport(&mut app, feet, g.tower_world());
+        step(&mut app, 2);
+        let harsh = signal(&app);
+        {
+            let mut mods = app.world_mut().resource_mut::<PlayerModifiers>();
+            mods.jammer_radius_mult = 1.0;
+            mods.wall_attenuation_exp = 1.0;
+        }
+        step(&mut app, 2);
+        let relaxed = signal(&app);
+        assert!(harsh.natural_raw_strength <= relaxed.natural_raw_strength + 1e-6, "{harsh:?} vs {relaxed:?}");
+        if harsh.natural_raw_strength < relaxed.natural_raw_strength - 1e-4 {
+            stricter += 1;
+        }
+        let mut mods = app.world_mut().resource_mut::<PlayerModifiers>();
+        mods.jammer_radius_mult = 1.3;
+        mods.wall_attenuation_exp = 1.2;
+    }
+    assert!(stricter >= 1, "Roaming Charges lowered the signal somewhere");
+}
+
+#[test]
+fn low_battery_mode_skips_floor_heal_and_sos_telemetry_counts() {
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, contract_loadout(&[CarrierContract::LowBatteryMode]), 7);
+    fast_clear_floor(&mut app);
+    assert_eq!(app_state(&app), AppState::UpgradeSelect);
+    let run = run_stats(&app);
+    assert_eq!((run.sos_completed, run.floors_cleared), (1, 1));
+    with_player(&mut app, |p| {
+        p.hp = 40.0;
+        p.armor = 0.0;
+        p.ammo_shells = 0;
+    });
+    bot(&mut app).pick_upgrade = Some(0);
+    step(&mut app, 3);
+    assert_eq!(app_state(&app), AppState::Playing);
+    let p = player(&mut app);
+    assert_eq!(p.hp, 40.0, "Low-Battery Mode: no HP field repair");
+    assert!(p.armor >= 15.0, "armor still patched");
+    assert!(p.ammo_shells >= p.max_shells / 2, "ammo still topped up");
+}
+
+#[test]
+fn signal_spoofer_dash_spoofs_four_bars_and_lights_the_oled() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    install(&mut app, UpgradeId::SignalSpoofer);
+    find_blackout(&mut app);
+    assert_eq!(signal(&app).bars, 0);
+    bot(&mut app).dash = true;
+    step(&mut app, 2);
+    let s = signal(&app);
+    assert_eq!(s.bars, 4, "spoofed to 4 bars: {s:?}");
+    assert!(s.spoofed && !s.in_dead_zone);
+    assert!(s.natural_raw_strength < 4.0, "natural signal untouched ({})", s.natural_raw_strength);
+    assert!(app.world().resource::<PhoneApps>().spoof_timer > SIGNAL_SPOOF_SECS - 0.1);
+    assert!(app.world().resource::<HudFeed>().toasts.iter().any(|t| t.text.contains("SPOOF")));
+    // OLED status bar shows "SPOOF" in bright cyan.
+    step(&mut app, 4);
+    let tex = app.world().resource::<PhoneScreenTexture>().image.clone();
+    let img = app.world().resource::<Assets<Image>>().get(&tex).unwrap();
+    let data = img.data.as_ref().unwrap();
+    let cyan_px = (6..15u32)
+        .flat_map(|y| (6..56u32).map(move |x| ((y * SCREEN_W + x) * 4) as usize))
+        .filter(|&i| data[i..i + 3] == SPOOF_CYAN)
+        .count();
+    assert!(cyan_px > 10, "SPOOF label lit on the phone OLED ({cyan_px} px)");
+
+    // The window expires after 2.5 s.
+    step(&mut app, (SIGNAL_SPOOF_SECS * FPS as f32) as usize);
+    let s = signal(&app);
+    assert!(!s.spoofed);
+    assert_eq!(s.bars, bars_from_strength(s.raw_strength));
+    assert_eq!(app.world().resource::<PhoneApps>().spoof_timer, 0.0);
+
+    // Dashing with healthy signal spoofs nothing.
+    let g = grid(&app);
+    teleport(&mut app, g.cell_center(ring_cell(&g)), g.tower_world());
+    step(&mut app, 3 * FPS);
+    bot(&mut app).dash = true;
+    step(&mut app, 2);
+    assert_eq!(app.world().resource::<PhoneApps>().spoof_timer, 0.0, "no spoof at 5 bars");
+}
+
+#[test]
+fn jammer_hijack_turns_kills_into_five_bar_hotspots() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    install(&mut app, UpgradeId::JammerHijack);
+    let dz = find_blackout(&mut app);
+    assert_eq!(signal(&app).bars, 0);
+    let g = grid(&app);
+
+    // A Jammer Fiend killed in the blackout leaves a hotspot under the player.
+    let fiend = spawn_demon(&mut app, EnemyKind::JammerFiend, spawn_pos_for(EnemyKind::JammerFiend, &g, dz));
+    step(&mut app, 1);
+    kill(&mut app, fiend);
+    step(&mut app, 3);
+    assert_eq!(count::<HijackedHotspot>(&mut app), 1);
+    let s = signal(&app);
+    assert_eq!(s.bars, 5, "hijacked hotspot: 5 bars ({s:?})");
+    assert!(s.hotspot_boosted && !s.in_dead_zone);
+    assert_eq!(bars_from_strength(s.natural_raw_strength), 0, "natural blackout preserved");
+    assert!(app.world().resource::<HudFeed>().toasts.iter().any(|t| t.text == "JAMMER HIJACKED - 5-BAR HOTSPOT!"));
+    let run = run_stats(&app);
+    assert_eq!((run.fiends_killed, run.blackout_kills), (1, 1), "feat telemetry");
+
+    // It expires after 8 s.
+    step(&mut app, (HIJACK_SECS * FPS as f32) as usize + 5);
+    assert_eq!(count::<HijackedHotspot>(&mut app), 0);
+    assert!(signal(&app).bars <= 1);
+
+    // Destroying a Demon Jammer hijacks it too.
+    let jammer = {
+        let mut q = app.world_mut().query_filtered::<Entity, With<DemonJammer>>();
+        q.iter(app.world()).next().unwrap()
+    };
+    app.world_mut().get_mut::<DemonJammer>(jammer).unwrap().hp = 0.0;
+    step(&mut app, 2);
+    assert_eq!(count::<HijackedHotspot>(&mut app), 1);
+    assert_eq!(run_stats(&app).jammers_destroyed, 1);
+
+    // Without the app: no hotspot.
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    let dz = find_blackout(&mut app);
+    let g = grid(&app);
+    let fiend = spawn_demon(&mut app, EnemyKind::JammerFiend, spawn_pos_for(EnemyKind::JammerFiend, &g, dz));
+    step(&mut app, 1);
+    kill(&mut app, fiend);
+    step(&mut app, 3);
+    assert_eq!(count::<HijackedHotspot>(&mut app), 0);
+}
+
+#[test]
+fn app_store_drafts_only_from_the_active_catalog() {
+    let catalog = vec![UpgradeId::SignalSpoofer, UpgradeId::JammerHijack, UpgradeId::CopperAntenna, UpgradeId::MissedCall];
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, RunLoadout { catalog: catalog.clone(), ..default() }, 3);
+    fast_clear_floor(&mut app);
+    assert_eq!(app_state(&app), AppState::UpgradeSelect);
+    let choices = app.world().resource::<UpgradeChoices>().0.clone();
+    assert_eq!(choices.len(), 3);
+    assert!(choices.iter().all(|c| catalog.contains(c)), "{choices:?} outside {catalog:?}");
+
+    // Default run: the 10 core apps only.
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 3);
+    fast_clear_floor(&mut app);
+    let choices = app.world().resource::<UpgradeChoices>().0.clone();
+    assert!(choices.iter().all(|c| c.is_core()), "{choices:?}");
+}
+
+#[test]
+fn handset_skin_styles_the_phone_viewmodel() {
+    for skin in HandsetSkin::ALL {
+        let mut app = build_headless_test_app();
+        begin_run_with(&mut app, RunLoadout { skin, ..default() }, 5);
+        let palette = skin.palette();
+        let mut q = app.world_mut().query::<&PhoneSkin>();
+        assert_eq!(q.iter(app.world()).map(|s| s.0).collect::<Vec<_>>(), vec![skin]);
+        let mut q = app.world_mut().query::<(&PhoneSkinPart, &MeshMaterial3d<StandardMaterial>)>();
+        let parts: Vec<(SkinSlot, Handle<StandardMaterial>)> = q.iter(app.world()).map(|(p, m)| (p.0, m.0.clone())).collect();
+        // Bezel + frame + 4 bumpers + 4 bolts + PTT + coil.
+        assert_eq!(parts.len(), 12, "{skin:?}");
+        let mats = app.world().resource::<Assets<StandardMaterial>>();
+        for (slot, h) in parts {
+            let m = mats.get(&h).unwrap();
+            let want = palette.slot(slot);
+            assert_eq!(m.base_color, want.color, "{skin:?} {slot:?}");
+            assert_eq!((m.perceptual_roughness, m.metallic), (want.roughness, want.metallic));
+        }
+    }
+}
+
+#[test]
+fn feats_unlock_on_game_over_and_victory() {
+    let mut app = build_headless_test_app();
+    assert!(profile(&app).path.is_none(), "headless runs never touch the disk");
+
+    // Run 1: die on Floor 1 -> recorded, nothing unlocked.
+    begin_run(&mut app, 7);
+    die(&mut app);
+    step(&mut app, 5);
+    let st = profile(&app);
+    assert_eq!(st.profile.stats.runs_played, 1, "recorded exactly once");
+    assert!(st.last_run_summary.as_ref().unwrap().is_empty());
+    assert!(run_stats(&app).run_recorded);
+    back_to_menu(&mut app);
+
+    // Run 2: extract Floor 1, die on Floor 2 -> First Uplink.
+    begin_run(&mut app, 8);
+    assert!(!run_stats(&app).run_recorded);
+    fast_clear_floor(&mut app);
+    bot(&mut app).pick_upgrade = Some(0);
+    step(&mut app, 3);
+    die(&mut app);
+    let st = profile(&app);
+    let sum = st.last_run_summary.clone().unwrap();
+    assert_eq!(sum.new_feats, vec![FeatId::FirstExtraction]);
+    assert_eq!(sum.new_skins, vec![HandsetSkin::MarsHazard]);
+    assert_eq!(sum.new_apps, vec![UpgradeId::MissedCall]);
+    assert!(st.profile.is_skin_unlocked(HandsetSkin::MarsHazard));
+    assert!(st.profile.is_upgrade_unlocked(UpgradeId::MissedCall));
+    assert_eq!(st.profile.stats.total_sos_completed, 1);
+    assert_eq!(st.profile.stats.best_floor, 2);
+    assert_eq!(st.profile.history.len(), 2);
+    back_to_menu(&mut app);
+    assert_eq!(*app.world().resource::<RunLoadout>(), RunLoadout::default(), "menu clears the run loadout");
+
+    // Run 3: all four contracts, five fast floors -> victory feats.
+    begin_run_with(&mut app, contract_loadout(&CarrierContract::ALL), 9);
+    for floor in 1..=5 {
+        fast_clear_floor(&mut app);
+        if floor < 5 {
+            assert_eq!(app_state(&app), AppState::UpgradeSelect);
+            bot(&mut app).pick_upgrade = Some(0);
+            step(&mut app, 3);
+        }
+    }
+    assert_eq!(app_state(&app), AppState::Victory);
+    step(&mut app, 5);
+    let st = profile(&app);
+    let sum = st.last_run_summary.clone().unwrap();
+    assert!(sum.victory);
+    for f in [FeatId::BunkerCleared, FeatId::ContractCleared, FeatId::AllContractsCleared, FeatId::SpeedExtraction] {
+        assert!(sum.new_feats.contains(&f), "{f:?} in {:?}", sum.new_feats);
+    }
+    assert!(sum.new_skins.contains(&HandsetSkin::StealthCarbon) && sum.new_skins.contains(&HandsetSkin::ChromeGold));
+    assert!(sum.new_chips.contains(&StarterChip::OverclockRadio));
+    assert!(sum.new_chips.contains(&StarterChip::SurveyOs), "reached Floor 3 -> Signal Scout");
+    assert!(sum.new_chips.contains(&StarterChip::FaradayCase), "6 lifetime SOS uplinks -> Faraday Tested");
+    let s = &st.profile.stats;
+    assert_eq!((s.runs_played, s.victories, s.max_contracts_cleared), (3, 1, 4));
+    assert!(s.fastest_victory_secs.unwrap() < 600.0);
+    assert_eq!(st.profile.history.last().unwrap().contracts_count, 4);
+    assert!(st.profile.history.last().unwrap().victory);
+}
+
+// ---------------------------------------------------------------------------
+// Milestone B: pre-run menu flow (MainMenu / Loadout / Contracts & Feats /
+// end screens) through the real HUD + meta UI plugins and keyboard input
+// ---------------------------------------------------------------------------
+
+/// Headless gameplay + the HUD / menu / meta UI plugins (no window: cursor
+/// clicks are inert, keyboard shortcuts drive the menus). `store` replaces the
+/// default in-memory profile.
+fn build_menu_app(store: Option<ProfileStore>) -> App {
+    let mut app = App::new();
+    if let Some(s) = store {
+        app.insert_resource(s);
+    }
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    app
+}
+
+/// Press and release a key through the real input pipeline, then let the
+/// state transition settle.
+fn tap(app: &mut App, key: KeyCode) {
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: key,
+            logical_key: Key::Unidentified(NativeKey::Unidentified),
+            state,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+    step(app, 2);
+}
+
+fn ui_texts(app: &mut App) -> Vec<String> {
+    let mut q = app.world_mut().query::<&Text>();
+    q.iter(app.world()).map(|t| t.0.clone()).collect()
+}
+
+fn edit(app: &mut App, t: MetaTarget) -> EditOutcome {
+    app.world_mut().run_system_once(move |mut store: ResMut<ProfileStore>| commit_meta_edit(&mut store, t)).unwrap()
+}
+
+fn temp_profile(name: &str) -> std::path::PathBuf {
+    let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-profiles").join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    d.join("profile.json")
+}
+
+#[test]
+fn menu_navigates_loadout_and_contracts_screens() {
+    let mut app = build_menu_app(None);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    assert!(ui_texts(&mut app).iter().any(|t| t.starts_with("OS: STOCK OS")), "loadout summary bar");
+    assert_eq!(count::<Camera3d>(&mut app), 1);
+
+    tap(&mut app, KeyCode::KeyL);
+    assert_eq!(app_state(&app), AppState::Loadout);
+    // 4 chips + 4 skins + 15 apps + jam toggle + reset button.
+    assert_eq!(count::<MetaCard>(&mut app), 4 + 4 + UpgradeId::ALL.len() + 2);
+    assert_eq!(count::<Camera3d>(&mut app), 1, "screen camera replaces the menu camera");
+    assert!(ui_texts(&mut app).contains(&"10/10 READY".to_string()));
+
+    tap(&mut app, KeyCode::KeyC);
+    assert_eq!(app_state(&app), AppState::ContractsFeats);
+    assert_eq!(count::<MetaCard>(&mut app), CarrierContract::ALL.len());
+    assert!(ui_texts(&mut app).contains(&"STANDARD".to_string()));
+
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    tap(&mut app, KeyCode::KeyC);
+    tap(&mut app, KeyCode::KeyL);
+    assert_eq!(app_state(&app), AppState::Loadout);
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    assert_eq!(count::<MetaCard>(&mut app), 0, "meta screens despawn on exit");
+    assert_eq!(count::<Camera3d>(&mut app), 1);
+
+    // Live refresh: a contract toggle updates the risk badge + card in place.
+    tap(&mut app, KeyCode::KeyC);
+    edit(&mut app, MetaTarget::Contract(CarrierContract::RoamingCharges));
+    edit(&mut app, MetaTarget::Contract(CarrierContract::LowBatteryMode));
+    step(&mut app, 1);
+    let texts = ui_texts(&mut app);
+    assert!(texts.contains(&"RISK x2".to_string()), "{texts:?}");
+    assert_eq!(texts.iter().filter(|t| *t == "[ACTIVE]").count(), 2);
+}
+
+#[test]
+fn game_over_to_loadout_redeploys_a_fresh_player_with_the_new_chip() {
+    let mut store = ProfileStore::in_memory(Default::default());
+    store.profile.set_jam_demo_unlock_all(true);
+    let mut app = build_menu_app(Some(store));
+
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 2);
+    assert_eq!(player(&mut app).max_hp, 100.0, "stock chip");
+    die(&mut app);
+    // The end screen spawned after the run was recorded (Jam Demo -> exhibition).
+    let st = profile(&app);
+    let sum = st.last_run_summary.as_ref().unwrap();
+    assert!(sum.is_empty() && sum.skipped_reason.as_deref().is_some_and(|r| r.contains("JAM DEMO")));
+    assert_eq!(st.profile.stats.runs_played, 0, "Jam Demo runs never pollute real stats");
+    assert!(ui_texts(&mut app).iter().any(|t| t.contains("JAM DEMO")));
+    assert!(ui_texts(&mut app).iter().any(|t| t.contains("CONTRACTS: NONE")));
+
+    tap(&mut app, KeyCode::KeyL);
+    assert_eq!(app_state(&app), AppState::Loadout);
+    assert_eq!(count::<Player>(&mut app), 0, "previous run's player torn down");
+    assert!(app.world().get_resource::<LevelGrid>().is_none(), "previous level torn down");
+    assert!(matches!(edit(&mut app, MetaTarget::Chip(StarterChip::SurveyOs)), EditOutcome::Changed(_)));
+    edit(&mut app, MetaTarget::Contract(CarrierContract::PriorityJamming));
+
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 3);
+    assert_eq!(count::<Player>(&mut app), 1);
+    let p = player(&mut app);
+    assert_eq!((p.hp, p.max_hp), (85.0, 85.0), "fresh Survey OS vitals");
+    let l = app.world().resource::<RunLoadout>().clone();
+    assert_eq!(l.chip, StarterChip::SurveyOs);
+    assert!(l.has_contract(CarrierContract::PriorityJamming));
+    assert!(app.world().resource::<PlayerModifiers>().priority_jamming);
+    let texts = ui_texts(&mut app);
+    assert!(texts.contains(&"SURVEY OS".to_string()) && texts.contains(&"PRIO".to_string()), "HUD loadout tag: {texts:?}");
+
+    // Victory -> Loadout -> Faraday Case: armor bonus on the fresh player.
+    app.world_mut()
+        .run_system_once(|mut run: ResMut<RunStats>, mut next: ResMut<NextState<AppState>>| {
+            run.floor = FINAL_FLOOR;
+            complete_floor(&mut run, &mut next);
+        })
+        .unwrap();
+    step(&mut app, 2);
+    assert_eq!(app_state(&app), AppState::Victory);
+    tap(&mut app, KeyCode::KeyL);
+    assert_eq!(count::<Player>(&mut app), 0);
+    edit(&mut app, MetaTarget::Chip(StarterChip::FaradayCase));
+    tap(&mut app, KeyCode::Enter);
+    step(&mut app, 3);
+    let p = player(&mut app);
+    assert_eq!((p.max_hp, p.armor), (100.0, 50.0), "fresh Faraday Case vitals");
+}
+
+#[test]
+fn victory_screen_lists_the_unlocks_recorded_on_entry() {
+    let mut app = build_menu_app(None);
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    app.world_mut()
+        .run_system_once(|mut run: ResMut<RunStats>, mut next: ResMut<NextState<AppState>>| {
+            run.floor = FINAL_FLOOR;
+            run.floors_cleared = FINAL_FLOOR - 1;
+            complete_floor(&mut run, &mut next);
+        })
+        .unwrap();
+    step(&mut app, 2);
+    assert_eq!(app_state(&app), AppState::Victory);
+    let sum = profile(&app).last_run_summary.unwrap();
+    assert!(sum.new_feats.contains(&FeatId::BunkerCleared));
+    let texts = ui_texts(&mut app);
+    assert!(texts.iter().any(|t| t.starts_with("NEW UNLOCKS THIS RUN")), "{texts:?}");
+    assert!(texts.contains(&"[DONE] Full Signal".to_string()));
+    assert!(texts.iter().any(|t| t.starts_with("OS CHIPS:") && t.contains("Overclock Radio")));
+    assert!(!texts.contains(&NO_UNLOCKS_LINE.to_string()));
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    assert!(ui_texts(&mut app).iter().any(|t| t.contains("FEATS: ") && !t.contains("FEATS: 0/")), "menu strip counts the new feats");
+}
+
+#[test]
+fn loadout_and_contract_edits_save_the_profile_immediately() {
+    let path = temp_profile("meta-ui-save");
+    let mut app = build_menu_app(Some(ProfileStore::open(Some(path.clone()))));
+    tap(&mut app, KeyCode::KeyL);
+    assert!(!path.exists(), "nothing saved before the first edit");
+
+    assert!(matches!(edit(&mut app, MetaTarget::JamDemo), EditOutcome::Changed(_)));
+    assert!(load_profile(&path).jam_demo_unlock_all, "jam toggle saved");
+    edit(&mut app, MetaTarget::Chip(StarterChip::OverclockRadio));
+    edit(&mut app, MetaTarget::Skin(HandsetSkin::StealthCarbon));
+    edit(&mut app, MetaTarget::App(UpgradeId::CopperAntenna));
+    edit(&mut app, MetaTarget::App(UpgradeId::JammerHijack));
+    let disk = load_profile(&path);
+    assert_eq!(disk.equipped_chip, StarterChip::OverclockRadio);
+    assert_eq!(disk.equipped_skin, HandsetSkin::StealthCarbon);
+    assert!(disk.active_catalog.contains(&UpgradeId::JammerHijack) && !disk.active_catalog.contains(&UpgradeId::CopperAntenna));
+
+    tap(&mut app, KeyCode::KeyC);
+    edit(&mut app, MetaTarget::Contract(CarrierContract::OvertimeUplink));
+    assert!(load_profile(&path).active_contracts.contains(&CarrierContract::OvertimeUplink), "contract saved");
+
+    // Refused edits never write.
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(edit(&mut app, MetaTarget::App(UpgradeId::SignalSpoofer)), EditOutcome::Denied(_)), "catalog full");
+    assert!(matches!(edit(&mut app, MetaTarget::Chip(StarterChip::OverclockRadio)), EditOutcome::Unchanged(_)));
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn f9_debug_skip_and_jam_demo_never_award_permanent_feats() {
+    // 1. F9 debug skip across all 5 floors with all 4 contracts -> exhibition only.
+    let mut app = build_menu_app(None);
+    for c in CarrierContract::ALL {
+        edit(&mut app, MetaTarget::Contract(c));
+    }
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    for floor in 1..=FINAL_FLOOR {
+        tap(&mut app, KeyCode::F9);
+        if floor < FINAL_FLOOR {
+            assert_eq!(app_state(&app), AppState::UpgradeSelect);
+            bot(&mut app).pick_upgrade = Some(0);
+            step(&mut app, 3);
+            assert_eq!(app_state(&app), AppState::Playing);
+        }
+    }
+    assert_eq!(app_state(&app), AppState::Victory);
+    let st = profile(&app);
+    assert!(st.profile.unlocked_feats.is_empty(), "F9 skip must never grant feats: {:?}", st.profile.unlocked_feats);
+    assert_eq!(st.profile.stats.runs_played, 0);
+    assert_eq!(st.profile.stats.victories, 0);
+    let sum = st.last_run_summary.as_ref().unwrap();
+    assert!(sum.skipped_reason.as_deref().is_some_and(|r| r.contains("Debug skip")));
+    assert!(ui_texts(&mut app).iter().any(|t| t.contains("Debug skip")));
+
+    // 2. Jam Demo victory with all 4 contracts -> exhibition only.
+    let mut app = build_menu_app(None);
+    edit(&mut app, MetaTarget::JamDemo);
+    for c in CarrierContract::ALL {
+        edit(&mut app, MetaTarget::Contract(c));
+    }
+    tap(&mut app, KeyCode::Enter);
+    app.world_mut()
+        .run_system_once(|mut run: ResMut<RunStats>, mut next: ResMut<NextState<AppState>>| {
+            run.floor = FINAL_FLOOR;
+            run.floors_cleared = FINAL_FLOOR - 1;
+            complete_floor(&mut run, &mut next);
+        })
+        .unwrap();
+    step(&mut app, 2);
+    assert_eq!(app_state(&app), AppState::Victory);
+    let st = profile(&app);
+    assert!(st.profile.unlocked_feats.is_empty(), "Jam Demo must not grant permanent feats");
+    assert_eq!(st.profile.stats.victories, 0);
+    assert!(st.last_run_summary.as_ref().unwrap().skipped_reason.as_deref().is_some_and(|r| r.contains("JAM DEMO")));
+}
+
+#[test]
+fn signal_spoofer_cooldown_prevents_infinite_chaining() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    install(&mut app, UpgradeId::SignalSpoofer);
+    find_blackout(&mut app);
+    assert_eq!(signal(&app).bars, 0);
+
+    // First dash in blackout triggers spoof + sets 6s cooldown.
+    bot(&mut app).dash = true;
+    step(&mut app, 2);
+    assert_eq!(signal(&app).bars, 4);
+    assert!(app.world().resource::<PhoneApps>().spoof_cooldown > 5.8);
+
+    // Wait 2.1s: dash is ready again (2.0s), spoof is still live, re-dashing must NOT refresh it.
+    step(&mut app, (2.1 * FPS as f32) as usize);
+    let rem_before = app.world().resource::<PhoneApps>().spoof_timer;
+    assert!(rem_before > 0.1 && rem_before < 0.6);
+    bot(&mut app).dash = true;
+    step(&mut app, 2);
+    assert!(app.world().resource::<PhoneApps>().spoof_timer < rem_before, "re-dash cannot refresh while on cooldown");
+
+    // Once spoof expires, player drops back to Dead Zone until the 6s cooldown clears.
+    step(&mut app, (0.6 * FPS as f32) as usize);
+    assert!(!signal(&app).spoofed);
+    assert!(app.world().resource::<PhoneApps>().spoof_cooldown > 2.0);
+    // Finish cooldown and verify spoofer rearms cleanly.
+    step(&mut app, (3.6 * FPS as f32) as usize);
+    assert_eq!(app.world().resource::<PhoneApps>().spoof_cooldown, 0.0);
+    find_blackout(&mut app);
+    bot(&mut app).dash = true;
+    step(&mut app, 2);
+    assert!(signal(&app).spoofed && signal(&app).bars == 4, "spoofer rearms after 6s cooldown");
+}
+
+#[test]
+fn faraday_case_reduces_hazard_damage_in_dead_zone() {
+    let mut app = build_headless_test_app();
+    begin_run_with(&mut app, chip_loadout(StarterChip::FaradayCase), 41);
+    despawn_all_enemies(&mut app);
+    find_blackout(&mut app);
+    assert!(signal(&app).in_dead_zone);
+    with_player(&mut app, |p| {
+        p.armor = 0.0;
+        p.hp = 100.0;
+        p.invuln_timer = 0.0;
+        p.hazard_timer = -0.01;
+    });
+    app.world_mut().run_system_once(hazard_damage).unwrap();
+    let lost_dz = 100.0 - player(&mut app).hp;
+    assert!((lost_dz - 7.5).abs() < 1e-3, "Faraday reduces 10 hazard dmg -> 7.5 in Dead Zone (lost {lost_dz})");
+
+    // Outside a Dead Zone (tower ring), hazard damage stays full 10.0.
+    let g = grid(&app);
+    teleport(&mut app, g.cell_center(ring_cell(&g)), g.tower_world());
+    step(&mut app, 3);
+    assert!(!signal(&app).in_dead_zone);
+    with_player(&mut app, |p| {
+        p.armor = 0.0;
+        p.hp = 100.0;
+        p.invuln_timer = 0.0;
+        p.hazard_timer = -0.01;
+    });
+    app.world_mut().run_system_once(hazard_damage).unwrap();
+    let lost_ring = 100.0 - player(&mut app).hp;
+    assert!((lost_ring - 10.0).abs() < 1e-3, "Full 10 hazard dmg outside Dead Zone (lost {lost_ring})");
+}
+
+#[test]
+fn all_starter_chips_preserve_weak_signal_opening_across_seeds() {
+    for chip in StarterChip::ALL {
+        let mut dead_zone_starts = 0;
+        for seed in 1..=12u64 {
+            let mut app = build_headless_test_app();
+            begin_run_with(&mut app, chip_loadout(chip), seed);
+            step(&mut app, 2);
+            let s = signal(&app);
+            assert!(s.bars <= 2, "{chip:?} seed {seed} opened too hot at {} bars", s.bars);
+            if s.in_dead_zone {
+                dead_zone_starts += 1;
+            }
+        }
+        assert!(dead_zone_starts >= 8, "{chip:?} only had {dead_zone_starts}/12 weak-signal starts");
+    }
+}
+
+#[test]
+fn corrupt_profile_is_backed_up_and_dirty_save_retries() {
+    let path = temp_profile("corrupt-backup");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let raw = r#"{"schema_version":999,"equipped_chip":"FutureOs"}"#;
+    std::fs::write(&path, raw).unwrap();
+
+    let store = ProfileStore::open(Some(path.clone()));
+    assert_eq!(store.profile, PlayerProfile::default());
+    assert!(store.recovery_notice.as_deref().is_some_and(|m| m.contains(".bak")), "{:?}", store.recovery_notice);
+    let bak = path.with_file_name("profile.json.bak");
+    assert!(bak.exists(), "original incompatible profile preserved at .bak");
+    assert_eq!(std::fs::read_to_string(&bak).unwrap(), raw);
+
+    // Dirty save retry: point store at an unwriteable path (a directory), edit fails -> dirty=true;
+    // then restore valid file path and retry without mutating again.
+    let dir_as_file = path.parent().unwrap().join("blocked-dir");
+    std::fs::create_dir_all(&dir_as_file).unwrap();
+    let mut store = ProfileStore::open(Some(dir_as_file.clone()));
+    let res = commit_meta_edit(&mut store, MetaTarget::Contract(CarrierContract::RoamingCharges));
+    assert!(matches!(res, EditOutcome::Denied(m) if m.contains("SAVE FAILED")));
+    assert!(store.dirty && store.last_save_error.is_some());
+    assert!(store.profile.active_contracts.contains(&CarrierContract::RoamingCharges), "choice kept in memory");
+
+    store.path = Some(path.clone());
+    assert!(store.try_save().is_ok());
+    assert!(!store.dirty && store.last_save_error.is_none());
+    assert!(load_profile(&path).active_contracts.contains(&CarrierContract::RoamingCharges));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn pause_menu_freezes_simulation_and_resumes_or_restarts_cleanly() {
+    let mut app = build_menu_app(None);
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 10);
+    let pos_before = player_pos(&mut app);
+    let t_before = run_stats(&app).time_elapsed;
+    assert!(t_before > 0.0);
+
+    // Esc opens the Pause overlay and freezes run time while keeping the world alive.
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert_eq!(count::<Player>(&mut app), 1);
+    assert!(ui_texts(&mut app).contains(&"PAUSED".to_string()));
+    let t_paused = run_stats(&app).time_elapsed;
+    step(&mut app, 30);
+    assert_eq!(run_stats(&app).time_elapsed, t_paused, "simulation stays frozen while paused");
+
+    // Esc resumes Playing at the exact same floor/position.
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert!(player_pos(&mut app).distance(pos_before) < 0.25);
+    step(&mut app, 6);
+    assert!(run_stats(&app).time_elapsed > t_paused);
+
+    // P also pauses; R restarts a fresh Floor 1 run with a fresh player.
+    with_player(&mut app, |p| p.hp = 37.0);
+    tap(&mut app, KeyCode::KeyP);
+    assert_eq!(app_state(&app), AppState::Paused);
+    tap(&mut app, KeyCode::KeyR);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 3);
+    assert_eq!(count::<Player>(&mut app), 1);
+    assert_eq!(player(&mut app).hp, 100.0, "restarted run spawns a fresh full-HP player");
+
+    // Esc -> M returns to MainMenu and tears down the run cleanly.
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    tap(&mut app, KeyCode::KeyM);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    assert_eq!(count::<Player>(&mut app), 0);
 }

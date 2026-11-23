@@ -7,9 +7,11 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 
 use crate::apps::{
-    emp_radius, ping_cooldown, CALLBACK_SECS, DECOY_LURE_RADIUS, DECOY_SECS, STORE_FORWARD_DAMAGE, STORE_FORWARD_MAX_PACKETS,
+    emp_radius, ping_cooldown, CALLBACK_SECS, DECOY_LURE_RADIUS, DECOY_SECS, HIJACK_SECS, SIGNAL_SPOOF_COOLDOWN, SIGNAL_SPOOF_SECS,
+    STORE_FORWARD_DAMAGE, STORE_FORWARD_MAX_PACKETS,
 };
 use crate::bot_input::BotControl;
+use crate::meta::{default_catalog, RunLoadout};
 use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::bars_from_strength;
 use crate::weapons::SHOTGUN_PELLETS;
@@ -32,6 +34,8 @@ impl UpgradeId {
                 | UpgradeId::StoreAndForward
                 | UpgradeId::EmergencyCallback
                 | UpgradeId::MissedCall
+                | UpgradeId::SignalSpoofer
+                | UpgradeId::JammerHijack
         )
     }
 
@@ -51,14 +55,35 @@ impl UpgradeId {
             UpgradeId::StoreAndForward => "[PKT+]",
             UpgradeId::EmergencyCallback => "[CALL]",
             UpgradeId::MissedCall => "[DECOY]",
+            UpgradeId::SignalSpoofer => "[SPOOF]",
+            UpgradeId::JammerHijack => "[HIJK]",
         }
     }
 }
 
-/// Draft 3 distinct upgrades, skipping owned non-stackables when the pool allows.
+/// Draft 3 distinct upgrades from the full pool, skipping owned non-stackables
+/// when the pool allows.
 pub fn draft_choices(owned: &[UpgradeId], rng: &mut impl Rng) -> Vec<UpgradeId> {
-    let (mut fresh, mut stale): (Vec<UpgradeId>, Vec<UpgradeId>) =
-        UpgradeId::ALL.into_iter().partition(|u| u.is_stackable() || !owned.contains(u));
+    draft_from_pool(UpgradeId::ALL.to_vec(), owned, rng)
+}
+
+/// Draft 3 distinct upgrades from a run's active catalog only (an empty
+/// catalog falls back to the 10 core apps). Never offers a card outside it.
+pub fn draft_choices_from_catalog(catalog: &[UpgradeId], owned: &[UpgradeId], rng: &mut impl Rng) -> Vec<UpgradeId> {
+    let mut pool: Vec<UpgradeId> = Vec::new();
+    for &u in catalog {
+        if !pool.contains(&u) {
+            pool.push(u);
+        }
+    }
+    if pool.is_empty() {
+        pool = default_catalog();
+    }
+    draft_from_pool(pool, owned, rng)
+}
+
+fn draft_from_pool(pool: Vec<UpgradeId>, owned: &[UpgradeId], rng: &mut impl Rng) -> Vec<UpgradeId> {
+    let (mut fresh, mut stale): (Vec<UpgradeId>, Vec<UpgradeId>) = pool.into_iter().partition(|u| u.is_stackable() || !owned.contains(u));
     fresh.shuffle(rng);
     stale.shuffle(rng);
     fresh.into_iter().chain(stale).take(3).collect()
@@ -111,6 +136,8 @@ pub fn apply_upgrade(id: UpgradeId, mods: &mut PlayerModifiers, player: &mut Pla
         UpgradeId::StoreAndForward => mods.store_and_forward = true,
         UpgradeId::EmergencyCallback => mods.emergency_callback = true,
         UpgradeId::MissedCall => mods.missed_call = true,
+        UpgradeId::SignalSpoofer => mods.signal_spoofer = true,
+        UpgradeId::JammerHijack => mods.jammer_hijack = true,
     }
     run.upgrades.push(id);
 }
@@ -172,12 +199,30 @@ pub fn next_rank_preview(id: UpgradeId, mods: &PlayerModifiers) -> String {
         UpgradeId::MissedCall => {
             owned_toggle(mods.missed_call).unwrap_or_else(|| format!("{DECOY_SECS:.1}s decoy, {DECOY_LURE_RADIUS:.0}m Imp lure"))
         }
+        UpgradeId::SignalSpoofer => {
+            owned_toggle(mods.signal_spoofer).unwrap_or_else(|| format!("Dash @0-1b -> 4b {SIGNAL_SPOOF_SECS:.1}s ({SIGNAL_SPOOF_COOLDOWN:.0}s CD)"))
+        }
+        UpgradeId::JammerHijack => {
+            owned_toggle(mods.jammer_hijack).unwrap_or_else(|| format!("Jammer kill -> {HIJACK_SECS:.0}s 5-bar zone"))
+        }
     }
 }
 
 /// Field repairs between floors: +25 HP, +15 armor, ammo topped up to >= 50%.
 pub fn between_floor_patch(player: &mut Player) {
-    player.heal(25.0);
+    patch_player(player, true);
+}
+
+/// [`between_floor_patch`] honoring the run's modifiers: the Low-Battery Mode
+/// contract skips the HP repair (armor + ammo still top up).
+pub fn between_floor_patch_with(player: &mut Player, mods: &PlayerModifiers) {
+    patch_player(player, !mods.skip_floor_heal);
+}
+
+fn patch_player(player: &mut Player, heal: bool) {
+    if heal {
+        player.heal(25.0);
+    }
     player.armor = (player.armor + 15.0).min(player.max_armor);
     player.ammo_shells = player.ammo_shells.max(player.max_shells / 2);
     player.ammo_plasma = player.ammo_plasma.max(player.max_plasma / 2);
@@ -196,13 +241,15 @@ pub fn pick_upgrade(
     let mut scratch = Player::default();
     let p = player.unwrap_or(&mut scratch);
     apply_upgrade(id, mods, p, run);
-    between_floor_patch(p);
+    between_floor_patch_with(p, mods);
     next.set(AppState::Playing);
     Some(id)
 }
 
-pub fn draft_upgrades(mut choices: ResMut<UpgradeChoices>, run: Res<RunStats>) {
-    choices.0 = draft_choices(&run.upgrades, &mut rand::rng());
+/// App Store visit: draft from the run's active 10-card catalog.
+pub fn draft_upgrades(mut choices: ResMut<UpgradeChoices>, run: Res<RunStats>, loadout: Option<Res<RunLoadout>>) {
+    let catalog = loadout.map(|l| l.catalog.clone()).unwrap_or_default();
+    choices.0 = draft_choices_from_catalog(&catalog, &run.upgrades, &mut rand::rng());
 }
 
 /// Virtual "click a card" for the playtest bot / integration tests.
@@ -270,8 +317,8 @@ mod tests {
     }
 
     #[test]
-    fn all_thirteen_upgrades_apply() {
-        assert_eq!(UpgradeId::ALL.len(), 13);
+    fn all_fifteen_upgrades_apply() {
+        assert_eq!(UpgradeId::ALL.len(), 15);
         for id in UpgradeId::ALL {
             let (mut m, mut p, mut r) = fresh();
             let before = m.clone();
@@ -347,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stackables_are_the_five_toggles() {
+    fn non_stackables_are_the_seven_toggles() {
         let toggles: Vec<UpgradeId> = UpgradeId::ALL.into_iter().filter(|u| !u.is_stackable()).collect();
         assert_eq!(
             toggles,
@@ -356,7 +403,9 @@ mod tests {
                 UpgradeId::AirplaneModePhase,
                 UpgradeId::StoreAndForward,
                 UpgradeId::EmergencyCallback,
-                UpgradeId::MissedCall
+                UpgradeId::MissedCall,
+                UpgradeId::SignalSpoofer,
+                UpgradeId::JammerHijack
             ]
         );
         for id in UpgradeId::ALL {
@@ -379,6 +428,8 @@ mod tests {
         assert_eq!(next_rank_preview(UpgradeId::SubGhzPenetration, &m), "Wall loss 100% -> 45% + route");
         assert_eq!(next_rank_preview(UpgradeId::HighCapacityCell, &m), "50 -> 68 shells, +30% pickups");
         assert_eq!(next_rank_preview(UpgradeId::FirewallDaemon, &m), "+0 -> +40 armor, 0 -> 6/s");
+        assert_eq!(next_rank_preview(UpgradeId::SignalSpoofer, &m), "Dash @0-1b -> 4b 2.5s (6s CD)");
+        assert_eq!(next_rank_preview(UpgradeId::JammerHijack, &m), "Jammer kill -> 8s 5-bar zone");
 
         // Ranks stack: the preview follows the current modifiers.
         let (mut m2, mut p, mut r) = fresh();
@@ -405,6 +456,76 @@ mod tests {
         p.hp = 95.0;
         between_floor_patch(&mut p);
         assert_eq!(p.hp, p.max_hp);
+    }
+
+    #[test]
+    fn signature_toggles_install_once() {
+        let (mut m, mut p, mut r) = fresh();
+        apply_upgrade(UpgradeId::SignalSpoofer, &mut m, &mut p, &mut r);
+        apply_upgrade(UpgradeId::JammerHijack, &mut m, &mut p, &mut r);
+        assert!(m.signal_spoofer && m.jammer_hijack);
+        assert_eq!(next_rank_preview(UpgradeId::SignalSpoofer, &m), "Already installed");
+        assert_eq!(next_rank_preview(UpgradeId::JammerHijack, &m), "Already installed");
+        assert_eq!(UpgradeId::SignalSpoofer.icon(), "[SPOOF]");
+        assert_eq!(UpgradeId::JammerHijack.icon(), "[HIJK]");
+    }
+
+    #[test]
+    fn catalog_draft_never_leaves_the_catalog() {
+        let mut rng = StdRng::seed_from_u64(21);
+        let catalog = [
+            UpgradeId::SignalSpoofer,
+            UpgradeId::JammerHijack,
+            UpgradeId::CopperAntenna,
+            UpgradeId::DualSimBarrels,
+            UpgradeId::SignalSpoofer,
+            UpgradeId::PacketSniffer,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..400 {
+            let c = draft_choices_from_catalog(&catalog, &[], &mut rng);
+            assert_eq!(c.len(), 3);
+            assert!(c[0] != c[1] && c[1] != c[2] && c[0] != c[2], "{c:?}");
+            assert!(c.iter().all(|u| catalog.contains(u)), "{c:?} outside the catalog");
+            seen.extend(c);
+        }
+        assert_eq!(seen.len(), 5, "every distinct catalog card gets offered");
+        // Owned toggles are skipped while enough fresh cards remain.
+        let owned = [UpgradeId::SignalSpoofer, UpgradeId::JammerHijack];
+        for _ in 0..200 {
+            let c = draft_choices_from_catalog(&catalog, &owned, &mut rng);
+            assert!(!c.contains(&UpgradeId::SignalSpoofer) && !c.contains(&UpgradeId::JammerHijack), "{c:?}");
+        }
+        // Empty catalog falls back to the 10 core apps.
+        for _ in 0..200 {
+            let c = draft_choices_from_catalog(&[], &[], &mut rng);
+            assert!(c.iter().all(|u| u.is_core()), "{c:?}");
+        }
+        // The unrestricted draft still reaches the full pool.
+        let full: std::collections::BTreeSet<UpgradeId> = (0..600).flat_map(|_| draft_choices(&[], &mut rng)).collect();
+        assert_eq!(full.len(), UpgradeId::ALL.len());
+    }
+
+    #[test]
+    fn low_battery_mode_skips_floor_heal_only() {
+        let lowbat = PlayerModifiers { skip_floor_heal: true, ..default() };
+        let mut p = Player { hp: 30.0, armor: 0.0, ammo_shells: 0, ammo_plasma: 0, ..default() };
+        between_floor_patch_with(&mut p, &lowbat);
+        assert_eq!(p.hp, 30.0, "no HP repair under Low-Battery Mode");
+        assert_eq!(p.armor, 15.0);
+        assert_eq!(p.ammo_shells, p.max_shells / 2);
+        assert_eq!(p.ammo_plasma, p.max_plasma / 2);
+        let mut q = Player { hp: 30.0, ..default() };
+        between_floor_patch_with(&mut q, &PlayerModifiers::default());
+        assert_eq!(q.hp, 55.0);
+        // pick_upgrade goes through the contract-aware patch.
+        let (mut m, mut pl, mut r) = fresh();
+        m.skip_floor_heal = true;
+        pl.hp = 40.0;
+        let choices = UpgradeChoices(vec![UpgradeId::CopperAntenna, UpgradeId::DualSimBarrels, UpgradeId::SignalSiphon]);
+        let mut next = NextState::<AppState>::default();
+        pick_upgrade(0, &choices, &mut m, Some(&mut pl), &mut r, &mut next);
+        assert_eq!(pl.hp, 40.0);
     }
 
     #[test]

@@ -8,6 +8,8 @@
 //! - Store & Forward: blackout-kill packets discharge as arcs at 3+ bars.
 //! - Emergency Callback: ping-marked Fiend kills unlock an any-signal Overload.
 //! - Missed Call: Ping at 0 bars drops a ringing decoy handset that lures Imps.
+//! - Signal Spoofer: dashing in a 0-1 bar Dead Zone spoofs 4 bars for 2.5s.
+//! - Jammer Hijack: destroyed Jammers / Fiends leave an 8s 5-bar hotspot.
 
 use bevy::prelude::*;
 
@@ -19,7 +21,7 @@ use crate::fx::additive_glow;
 use crate::level::{DemonJammer, LevelEntity, LevelGrid};
 use crate::physics::sample_floor_height;
 use crate::player::{CursorCaptured, Player};
-use crate::signal::SignalState;
+use crate::signal::{bars_from_strength, SignalState};
 use crate::state::PlayerModifiers;
 use crate::weapons::{damage_jammer, knockback_scale, CombatDamage};
 
@@ -50,6 +52,16 @@ pub const CALLBACK_SECS: f32 = 6.0;
 /// Missed Call decoy.
 pub const DECOY_SECS: f32 = 2.5;
 pub const DECOY_LURE_RADIUS: f32 = 18.0;
+/// Signal Spoofer window, rearm cooldown and the spoofed signal strength (bars).
+pub const SIGNAL_SPOOF_SECS: f32 = 2.5;
+pub const SIGNAL_SPOOF_COOLDOWN: f32 = 6.0;
+pub const SPOOF_STRENGTH: f32 = 4.0;
+/// Highest (natural or displayed) bar count at which a dash can spoof.
+pub const SPOOF_MAX_BARS: u8 = 1;
+/// Jammer Hijack hotspot.
+pub const HIJACK_RADIUS: f32 = 12.0;
+pub const HIJACK_SECS: f32 = 8.0;
+pub const HIJACK_STRENGTH: f32 = 5.0;
 
 /// Phone app cooldowns and animation timers (reset every floor).
 #[derive(Resource, Debug, Clone, Default, PartialEq)]
@@ -66,6 +78,24 @@ pub struct PhoneApps {
     pub queued_packets: u8,
     /// Emergency Callback: seconds left on the any-signal 5G Overload.
     pub callback_timer: f32,
+    /// Signal Spoofer: seconds left on the spoofed 4-bar signal.
+    pub spoof_timer: f32,
+    /// Signal Spoofer: seconds until another Dead-Zone dash can spoof again.
+    pub spoof_cooldown: f32,
+}
+
+/// Jammer Hijack: a temporary 5-bar signal hotspot left by a destroyed
+/// Jammer / Jammer Fiend (read by the signal solver, ticked by [`tick_hijack_hotspots`]).
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct HijackedHotspot {
+    pub radius: f32,
+    pub timer: f32,
+}
+
+impl Default for HijackedHotspot {
+    fn default() -> Self {
+        HijackedHotspot { radius: HIJACK_RADIUS, timer: HIJACK_SECS }
+    }
 }
 
 /// Sub-GHz route node: pulsing floor beacon on the path to the Tower.
@@ -95,6 +125,20 @@ pub fn ping_radius(bars: u8) -> f32 {
 
 pub fn ping_cooldown(mods: &PlayerModifiers) -> f32 {
     PING_COOLDOWN * mods.ping_cooldown_mult
+}
+
+/// 5G Overload cooldown after a cast (Faraday Case lengthens it).
+pub fn overload_cooldown(mods: &PlayerModifiers) -> f32 {
+    OVERLOAD_COOLDOWN * mods.emp_cooldown_mult
+}
+
+/// Signal Spoofer trigger: the upgrade is installed, off cooldown, a dash just
+/// began and the player is in a 0-1 bar Dead Zone (displayed or natural signal).
+pub fn spoof_triggers(mods: &PlayerModifiers, dash_started: bool, bars: u8, natural_raw: f32, spoof_cooldown: f32) -> bool {
+    mods.signal_spoofer
+        && dash_started
+        && spoof_cooldown <= 0.0
+        && (bars <= SPOOF_MAX_BARS || bars_from_strength(natural_raw) <= SPOOF_MAX_BARS)
 }
 
 pub fn emp_radius(mods: &PlayerModifiers) -> f32 {
@@ -137,6 +181,12 @@ impl PhoneApps {
         self.overload_flash_timer = (self.overload_flash_timer - dt).max(0.0);
         self.cast_anim = (self.cast_anim - dt * 2.0).max(0.0);
         self.callback_timer = (self.callback_timer - dt).max(0.0);
+        self.spoof_timer = (self.spoof_timer - dt).max(0.0);
+        self.spoof_cooldown = (self.spoof_cooldown - dt).max(0.0);
+    }
+
+    pub fn spoof_active(&self) -> bool {
+        self.spoof_timer > 0.0
     }
 
     /// Store & Forward: queue one blackout packet (capped). Returns the new count.
@@ -408,7 +458,7 @@ fn phone_apps(
                     apps.callback_timer = 0.0;
                     feed.toast("EMERGENCY CALLBACK: 5G OVERLOAD FIRED", Color::srgb(1.0, 0.85, 0.25));
                 }
-                apps.overload_cooldown = OVERLOAD_COOLDOWN;
+                apps.overload_cooldown = overload_cooldown(&mods);
                 apps.overload_flash_timer = 0.8;
                 apps.cast_anim = 1.0;
                 sfx.play(SfxEvent::Overload);
@@ -543,6 +593,63 @@ fn dash_shockwave(
     }
 }
 
+/// Signal Spoofer: a dash in a 0-1 bar Dead Zone spoofs 4 bars for 2.5s.
+#[allow(clippy::too_many_arguments)]
+fn signal_spoofer(
+    mut commands: Commands,
+    mods: Res<PlayerModifiers>,
+    signal: Res<SignalState>,
+    mut apps: ResMut<PhoneApps>,
+    fx: Res<FxAssets>,
+    mut feed: ResMut<HudFeed>,
+    mut sfx: ResMut<SfxQueue>,
+    players: Query<(&Transform, &Player)>,
+) {
+    let Ok((ptf, p)) = players.single() else { return };
+    if !spoof_triggers(&mods, p.dash_started, signal.bars, signal.natural_raw_strength, apps.spoof_cooldown) {
+        return;
+    }
+    apps.spoof_timer = SIGNAL_SPOOF_SECS;
+    apps.spoof_cooldown = SIGNAL_SPOOF_COOLDOWN;
+    let c = ptf.translation + Vec3::Y * 1.0;
+    let cyan = Color::srgb(0.25, 1.0, 1.0);
+    spawn_flash_light(&mut commands, c, cyan, 900_000.0, 10.0, 0.3);
+    spawn_burst(&mut commands, &fx, c, BurstColor::Cyan, 12, 6.5, 0.07);
+    sfx.play(SfxEvent::Ping);
+    feed.toast(format!("SIGNAL SPOOFED - 4 BARS ({SIGNAL_SPOOF_SECS:.1}s)"), cyan);
+}
+
+/// Jammer Hijack: spawn a 5-bar signal hotspot (glowing floor ring + beam).
+pub fn spawn_hijack_hotspot(commands: &mut Commands, fx: &FxAssets, materials: &mut Assets<StandardMaterial>, feed: &mut HudFeed, pos: Vec3) -> Entity {
+    let ground = pos.with_y(pos.y.max(0.0) + 0.07);
+    let emerald = Color::srgb(0.2, 1.0, 0.7);
+    spawn_beam(commands, fx, materials, ground, 7.0, 0.55, HIJACK_SECS, emerald, false);
+    let mat = additive_glow(Color::srgb(0.25, 1.0, 0.85), 0.7);
+    let emissive = mat.emissive;
+    let handle = materials.add(mat);
+    let scale = Vec3::new(HIJACK_RADIUS, 0.08, HIJACK_RADIUS);
+    commands.spawn((
+        LevelEntity,
+        Fx::new(HIJACK_SECS, FxMotion::Hold, scale),
+        FxFade { material: handle.clone(), alpha: 0.7, emissive },
+        Mesh3d(fx.ring.clone()),
+        MeshMaterial3d(handle),
+        Transform::from_translation(ground).with_scale(scale),
+    ));
+    feed.toast("JAMMER HIJACKED - 5-BAR HOTSPOT!", emerald);
+    commands.spawn((LevelEntity, HijackedHotspot::default(), Transform::from_translation(ground))).id()
+}
+
+/// Expire Jammer Hijack hotspots.
+pub fn tick_hijack_hotspots(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity, &mut HijackedHotspot)>) {
+    for (e, mut h) in &mut q {
+        h.timer -= time.delta_secs();
+        if h.timer <= 0.0 {
+            commands.entity(e).try_despawn();
+        }
+    }
+}
+
 pub struct AppsPlugin;
 
 impl Plugin for AppsPlugin {
@@ -553,7 +660,8 @@ impl Plugin for AppsPlugin {
                 Update,
                 (phone_apps, dash_shockwave, store_and_forward_discharge).chain().in_set(CombatDamage).run_if(resource_exists::<LevelGrid>),
             )
-            .add_systems(Update, (tick_decoys, animate_breadcrumbs).in_set(crate::state::GameSet::World));
+            .add_systems(Update, signal_spoofer.after(phone_apps).in_set(CombatDamage).run_if(resource_exists::<LevelGrid>))
+            .add_systems(Update, (tick_decoys, animate_breadcrumbs, tick_hijack_hotspots).in_set(crate::state::GameSet::World));
     }
 }
 
@@ -619,6 +727,36 @@ mod tests {
         assert_eq!(packet_targets(&d, 3, STORE_FORWARD_RANGE), vec![1, 2, 1]);
         assert_eq!(packet_targets(&[(4, 8.0)], 3, STORE_FORWARD_RANGE), vec![4, 4, 4]);
         assert!(packet_targets(&[(0, 30.0)], 3, STORE_FORWARD_RANGE).is_empty());
+    }
+
+    #[test]
+    fn spoofer_triggers_only_on_dash_in_dead_zone() {
+        let on = PlayerModifiers { signal_spoofer: true, ..default() };
+        assert!(spoof_triggers(&on, true, 0, 0.0, 0.0));
+        assert!(spoof_triggers(&on, true, 1, 1.5, 0.0));
+        assert!(!spoof_triggers(&on, true, 3, 3.2, 0.0), "healthy signal: nothing to spoof");
+        assert!(!spoof_triggers(&on, false, 0, 0.0, 0.0), "needs the dash");
+        assert!(!spoof_triggers(&PlayerModifiers::default(), true, 0, 0.0, 0.0), "needs the app");
+        // Copper Antenna lifts the display, the natural Dead Zone still counts once off cooldown.
+        assert!(spoof_triggers(&on, true, 2, 0.4, 0.0));
+        // Rearm cooldown prevents chaining dashes into permanent 4-bar uptime.
+        assert!(!spoof_triggers(&on, true, 0, 0.0, 1.2), "blocked while cooling down");
+        assert!(!spoof_triggers(&on, true, 4, 0.4, SIGNAL_SPOOF_COOLDOWN - 2.0), "re-dash cannot refresh early");
+        let mut a = PhoneApps { spoof_timer: SIGNAL_SPOOF_SECS, spoof_cooldown: SIGNAL_SPOOF_COOLDOWN, ..default() };
+        assert!(a.spoof_active());
+        a.tick(SIGNAL_SPOOF_SECS);
+        assert!(!a.spoof_active());
+        assert!(a.spoof_cooldown > 0.0, "rearm delay remains after spoof ends");
+        a.tick(SIGNAL_SPOOF_COOLDOWN);
+        assert_eq!(a.spoof_cooldown, 0.0);
+    }
+
+    #[test]
+    fn faraday_lengthens_overload_cooldown() {
+        assert_eq!(overload_cooldown(&PlayerModifiers::default()), OVERLOAD_COOLDOWN);
+        let f = PlayerModifiers { emp_cooldown_mult: 1.25, ..default() };
+        assert!((overload_cooldown(&f) - 12.5).abs() < 1e-5);
+        assert_eq!(HijackedHotspot::default(), HijackedHotspot { radius: HIJACK_RADIUS, timer: HIJACK_SECS });
     }
 
     #[test]

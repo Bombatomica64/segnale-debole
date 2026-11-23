@@ -40,8 +40,8 @@ Each run descends/ascends through increasingly hostile Mars Bunker Sectors (**Fl
 
 ### Phase 3: EXTRACT & DOWNLOAD ("App Store" Roguelike Upgrades)
 1. At **100% SOS Uplink**, an orbital beam locks onto the tower, vaporizing remaining demons and extracting you to the next sector.
-2. With full 5-bar reception during extraction, your phone opens the **FIRMWARE / APP DOWNLOAD** screen — choose **1 of 3 randomized Roguelike Upgrades**:
-   Each card shows a live **NEXT:** line previewing exactly what the next rank changes (e.g. `8 -> 11 pellets`, `Min 0 -> 1 bar`, `4.0s -> 2.0s ping, +35% dmg`). 13 upgrades; stackable ones (S) can be re-bought, toggles (T) are drafted again only when the pool runs dry.
+2. With full 5-bar reception during extraction, your phone opens the **FIRMWARE / APP DOWNLOAD** screen — choose **1 of 3 randomized Roguelike Upgrades** drawn from your active **10-card App Store Catalog**:
+   Each card shows a live **NEXT:** line previewing exactly what the next rank changes (e.g. `8 -> 11 pellets`, `Min 0 -> 1 bar`, `4.0s -> 2.0s ping, +35% dmg`). 15 total upgrades (10 core + 5 feat-licensed signature apps); stackable ones (S) can be re-bought, toggles (T) are drafted again only when the pool runs dry.
    - **Dual-SIM Barrels (S):** Shotgun fires +3 pellets with a 25% tighter choke.
    - **5G Overclock (S):** At 4–5 bars, fire rate +35% and move speed +25%.
    - **External Copper Antenna (S):** +1.25 minimum signal bars everywhere (capped at 4.0); resists Dead Zones.
@@ -52,9 +52,21 @@ Each run descends/ascends through increasingly hostile Mars Bunker Sectors (**Fl
    - **Airplane Mode Phase (T):** Dash grants invulnerability, a static shockwave, and -15% dash cooldown.
    - **High-Capacity Cell (S):** Ammo caps +35%; all pickups +30% fuller. (No fire-rate bonus: that is 5G Overclock's niche.)
    - **Sub-GHz Penetration (S):** Walls attenuate 55% less (multiplicative per rank); every Ping Scan also projects a pulsing cyan **floor route** — the next 14 cells of the shortest walkable BFS path to the Tower (5 s) — so you can follow it around bunker walls.
-   - **Store & Forward (T):** Kills during a *natural* 0-bar blackout (measured before the Copper Antenna floor, so antenna owners still qualify) queue up to 3 packets, shown as glowing pips on the phone's status bar. Reaching 3+ bars discharges every packet as a 20-damage lightning arc at the nearest demons within 22 m (cycling over targets; ping marks apply).
-   - **Emergency Callback (T):** Killing a ping-marked Jammer Fiend unlocks one any-signal 5G Overload for 6 s (cooldown still applies). The phone's `Q EMP` tile flashes gold **CALL!**.
-   - **Missed Call (T):** Pressing Ping at 0 bars drops a ringing, vibrating decoy handset (shares the Ping cooldown, one active at a time) that pulls every Imp within 18 m toward it for 2.5 s. The `RMB PNG` tile reads amber **DECOY** when ready.
+   - **Store & Forward (T, Signature):** Kills during a *natural* 0-bar blackout (measured before the Copper Antenna floor, so antenna owners still qualify) queue up to 3 packets, shown as glowing pips on the phone's status bar. Reaching 3+ bars discharges every packet as a 20-damage lightning arc at the nearest demons within 22 m (cycling over targets; ping marks apply).
+   - **Emergency Callback (T, Signature):** Killing a ping-marked Jammer Fiend unlocks one any-signal 5G Overload for 6 s (cooldown still applies). The phone's `Q EMP` tile flashes gold **CALL!**.
+   - **Missed Call (T, Signature):** Pressing Ping at 0 bars drops a ringing, vibrating decoy handset (shares the Ping cooldown, one active at a time) that pulls every Imp within 18 m toward it for 2.5 s. The `RMB PNG` tile reads amber **DECOY** when ready.
+   - **Signal Spoofer (T, Signature):** Dashing inside a 0–1 bar Dead Zone spoofs 4 bars of signal for 2.5 s (`6 s` rearm cooldown; preserves natural blackout detection for Store & Forward; OLED status bar reads cyan **SPOOF**).
+   - **Jammer Hijack (T, Signature):** Destroying a Demon Jammer or Jammer Fiend turns its position into a temporary 5-bar Signal Hotspot for 8 s (`12 m` radius with glowing emerald floor ring & beacon; OLED status bar reads emerald **HIJK**).
+
+### Phase 4: Outside-the-Round Meta-Progression (`src/meta.rs`, `src/meta_ui.rs`)
+Core principle: **persist player choices, unlocks, and opt-in challenges — reset raw combat power at run start** (no permanent `+1 bar` or raw damage boosts that erase Floor 1's 0-bar tension).
+- **Persistent JSON Profile (`serde` + `serde_json`):** Saved atomically to `$XDG_DATA_HOME/segnale-debole/profile.json` (`SEGNALE_PROFILE` override; in-memory for headless tests/bots/screenshots). Incompatible or corrupt files are backed up to `.bak` with a recovery notice; failed writes stay marked dirty and retry automatically.
+- **4 Starter Phone OS Chips (Balanced Sidegrades):** *Stock UAC OS* (neutral), *Survey OS* (`-30%` Ping CD & `+25%` wall penetration, `-15` max HP), *Overclock Radio* (`+20%` fire & `+15%` move at 4–5 bars, `-25%` pickup yield), *Faraday Case* (`+25` starting armor & `-25%` damage taken in Dead Zones including hazards, `+25%` Ping/EMP cooldowns).
+- **10-Card Active App Store Catalog:** Curate 10 unlocked apps before each run (missing slots display `AUTO-FILL` and pad deterministically on deploy) so unlocking all 5 signature apps keeps 4-draft run odds sharp.
+- **4 Stackable Carrier Contracts:** *Roaming Charges* (`+30%` Jammer radius & `+20%` harsher wall loss), *Priority Jamming* (extra Jammer Fiend crashes every SOS + higher Fiend weight), *Overtime Uplink* (`+35%` SOS duration & `20%` faster rush waves), *Low-Battery Mode* (no between-floor HP heal).
+- **4 3D In-Hand Handset Skins:** *UAC Standard Orange*, *Mars Hazard Yellow*, *Stealth Carbon*, and *5G Chrome Gold* — styling the live left-hand 3D smartphone viewmodel.
+- **10 Feats & Jam Demo Mode:** All unlockable chips, signature apps, and skins tie transparently to 10 Feats; a one-click **JAM DEMO UNLOCK ALL** toggle lets judges/testers try everything immediately (exhibition runs — like `F9` debug skips — never pollute permanent feats or lifetime stats).
+- **Pause Menu (`Esc` / `P`):** Freezes gameplay over the live 3D viewport with Resume, Restart Run, Loadout, and Main Menu.
 
 ---
 
@@ -135,3 +147,5 @@ src/
 - **Milestone 2 (Combat, Phone & Roguelike Extraction):** Dual-wield Phone & Gun viewmodels, Shotgun + Plasma Repeater, Ping Scan & 5G Overload apps, 4 Demon archetypes with AI & projectiles, SOS Countdown rush + alarm lighting, 10 Roguelike App Store upgrades, Dead-Zone glitch FX, menus/game-over/victory flow, procedural SFX, and comprehensive tests.
 - **Milestone 3 (Polish & Verification):** Playability audit, game-feel tuning (hitstop, recoil, FOV kick on dash, screen flash, signal readability), full `cargo test` + `cargo build --release` check.
 - **Milestone 6 (Upgrade Reworks & Signature Upgrades):** High-Capacity Cell narrowed (no fire rate), Sub-GHz floor route on Ping, Firewall regen only while un-jammed, clearer card text + live next-rank previews, and three blackout-themed signature upgrades (Store & Forward, Emergency Callback, Missed Call) with phone OLED indicators and headless ECS tests.
+- **Milestone 7 (Outside-the-Round Meta-Progression & Pause Menu):** Persistent JSON profile (`src/meta.rs`), 4 Starter OS Chips, 15 upgrades (adding Signal Spoofer & Jammer Hijack) with 10-card active catalog curation, 4 stackable Carrier Contracts, 4 3D Handset Skins, 10 Feats, Jam Demo toggle, Loadout / Contracts & Feats / Pause UI (`src/meta_ui.rs`, `src/hud.rs`), and 155 passing tests.
+- **Next Up (Queued):** Quake/Doom-style **bunny hopping & air-strafing** movement mechanics in `src/player.rs` (air-strafe acceleration, jump buffering / momentum conservation on landing).

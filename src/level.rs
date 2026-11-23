@@ -683,6 +683,8 @@ impl Plugin for LevelPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(AppState::Playing), build_level_if_needed)
             .add_systems(OnEnter(AppState::MainMenu), teardown_level)
+            .add_systems(OnEnter(AppState::Loadout), teardown_level)
+            .add_systems(OnEnter(AppState::ContractsFeats), teardown_level)
             .add_systems(Update, animate_props.in_set(GameSet::World));
     }
 }

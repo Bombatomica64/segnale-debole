@@ -12,7 +12,7 @@ use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
 use rand::Rng;
 
-use crate::apps::PhoneApps;
+use crate::apps::{spawn_hijack_hotspot, PhoneApps};
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::BotControl;
 use crate::enemies::{damage_enemy, ray_sphere, Enemy, EnemyKind, PingMarked};
@@ -22,6 +22,7 @@ use crate::fx::{
 };
 use crate::hud::signal_color;
 use crate::level::{Cell, DemonJammer, JammerCore, LevelEntity, LevelGrid};
+use crate::meta::{HandsetSkin, RunLoadout, SkinSlot};
 use crate::phone_screen::PhoneScreenTexture;
 use crate::physics::raycast_grid;
 use crate::player::{CursorCaptured, Player, PlayerCamera};
@@ -434,6 +435,14 @@ pub struct PhoneMaterials {
     pub coil: Handle<StandardMaterial>,
 }
 
+/// A phone chassis part styled by the run's [`HandsetSkin`] palette slot.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhoneSkinPart(pub SkinSlot);
+
+/// The handset skin the current phone viewmodel was built with.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhoneSkin(pub HandsetSkin);
+
 pub const WEAPON_REST: Vec3 = Vec3::new(0.24, -0.20, -0.40);
 pub const PHONE_REST: Vec3 = Vec3::new(-0.265, -0.135, -0.37);
 
@@ -448,8 +457,11 @@ fn spawn_viewmodels(
     phone_tex: Option<Res<PhoneScreenTexture>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    loadout: Option<Res<RunLoadout>>,
 ) {
     let Ok((cam, proj)) = cams.single() else { return };
+    let skin = loadout.map(|l| l.skin).unwrap_or_default();
+    let palette = skin.palette();
     let fov = match proj {
         Projection::Perspective(p) => p.fov,
         _ => 85f32.to_radians(),
@@ -482,8 +494,16 @@ fn spawn_viewmodels(
     let glove = mat(&mut materials, Color::srgb(0.17, 0.20, 0.14), 0.88, 0.05);
     let glove_plate = mat(&mut materials, Color::srgb(0.26, 0.29, 0.22), 0.55, 0.45);
     let hazard = mat(&mut materials, Color::srgb(0.88, 0.52, 0.04), 0.5, 0.2);
-    let bezel = mat(&mut materials, Color::srgb(0.07, 0.075, 0.085), 0.75, 0.35);
-    let bumper = mat(&mut materials, Color::srgb(0.82, 0.42, 0.04), 0.62, 0.1);
+    // Handset skin: unique materials for every skinned phone chassis slot.
+    let mut skin_mat = |slot: SkinSlot| materials.add(palette.slot(slot).to_material());
+    let (bezel, phone_frame, bumper, phone_ptt, phone_coil, phone_bolts) = (
+        skin_mat(SkinSlot::Bezel),
+        skin_mat(SkinSlot::Frame),
+        skin_mat(SkinSlot::Bumper),
+        skin_mat(SkinSlot::Ptt),
+        skin_mat(SkinSlot::Coil),
+        skin_mat(SkinSlot::Bolts),
+    );
     let bolt_silver = mat(&mut materials, Color::srgb(0.68, 0.72, 0.76), 0.25, 0.95);
 
     let sight_green = glow(&mut materials, Color::srgb(0.3, 1.0, 0.4), LinearRgba::rgb(1.0, 9.0, 1.5));
@@ -523,8 +543,8 @@ fn spawn_viewmodels(
     ));
     commands.spawn((
         ChildOf(overlay),
-        PointLight { color: Color::srgb(0.45, 0.8, 1.0), intensity: 4_200.0, range: 3.0, shadow_maps_enabled: false, ..default() },
-        Transform::from_xyz(-0.35, 0.18, -0.05),
+        PointLight { color: Color::srgb(0.82, 0.9, 1.0), intensity: 6_800.0, range: 3.2, shadow_maps_enabled: false, ..default() },
+        Transform::from_xyz(-0.35, 0.22, 0.02),
         overlay_layer(),
     ));
     commands.spawn((
@@ -682,11 +702,11 @@ fn spawn_viewmodels(
     // =========================================================================
     let phone_rot = Quat::from_rotation_y(0.24) * Quat::from_rotation_x(0.11) * Quat::from_rotation_z(-0.04);
     let proot = commands
-        .spawn((ChildOf(cam), PhoneViewmodel, Transform::from_translation(PHONE_REST).with_rotation(phone_rot), Visibility::default()))
+        .spawn((ChildOf(cam), PhoneViewmodel, PhoneSkin(skin), Transform::from_translation(PHONE_REST).with_rotation(phone_rot), Visibility::default()))
         .id();
     // Main ruggedized anodized chassis + recessed stepped titanium frame rails.
-    commands.spawn(vm_part(proot, &cube, &bezel, Vec3::ZERO, Vec3::new(0.136, 0.214, 0.020), id));
-    commands.spawn(vm_part(proot, &cube, &titanium, Vec3::new(0.0, 0.0, -0.002), Vec3::new(0.142, 0.200, 0.014), id));
+    commands.spawn((PhoneSkinPart(SkinSlot::Bezel), vm_part(proot, &cube, &bezel, Vec3::ZERO, Vec3::new(0.136, 0.214, 0.020), id)));
+    commands.spawn((PhoneSkinPart(SkinSlot::Frame), vm_part(proot, &cube, &phone_frame, Vec3::new(0.0, 0.0, -0.002), Vec3::new(0.142, 0.200, 0.014), id)));
     // Rubberized grip ribs along left and right chassis edges.
     for k in 0..6 {
         let y = -0.062 + k as f32 * 0.024;
@@ -696,8 +716,11 @@ fn spawn_viewmodels(
     }
     // 4 sculpted rugged corner armor bumpers with silver hex bolts.
     for (x, y) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-        commands.spawn(vm_part(proot, &cube, &bumper, Vec3::new(x * 0.066, y * 0.104, 0.001), Vec3::new(0.018, 0.018, 0.024), id));
-        commands.spawn(vm_part(proot, &cyl, &bolt_silver, Vec3::new(x * 0.064, y * 0.102, 0.0135), Vec3::new(0.0032, 0.003, 0.0032), rx));
+        commands.spawn((PhoneSkinPart(SkinSlot::Bumper), vm_part(proot, &cube, &bumper, Vec3::new(x * 0.066, y * 0.104, 0.001), Vec3::new(0.018, 0.018, 0.024), id)));
+        commands.spawn((
+            PhoneSkinPart(SkinSlot::Bolts),
+            vm_part(proot, &cyl, &phone_bolts, Vec3::new(x * 0.064, y * 0.102, 0.0135), Vec3::new(0.0032, 0.003, 0.0032), rx),
+        ));
     }
     // Top bulkhead: speaker grille slot + front-facing lens + blinking status LED.
     commands.spawn(vm_part(proot, &cube, &dark_steel, Vec3::new(0.0, 0.097, 0.0105), Vec3::new(0.036, 0.005, 0.003), id));
@@ -706,13 +729,13 @@ fn spawn_viewmodels(
     // Bottom chin tactile home bar + lanyard loop.
     commands.spawn(vm_part(proot, &cube, &brushed, Vec3::new(0.0, -0.098, 0.0105), Vec3::new(0.044, 0.006, 0.003), id));
     // Side hardware controls: orange PTT button on left, volume rockers on right.
-    commands.spawn(vm_part(proot, &cube, &hazard, Vec3::new(-0.074, 0.036, 0.0), Vec3::new(0.006, 0.026, 0.010), id));
+    commands.spawn((PhoneSkinPart(SkinSlot::Ptt), vm_part(proot, &cube, &phone_ptt, Vec3::new(-0.074, 0.036, 0.0), Vec3::new(0.006, 0.026, 0.010), id)));
     commands.spawn(vm_part(proot, &cube, &steel, Vec3::new(0.074, 0.046, 0.0), Vec3::new(0.005, 0.018, 0.008), id));
     commands.spawn(vm_part(proot, &cube, &steel, Vec3::new(0.074, 0.020, 0.0), Vec3::new(0.005, 0.018, 0.008), id));
     // Knurled antenna collar + telescoping tactical whip antenna + helical coil + glowing beacon bead.
     commands.spawn(vm_part(proot, &cyl, &brushed, Vec3::new(0.048, 0.114, -0.001), Vec3::new(0.011, 0.018, 0.011), id));
     commands.spawn(vm_part(proot, &cyl, &dark_steel, Vec3::new(0.048, 0.145, -0.001), Vec3::new(0.0048, 0.052, 0.0048), id));
-    commands.spawn(vm_part(proot, &thin_ring, &copper, Vec3::new(0.048, 0.132, -0.001), Vec3::new(0.008, 0.006, 0.008), id));
+    commands.spawn((PhoneSkinPart(SkinSlot::Coil), vm_part(proot, &thin_ring, &phone_coil, Vec3::new(0.048, 0.132, -0.001), Vec3::new(0.008, 0.006, 0.008), id)));
     commands.spawn((PhoneLed, vm_part(proot, &sphere, &led, Vec3::new(0.048, 0.174, -0.001), Vec3::splat(0.0062), id)));
     // Raised screen surround lip + LIVE 160x240 pixel-art OLED screen quad!
     commands.spawn(vm_part(proot, &cube, &grip, Vec3::new(0.0, 0.0, 0.0096), Vec3::new(0.123, 0.182, 0.002), id));
@@ -1133,6 +1156,7 @@ fn jammer_deaths(
     time: Res<Time>,
     mut jammers: Query<(Entity, &mut DemonJammer, &GlobalTransform, &Children)>,
     mut cores: Query<&mut Transform, With<JammerCore>>,
+    (mods, mut materials): (Res<PlayerModifiers>, ResMut<Assets<StandardMaterial>>),
 ) {
     for (e, mut j, g, children) in &mut jammers {
         if j.is_active() {
@@ -1156,6 +1180,9 @@ fn jammer_deaths(
         sfx.play(SfxEvent::JammerDestroyed);
         feed.toast("JAMMER DESTROYED - SIGNAL BOOSTED", Color::srgb(0.3, 1.0, 0.8));
         feed.hit(true);
+        if mods.jammer_hijack {
+            spawn_hijack_hotspot(&mut commands, &fx, &mut materials, &mut feed, base);
+        }
         for (i, k) in [PickupKind::Shells, PickupKind::Health, PickupKind::Plasma].into_iter().enumerate() {
             let a = i as f32 * TAU / 3.0;
             spawn_pickup(&mut commands, &pickups, k, base + Vec3::new(a.cos(), 0.0, a.sin()) * 1.2, true);

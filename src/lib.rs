@@ -9,7 +9,10 @@ pub mod enemies;
 pub mod extraction;
 pub mod fx;
 pub mod hud;
+pub mod ui_kit;
 pub mod level;
+pub mod meta;
+pub mod meta_ui;
 pub mod phone_screen;
 pub mod physics;
 pub mod player;
@@ -50,17 +53,21 @@ impl Plugin for CoreGameplayPlugin {
                 extraction::ExtractionPlugin,
                 upgrades::UpgradesPlugin,
                 audio::GameAudioPlugin,
+                meta::MetaPlugin,
             ));
     }
 }
 
 /// The full game: simulation + HUD/menus + env-driven dev hooks (screenshot
-/// tour, autonomous playtest bot).
+/// tour, autonomous playtest bot). Windowed launches load the persistent
+/// on-disk profile unless a bot / screenshot run or `SEGNALE_PROFILE` says
+/// otherwise (see [`meta::resolve_profile_path`]).
 pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((CoreGameplayPlugin, hud::HudPlugin, dev::DevPlugin));
+        app.insert_resource(meta::ProfileStore::open(meta::resolve_profile_path(true)))
+            .add_plugins((CoreGameplayPlugin, hud::HudPlugin, dev::DevPlugin));
     }
 }
 

@@ -10,6 +10,7 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::{take_flag, BotControl};
 use crate::level::LevelGrid;
+use crate::meta::{RunLoadout, StarterChip};
 use crate::physics::{resolve_player_movement, JUMP_VELOCITY, PLAYER_HEIGHT, PLAYER_RADIUS, PLAYER_STEP_HEIGHT};
 use crate::signal::{overclock_move_factor, SignalState};
 use crate::state::{AppState, GameSet, PlayerModifiers};
@@ -122,7 +123,12 @@ impl Plugin for PlayerPlugin {
         app.init_resource::<CursorCaptured>()
             .add_systems(OnEnter(AppState::Playing), capture_cursor)
             .add_systems(OnExit(AppState::Playing), release_cursor)
+            // Every pre-run screen ends the previous run, so the next
+            // "DEPLOY" spawns a fresh player with the newly equipped chip.
+            // (`Playing <-> UpgradeSelect` keeps the player alive.)
             .add_systems(OnEnter(AppState::MainMenu), despawn_player)
+            .add_systems(OnEnter(AppState::Loadout), despawn_player)
+            .add_systems(OnEnter(AppState::ContractsFeats), despawn_player)
             .add_systems(
                 Update,
                 (
@@ -140,11 +146,18 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-fn spawn_player(commands: &mut Commands, grid: &LevelGrid) {
+/// Fresh run player with the starter chip's vitals (Survey OS 85 HP, Faraday +25 armor).
+pub fn new_run_player(chip: StarterChip, yaw: f32) -> Player {
+    let mut p = Player { yaw, ..default() };
+    chip.apply_to_player(&mut p);
+    p
+}
+
+fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip) {
     let pos = grid.spawn_world();
     commands
         .spawn((
-            Player { yaw: grid.spawn_yaw, ..default() },
+            new_run_player(chip, grid.spawn_yaw),
             Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(grid.spawn_yaw)),
             Visibility::default(),
         ))
@@ -170,10 +183,11 @@ fn spawn_player(commands: &mut Commands, grid: &LevelGrid) {
 }
 
 /// Spawn the player once a level exists (player persists across floors).
-fn ensure_player(mut commands: Commands, grid: Option<Res<LevelGrid>>, players: Query<(), With<Player>>) {
+fn ensure_player(mut commands: Commands, grid: Option<Res<LevelGrid>>, loadout: Option<Res<RunLoadout>>, players: Query<(), With<Player>>) {
     if let Some(grid) = grid
         && players.is_empty() {
-            spawn_player(&mut commands, &grid);
+            let chip = loadout.map(|l| l.chip).unwrap_or_default();
+            spawn_player(&mut commands, &grid, chip);
         }
 }
 
@@ -214,18 +228,14 @@ fn release_cursor(mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>, mu
     captured.0 = false;
 }
 
-/// Click to capture, Esc to release.
+/// Click to recapture the cursor while playing (Esc pauses via `hud::pause_input`).
 fn cursor_capture_input(
     mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut captured: ResMut<CursorCaptured>,
 ) {
     let Ok(mut c) = cursor.single_mut() else { return };
-    if keys.just_pressed(KeyCode::Escape) && captured.0 {
-        set_cursor(&mut c, false);
-        captured.0 = false;
-    } else if mouse.just_pressed(MouseButton::Left) && !captured.0 {
+    if mouse.just_pressed(MouseButton::Left) && !captured.0 {
         set_cursor(&mut c, true);
         captured.0 = true;
     }
@@ -368,10 +378,11 @@ fn view_bob(
     }
 }
 
-pub fn hazard_damage(mut players: Query<&mut Player>) {
+pub fn hazard_damage(signal: Res<SignalState>, mods: Res<PlayerModifiers>, mut players: Query<&mut Player>) {
     let Ok(mut p) = players.single_mut() else { return };
     if p.hazard_timer < 0.0 {
-        p.apply_damage(HAZARD_DAMAGE);
+        let scale = if signal.in_dead_zone { mods.dead_zone_damage_mult } else { 1.0 };
+        p.apply_damage(HAZARD_DAMAGE * scale);
         p.hazard_timer += HAZARD_TICK;
     }
 }
@@ -397,6 +408,16 @@ mod tests {
         p.invuln_timer = 1.0;
         assert_eq!(p.apply_damage(50.0), 0.0);
         assert_eq!(p.hp, 70.0);
+    }
+
+    #[test]
+    fn starter_chip_sets_spawn_vitals() {
+        let stock = new_run_player(StarterChip::StockUac, 0.5);
+        assert_eq!((stock.hp, stock.max_hp, stock.armor, stock.yaw), (100.0, 100.0, 25.0, 0.5));
+        let survey = new_run_player(StarterChip::SurveyOs, 0.0);
+        assert_eq!((survey.hp, survey.max_hp), (85.0, 85.0));
+        let faraday = new_run_player(StarterChip::FaradayCase, 0.0);
+        assert_eq!((faraday.hp, faraday.armor), (100.0, 50.0));
     }
 
     #[test]

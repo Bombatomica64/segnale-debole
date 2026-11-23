@@ -1,8 +1,11 @@
-//! Menus (main / App Store upgrade select / game over / victory) and the
-//! in-game HUD: status + SOS uplink bar, crosshair hitmarker, killfeed toasts,
-//! HP / armor / stamina vitals, weapon & ammo deck and a subtle Dead-Zone edge
-//! frame. Signal bars, radar and phone apps live on the 3D phone screen
-//! (`phone_screen.rs`), not here.
+//! Menus (main / App Store upgrade select / pause / game over / victory) and
+//! the in-game HUD: status + SOS uplink bar, crosshair hitmarker, killfeed
+//! toasts, HP / armor / stamina vitals, weapon & ammo deck and a subtle
+//! Dead-Zone edge frame. Signal bars, radar and phone apps live on the 3D
+//! phone screen (`phone_screen.rs`), not here.
+//!
+//! Everything is built from the gritty industrial-punk kit in `ui_kit.rs`
+//! (hard corners, bolted-plate borders, tape strips, stencil titles).
 //!
 //! Buttons use a small manual hit test (`ComputedNode::contains_point` with the
 //! window's physical cursor position) because Bevy 0.20 deprecated `Interaction`
@@ -15,23 +18,32 @@ use bevy::window::PrimaryWindow;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
 use crate::fx::HudFeed;
+use crate::meta::{record_game_over, record_victory, start_run_with_loadout, ProfileStore, RunLoadout};
+use crate::meta_ui::{
+    end_loadout_line, loadout_summary_line, loadout_tag_parts, unlock_reward_lines, MetaBox, MetaUiPlugin, NO_UNLOCKS_LINE,
+};
 use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::SignalState;
-use crate::state::{complete_floor, start_run, AppState, GameSet, PlayerModifiers, RunStats, FINAL_FLOOR};
+use crate::state::{complete_floor, AppState, GameSet, PlayerModifiers, RunStats, FINAL_FLOOR};
+use crate::ui_kit::{
+    hard_shadow, hazard_strip, hero_title, hud_plate, inset_border, keycap, plate_border, plate_rect, punk_button, punk_screen_root,
+    punk_screen_root_tinted, recessed_bezel, screen_rails, section_crate, signal_bars, stamped_tag, stencil_title, stencil_title_layers,
+    terminal_chassis, tiled_image, ButtonStyle, PunkButtonColors, Tape, UiKitPlugin, UiKitTextures, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_MID, PUNK_RED, STEEL_BORDER, STEEL_LIGHT,
+};
 use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeChoices};
 use crate::weapons::{Weapon, WeaponState};
 
-pub const COLOR_BG: Color = Color::srgb(0.07, 0.01, 0.01);
-pub const COLOR_TITLE: Color = Color::srgb(1.0, 0.22, 0.12);
-pub const COLOR_TEXT: Color = Color::srgb(0.92, 0.82, 0.75);
-pub const COLOR_DIM: Color = Color::srgb(0.55, 0.45, 0.42);
+pub const COLOR_BG: Color = INK_BLACK;
+pub const COLOR_TITLE: Color = PUNK_RED;
+pub const COLOR_TEXT: Color = BONE_TEXT;
+pub const COLOR_DIM: Color = ASH_DIM;
 pub const COLOR_SIGNAL_RED: Color = Color::srgb(1.0, 0.15, 0.1);
 pub const COLOR_SIGNAL_AMBER: Color = Color::srgb(1.0, 0.7, 0.1);
 pub const COLOR_SIGNAL_GREEN: Color = Color::srgb(0.2, 1.0, 0.75);
 pub const COLOR_CYAN: Color = Color::srgb(0.3, 0.95, 1.0);
-pub const COLOR_STORE_BG: Color = Color::srgba(0.0, 0.04, 0.05, 0.94);
-pub const COLOR_CARD: Color = Color::srgb(0.02, 0.1, 0.11);
-pub const COLOR_CARD_HOVER: Color = Color::srgb(0.04, 0.22, 0.22);
+pub const COLOR_STORE_BG: Color = Color::srgba(0.03, 0.025, 0.02, 0.94);
+pub const COLOR_CARD: Color = IRON_MID;
+pub const COLOR_CARD_HOVER: Color = Color::srgb(0.2, 0.17, 0.15);
 
 /// Color for a 0..=5 bar reading.
 pub fn signal_color(bars: u8) -> Color {
@@ -42,16 +54,48 @@ pub fn signal_color(bars: u8) -> Color {
     }
 }
 
-/// What a clickable menu button does.
+/// What a clickable menu button (or its keyboard shortcut) does.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
+    /// Deploy a run with the profile's equipped loadout.
     StartRun,
+    /// Tear down the current run and immediately redeploy on Floor 1.
+    RestartRun,
     Continue,
     BackToMenu,
+    OpenLoadout,
+    OpenContractsFeats,
 }
 
+/// A clickable menu switch (see [`crate::ui_kit::punk_button`]).
 #[derive(Component)]
-struct MenuButton;
+pub struct MenuButton;
+
+/// Keyboard shortcut for a state, given which keys were just pressed:
+/// - `MainMenu`: ENTER play, L loadout, C contracts & feats
+/// - `Paused`: ESC / ENTER resume, R restart, L loadout, M main menu
+/// - `Loadout`: ENTER deploy, ESC back, C contracts & feats
+/// - `ContractsFeats`: ENTER deploy, ESC back, L loadout
+/// - `GameOver` / `Victory`: ENTER main menu, L loadout
+pub fn menu_key_action(state: AppState, enter: bool, esc: bool, l: bool, c: bool, r: bool, m: bool) -> Option<MenuAction> {
+    use MenuAction::*;
+    match state {
+        AppState::MainMenu if enter => Some(StartRun),
+        AppState::MainMenu if l => Some(OpenLoadout),
+        AppState::MainMenu if c => Some(OpenContractsFeats),
+        AppState::Paused if esc || enter => Some(Continue),
+        AppState::Paused if r => Some(RestartRun),
+        AppState::Paused if l => Some(OpenLoadout),
+        AppState::Paused if m => Some(BackToMenu),
+        AppState::Loadout | AppState::ContractsFeats if enter => Some(StartRun),
+        AppState::Loadout | AppState::ContractsFeats if esc => Some(BackToMenu),
+        AppState::Loadout if c => Some(OpenContractsFeats),
+        AppState::ContractsFeats if l => Some(OpenLoadout),
+        AppState::GameOver | AppState::Victory if enter => Some(BackToMenu),
+        AppState::GameOver | AppState::Victory if l => Some(OpenLoadout),
+        _ => None,
+    }
+}
 
 /// App Store card for offer `n` (0..3).
 #[derive(Component)]
@@ -61,194 +105,380 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
+        app.add_plugins((UiKitPlugin, MetaUiPlugin))
+            .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
             .add_systems(OnEnter(AppState::Playing), spawn_hud)
+            .add_systems(OnEnter(AppState::Paused), spawn_pause_menu)
             .add_systems(OnEnter(AppState::UpgradeSelect), spawn_app_store.after(draft_upgrades))
-            .add_systems(OnEnter(AppState::GameOver), spawn_game_over)
-            .add_systems(OnEnter(AppState::Victory), spawn_victory)
+            // End screens read the run summary the profile recorder just stored.
+            .add_systems(OnEnter(AppState::GameOver), spawn_game_over.after(record_game_over))
+            .add_systems(OnEnter(AppState::Victory), spawn_victory.after(record_victory))
             .add_systems(Update, (menu_buttons, menu_keys).run_if(not(in_state(AppState::Playing))))
             .add_systems(Update, upgrade_cards.run_if(in_state(AppState::UpgradeSelect)))
-            .add_systems(Update, (update_hud, update_hud_boxes, debug_skip_floor).in_set(GameSet::Ui));
+            .add_systems(Update, (update_hud, update_hud_boxes, pause_input, debug_skip_floor).in_set(GameSet::Ui));
     }
 }
 
-fn text(s: impl Into<String>, size: f32, color: Color) -> impl Bundle {
+pub fn text(s: impl Into<String>, size: f32, color: Color) -> impl Bundle {
     (Text::new(s), TextFont::from_font_size(size), TextColor(color))
 }
 
-fn button(label: &str, action: MenuAction) -> impl Bundle {
-    (
-        MenuButton,
-        action,
-        Node {
-            padding: UiRect::axes(Val::Px(36.0), Val::Px(14.0)),
-            margin: UiRect::top(Val::Px(28.0)),
-            border: UiRect::all(Val::Px(3.0)),
-            justify_content: JustifyContent::Center,
-            ..default()
-        },
-        BorderColor::all(COLOR_TITLE),
-        BackgroundColor(Color::srgb(0.25, 0.03, 0.02)),
-        children![text(label, 28.0, COLOR_TEXT)],
-    )
+/// Centered row of punk switches. A [`ButtonStyle::HeroAcid`] switch is the
+/// row's call to action and is set ~1.5x larger than its neighbours.
+pub fn button_row(commands: &mut Commands, parent: Entity, buttons: &[(&str, MenuAction, ButtonStyle)], font: f32, top: f32) {
+    let row = commands
+        .spawn((
+            ChildOf(parent),
+            Node {
+                margin: UiRect::top(Val::Px(top)),
+                column_gap: Val::Px(20.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .id();
+    for (label, action, style) in buttons {
+        commands.spawn((ChildOf(row), punk_button(label, *action, button_font(*style, font), *style)));
+    }
 }
 
-fn screen_root(state: AppState, bg: Color) -> impl Bundle {
-    (
-        DespawnOnExit(state),
-        Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::Center,
-            row_gap: Val::Px(10.0),
-            ..default()
-        },
-        BackgroundColor(bg),
-    )
+/// Font of a switch in a row whose secondary switches use `font`.
+pub fn button_font(style: ButtonStyle, font: f32) -> f32 {
+    if style == ButtonStyle::HeroAcid { (font * 1.5).round() } else { font }
 }
 
-fn spawn_main_menu(mut commands: Commands) {
+/// Full-width row that centers its children (keeps stencil titles and tags
+/// from stretching inside `Stretch` columns).
+pub fn centered(commands: &mut Commands, parent: Entity) -> Entity {
+    commands.spawn((ChildOf(parent), Node { width: Val::Percent(100.0), justify_content: JustifyContent::Center, ..default() })).id()
+}
+
+/// A stamped tag wrapped in a node with a vertical margin.
+fn spaced_tag(commands: &mut Commands, parent: Entity, label: &str, (bg, fg): (Color, Color), font: f32, margin: f32) {
+    commands.spawn((ChildOf(parent), Node { margin: UiRect::vertical(Val::Px(margin)), ..default() }, children![stamped_tag(label, bg, fg, font)]));
+}
+
+/// Firmware stamp of the title lockup.
+pub const OS_STAMP: &str = "UAC-OS v0.7";
+
+/// One field-manual binding: the keycaps and what they do.
+pub type KeyBind = (&'static [&'static str], &'static str);
+
+/// Field-manual rows: `(category, bindings)`.
+pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
+    ("MOVE", &[(&["WASD"], "move"), (&["MOUSE"], "look"), (&["SPACE"], "jump"), (&["SHIFT"], "airplane-mode dash")]),
+    ("FIGHT", &[(&["LMB"], "fire"), (&["1", "2", "TAB", "WHEEL"], "switch shotgun / plasma")]),
+    ("PHONE", &[(&["RMB"], "ping scan (1+ bar)"), (&["Q"], "5G overload EMP (3+ bars)"), (&["E"], "SOS uplink at the tower")]),
+    ("SYSTEM", &[(&["CLICK"], "capture mouse"), (&["ESC", "P"], "pause"), (&["F9"], "debug: skip floor")]),
+];
+
+fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
+    let tex = tex.as_deref();
     // Menu needs its own camera: the player camera only exists in a run.
     commands.spawn((DespawnOnExit(AppState::MainMenu), Camera3d::default(), Camera { clear_color: ClearColorConfig::Custom(COLOR_BG), ..default() }));
+    let root = punk_screen_root(&mut commands, AppState::MainMenu, tex, INK_BLACK, 1.0);
+    screen_rails(&mut commands, root, tex, 12.0, false);
+
+    // One poster column, exactly as wide as the wordmark: every block below
+    // the title shares its left and right edges.
+    let column = commands
+        .spawn((ChildOf(root), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(13.0), ..default() }))
+        .id();
+
+    // Hero lockup: firmware stamp + a dying 1-bar signal above the wordmark,
+    // the caution tape tag + genre line below it.
+    let lockup = commands
+        .spawn((ChildOf(column), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(6.0), ..default() }))
+        .id();
+    let stamp_row = commands
+        .spawn((ChildOf(lockup), Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::FlexEnd, ..default() }))
+        .id();
     commands.spawn((
-        screen_root(AppState::MainMenu, COLOR_BG),
+        ChildOf(stamp_row),
+        Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() },
+        children![stamped_tag(OS_STAMP, STEEL_BORDER, BONE_TEXT, 12.0), text("// BUNKER 7 // FIELD TERMINAL", 12.0, ASH_DIM)],
+    ));
+    let weak = commands.spawn((ChildOf(stamp_row), Node { column_gap: Val::Px(10.0), align_items: AlignItems::FlexEnd, ..default() })).id();
+    commands.spawn((ChildOf(weak), text("SIGNAL 1/5", 12.0, PUNK_RED)));
+    signal_bars(&mut commands, weak, 1, PUNK_RED, 6.0);
+    hero_title(&mut commands, lockup, "SEGNALE DEBOLE", 100.0, BONE_TEXT, PUNK_RED);
+    commands.spawn((
+        ChildOf(lockup),
+        Node { margin: UiRect::top(Val::Px(2.0)), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
         children![
-            text("SEGNALE DEBOLE", 84.0, COLOR_TITLE),
-            text("// WEAK SIGNAL //", 22.0, COLOR_SIGNAL_AMBER),
-            (
-                Node { max_width: Val::Px(780.0), margin: UiRect::vertical(Val::Px(14.0)), ..default() },
-                children![text(
-                    "Mars Research Bunker 7 has gone dark. Hell came through the server racks.\n\
-                     Your left hand grips a cracked phone hunting for a single bar.\n\
-                     Your right hand grips a pump shotgun.\n\
-                     Find the 5-bar Signal Tower, destroy the Demon Jammers, hold the SOS uplink. Get out.",
-                    20.0,
-                    COLOR_TEXT
-                )],
-            ),
-            text(
-                "WASD move   MOUSE look   SPACE jump   SHIFT airplane-mode dash\n\
-                 LMB fire   1/2/TAB/WHEEL switch shotgun / plasma\n\
-                 RMB PING SCAN (1+ bar)   Q 5G OVERLOAD EMP (3+ bars)   E trigger SOS uplink at the tower\n\
-                 CLICK capture mouse   ESC release   (F9 debug: skip floor)",
-                17.0,
-                COLOR_DIM
-            ),
-            button("START RUN  [ENTER]", MenuAction::StartRun),
+            stamped_tag("// WEAK SIGNAL // MARS BUNKER 7 //", HAZARD_YELLOW, INK_BLACK, 16.0),
+            text("ROGUELIKE BOOMER SHOOTER  //  5 FLOORS  //  1 PHONE", 12.0, ASH_DIM),
         ],
     ));
+
+    // Briefing on a spray-red margin rule; the objective line is the loud one.
+    commands.spawn((
+        ChildOf(column),
+        Node { padding: UiRect::left(Val::Px(14.0)), border: UiRect::left(Val::Px(3.0)), flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() },
+        BorderColor::all(PUNK_RED),
+        children![
+            text(
+                "Mars Research Bunker 7 has gone dark. Hell came through the server racks.\n\
+                 Your left hand grips a cracked phone hunting for a single bar.\n\
+                 Your right hand grips a pump shotgun.",
+                16.0,
+                BONE_TEXT.with_alpha(0.82)
+            ),
+            text("> Find the 5-bar Signal Tower, destroy the Demon Jammers, hold the SOS uplink. Get out.", 16.0, HAZARD_YELLOW),
+        ],
+    ));
+
+    // Field manual: keycap chips on a brushed-steel plate.
+    let (manual, manual_head) = section_crate(&mut commands, column, "FIELD MANUAL // CONTROLS", ASH_DIM, Node::default());
+    if let Some(t) = tex {
+        commands.entity(manual).insert(tiled_image(t.plate_bg.clone(), Color::WHITE.with_alpha(0.4), 2.0));
+    }
+    commands.spawn((ChildOf(manual_head), Node { flex_grow: 1.0, ..default() }));
+    commands.spawn((ChildOf(manual_head), text("REV 07-B", 11.0, ASH_DIM.with_alpha(0.75))));
+    for (category, binds) in CONTROLS {
+        let row = commands.spawn((ChildOf(manual), Node { align_items: AlignItems::Center, column_gap: Val::Px(16.0), ..default() })).id();
+        commands.spawn((ChildOf(row), Node { width: Val::Px(52.0), flex_shrink: 0.0, ..default() }, children![text(category, 11.0, HAZARD_YELLOW)]));
+        for (keys, what) in binds {
+            let bind = commands.spawn((ChildOf(row), Node { align_items: AlignItems::Center, column_gap: Val::Px(4.0), ..default() })).id();
+            for key in *keys {
+                commands.spawn((ChildOf(bind), keycap(key, 12.0)));
+            }
+            commands.spawn((ChildOf(bind), Node { margin: UiRect::left(Val::Px(3.0)), ..default() }, children![text(*what, 13.0, BONE_TEXT.with_alpha(0.72))]));
+        }
+    }
+
+    // Active loadout telemetry crate (+ JAM DEMO caution tag in its header).
+    let (loadout, loadout_head) = section_crate(&mut commands, column, "ACTIVE LOADOUT", ARC_CYAN, Node::default());
+    commands.spawn((ChildOf(loadout_head), Node { flex_grow: 1.0, ..default() }));
+    if store.profile.jam_demo_unlock_all {
+        commands.spawn((ChildOf(loadout_head), MetaBox::JamPill, stamped_tag("JAM DEMO: ALL UNLOCKED", HAZARD_YELLOW, INK_BLACK, 11.0)));
+    }
+    commands.spawn((ChildOf(loadout), text(loadout_summary_line(&store.profile), 14.0, ARC_CYAN)));
+
+    // PLAY is the slab that fills the column; the two side doors stay small.
+    let actions = commands
+        .spawn((ChildOf(column), Node { margin: UiRect::top(Val::Px(3.0)), column_gap: Val::Px(20.0), align_items: AlignItems::Center, ..default() }))
+        .id();
+    commands.spawn((
+        ChildOf(actions),
+        Node { flex_grow: 1.0, flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, ..default() },
+        children![punk_button("PLAY  [ENTER]", MenuAction::StartRun, 30.0, ButtonStyle::HeroAcid)],
+    ));
+    commands.spawn((ChildOf(actions), punk_button("LOADOUT  [L]", MenuAction::OpenLoadout, 19.0, ButtonStyle::HazardAmber)));
+    commands.spawn((ChildOf(actions), punk_button("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, 19.0, ButtonStyle::DangerRed)));
 }
 
 // ---------------------------------------------------------------------------
 // App Store (upgrade select)
 // ---------------------------------------------------------------------------
 
-/// "APP STORE // FIRMWARE DOWNLOAD": three upgrade cards (click or 1/2/3).
-pub fn spawn_app_store(mut commands: Commands, run: Res<RunStats>, mods: Res<PlayerModifiers>, choices: Res<UpgradeChoices>) {
-    let root = commands.spawn(screen_root(AppState::UpgradeSelect, COLOR_STORE_BG)).id();
-    let phone = commands
-        .spawn((
-            ChildOf(root),
-            Node {
-                width: Val::Px(1080.0),
-                max_width: Val::Percent(96.0),
-                padding: UiRect::all(Val::Px(22.0)),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(8.0),
-                border: UiRect::all(Val::Px(4.0)),
-                border_radius: BorderRadius::all(Val::Px(26.0)),
-                ..default()
-            },
-            BorderColor::all(Color::srgb(0.2, 0.22, 0.24)),
-            BackgroundColor(Color::srgba(0.01, 0.03, 0.035, 0.97)),
-        ))
-        .id();
+const UPGRADE_CARD_BORDER: (f32, f32, f32, f32) = (5.0, 1.0, 1.0, 4.0);
+/// Near-black phosphor well of the NEXT RANK terminal strip.
+const COLOR_PHOSPHOR_WELL: Color = Color::srgb(0.012, 0.07, 0.035);
+
+fn upgrade_card_border(hovered: bool) -> BorderColor {
+    if hovered { plate_border(ACID_GREEN, BONE_TEXT) } else { plate_border(HAZARD_YELLOW, STEEL_BORDER) }
+}
+
+/// `SLOT 01`..`SLOT 03` header label of offer `i` (0-based).
+pub fn slot_label(i: usize) -> String {
+    format!("SLOT {:02}", i + 1)
+}
+
+/// "APP STORE // FIRMWARE": three bolted upgrade cards (click or 1/2/3).
+pub fn spawn_app_store(
+    mut commands: Commands,
+    run: Res<RunStats>,
+    mods: Res<PlayerModifiers>,
+    choices: Res<UpgradeChoices>,
+    tex: Option<Res<UiKitTextures>>,
+) {
+    let tex = tex.as_deref();
+    let root = punk_screen_root(&mut commands, AppState::UpgradeSelect, tex, COLOR_STORE_BG, 0.85);
+    let phone = terminal_chassis(&mut commands, root, tex, 1120.0, false);
     commands.spawn((
         ChildOf(phone),
         Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, ..default() },
         children![
-            text("UAC-PHONE  5G", 15.0, COLOR_SIGNAL_GREEN),
-            text("||||| -55 dBm   SOS SENT", 15.0, COLOR_SIGNAL_GREEN),
+            text("UAC-PHONE 5G // HACKED FIRMWARE", 13.0, ACID_GREEN),
+            text("||||| -55 dBm   SOS SENT", 13.0, ACID_GREEN),
         ],
     ));
-    commands.spawn((ChildOf(phone), text("APP STORE // FIRMWARE DOWNLOAD", 44.0, COLOR_CYAN)));
+    let title = centered(&mut commands, phone);
+    stencil_title(&mut commands, title, "APP STORE // FIRMWARE", 44.0, BONE_TEXT, PUNK_RED);
+    let sub = centered(&mut commands, phone);
     commands.spawn((
-        ChildOf(phone),
-        text(
-            format!("Full 5-bar uplink. One download slot unlocked.  Next: SECTOR {} / {}", run.floor, FINAL_FLOOR),
-            19.0,
-            COLOR_TEXT,
-        ),
+        ChildOf(sub),
+        text(format!("Full 5-bar uplink. One download slot unlocked.  Next: SECTOR {} / {}", run.floor, FINAL_FLOOR), 17.0, BONE_TEXT),
     ));
     let row = commands
         .spawn((
             ChildOf(phone),
-            Node { margin: UiRect::vertical(Val::Px(16.0)), column_gap: Val::Px(18.0), justify_content: JustifyContent::Center, ..default() },
+            Node {
+                margin: UiRect { top: Val::Px(8.0), bottom: Val::Px(12.0), ..default() },
+                column_gap: Val::Px(24.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Stretch,
+                ..default()
+            },
         ))
         .id();
     for (i, id) in choices.0.iter().enumerate() {
         let owned = run.upgrades.iter().filter(|u| *u == id).count();
-        let tag = if owned > 0 { format!("INSTALLED x{owned} - UPDATE") } else { "NEW".to_string() };
+        let (tag, tag_bg) = if owned > 0 { (format!("INSTALLED x{owned} - UPDATE"), HAZARD_YELLOW) } else { ("NEW".to_string(), ACID_GREEN) };
+        // The card: a bolted plate on a deep ink slab.
+        let card = commands
+            .spawn((
+                ChildOf(row),
+                UpgradeCard(i),
+                Node { width: Val::Px(336.0), flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, border: plate_rect(UPGRADE_CARD_BORDER), ..default() },
+                upgrade_card_border(false),
+                BackgroundColor(COLOR_CARD),
+                hard_shadow(8.0),
+            ))
+            .id();
+        if let Some(t) = tex {
+            commands.entity(card).insert(tiled_image(t.noise_strip.clone(), Color::WHITE.with_alpha(0.05), 1.0));
+        }
+        // Slot header bar: stamped slot plate | install state.
         commands.spawn((
-            ChildOf(row),
-            UpgradeCard(i),
+            ChildOf(card),
             Node {
-                width: Val::Px(330.0),
-                min_height: Val::Px(270.0),
-                padding: UiRect::all(Val::Px(16.0)),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(10.0),
-                border: UiRect::all(Val::Px(3.0)),
-                border_radius: BorderRadius::all(Val::Px(16.0)),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Stretch,
+                border: UiRect::bottom(Val::Px(2.0)),
                 ..default()
             },
-            BorderColor::all(Color::srgb(0.1, 0.6, 0.6)),
-            BackgroundColor(COLOR_CARD),
+            BorderColor::all(HAZARD_YELLOW),
+            BackgroundColor(INK_BLACK),
             children![
-                text(format!("[{}]", i + 1), 18.0, COLOR_DIM),
                 (
-                    Node {
-                        width: Val::Px(84.0),
-                        height: Val::Px(84.0),
-                        align_items: AlignItems::Center,
-                        justify_content: JustifyContent::Center,
-                        border_radius: BorderRadius::all(Val::Px(18.0)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.05, 0.3, 0.32)),
-                    children![text(id.icon(), 24.0, COLOR_CYAN)],
-                ),
-                text(id.name(), 24.0, COLOR_TEXT),
-                (Node { max_width: Val::Px(296.0), ..default() }, children![text(id.description(), 19.0, COLOR_DIM)]),
-                text(tag, 14.0, COLOR_SIGNAL_AMBER),
-                (
-                    Node {
-                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-                        flex_direction: FlexDirection::Column,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(8.0)),
-                        max_width: Val::Px(298.0),
-                        ..default()
-                    },
-                    BorderColor::all(Color::srgb(0.15, 0.55, 0.6)),
-                    BackgroundColor(Color::srgb(0.01, 0.06, 0.07)),
-                    children![text("NEXT RANK", 11.0, COLOR_SIGNAL_AMBER), text(next_rank_preview(*id, &mods), 14.0, COLOR_CYAN)],
+                    Node { padding: UiRect::axes(Val::Px(12.0), Val::Px(3.0)), align_items: AlignItems::Center, ..default() },
+                    BackgroundColor(HAZARD_YELLOW),
+                    children![text(slot_label(i), 15.0, INK_BLACK)],
                 ),
                 (
-                    Node { padding: UiRect::axes(Val::Px(22.0), Val::Px(6.0)), border_radius: BorderRadius::all(Val::Px(10.0)), ..default() },
-                    BackgroundColor(Color::srgb(0.08, 0.55, 0.5)),
-                    children![text("INSTALL", 18.0, Color::WHITE)],
+                    Node { padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)), column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() },
+                    children![text(format!("KEY [{}]", i + 1), 11.0, ASH_DIM), stamped_tag(&tag, tag_bg, INK_BLACK, 12.0)],
                 ),
             ],
         ));
+        let body = commands
+            .spawn((
+                ChildOf(card),
+                Node {
+                    flex_grow: 1.0,
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    padding: UiRect { left: Val::Px(14.0), right: Val::Px(14.0), top: Val::Px(12.0), bottom: Val::Px(14.0) },
+                    row_gap: Val::Px(9.0),
+                    ..default()
+                },
+            ))
+            .id();
+        // Recessed icon bay: vent slits either side of a stepped frame
+        // (steel lip -> ink gap -> caution plate).
+        let bay = commands
+            .spawn((
+                ChildOf(body),
+                recessed_bezel(Node {
+                    width: Val::Percent(100.0),
+                    padding: UiRect::vertical(Val::Px(8.0)),
+                    column_gap: Val::Px(16.0),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                }),
+            ))
+            .id();
+        let vents = |commands: &mut Commands| {
+            let v = commands.spawn((ChildOf(bay), Node { column_gap: Val::Px(4.0), ..default() })).id();
+            for _ in 0..4 {
+                commands.spawn((ChildOf(v), Node { width: Val::Px(3.0), height: Val::Px(30.0), ..default() }, BackgroundColor(STEEL_BORDER.with_alpha(0.7))));
+            }
+        };
+        vents(&mut commands);
+        commands.spawn((
+            ChildOf(bay),
+            Node { padding: UiRect::all(Val::Px(3.0)), border: UiRect::all(Val::Px(2.0)), ..default() },
+            BorderColor { left: STEEL_LIGHT, top: STEEL_LIGHT, right: STEEL_BORDER, bottom: STEEL_BORDER },
+            BackgroundColor(INK_BLACK),
+            children![(
+                Node {
+                    width: Val::Px(104.0),
+                    height: Val::Px(50.0),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    border: plate_rect((0.0, 0.0, 0.0, 4.0)),
+                    ..default()
+                },
+                BorderColor::all(HAZARD_DARK.mix(&HAZARD_YELLOW, 0.35)),
+                BackgroundColor(HAZARD_YELLOW),
+                children![text(id.icon(), 24.0, INK_BLACK)],
+            )],
+        ));
+        vents(&mut commands);
+        // Name over a short caution dash, then the pitch.
+        commands.spawn((
+            ChildOf(body),
+            Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(5.0), margin: UiRect::top(Val::Px(2.0)), ..default() },
+            children![
+                text(id.name().to_uppercase(), 22.0, BONE_TEXT),
+                (Node { width: Val::Px(44.0), height: Val::Px(3.0), ..default() }, BackgroundColor(HAZARD_YELLOW)),
+            ],
+        ));
+        commands.spawn((
+            ChildOf(body),
+            Node { width: Val::Percent(100.0), min_height: Val::Px(57.0), ..default() },
+            children![text(id.description(), 15.0, ASH_DIM.mix(&BONE_TEXT, 0.3))],
+        ));
+        commands.spawn((ChildOf(body), Node { flex_grow: 1.0, ..default() }));
+        // NEXT RANK > phosphor terminal strip.
+        commands.spawn((
+            ChildOf(body),
+            Node { width: Val::Percent(100.0), flex_direction: FlexDirection::Column, border: plate_rect((4.0, 1.0, 1.0, 2.0)), ..default() },
+            BorderColor { left: ACID_GREEN, top: ACID_GREEN.with_alpha(0.4), right: ACID_GREEN.with_alpha(0.4), bottom: INK_BLACK },
+            BackgroundColor(COLOR_PHOSPHOR_WELL),
+            children![
+                (
+                    Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
+                    BackgroundColor(ACID_GREEN.with_alpha(0.14)),
+                    children![
+                        (
+                            Node { padding: UiRect::axes(Val::Px(7.0), Val::Px(1.0)), ..default() },
+                            BackgroundColor(ACID_GREEN),
+                            children![text("NEXT RANK >", 11.0, INK_BLACK)],
+                        ),
+                        (Node { padding: UiRect::right(Val::Px(7.0)), ..default() }, children![text(if owned > 0 { "PATCH" } else { "v1.0" }, 10.0, ACID_GREEN.with_alpha(0.7))]),
+                    ],
+                ),
+                (
+                    Node { padding: UiRect { left: Val::Px(8.0), right: Val::Px(6.0), top: Val::Px(5.0), bottom: Val::Px(6.0) }, ..default() },
+                    children![text(next_rank_preview(*id, &mods), 15.0, ACID_GREEN)],
+                ),
+            ],
+        ));
+        commands.spawn((
+            ChildOf(body),
+            Node {
+                width: Val::Percent(100.0),
+                margin: UiRect::top(Val::Px(3.0)),
+                padding: UiRect::vertical(Val::Px(6.0)),
+                justify_content: JustifyContent::Center,
+                border: plate_rect((0.0, 0.0, 2.0, 4.0)),
+                ..default()
+            },
+            BorderColor { top: ACID_GREEN.mix(&BONE_TEXT, 0.6), bottom: INK_BLACK, left: INK_BLACK, right: INK_BLACK },
+            BackgroundColor(ACID_GREEN),
+            hard_shadow(4.0),
+            children![text(format!("INSTALL  [{}]", i + 1), 19.0, INK_BLACK)],
+        ));
     }
-    commands.spawn((ChildOf(phone), text(installed_list(&run), 16.0, COLOR_DIM)));
-    commands.spawn((ChildOf(phone), text("CLICK A CARD OR PRESS 1 / 2 / 3", 16.0, COLOR_SIGNAL_AMBER)));
+    let foot = centered(&mut commands, phone);
+    commands.spawn((ChildOf(foot), text(installed_list(&run), 14.0, ASH_DIM)));
+    let hint = centered(&mut commands, phone);
+    spaced_tag(&mut commands, hint, "CLICK A CARD OR PRESS 1 / 2 / 3", (HAZARD_YELLOW, INK_BLACK), 13.0, 0.0);
 }
 
 fn installed_list(run: &RunStats) -> String {
@@ -278,7 +508,10 @@ fn upgrade_cards(
     for (node, tf, card, mut bg, mut border) in &mut cards {
         let hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
         bg.0 = if hovered { COLOR_CARD_HOVER } else { COLOR_CARD };
-        *border = BorderColor::all(if hovered { COLOR_CYAN } else { Color::srgb(0.1, 0.6, 0.6) });
+        let want = upgrade_card_border(hovered);
+        if *border != want {
+            *border = want;
+        }
         if hovered && mouse.just_released(MouseButton::Left) {
             chosen = Some(card.0);
         }
@@ -307,73 +540,342 @@ fn summary(run: &RunStats) -> String {
     )
 }
 
-fn spawn_game_over(mut commands: Commands, run: Res<RunStats>) {
-    commands.spawn((
-        screen_root(AppState::GameOver, Color::srgba(0.12, 0.0, 0.0, 0.9)),
-        children![
-            text("NO SERVICE", 80.0, COLOR_SIGNAL_RED),
-            text("Connection lost. The bunker keeps your body.", 22.0, COLOR_TEXT),
-            text(summary(&run), 20.0, COLOR_DIM),
-            (Node { max_width: Val::Px(900.0), ..default() }, children![text(installed_list(&run), 17.0, COLOR_SIGNAL_AMBER)]),
-            button("MAIN MENU  [ENTER]", MenuAction::BackToMenu),
-        ],
-    ));
+/// Look of an end screen.
+struct EndLook {
+    title: &'static str,
+    title_color: Color,
+    /// Slab copy between the title and its ink shadow.
+    title_slab: Color,
+    flavor: &'static str,
+    /// Carrier stamp next to the signal bars.
+    stamp: &'static str,
+    /// Lit signal bars (0 = dead, 5 = full uplink).
+    bars: u8,
+    bg: Color,
+    /// Multiplied into the CRT backdrop (alpha = overlay strength).
+    backdrop: Color,
+    /// Title band fill and its RF static tint.
+    band: (Color, Color),
+    accent: Color,
+    tape: Tape,
+    /// Top-right RF link stamp.
+    link: &'static str,
+    /// Color of the installed-apps line.
+    apps: Color,
+    buttons: [(&'static str, MenuAction, ButtonStyle); 2],
 }
 
-fn spawn_victory(mut commands: Commands, run: Res<RunStats>) {
-    commands.spawn((
-        screen_root(AppState::Victory, Color::srgba(0.0, 0.06, 0.05, 0.92)),
-        children![
-            text("FULL SIGNAL", 80.0, COLOR_SIGNAL_GREEN),
-            text("SOS received. Orbital extraction confirmed. Bunker 7 sealed.", 22.0, COLOR_TEXT),
-            text(summary(&run), 20.0, COLOR_DIM),
-            (Node { max_width: Val::Px(900.0), ..default() }, children![text(installed_list(&run), 17.0, COLOR_CYAN)]),
-            button("MAIN MENU  [ENTER]", MenuAction::BackToMenu),
-        ],
-    ));
-}
-
-fn perform(action: MenuAction, run: &mut RunStats, mods: &mut PlayerModifiers, time: &Time, next: &mut NextState<AppState>) {
-    match action {
-        MenuAction::StartRun => start_run(run, mods, next, time.elapsed().as_nanos() as u64 ^ 0xA5A5_5A5A_1234_5678),
-        MenuAction::Continue => next.set(AppState::Playing),
-        MenuAction::BackToMenu => next.set(AppState::MainMenu),
+/// NO SERVICE: bleak crimson dead-zone static under danger tape. No green.
+fn no_service_look() -> EndLook {
+    EndLook {
+        title: "NO SERVICE",
+        title_color: PUNK_RED,
+        title_slab: Color::srgb(0.3, 0.03, 0.02),
+        flavor: "Connection lost. The bunker keeps your body.",
+        stamp: "0 BARS  //  CARRIER LOST  //  SOS NOT DELIVERED",
+        bars: 0,
+        bg: Color::srgb(0.05, 0.008, 0.008),
+        backdrop: Color::srgba(1.0, 0.36, 0.3, 0.9),
+        band: (Color::srgba(0.0, 0.0, 0.0, 0.5), Color::srgba(1.0, 0.16, 0.1, 0.2)),
+        accent: PUNK_RED,
+        tape: Tape::Danger,
+        link: "RF-LINK: DEAD",
+        apps: ASH_DIM.mix(&BONE_TEXT, 0.35),
+        buttons: [("MAIN MENU  [ENTER]", MenuAction::BackToMenu, ButtonStyle::DangerRed), ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::HazardAmber)],
     }
 }
 
+/// FULL SIGNAL: electric acid-phosphor uplink under signal tape. No red.
+fn full_signal_look() -> EndLook {
+    EndLook {
+        title: "FULL SIGNAL",
+        title_color: ACID_GREEN,
+        title_slab: Color::srgb(0.02, 0.24, 0.1),
+        flavor: "SOS received. Orbital extraction confirmed. Bunker 7 sealed.",
+        stamp: "5 BARS  //  UPLINK LOCKED  //  SOS DELIVERED",
+        bars: 5,
+        bg: Color::srgb(0.006, 0.045, 0.02),
+        backdrop: Color::srgba(0.42, 1.0, 0.58, 0.9),
+        band: (ACID_GREEN.with_alpha(0.1), Color::srgba(0.3, 1.0, 0.5, 0.12)),
+        accent: ACID_GREEN,
+        tape: Tape::Signal,
+        link: "RF-LINK: LOCKED",
+        apps: ACID_GREEN,
+        buttons: [("MAIN MENU  [ENTER]", MenuAction::BackToMenu, ButtonStyle::HeroAcid), ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::HazardAmber)],
+    }
+}
+
+/// Shared GAME OVER / VICTORY layout: tape rails, a full-width static band
+/// carrying the signal bars + stencil title, flavor, the recessed run readout,
+/// the RUN UNLOCKS crate and the action switches.
+fn spawn_end_screen(
+    commands: &mut Commands,
+    state: AppState,
+    look: EndLook,
+    run: &RunStats,
+    loadout: &RunLoadout,
+    store: &ProfileStore,
+    tex: Option<&UiKitTextures>,
+) {
+    let root = punk_screen_root_tinted(commands, state, tex, look.bg, look.backdrop, (look.link, look.accent));
+    screen_rails(commands, root, tex, 16.0, look.tape);
+
+    // Title band: RF static edge to edge, hairline accent rules.
+    let band = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(4.0),
+                padding: UiRect { top: Val::Px(10.0), bottom: Val::Px(12.0), ..default() },
+                border: UiRect::vertical(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor::all(look.accent.with_alpha(0.55)),
+            BackgroundColor(look.band.0),
+        ))
+        .id();
+    if let Some(t) = tex {
+        commands.entity(band).insert(tiled_image(t.noise_strip.clone(), look.band.1, 2.0));
+    }
+    let stamp = commands.spawn((ChildOf(band), Node { column_gap: Val::Px(14.0), align_items: AlignItems::FlexEnd, ..default() })).id();
+    signal_bars(commands, stamp, look.bars, look.accent, 8.0);
+    commands.spawn((ChildOf(stamp), text(look.stamp, 13.0, look.accent)));
+    stencil_title_layers(commands, band, look.title, 84.0, look.title_color, look.title_color, &[(8.0, Color::BLACK), (4.0, look.title_slab)]);
+
+    commands.spawn((ChildOf(root), text(look.flavor, 19.0, BONE_TEXT)));
+    let readout = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                max_width: Val::Px(1000.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(4.0),
+                padding: UiRect::axes(Val::Px(22.0), Val::Px(8.0)),
+                border: plate_rect((4.0, 2.0, 2.0, 2.0)),
+                ..default()
+            },
+            BorderColor { left: look.accent, ..inset_border() },
+            BackgroundColor(INK_BLACK.with_alpha(0.74)),
+        ))
+        .id();
+    commands.spawn((ChildOf(readout), text(summary(run), 18.0, BONE_TEXT)));
+    commands.spawn((ChildOf(readout), text(installed_list(run), 14.0, look.apps)));
+    commands.spawn((ChildOf(readout), text(end_loadout_line(loadout), 13.0, ASH_DIM)));
+
+    let summary = store.last_run_summary.clone().unwrap_or_default();
+    let (panel, header) = section_crate(
+        commands,
+        root,
+        "RUN UNLOCKS",
+        look.accent,
+        Node { margin: UiRect::top(Val::Px(4.0)), max_width: Val::Px(1000.0), min_width: Val::Px(600.0), align_items: AlignItems::Center, ..default() },
+    );
+    commands.entity(panel).insert((MetaBox::UnlockPanel, hard_shadow(6.0)));
+    commands.spawn((ChildOf(header), Node { flex_grow: 1.0, ..default() }));
+    commands.spawn((ChildOf(header), text(if summary.is_empty() { "NO DATA" } else { "UNLOCKED" }, 11.0, ASH_DIM)));
+    if let Some(reason) = &summary.skipped_reason {
+        commands.spawn((ChildOf(panel), text(reason.clone(), 15.0, HAZARD_YELLOW)));
+    } else if summary.is_empty() {
+        commands.spawn((ChildOf(panel), Node { margin: UiRect::vertical(Val::Px(4.0)), ..default() }, children![text(NO_UNLOCKS_LINE, 15.0, ASH_DIM)]));
+    } else {
+        commands.spawn((
+            ChildOf(panel),
+            text(
+                format!("NEW UNLOCKS THIS RUN  //  {} FEAT{}", summary.new_feats.len(), if summary.new_feats.len() == 1 { "" } else { "S" }),
+                18.0,
+                COLOR_GOLD,
+            ),
+        ));
+        let feats = commands
+            .spawn((
+                ChildOf(panel),
+                Node { flex_wrap: FlexWrap::Wrap, justify_content: JustifyContent::Center, column_gap: Val::Px(8.0), row_gap: Val::Px(6.0), ..default() },
+            ))
+            .id();
+        for f in &summary.new_feats {
+            commands.spawn((ChildOf(feats), stamped_tag(&format!("[DONE] {}", f.name()), COLOR_GOLD, INK_BLACK, 14.0)));
+        }
+        for line in unlock_reward_lines(&summary) {
+            commands.spawn((ChildOf(panel), text(line, 15.0, ARC_CYAN)));
+        }
+    }
+    if let Some(err) = &store.last_save_error {
+        commands.spawn((ChildOf(panel), text(format!("SAVE PENDING ({err}) - will retry at menu"), 13.0, PUNK_RED)));
+    }
+    button_row(commands, root, &look.buttons, 21.0, 10.0);
+}
+
+fn spawn_game_over(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
+    spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), &run, &loadout, &store, tex.as_deref());
+}
+
+fn spawn_victory(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
+    spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), &run, &loadout, &store, tex.as_deref());
+}
+
+/// In-run pause overlay (`Esc` / `P`): keeps the frozen 3D scene behind a dark
+/// tactical overlay + hazard-taped terminal and lets the player resume,
+/// restart, edit loadout, or quit.
+fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, tex: Option<Res<UiKitTextures>>) {
+    let tex = tex.as_deref();
+    let root = punk_screen_root(&mut commands, AppState::Paused, tex, Color::srgba(0.02, 0.015, 0.012, 0.74), 0.3);
+    let card = terminal_chassis(&mut commands, root, tex, 700.0, false);
+    commands.spawn((
+        ChildOf(card),
+        Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, ..default() },
+        children![text("UAC-PHONE // STANDBY", 13.0, ASH_DIM), text("SIMULATION PAUSED", 13.0, HAZARD_YELLOW)],
+    ));
+    let title = centered(&mut commands, card);
+    stencil_title(&mut commands, title, "PAUSED", 68.0, BONE_TEXT, PUNK_RED);
+    // Run readout in a recessed slot: read, not pressed.
+    let readout = commands
+        .spawn((
+            ChildOf(card),
+            Node {
+                margin: UiRect::top(Val::Px(4.0)),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(4.0),
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+                border: plate_rect((4.0, 2.0, 2.0, 2.0)),
+                ..default()
+            },
+            BorderColor { left: HAZARD_YELLOW, ..inset_border() },
+            BackgroundColor(INK_BLACK.with_alpha(0.74)),
+        ))
+        .id();
+    commands.spawn((ChildOf(readout), text(summary(&run), 17.0, BONE_TEXT)));
+    commands.spawn((ChildOf(readout), text(end_loadout_line(&loadout), 13.0, HAZARD_YELLOW)));
+    commands.spawn((ChildOf(readout), Node { max_width: Val::Px(620.0), ..default() }, children![text(installed_list(&run), 13.0, ASH_DIM)]));
+    let wrap = centered(&mut commands, card);
+    let btns = commands
+        .spawn((
+            ChildOf(wrap),
+            Node {
+                margin: UiRect { top: Val::Px(10.0), bottom: Val::Px(12.0), ..default() },
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Stretch,
+                row_gap: Val::Px(13.0),
+                width: Val::Px(380.0),
+                ..default()
+            },
+        ))
+        .id();
+    // RESUME is the one loud switch; the exits step down in weight.
+    for (label, action, style, font) in [
+        ("RESUME  [ESC]", MenuAction::Continue, ButtonStyle::HeroAcid, 24.0),
+        ("RESTART RUN  [R]", MenuAction::RestartRun, ButtonStyle::HazardAmber, 18.0),
+        ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::ScrapSteel, 18.0),
+        ("MAIN MENU  [M]", MenuAction::BackToMenu, ButtonStyle::DangerRed, 18.0),
+    ] {
+        commands.spawn((ChildOf(btns), punk_button(label, action, font, style)));
+    }
+}
+
+/// Menu action. "START" snapshots the profile's equipped loadout (chip, skin,
+/// contracts, catalog) into the run.
 #[allow(clippy::too_many_arguments)]
+fn perform(
+    commands: &mut Commands,
+    players: &Query<Entity, With<Player>>,
+    action: MenuAction,
+    run: &mut RunStats,
+    mods: &mut PlayerModifiers,
+    (store, loadout): (&ProfileStore, &mut RunLoadout),
+    time: &Time,
+    next: &mut NextState<AppState>,
+) {
+    match action {
+        MenuAction::StartRun => {
+            let seed = time.elapsed().as_nanos() as u64 ^ 0xA5A5_5A5A_1234_5678;
+            start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
+        }
+        MenuAction::RestartRun => {
+            for e in players.iter() {
+                commands.entity(e).despawn();
+            }
+            let seed = time.elapsed().as_nanos() as u64 ^ run.run_seed.wrapping_add(0x9E37_79B9);
+            start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
+        }
+        MenuAction::Continue => next.set(AppState::Playing),
+        MenuAction::BackToMenu => next.set(AppState::MainMenu),
+        MenuAction::OpenLoadout => next.set(AppState::Loadout),
+        MenuAction::OpenContractsFeats => next.set(AppState::ContractsFeats),
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn menu_buttons(
+    mut commands: Commands,
+    players: Query<Entity, With<Player>>,
     window: Query<&Window, With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
-    mut buttons: Query<(&ComputedNode, &UiGlobalTransform, &MenuAction, &mut BackgroundColor), With<MenuButton>>,
+    mut buttons: Query<
+        (&ComputedNode, &UiGlobalTransform, &MenuAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>),
+        With<MenuButton>,
+    >,
+    mut labels: Query<&mut TextColor>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
+    (store, mut loadout): (Res<ProfileStore>, ResMut<RunLoadout>),
     time: Res<Time>,
     mut next: ResMut<NextState<AppState>>,
 ) {
     let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
-    for (node, tf, action, mut bg) in &mut buttons {
+    for (node, tf, action, colors, mut bg, mut border, children) in &mut buttons {
         let hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
-        bg.0 = if hovered { Color::srgb(0.55, 0.06, 0.03) } else { Color::srgb(0.25, 0.03, 0.02) };
+        // Punk hover snap: solid accent fill, inverted label, bright frame.
+        let want = colors.bg(hovered);
+        if bg.0 != want {
+            bg.0 = want;
+        }
+        let want = colors.border(hovered);
+        if *border != want {
+            *border = want;
+        }
+        for child in children.into_iter().flatten() {
+            if let Ok(mut c) = labels.get_mut(*child) {
+                let want = colors.text(hovered);
+                if c.0 != want {
+                    c.0 = want;
+                }
+            }
+        }
         if hovered && mouse.just_released(MouseButton::Left) {
-            perform(*action, &mut run, &mut mods, &time, &mut next);
+            perform(&mut commands, &players, *action, &mut run, &mut mods, (&store, &mut loadout), &time, &mut next);
             return;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn menu_keys(
+    mut commands: Commands,
+    players: Query<Entity, With<Player>>,
     keys: Res<ButtonInput<KeyCode>>,
-    buttons: Query<&MenuAction, With<MenuButton>>,
+    state: Res<State<AppState>>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
+    (store, mut loadout): (Res<ProfileStore>, ResMut<RunLoadout>),
     time: Res<Time>,
     mut next: ResMut<NextState<AppState>>,
 ) {
-    if (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter))
-        && let Some(action) = buttons.iter().next()
-    {
-        perform(*action, &mut run, &mut mods, &time, &mut next);
+    let enter = keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]);
+    let action = menu_key_action(
+        *state.get(),
+        enter,
+        keys.just_pressed(KeyCode::Escape),
+        keys.just_pressed(KeyCode::KeyL),
+        keys.just_pressed(KeyCode::KeyC),
+        keys.just_pressed(KeyCode::KeyR),
+        keys.just_pressed(KeyCode::KeyM),
+    );
+    if let Some(action) = action {
+        perform(&mut commands, &players, action, &mut run, &mut mods, (&store, &mut loadout), &time, &mut next);
     }
 }
 
@@ -391,13 +893,13 @@ fn menu_keys(
 //   slot chips, 5G overclock pill)
 // - edges: subtle dark-red Dead-Zone frame (no scanlines across the view)
 
-const PANEL_BG: Color = Color::srgba(0.02, 0.03, 0.04, 0.72);
-const PANEL_BORDER: Color = Color::srgba(0.55, 0.6, 0.65, 0.28);
-const TRACK_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.65);
-const TRACK_BORDER: Color = Color::srgba(1.0, 1.0, 1.0, 0.18);
+const PANEL_BG: Color = Color::srgba(0.085, 0.072, 0.066, 0.8);
+const PANEL_EDGE: Color = Color::srgba(0.32, 0.28, 0.25, 0.45);
+const TRACK_BG: Color = Color::srgba(0.02, 0.018, 0.016, 0.8);
+const TRACK_BORDER: Color = Color::srgba(0.32, 0.28, 0.25, 0.7);
 const COLOR_HP_GREEN: Color = Color::srgb(0.16, 0.9, 0.46);
 const COLOR_ARMOR: Color = Color::srgb(0.46, 0.74, 0.88);
-const COLOR_GOLD: Color = Color::srgb(1.0, 0.8, 0.28);
+pub const COLOR_GOLD: Color = Color::srgb(1.0, 0.8, 0.28);
 const COLOR_SHOTGUN: Color = Color::srgb(1.0, 0.56, 0.14);
 const COLOR_SHELL: Color = Color::srgb(0.82, 0.13, 0.09);
 const COLOR_BRASS: Color = Color::srgb(0.95, 0.72, 0.3);
@@ -408,7 +910,10 @@ const TOAST_SLOTS: u8 = 5;
 /// Shell pips shown for the shotgun magazine.
 pub const SHELL_PIPS: u8 = 10;
 const DECK_WIDTH: f32 = 272.0;
-const VITALS_WIDTH: f32 = 300.0;
+const VITALS_WIDTH: f32 = 312.0;
+const UPLINK_WIDTH: f32 = 440.0;
+/// Height of the danger tape rails that clamp the status plate during a rush.
+const RUSH_RAIL_HEIGHT: f32 = 6.0;
 
 /// `cur / max` clamped to `0..=1` (0 when `max` is not positive).
 pub fn fraction(cur: f32, max: f32) -> f32 {
@@ -486,6 +991,10 @@ fn ammo(p: &Player, w: Weapon) -> (u32, u32) {
 enum HudText {
     Floor,
     Stats,
+    /// Starter chip label of the run loadout.
+    LoadoutChip,
+    /// Active contract tags (empty without contracts).
+    LoadoutContracts,
     Status,
     Prompt,
     Alert,
@@ -506,10 +1015,16 @@ enum HudText {
 enum HudBox {
     DamageFlash,
     DeadZoneFrame,
+    /// Status plate: its rail goes alert-red during the SOS uplink.
+    StatusPlate,
+    /// Danger tape rail above / below the status plate (SOS uplink only).
+    RushRail,
     UplinkPanel,
     UplinkFill,
     AlertPanel,
     ToastChip(u8),
+    /// Square bullet between the chip label and the contract tags.
+    LoadoutDot,
     HpFill,
     ArmorFill,
     StaminaFill,
@@ -526,22 +1041,65 @@ fn abs_full() -> Node {
     Node { position_type: PositionType::Absolute, width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }
 }
 
-/// Dark translucent backing panel with a thin border and rounded corners.
-fn panel(node: Node) -> impl Bundle {
+/// Segment cuts every 10% across a bar track; the 50% cut is heavier so the
+/// half-way mark reads at a glance.
+fn spawn_ticks(commands: &mut Commands, track: Entity) {
+    for n in 1..10 {
+        let major = n == 5;
+        commands.spawn((
+            ChildOf(track),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(n as f32 * 10.0),
+                top: Val::Px(0.0),
+                width: Val::Px(if major { 3.0 } else { 2.0 }),
+                height: Val::Percent(100.0),
+                margin: UiRect::left(Val::Px(-1.0)),
+                ..default()
+            },
+            BackgroundColor(INK_BLACK.with_alpha(if major { 0.95 } else { 0.78 })),
+        ));
+    }
+}
+
+/// Instrument ruler under a bar: a 1px tick every 10%, taller bone ticks at
+/// 0 / 50 / 100%. Lives outside the track, so the fill never hides it.
+fn spawn_ruler(commands: &mut Commands, parent: Entity) {
+    let ruler = commands.spawn((ChildOf(parent), Node { width: Val::Percent(100.0), height: Val::Px(RULER_HEIGHT), ..default() })).id();
+    for n in 0..=10u8 {
+        let major = n % 5 == 0;
+        commands.spawn((
+            ChildOf(ruler),
+            Node {
+                position_type: PositionType::Absolute,
+                // Pin the last tick to the right edge so it never overflows.
+                left: if n == 10 { Val::Auto } else { Val::Percent(n as f32 * 10.0) },
+                right: if n == 10 { Val::Px(0.0) } else { Val::Auto },
+                top: Val::Px(0.0),
+                width: Val::Px(if major { 2.0 } else { 1.0 }),
+                height: Val::Px(if major { RULER_HEIGHT } else { RULER_HEIGHT - 2.0 }),
+                ..default()
+            },
+            BackgroundColor(if major { BONE_TEXT.with_alpha(0.7) } else { ASH_DIM.with_alpha(0.6) }),
+        ));
+    }
+}
+
+const RULER_HEIGHT: f32 = 5.0;
+
+/// Framed bar track: a colored left cap, a matching dimmer right cap and a
+/// dark bottom lip, so the bar reads as a bracketed gauge.
+fn bar_track(width: Val, height: f32, color: Color, display: Display) -> impl Bundle {
     (
-        Node {
-            padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-            border: UiRect::all(Val::Px(1.0)),
-            border_radius: BorderRadius::all(Val::Px(8.0)),
-            ..node
-        },
-        BorderColor::all(PANEL_BORDER),
-        BackgroundColor(PANEL_BG),
+        Node { display, width, height: Val::Px(height), border: plate_rect((3.0, 2.0, 1.0, 2.0)), padding: UiRect::all(Val::Px(1.0)), ..default() },
+        BorderColor { left: color, right: color.with_alpha(0.55), top: TRACK_BORDER, bottom: INK_BLACK },
+        BackgroundColor(TRACK_BG),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Labelled horizontal bar: `LABEL ......... value` over a framed track.
+/// Labelled horizontal bar: `LABEL ......... value` over a framed track, with
+/// an instrument ruler under tall (primary) bars.
 fn spawn_bar(commands: &mut Commands, parent: Entity, label: &str, label_color: Color, value: HudText, fill: HudBox, height: f32, color: Color) {
     let block = commands
         .spawn((ChildOf(parent), Node { width: Val::Percent(100.0), flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }))
@@ -549,32 +1107,20 @@ fn spawn_bar(commands: &mut Commands, parent: Entity, label: &str, label_color: 
     commands.spawn((
         ChildOf(block),
         Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::FlexEnd, ..default() },
-        children![text(label, 13.0, label_color), (value, text("", 15.0, COLOR_TEXT))],
+        children![text(label, 12.0, label_color), (value, text("", 15.0, COLOR_TEXT))],
     ));
-    let track = commands
-        .spawn((
-            ChildOf(block),
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Px(height),
-                border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(3.0)),
-                padding: UiRect::all(Val::Px(1.0)),
-                ..default()
-            },
-            BorderColor::all(TRACK_BORDER),
-            BackgroundColor(TRACK_BG),
-        ))
-        .id();
-    commands.spawn((
-        ChildOf(track),
-        fill,
-        Node { width: Val::Percent(100.0), height: Val::Percent(100.0), border_radius: BorderRadius::all(Val::Px(2.0)), ..default() },
-        BackgroundColor(color),
-    ));
+    let track = commands.spawn((ChildOf(block), bar_track(Val::Percent(100.0), height, color, Display::Flex))).id();
+    commands.spawn((ChildOf(track), fill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(color)));
+    if height >= 8.0 {
+        spawn_ticks(commands, track);
+    }
+    if height >= 12.0 {
+        spawn_ruler(commands, block);
+    }
 }
 
-fn spawn_hud(mut commands: Commands) {
+fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
+    let tex = tex.as_deref();
     let root = commands.spawn((DespawnOnExit(AppState::Playing), abs_full())).id();
 
     // Dead Zone: a thin dark-red edge frame + barely-there tint. The real
@@ -616,17 +1162,32 @@ fn spawn_hud(mut commands: Commands) {
     // Top-left: floor + kills / jammers.
     commands.spawn((
         ChildOf(root),
-        panel(Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(14.0),
-            top: Val::Px(12.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(2.0),
-            ..default()
-        }),
+        hud_plate(
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(14.0),
+                top: Val::Px(12.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(2.0),
+                ..default()
+            },
+            HAZARD_YELLOW,
+        ),
         children![
             (HudText::Floor, text("FLOOR 1/5", 20.0, COLOR_TEXT)),
             (HudText::Stats, text("KILLS 0  |  JAMMERS 0", 14.0, COLOR_DIM)),
+            (
+                Node { column_gap: Val::Px(7.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(1.0)), ..default() },
+                children![
+                    (HudText::LoadoutChip, text("STOCK OS", 12.0, COLOR_DIM)),
+                    (
+                        HudBox::LoadoutDot,
+                        Node { display: Display::None, width: Val::Px(5.0), height: Val::Px(5.0), ..default() },
+                        BackgroundColor(COLOR_SIGNAL_AMBER),
+                    ),
+                    (HudText::LoadoutContracts, text("", 12.0, COLOR_SIGNAL_AMBER)),
+                ],
+            ),
         ],
     ));
 
@@ -645,10 +1206,16 @@ fn spawn_hud(mut commands: Commands) {
             },
         ))
         .id();
+    // The status plate sits between two tape rails that only show during the
+    // SOS uplink (DEMON RUSH), when its left rail also flips to alert red.
+    let rush = commands.spawn((ChildOf(top), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, ..default() })).id();
+    let rail = hazard_strip(&mut commands, rush, tex, RUSH_RAIL_HEIGHT, Tape::Danger);
+    commands.entity(rail).insert((HudBox::RushRail, Node { display: Display::None, width: Val::Percent(100.0), height: Val::Px(RUSH_RAIL_HEIGHT), ..default() }));
     let status = commands
         .spawn((
-            ChildOf(top),
-            panel(Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(6.0), ..default() }),
+            ChildOf(rush),
+            HudBox::StatusPlate,
+            hud_plate(Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(6.0), ..default() }, ARC_CYAN),
         ))
         .id();
     commands.spawn((ChildOf(status), HudText::Status, text("SEARCH FOR 5-BAR SIGNAL TOWER", 22.0, COLOR_SIGNAL_AMBER)));
@@ -659,32 +1226,20 @@ fn spawn_hud(mut commands: Commands) {
             Node { display: Display::None, flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(4.0), ..default() },
         ))
         .id();
-    commands.spawn((ChildOf(uplink), HudText::UplinkLabel, text("UPLOADING SOS 0%", 20.0, COLOR_CYAN)));
-    let track = commands
-        .spawn((
-            ChildOf(uplink),
-            Node {
-                width: Val::Px(440.0),
-                height: Val::Px(16.0),
-                border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
-                padding: UiRect::all(Val::Px(2.0)),
-                ..default()
-            },
-            BorderColor::all(Color::srgb(0.3, 0.8, 0.85)),
-            BackgroundColor(TRACK_BG),
-        ))
+    commands.spawn((ChildOf(uplink), HudText::UplinkLabel, text("UPLOADING SOS 0%", 19.0, COLOR_CYAN)));
+    let gauge = commands
+        .spawn((ChildOf(uplink), Node { width: Val::Px(UPLINK_WIDTH), flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }))
         .id();
-    commands.spawn((
-        ChildOf(track),
-        HudBox::UplinkFill,
-        Node { width: Val::Percent(0.0), height: Val::Percent(100.0), border_radius: BorderRadius::all(Val::Px(2.0)), ..default() },
-        BackgroundColor(COLOR_CYAN),
-    ));
+    let track = commands.spawn((ChildOf(gauge), bar_track(Val::Percent(100.0), 16.0, ARC_CYAN, Display::Flex))).id();
+    commands.spawn((ChildOf(track), HudBox::UplinkFill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(COLOR_CYAN)));
+    spawn_ticks(&mut commands, track);
+    spawn_ruler(&mut commands, gauge);
+    let rail = hazard_strip(&mut commands, rush, tex, RUSH_RAIL_HEIGHT, Tape::Danger);
+    commands.entity(rail).insert((HudBox::RushRail, Node { display: Display::None, width: Val::Percent(100.0), height: Val::Px(RUSH_RAIL_HEIGHT), ..default() }));
     commands.spawn((
         ChildOf(top),
         HudBox::AlertPanel,
-        panel(Node { display: Display::None, ..default() }),
+        hud_plate(Node { display: Display::None, ..default() }, PUNK_RED),
         children![(HudText::Alert, text("", 30.0, COLOR_SIGNAL_AMBER))],
     ));
 
@@ -720,7 +1275,7 @@ fn spawn_hud(mut commands: Commands) {
         commands.spawn((
             ChildOf(feed),
             HudBox::ToastChip(i),
-            panel(Node { display: Display::None, padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)), ..default() }),
+            hud_plate(Node { display: Display::None, padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)), ..default() }, STEEL_BORDER),
             children![(HudText::Toast(i), text("", 15.0, COLOR_TEXT))],
         ));
     }
@@ -729,17 +1284,20 @@ fn spawn_hud(mut commands: Commands) {
     let vitals = commands
         .spawn((
             ChildOf(root),
-            panel(Node {
-                position_type: PositionType::Absolute,
-                left: Val::Percent(50.0),
-                bottom: Val::Px(14.0),
-                width: Val::Px(VITALS_WIDTH),
-                margin: UiRect::left(Val::Px(-VITALS_WIDTH / 2.0)),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(5.0),
-                padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
-                ..default()
-            }),
+            hud_plate(
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Percent(50.0),
+                    bottom: Val::Px(14.0),
+                    width: Val::Px(VITALS_WIDTH),
+                    margin: UiRect::left(Val::Px(-VITALS_WIDTH / 2.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(4.0),
+                    padding: UiRect { left: Val::Px(12.0), right: Val::Px(12.0), top: Val::Px(7.0), bottom: Val::Px(8.0) },
+                    ..default()
+                },
+                PUNK_RED,
+            ),
         ))
         .id();
     spawn_bar(&mut commands, vitals, "HP", COLOR_TEXT, HudText::HpValue, HudBox::HpFill, 14.0, COLOR_HP_GREEN);
@@ -769,12 +1327,11 @@ fn spawn_hud(mut commands: Commands) {
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
                 padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
-                border: UiRect::all(Val::Px(2.0)),
-                border_radius: BorderRadius::all(Val::Px(8.0)),
+                border: plate_rect((5.0, 1.0, 1.0, 3.0)),
                 ..default()
             },
-            BorderColor::all(COLOR_SHOTGUN),
-            BackgroundColor(Color::srgba(0.02, 0.03, 0.04, 0.8)),
+            plate_border(COLOR_SHOTGUN, PANEL_EDGE),
+            BackgroundColor(PANEL_BG),
         ))
         .id();
     commands.spawn((
@@ -784,16 +1341,10 @@ fn spawn_hud(mut commands: Commands) {
             (HudText::WeaponName, text("SHOTGUN", 15.0, COLOR_SHOTGUN)),
             (
                 HudBox::OverclockPill,
-                Node {
-                    display: Display::None,
-                    padding: UiRect::axes(Val::Px(6.0), Val::Px(1.0)),
-                    border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(8.0)),
-                    ..default()
-                },
-                BorderColor::all(COLOR_SIGNAL_GREEN),
-                BackgroundColor(Color::srgba(0.05, 0.4, 0.3, 0.55)),
-                children![text("5G OVERCLOCK", 11.0, COLOR_SIGNAL_GREEN)],
+                Node { display: Display::None, padding: UiRect::axes(Val::Px(6.0), Val::Px(1.0)), border: UiRect::bottom(Val::Px(2.0)), ..default() },
+                BorderColor::all(INK_BLACK),
+                BackgroundColor(ACID_GREEN),
+                children![text("5G OVERCLOCK", 11.0, INK_BLACK)],
             ),
         ],
     ));
@@ -813,7 +1364,6 @@ fn spawn_hud(mut commands: Commands) {
                 width: Val::Px(20.0),
                 height: Val::Px(14.0),
                 border: UiRect::top(Val::Px(4.0)),
-                border_radius: BorderRadius::all(Val::Px(3.0)),
                 ..default()
             },
             BorderColor::all(COLOR_BRASS),
@@ -824,32 +1374,16 @@ fn spawn_hud(mut commands: Commands) {
         .spawn((
             ChildOf(card),
             HudBox::PlasmaTrack,
-            Node {
-                display: Display::None,
-                width: Val::Percent(100.0),
-                height: Val::Px(14.0),
-                border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(3.0)),
-                padding: UiRect::all(Val::Px(2.0)),
-                ..default()
-            },
-            BorderColor::all(COLOR_CYAN.with_alpha(0.7)),
-            BackgroundColor(TRACK_BG),
+            bar_track(Val::Percent(100.0), 14.0, COLOR_CYAN, Display::None),
         ))
         .id();
     commands.spawn((
         ChildOf(ptrack),
         HudBox::PlasmaFill,
-        Node { width: Val::Percent(100.0), height: Val::Percent(100.0), border_radius: BorderRadius::all(Val::Px(2.0)), ..default() },
+        Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() },
         BackgroundColor(COLOR_CYAN),
     ));
-    for n in 1..10 {
-        commands.spawn((
-            ChildOf(ptrack),
-            Node { position_type: PositionType::Absolute, left: Val::Percent(n as f32 * 10.0), top: Val::Px(0.0), width: Val::Px(1.0), height: Val::Percent(100.0), ..default() },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
-        ));
-    }
+    spawn_ticks(&mut commands, ptrack);
     let slots = commands.spawn((ChildOf(deck), Node { column_gap: Val::Px(6.0), ..default() })).id();
     for i in 0..2u8 {
         commands.spawn((
@@ -860,11 +1394,10 @@ fn spawn_hud(mut commands: Commands) {
                 flex_basis: Val::Px(0.0),
                 justify_content: JustifyContent::Center,
                 padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
+                border: plate_rect((4.0, 1.0, 1.0, 2.0)),
                 ..default()
             },
-            BorderColor::all(PANEL_BORDER),
+            plate_border(PANEL_EDGE, PANEL_EDGE),
             BackgroundColor(PANEL_BG),
             children![(HudText::Slot(i), text("", 13.0, COLOR_DIM))],
         ));
@@ -879,17 +1412,25 @@ fn update_hud(
     feed: Res<HudFeed>,
     ws: Res<WeaponState>,
     ext: Res<ExtractionState>,
+    loadout: Res<RunLoadout>,
     players: Query<&Player>,
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
 ) {
     let t = time.elapsed_secs();
     let Ok(p) = players.single() else { return };
+    let (chip_tag, contract_tags) = loadout_tag_parts(&loadout);
+    let contract_color = loadout_contract_color(loadout.contract_count());
     let accent = weapon_accent(ws.current);
     let (cur, max) = ammo(p, ws.current);
     for (slot, mut txt, mut col) in &mut texts {
         let (s, c): (String, Color) = match *slot {
             HudText::Floor => (format!("FLOOR {}/{}", run.floor, FINAL_FLOOR), COLOR_TEXT),
             HudText::Stats => (format!("KILLS {}  |  JAMMERS {}", run.kills, run.jammers_destroyed), COLOR_DIM),
+            HudText::LoadoutChip => {
+                let c = if loadout.chip == crate::meta::StarterChip::StockUac { COLOR_DIM } else { COLOR_CYAN.with_alpha(0.9) };
+                (chip_tag.clone(), c)
+            }
+            HudText::LoadoutContracts => (contract_tags.clone().unwrap_or_default(), contract_color),
             HudText::Status => match *ext {
                 ExtractionState::Uploading { .. } => ("DEMON RUSH - HOLD THE SIGNAL".into(), COLOR_SIGNAL_RED),
                 ExtractionState::Extracting { .. } | ExtractionState::Complete => ("ORBITAL EXTRACTION IN PROGRESS".into(), COLOR_CYAN),
@@ -956,6 +1497,21 @@ fn update_hud(
     }
 }
 
+/// HUD contract-tag accent: amber, red at 3+ contracts.
+fn loadout_contract_color(contracts: u32) -> Color {
+    if contracts >= 3 { COLOR_SIGNAL_RED } else { COLOR_SIGNAL_AMBER }
+}
+
+/// Status plate frame: calm cyan rail while searching, a full alert-red frame
+/// while the SOS uplink (DEMON RUSH) is running.
+fn status_plate_border(ext: &ExtractionState) -> BorderColor {
+    if matches!(ext, ExtractionState::Uploading { .. }) {
+        plate_border(PUNK_RED, PUNK_RED.with_alpha(0.55))
+    } else {
+        plate_border(ARC_CYAN, STEEL_BORDER.with_alpha(0.45))
+    }
+}
+
 fn set_display(node: &mut Node, show: bool) {
     let want = if show { Display::Flex } else { Display::None };
     if node.display != want {
@@ -971,6 +1527,7 @@ fn update_hud_boxes(
     feed: Res<HudFeed>,
     ws: Res<WeaponState>,
     mods: Res<PlayerModifiers>,
+    loadout: Res<RunLoadout>,
     players: Query<&Player>,
     mut boxes: Query<(&HudBox, &mut Node, &mut BackgroundColor, Option<&mut BorderColor>)>,
 ) {
@@ -981,11 +1538,13 @@ fn update_hud_boxes(
     let (cur, max) = ammo(p, ws.current);
     let lit = lit_pips(p.ammo_shells, p.max_shells, SHELL_PIPS);
     let stamina = stamina_fill(p.dash_cooldown, DASH_COOLDOWN * mods.dash_cooldown_mult);
-    let toast_alpha = |i: u8| feed.toasts.iter().rev().nth(i as usize).map(|toast| (toast.timer / 0.6).min(1.0));
+    let toast_look = |i: u8| feed.toasts.iter().rev().nth(i as usize).map(|toast| ((toast.timer / 0.6).min(1.0), toast.color));
     for (b, mut node, mut bg, border) in &mut boxes {
-        let set_border = |c: Color| {
-            if let Some(mut bc) = border {
-                *bc = BorderColor::all(c);
+        let set_border = |c: BorderColor| {
+            if let Some(mut bc) = border
+                && *bc != c
+            {
+                *bc = c;
             }
         };
         match *b {
@@ -993,13 +1552,15 @@ fn update_hud_boxes(
             HudBox::DeadZoneFrame => {
                 if signal.in_dead_zone {
                     let strength = if signal.bars == 0 { 1.0 } else { 0.6 };
-                    set_border(Color::srgba(0.55, 0.03, 0.03, strength * (0.4 + 0.2 * (t * 3.0).sin())));
+                    set_border(BorderColor::all(Color::srgba(0.55, 0.03, 0.03, strength * (0.4 + 0.2 * (t * 3.0).sin()))));
                     bg.0 = Color::srgba(0.4, 0.0, 0.0, 0.03 * strength);
                 } else {
-                    set_border(Color::NONE);
+                    set_border(BorderColor::all(Color::NONE));
                     bg.0 = Color::NONE;
                 }
             }
+            HudBox::StatusPlate => set_border(status_plate_border(&ext)),
+            HudBox::RushRail => set_display(&mut node, matches!(*ext, ExtractionState::Uploading { .. })),
             HudBox::UplinkPanel => set_display(&mut node, matches!(*ext, ExtractionState::Uploading { .. })),
             HudBox::UplinkFill => {
                 if let ExtractionState::Uploading { progress, jammed, in_ring, .. } = *ext {
@@ -1014,12 +1575,16 @@ fn update_hud_boxes(
                 }
             }
             HudBox::AlertPanel => set_display(&mut node, feed.alert.is_some()),
+            HudBox::LoadoutDot => {
+                set_display(&mut node, loadout.contract_count() > 0);
+                bg.0 = loadout_contract_color(loadout.contract_count());
+            }
             HudBox::ToastChip(i) => {
-                let a = toast_alpha(i);
-                set_display(&mut node, a.is_some());
-                let a = a.unwrap_or(0.0);
-                bg.0 = PANEL_BG.with_alpha(0.72 * a);
-                set_border(PANEL_BORDER.with_alpha(0.28 * a));
+                let look = toast_look(i);
+                set_display(&mut node, look.is_some());
+                let (a, c) = look.unwrap_or((0.0, Color::NONE));
+                bg.0 = PANEL_BG.with_alpha(0.8 * a);
+                set_border(plate_border(c.with_alpha(a), PANEL_EDGE.with_alpha(0.45 * a)));
             }
             HudBox::HpFill => {
                 let f = fraction(p.hp, p.max_hp);
@@ -1035,28 +1600,37 @@ fn update_hud_boxes(
             HudBox::ShellPip(i) => {
                 let on = i < lit;
                 bg.0 = if on { COLOR_SHELL } else { COLOR_PIP_OFF };
-                set_border(if on { COLOR_BRASS } else { COLOR_PIP_OFF_BORDER });
+                set_border(BorderColor::all(if on { COLOR_BRASS } else { COLOR_PIP_OFF_BORDER }));
             }
             HudBox::PlasmaTrack => set_display(&mut node, !shotgun),
             HudBox::PlasmaFill => {
                 node.width = Val::Percent(fraction(cur as f32, max as f32) * 100.0);
                 bg.0 = COLOR_CYAN.with_alpha(0.8 + 0.2 * (t * 4.0).sin());
             }
-            HudBox::WeaponCard => set_border(accent),
+            HudBox::WeaponCard => set_border(plate_border(accent, PANEL_EDGE)),
             HudBox::SlotChip(i) => {
                 let active = (i == 0) == shotgun;
                 let w = if i == 0 { Weapon::Shotgun } else { Weapon::Plasma };
-                set_border(if active { weapon_accent(w) } else { PANEL_BORDER });
-                bg.0 = if active { weapon_accent(w).with_alpha(0.16) } else { PANEL_BG };
+                set_border(if active { plate_border(weapon_accent(w), weapon_accent(w).with_alpha(0.5)) } else { plate_border(PANEL_EDGE, PANEL_EDGE) });
+                bg.0 = if active { weapon_accent(w).with_alpha(0.18) } else { PANEL_BG };
             }
             HudBox::OverclockPill => set_display(&mut node, overclock_active(signal.bars, mods.overclock_bonus)),
         }
     }
 }
 
+/// Esc or P during play pauses the run and opens the pause overlay.
+fn pause_input(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppState>>) {
+    if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::KeyP) {
+        next.set(AppState::Paused);
+    }
+}
+
 /// F9: debug-complete the current floor (exercises the floor transition flow).
+/// Marks the run as debug-skipped so it cannot award permanent feats or stats.
 fn debug_skip_floor(keys: Res<ButtonInput<KeyCode>>, mut run: ResMut<RunStats>, mut next: ResMut<NextState<AppState>>) {
     if keys.just_pressed(KeyCode::F9) {
+        run.debug_skipped = true;
         complete_floor(&mut run, &mut next);
     }
 }
@@ -1126,6 +1700,82 @@ mod tests {
         assert!(overclock_active(4, 0.25));
         assert!(!overclock_active(3, 0.25));
         assert!(!overclock_active(5, 0.0));
+    }
+
+    #[test]
+    fn menu_shortcuts_per_state() {
+        use MenuAction::*;
+        let k = |s, e, x, l, c| menu_key_action(s, e, x, l, c, false, false);
+        assert_eq!(k(AppState::MainMenu, true, false, false, false), Some(StartRun));
+        assert_eq!(k(AppState::MainMenu, false, false, true, false), Some(OpenLoadout));
+        assert_eq!(k(AppState::MainMenu, false, false, false, true), Some(OpenContractsFeats));
+        assert_eq!(k(AppState::MainMenu, false, true, false, false), None);
+        assert_eq!(menu_key_action(AppState::Paused, false, true, false, false, false, false), Some(Continue));
+        assert_eq!(menu_key_action(AppState::Paused, true, false, false, false, false, false), Some(Continue));
+        assert_eq!(menu_key_action(AppState::Paused, false, false, false, false, true, false), Some(RestartRun));
+        assert_eq!(menu_key_action(AppState::Paused, false, false, true, false, false, false), Some(OpenLoadout));
+        assert_eq!(menu_key_action(AppState::Paused, false, false, false, false, false, true), Some(BackToMenu));
+        assert_eq!(k(AppState::Loadout, true, false, false, false), Some(StartRun));
+        assert_eq!(k(AppState::Loadout, false, true, false, false), Some(BackToMenu));
+        assert_eq!(k(AppState::Loadout, false, false, false, true), Some(OpenContractsFeats));
+        assert_eq!(k(AppState::Loadout, false, false, true, false), None);
+        assert_eq!(k(AppState::ContractsFeats, false, false, true, false), Some(OpenLoadout));
+        assert_eq!(k(AppState::ContractsFeats, false, true, false, false), Some(BackToMenu));
+        assert_eq!(k(AppState::GameOver, true, false, false, false), Some(BackToMenu));
+        assert_eq!(k(AppState::Victory, false, false, true, false), Some(OpenLoadout));
+        assert_eq!(k(AppState::Victory, false, false, false, true), None);
+        assert_eq!(k(AppState::Playing, true, true, true, true), None);
+        assert_eq!(k(AppState::UpgradeSelect, true, false, true, true), None);
+        assert_eq!(loadout_contract_color(1), COLOR_SIGNAL_AMBER);
+        assert_eq!(loadout_contract_color(4), COLOR_SIGNAL_RED);
+    }
+
+    #[test]
+    fn end_screens_keep_separate_palettes() {
+        let (dead, live) = (no_service_look(), full_signal_look());
+        // NO SERVICE is crimson with dead bars; FULL SIGNAL phosphor with all 5.
+        assert_eq!((dead.bars, live.bars), (0, 5));
+        assert_eq!((dead.tape, live.tape), (Tape::Danger, Tape::Signal));
+        let red_over_green = |c: Color| {
+            let c = c.to_srgba();
+            c.red - c.green
+        };
+        for c in [dead.title_color, dead.accent, dead.backdrop, dead.bg, dead.title_slab, dead.band.1] {
+            assert!(red_over_green(c) > 0.0, "NO SERVICE carries no green: {c:?}");
+        }
+        for c in [live.title_color, live.accent, live.backdrop, live.bg, live.title_slab, live.band.0, live.band.1] {
+            assert!(red_over_green(c) < 0.0, "FULL SIGNAL carries no red: {c:?}");
+        }
+        // Only the win gets the lit hero switch; the loss stays unlit.
+        assert_eq!(live.buttons[0].2, ButtonStyle::HeroAcid);
+        assert!(dead.buttons.iter().all(|b| !matches!(b.2, ButtonStyle::HeroAcid | ButtonStyle::PrimaryAcid)));
+        // Same actions on both: ENTER -> menu, L -> loadout.
+        for look in [&dead, &live] {
+            assert_eq!(look.buttons.map(|b| b.1), [MenuAction::BackToMenu, MenuAction::OpenLoadout]);
+        }
+        assert_ne!(dead.link, live.link);
+    }
+
+    #[test]
+    fn slot_labels_hero_font_and_rush_frame() {
+        assert_eq!([slot_label(0), slot_label(1), slot_label(2)], ["SLOT 01", "SLOT 02", "SLOT 03"]);
+        // The hero switch is set larger than the secondary switches of its row.
+        assert_eq!(button_font(ButtonStyle::HazardAmber, 20.0), 20.0);
+        assert_eq!(button_font(ButtonStyle::HeroAcid, 20.0), 30.0);
+        // DEMON RUSH: the status plate's rail and edges go alert red.
+        let calm = status_plate_border(&ExtractionState::Searching { hold: 0.0 });
+        let rush = status_plate_border(&ExtractionState::Uploading {
+            progress: 0.4,
+            duration: 28.0,
+            in_ring: true,
+            jammed: false,
+            wave_timer: 0.5,
+            baron_spawned: false,
+        });
+        assert_eq!((calm.left, rush.left), (ARC_CYAN, PUNK_RED));
+        assert_ne!(calm.top, rush.top);
+        // Every control row of the field manual has a category and keys.
+        assert!(CONTROLS.iter().all(|(cat, binds)| !cat.is_empty() && binds.iter().all(|(keys, what)| !keys.is_empty() && what.is_ascii())));
     }
 
     #[test]

@@ -8,16 +8,17 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
 - **Live Diegetic 3D Phone OLED Screen:** Signal bars, dBm readout, oscilloscope waveform, directional tower radar, `[RMB] PING` & `[Q] 5G EMP` app status tiles, SOS progress, and Dead-Zone static snow rendered directly on the left-hand smartphone.
 - **Dual-Wield Boomer Shooter Combat:** Mars Pump Shotgun (hitscan pellets + shell ejection) & UAC Plasma Repeater (3D energy bolts), plus signal-powered Phone Apps (**Ping Scan**, **5G Overload EMP**, **Airplane Mode Dash**).
 - **4 Classic Doom-Inspired Demons:** Static Imps (electric-violet Dead-Zone enrage), floating Dead-Zone Cacodemons, mobile **Jammer Fiends** (project a live Dead Zone and stall SOS uplinks), and the **Hell Baron**.
-- **Roguelike Extraction Loop:** Procedural 3D bunkers with ramps, catwalks, lava trenches, open-roof crimson atrium, SOS countdown rush, orbital extraction beam, and 10 randomized App Store upgrades.
+- **Roguelike Extraction Loop & Meta-Progression:** Procedural 3D bunkers with ramps, catwalks, lava trenches, open-roof crimson atrium, SOS countdown rush, orbital extraction beam, **15 App Store upgrades** (10 core + 5 feat-licensed signature apps curated into a **10-card active catalog**), **4 Starter Phone OS Chips**, **4 stackable Carrier Contracts**, **4 3D Handset Skins**, and **10 Feats** persisted to JSON (plus a non-destructive **Jam Demo: Unlock All** toggle).
 - **100% Procedural Retro Assets & Audio:** Nearest-neighbor 64×64 textures, sculpted 3D meshes, and pure-Rust procedural PCM WAV synth SFX (`--features audio`).
 
 ## Controls
-- `WASD` — Move | `Mouse` — Look (`Click` capture, `Esc` release)
+- `WASD` — Move | `Mouse` — Look (`Click` capture, `Esc` / `P` pause menu)
 - `Space` — Jump | `Shift` — Airplane Mode Dash
 - `LMB` — Fire | `1` / `2` / `Tab` / `Wheel` — Switch Shotgun / Plasma Repeater
 - `RMB` — **Ping Scan** (1+ bar) | `Q` — **5G Overload EMP** (3+ bars)
 - `E` — Trigger SOS Uplink at the 5-bar Signal Tower
 - `1` / `2` / `3` or Click — Draft firmware upgrade in the App Store
+- Menus: `Enter` — Play / Deploy / Resume | `L` — Loadout | `C` — Contracts & Feats | `Esc` — Back / Pause (`R` restart, `M` main menu while paused)
 
 ## Build & Run
 ```bash
@@ -35,6 +36,11 @@ cargo test
 
 # Full test suite + live rendered autonomous playtest bot (under xvfb-run)
 ./scripts/playtest.sh
+```
+
+Meta-progression screenshot tour (in-memory showcase profile, never touches your saved profile):
+```bash
+xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_META_SHOTS=$HOME/scratch/meta-shots cargo run
 ```
 
 See [DESIGN.md](DESIGN.md) for the full game design and architecture notes.

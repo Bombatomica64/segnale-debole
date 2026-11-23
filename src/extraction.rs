@@ -90,6 +90,19 @@ pub fn wave_interval(floor: u32) -> std::ops::Range<f32> {
     (5.0 - tighten)..(6.5 - tighten)
 }
 
+/// [`wave_interval`] scaled by the Overtime Uplink contract (< 1 = faster waves).
+pub fn scaled_wave_interval(floor: u32, mult: f32) -> std::ops::Range<f32> {
+    let r = wave_interval(floor);
+    let m = mult.max(0.05);
+    (r.start * m)..(r.end * m)
+}
+
+/// Jammer Fiend odds in a Demon Rush wave: `(max living fiends, roll chance)`.
+/// Priority Jamming raises both.
+pub fn rush_fiend_odds(priority_jamming: bool) -> (usize, f32) {
+    if priority_jamming { (3, 0.45) } else { (2, 0.3) }
+}
+
 /// Seconds between X-ray beacons on a jamming Jammer Fiend.
 pub const FIEND_BEACON_SECS: f32 = 1.1;
 
@@ -116,9 +129,14 @@ pub fn ring_supply_cells(grid: &LevelGrid) -> Vec<IVec2> {
 
 impl ExtractionState {
     pub fn start_upload(floor: u32) -> Self {
+        Self::start_upload_scaled(floor, 1.0)
+    }
+
+    /// Start the uplink with its duration scaled (Overtime Uplink contract).
+    pub fn start_upload_scaled(floor: u32, duration_mult: f32) -> Self {
         ExtractionState::Uploading {
             progress: 0.0,
-            duration: upload_duration(floor),
+            duration: upload_duration(floor) * duration_mult.max(0.05),
             in_ring: true,
             jammed: false,
             wave_timer: 2.5,
@@ -258,8 +276,19 @@ fn update_extraction(
             *hold = if by_mast { *hold + dt } else { 0.0 };
             let pressed = (keys.just_pressed(KeyCode::KeyE) || take_flag(&mut bot, |b| &mut b.interact)) && signal.near_tower;
             if pressed || *hold >= UPLINK_HOLD_SECS {
-                *state = ExtractionState::start_upload(run.floor);
+                *state = ExtractionState::start_upload_scaled(run.floor, mods.upload_duration_mult);
                 rush.0 = rush_cells(&grid);
+                // Priority Jamming: a Jammer Fiend crashes the uplink immediately.
+                if mods.priority_jamming {
+                    let far: Vec<IVec2> = rush.0.iter().copied().filter(|c| grid.cell_center(*c).distance(ppos) > 11.0).collect();
+                    let pool = if far.is_empty() { &rush.0 } else { &far };
+                    if let Some(&c) = pool.choose(&mut rng) {
+                        let pos = spawn_pos_for(EnemyKind::JammerFiend, &grid, c);
+                        spawn_enemy(&mut commands, &ea, &mut materials, EnemyKind::JammerFiend, pos, run.floor, true);
+                        spawn_burst(&mut commands, &fx, pos + Vec3::Y, BurstColor::Green, 12, 5.0, 0.15);
+                        feed.toast("PRIORITY JAMMING: JAMMER FIEND INBOUND", Color::srgb(0.4, 1.0, 0.25));
+                    }
+                }
                 sfx.play(SfxEvent::UplinkStart);
                 feed.alert("SOS UPLINK ONLINE - HOLD THE SIGNAL RING", Color::srgb(0.3, 1.0, 0.85), 3.0);
                 // Tactical supply drops on the ring perimeter: kiting the tower pays.
@@ -327,7 +356,7 @@ fn update_extraction(
             }
             let spawn_wave = *wave_timer <= 0.0;
             if spawn_wave {
-                *wave_timer = rng.random_range(wave_interval(run.floor));
+                *wave_timer = rng.random_range(scaled_wave_interval(run.floor, mods.wave_interval_mult));
             }
             let floor = run.floor;
             let p_eye = ppos + Vec3::Y * PLAYER_EYE_HEIGHT;
@@ -344,10 +373,11 @@ fn update_extraction(
             };
             if spawn_wave && alive < rush_cap(floor) {
                 let living_fiends = fiends.len();
+                let (fiend_cap, fiend_chance) = rush_fiend_odds(mods.priority_jamming);
                 let n = (2 + floor as usize / 2).min(rush_cap(floor) - alive);
                 for i in 0..n {
                     let roll: f32 = rng.random();
-                    let kind = if i == 0 && living_fiends < 2 && roll < 0.3 {
+                    let kind = if i == 0 && living_fiends < fiend_cap && roll < fiend_chance {
                         EnemyKind::JammerFiend
                     } else if roll < 0.62 {
                         EnemyKind::Imp
@@ -400,6 +430,7 @@ fn update_extraction(
             *timer -= dt;
             if *timer <= 0.0 {
                 *state = ExtractionState::Complete;
+                run.sos_completed += 1;
                 complete_floor(&mut run, &mut next);
             }
         }
@@ -475,6 +506,24 @@ mod tests {
         assert_eq!(upload_rate(false, false), OUTSIDE_RING_RATE);
         assert_eq!(upload_rate(true, true), 0.0);
         assert_eq!(upload_rate(false, true), 0.0);
+    }
+
+    #[test]
+    fn overtime_uplink_and_priority_jamming_scale_the_sos() {
+        let s = ExtractionState::start_upload_scaled(1, 1.35);
+        assert!(matches!(s, ExtractionState::Uploading { duration, .. } if (duration - 32.4).abs() < 1e-4));
+        assert_eq!(ExtractionState::start_upload_scaled(3, 1.0), ExtractionState::start_upload(3));
+        let fast = scaled_wave_interval(1, 0.8);
+        assert!((fast.start - 4.0).abs() < 1e-5 && (fast.end - 5.2).abs() < 1e-5);
+        assert_eq!(scaled_wave_interval(2, 1.0), wave_interval(2));
+        assert_eq!(rush_fiend_odds(false), (2, 0.3));
+        assert_eq!(rush_fiend_odds(true), (3, 0.45));
+        // Overtime: the same in-ring time covers less of the uplink.
+        let mut a = ExtractionState::start_upload(1);
+        let mut b = ExtractionState::start_upload_scaled(1, 1.35);
+        a.advance_upload(12.0, true, false);
+        b.advance_upload(12.0, true, false);
+        assert!(b.progress().unwrap() < a.progress().unwrap());
     }
 
     #[test]

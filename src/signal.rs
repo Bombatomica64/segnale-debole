@@ -1,7 +1,10 @@
 //! Real-time cell-signal field: distance to the Extraction Tower, wall
-//! attenuation, Demon Jammer suppression and upgrade modifiers.
+//! attenuation, Demon Jammer suppression, upgrade/contract modifiers and
+//! temporary boosts (Signal Spoofer, Jammer Hijack hotspots).
 
 use bevy::prelude::*;
+
+use crate::apps::{HijackedHotspot, PhoneApps, HIJACK_STRENGTH, SPOOF_STRENGTH};
 
 use crate::enemies::{fiend_jammer_fields, Enemy};
 use crate::level::{DemonJammer, LevelGrid, SignalTower};
@@ -23,6 +26,14 @@ pub const DBM_MAX: i32 = -55;
 /// A jammer's suppression field as seen by the solver.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JammerField {
+    pub pos: Vec3,
+    pub radius: f32,
+    pub strength: f32,
+}
+
+/// A Jammer Hijack hotspot as seen by the solver.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HotspotField {
     pub pos: Vec3,
     pub radius: f32,
     pub strength: f32,
@@ -57,6 +68,10 @@ pub struct SignalState {
     pub tower_distance: f32,
     pub nearest_jammer_dist: Option<f32>,
     pub wall_occlusions: u32,
+    /// Signal Spoofer is lifting the effective signal to 4 bars.
+    pub spoofed: bool,
+    /// Standing in a Jammer Hijack hotspot lifted the effective signal.
+    pub hotspot_boosted: bool,
 }
 
 impl Default for SignalState {
@@ -72,6 +87,8 @@ impl Default for SignalState {
             tower_distance: f32::INFINITY,
             nearest_jammer_dist: None,
             wall_occlusions: 0,
+            spoofed: false,
+            hotspot_boosted: false,
         }
     }
 }
@@ -106,6 +123,15 @@ pub fn dbm_from_strength(raw: f32) -> i32 {
     (DBM_MIN as f32 + (DBM_MAX - DBM_MIN) as f32 * t).round() as i32
 }
 
+/// Signal multiplier for crossing `walls` wall cells: penetration ignores a
+/// fraction of each wall, `wall_attenuation_exp` (Roaming Charges) raises the
+/// per-wall loss factor to a power (> 1 = more loss per wall).
+pub fn wall_factor(walls: u32, modifiers: &PlayerModifiers) -> f32 {
+    let pen = modifiers.wall_penetration.clamp(0.0, 1.0);
+    let effective_walls = walls as f32 * (1.0 - pen);
+    WALL_ATTENUATION.powf(effective_walls * modifiers.wall_attenuation_exp.max(0.0))
+}
+
 /// Pure signal solver, reusable for enemies (Dead-Zone enrage) and tests.
 pub fn compute_signal_at(
     pos: Vec3,
@@ -118,15 +144,56 @@ pub fn compute_signal_at(
     let near_tower = dist <= TOWER_RING_RADIUS;
     let mut raw = distance_strength(dist);
     if !near_tower {
-        let pen = modifiers.wall_penetration.clamp(0.0, 1.0);
-        let effective_walls = wall_occlusions as f32 * (1.0 - pen);
-        raw *= WALL_ATTENUATION.powf(effective_walls);
+        raw *= wall_factor(wall_occlusions, modifiers);
     }
-    raw -= jammer_suppression(pos, jammers);
+    if (modifiers.jammer_radius_mult - 1.0).abs() > f32::EPSILON {
+        let scaled: Vec<JammerField> = jammers.iter().map(|j| JammerField { radius: j.radius * modifiers.jammer_radius_mult, ..*j }).collect();
+        raw -= jammer_suppression(pos, &scaled);
+    } else {
+        raw -= jammer_suppression(pos, jammers);
+    }
     let natural = raw.clamp(0.0, MAX_BARS);
     raw = raw.max(modifiers.min_signal_floor).clamp(0.0, MAX_BARS);
     let bars = bars_from_strength(raw);
     SignalReading { raw_strength: raw, natural_raw_strength: natural, bars, dbm: dbm_from_strength(raw), in_dead_zone: bars <= 1, near_tower }
+}
+
+/// Strongest Jammer Hijack hotspot covering `pos` (0 when outside all of
+/// them). Coverage is horizontal, with a generous vertical tolerance.
+pub fn hotspot_boost(pos: Vec3, hotspots: &[HotspotField]) -> f32 {
+    hotspots
+        .iter()
+        .filter(|h| Vec2::new(pos.x - h.pos.x, pos.z - h.pos.z).length() <= h.radius && (pos.y - h.pos.y).abs() <= 4.0)
+        .map(|h| h.strength)
+        .fold(0.0, f32::max)
+}
+
+/// Lift the effective signal to at least `floor` bars (Spoofer / hotspot),
+/// keeping `natural_raw_strength` untouched (Store & Forward blackouts).
+pub fn boost_reading(mut r: SignalReading, floor: f32) -> SignalReading {
+    if floor > r.raw_strength {
+        r.raw_strength = floor.min(MAX_BARS);
+        r.bars = bars_from_strength(r.raw_strength);
+        r.dbm = dbm_from_strength(r.raw_strength);
+        r.in_dead_zone = r.bars <= 1;
+    }
+    r
+}
+
+/// [`compute_signal_at`] plus the temporary boosts: Jammer Hijack hotspots and
+/// an active Signal Spoofer (4 bars).
+pub fn compute_signal_with_boosts(
+    pos: Vec3,
+    tower_pos: Vec3,
+    jammers: &[JammerField],
+    wall_occlusions: u32,
+    modifiers: &PlayerModifiers,
+    hotspots: &[HotspotField],
+    spoofed: bool,
+) -> SignalReading {
+    let r = compute_signal_at(pos, tower_pos, jammers, wall_occlusions, modifiers);
+    let r = boost_reading(r, hotspot_boost(pos, hotspots));
+    if spoofed { boost_reading(r, SPOOF_STRENGTH) } else { r }
 }
 
 /// 5G Overclock fire-rate multiplier (only at >= 4 bars).
@@ -167,14 +234,17 @@ impl Plugin for SignalPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_signal(
     grid: Option<Res<LevelGrid>>,
     modifiers: Res<PlayerModifiers>,
+    apps: Option<Res<PhoneApps>>,
     mut state: ResMut<SignalState>,
     player: Query<&Transform, With<Player>>,
     tower: Query<&SignalTower>,
     jammers: Query<(&DemonJammer, &GlobalTransform)>,
     fiends: Query<(&Enemy, &GlobalTransform)>,
+    hotspots: Query<(&HijackedHotspot, &Transform)>,
 ) {
     let (Some(grid), Ok(ptf), Ok(tower)) = (grid, player.single(), tower.single()) else {
         return;
@@ -184,7 +254,13 @@ fn update_signal(
     // Jammer Fiends carry a mobile Dead Zone.
     fields.extend(fiend_jammer_fields(fiends.iter()));
     let walls = count_wall_occlusions(&grid, head, tower.beacon);
-    let r = compute_signal_at(head, grid.tower_world() + Vec3::Y * 1.5, &fields, walls, &modifiers);
+    let tower_pos = grid.tower_world() + Vec3::Y * 1.5;
+    let base = compute_signal_at(head, tower_pos, &fields, walls, &modifiers);
+    let spots: Vec<HotspotField> =
+        hotspots.iter().map(|(h, tf)| HotspotField { pos: tf.translation, radius: h.radius, strength: HIJACK_STRENGTH }).collect();
+    let spoofed = apps.is_some_and(|a| a.spoof_active());
+    let boosted = boost_reading(base, hotspot_boost(head, &spots));
+    let r = if spoofed { boost_reading(boosted, SPOOF_STRENGTH) } else { boosted };
     let forward = ptf.rotation * Vec3::NEG_Z;
     *state = SignalState {
         raw_strength: r.raw_strength,
@@ -197,6 +273,8 @@ fn update_signal(
         tower_distance: head.distance(grid.tower_world()),
         nearest_jammer_dist: fields.iter().map(|f| f.pos.distance(head)).reduce(f32::min),
         wall_occlusions: walls,
+        spoofed,
+        hotspot_boosted: boosted.raw_strength > base.raw_strength,
     };
 }
 
@@ -282,6 +360,49 @@ mod tests {
         assert_eq!(r.natural_raw_strength, 0.0);
         assert_eq!(bars_from_strength(r.natural_raw_strength), 0);
         assert_eq!(base.natural_raw_strength, base.raw_strength);
+    }
+
+    #[test]
+    fn roaming_charges_harshen_walls_and_jammers() {
+        let tower = Vec3::ZERO;
+        let p = Vec3::new(30.0, 0.0, 0.0);
+        let roam = PlayerModifiers { wall_attenuation_exp: 1.2, jammer_radius_mult: 1.3, ..m() };
+        let walled = compute_signal_at(p, tower, &[], 4, &m());
+        let harsh = compute_signal_at(p, tower, &[], 4, &roam);
+        assert!(harsh.raw_strength < walled.raw_strength, "walls drop more signal");
+        assert!((wall_factor(1, &roam) - WALL_ATTENUATION.powf(1.2)).abs() < 1e-6);
+        assert_eq!(wall_factor(0, &roam), 1.0);
+        // Jammer just outside its normal radius now reaches the player.
+        let jam = JammerField { pos: p + Vec3::new(12.0, 0.0, 0.0), radius: 10.0, strength: 3.0 };
+        let clean = compute_signal_at(p, tower, &[jam], 0, &m());
+        assert_eq!(clean, compute_signal_at(p, tower, &[], 0, &m()));
+        let reached = compute_signal_at(p, tower, &[jam], 0, &PlayerModifiers { jammer_radius_mult: 1.3, ..m() });
+        assert!(reached.raw_strength < clean.raw_strength);
+    }
+
+    #[test]
+    fn hotspots_and_spoof_boost_effective_signal_only() {
+        let tower = Vec3::ZERO;
+        let p = Vec3::new(200.0, 1.6, 0.0);
+        let jam = JammerField { pos: p, radius: 10.0, strength: 5.0 };
+        let dead = compute_signal_at(p, tower, &[jam], 12, &m());
+        assert_eq!(dead.bars, 0);
+        let spot = HotspotField { pos: Vec3::new(205.0, 0.0, 0.0), radius: 12.0, strength: 5.0 };
+        assert_eq!(hotspot_boost(p, &[spot]), 5.0);
+        assert_eq!(hotspot_boost(p + Vec3::new(30.0, 0.0, 0.0), &[spot]), 0.0, "outside the radius");
+        let hot = compute_signal_with_boosts(p, tower, &[jam], 12, &m(), &[spot], false);
+        assert_eq!(hot.bars, 5);
+        assert!(!hot.in_dead_zone);
+        assert_eq!(hot.dbm, DBM_MAX);
+        assert_eq!(hot.natural_raw_strength, 0.0, "natural signal still reads blackout");
+        let spoof = compute_signal_with_boosts(p, tower, &[jam], 12, &m(), &[], true);
+        assert_eq!(spoof.bars, 4);
+        assert!(!spoof.in_dead_zone);
+        assert_eq!(spoof.natural_raw_strength, 0.0);
+        // Boosts never lower a stronger signal.
+        let near = compute_signal_with_boosts(Vec3::new(3.0, 0.0, 0.0), tower, &[], 0, &m(), &[], true);
+        assert_eq!(near.bars, 5);
+        assert_eq!(compute_signal_with_boosts(p, tower, &[jam], 12, &m(), &[], false), dead);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use rand::seq::SliceRandom;
 
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::fx::{spawn_burst, BurstColor, FxAssets, HudFeed};
+use crate::apps::spawn_hijack_hotspot;
 use crate::level::{Cell, DemonJammer, LevelEntity, LevelGrid, RampDir, SignalTower, CEILING_HEIGHT};
 use crate::physics::{count_wall_occlusions, has_line_of_sight, raycast_grid, resolve_player_movement, sample_floor_height, PLAYER_RADIUS};
 use crate::player::{Player, PLAYER_EYE_HEIGHT};
@@ -241,6 +242,12 @@ pub fn damage_enemy(enemy: &mut Enemy, base: f32, marked: bool, mods: &PlayerMod
     enemy.hit_flash = HIT_FLASH_SECS;
     enemy.alerted = true;
     dmg
+}
+
+/// Multiplier on demon damage dealt to the player: Faraday Case shields the
+/// player while in a 0-1 bar Dead Zone.
+pub fn incoming_damage_scale(player_in_dead_zone: bool, mods: &PlayerModifiers) -> f32 {
+    if player_in_dead_zone { mods.dead_zone_damage_mult } else { 1.0 }
 }
 
 /// Static Enrage rule: Imps inside a Dead Zone (0-1 bars at their position).
@@ -826,11 +833,12 @@ fn enemy_ai(
     jammers: Query<(&DemonJammer, &GlobalTransform)>,
     tower: Query<&SignalTower>,
     decoys: Query<&GlobalTransform, (With<DecoyHandset>, Without<Enemy>)>,
-    freeze: Option<Res<crate::dev::DevFreezeAi>>,
+    (freeze, signal, mods): (Option<Res<crate::dev::DevFreezeAi>>, Res<SignalState>, Res<PlayerModifiers>),
 ) {
     if freeze.is_some() {
         return;
     }
+    let incoming = incoming_damage_scale(signal.in_dead_zone, &mods);
     let Ok((ptf, mut player)) = players.single_mut() else { return };
     let dt = time.delta_secs().min(1.0 / 20.0);
     let ppos = ptf.translation;
@@ -1006,7 +1014,7 @@ fn enemy_ai(
         if dist < melee_reach && (to_p.y).abs() < 2.5 && e.melee_timer <= 0.0 {
             e.melee_timer = if e.kind == EnemyKind::HellBaron { 1.4 } else { 1.0 };
             let hurt = player.invuln_timer <= 0.0;
-            player.apply_damage(e.stats.melee_damage * if e.enraged { 1.3 } else { 1.0 });
+            player.apply_damage(e.stats.melee_damage * if e.enraged { 1.3 } else { 1.0 } * incoming);
             if hurt {
                 sfx.play(SfxEvent::Hurt);
             }
@@ -1120,7 +1128,9 @@ fn move_enemy_projectiles(
     mut sfx: ResMut<SfxQueue>,
     mut players: Query<(&Transform, &mut Player)>,
     mut q: Query<(Entity, &mut EnemyProjectile, &mut Transform), Without<Player>>,
+    (signal, mods): (Res<SignalState>, Res<PlayerModifiers>),
 ) {
+    let incoming = incoming_damage_scale(signal.in_dead_zone, &mods);
     let Ok((ptf, mut player)) = players.single_mut() else { return };
     let dt = time.delta_secs().min(1.0 / 20.0);
     let pfeet = ptf.translation;
@@ -1133,7 +1143,7 @@ fn move_enemy_projectiles(
         let hit_player = [0.3f32, 0.9, 1.5].iter().any(|h| segment_point_distance(from, to, pfeet + Vec3::Y * *h) < p.radius + PLAYER_RADIUS);
         if hit_player {
             let hurt = player.invuln_timer <= 0.0;
-            player.apply_damage(p.damage);
+            player.apply_damage(p.damage * incoming);
             if hurt {
                 sfx.play(SfxEvent::Hurt);
             }
@@ -1269,6 +1279,7 @@ fn enemy_deaths(
     mut apps: ResMut<PhoneApps>,
     mut players: Query<&mut Player>,
     enemies: Query<(Entity, &Enemy, &Transform, Option<&PingMarked>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let mut rng = rand::rng();
     for (entity, e, tf, marked) in &enemies {
@@ -1292,6 +1303,17 @@ fn enemy_deaths(
         }
         feed.hit(true);
         feed.toast(format!("+ {} DOWN", e.kind.name()), Color::srgb(1.0, 0.55, 0.35));
+        // Feat telemetry: natural 0-bar blackout kills and Jammer Fiend kills.
+        if signal.natural_raw_strength < 1.0 {
+            run.blackout_kills += 1;
+        }
+        if e.kind == EnemyKind::JammerFiend {
+            run.fiends_killed += 1;
+            if mods.jammer_hijack {
+                let foot = tf.translation.with_y(tf.translation.y - if e.kind.flying() { 2.0 } else { 0.0 });
+                spawn_hijack_hotspot(&mut commands, &fx, &mut materials, &mut feed, foot);
+            }
+        }
         if mods.siphon_heal > 0.0
             && signal.bars >= 3
             && let Ok(mut p) = players.single_mut()
@@ -1390,6 +1412,14 @@ mod tests {
         assert!(e.alerted && e.hit_flash > 0.0);
         e.hp = 0.0;
         assert_eq!(damage_enemy(&mut e, 20.0, false, &mods), 0.0);
+    }
+
+    #[test]
+    fn faraday_case_scales_dead_zone_damage_only() {
+        let faraday = PlayerModifiers { dead_zone_damage_mult: 0.75, ..default() };
+        assert_eq!(incoming_damage_scale(true, &faraday), 0.75);
+        assert_eq!(incoming_damage_scale(false, &faraday), 1.0);
+        assert_eq!(incoming_damage_scale(true, &PlayerModifiers::default()), 1.0);
     }
 
     #[test]
