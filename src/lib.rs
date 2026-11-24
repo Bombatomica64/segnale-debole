@@ -20,6 +20,7 @@ pub mod phone_screen;
 pub mod physics;
 pub mod player;
 pub mod playtest_bot;
+pub mod raytracing;
 pub mod signal;
 pub mod state;
 pub mod upgrades;
@@ -42,6 +43,8 @@ impl Plugin for CoreGameplayPlugin {
                 brightness: 90.0,
                 ..default()
             })
+            // Before PerfPlugin: its finish() reads RaytracingActive.
+            .add_plugins(raytracing::RaytracingPlugin)
             .add_plugins((
                 state::StatePlugin,
                 assets_gen::AssetsGenPlugin,

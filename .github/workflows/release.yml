@@ -11,21 +11,30 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.archive }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.variant.prefix }}-${{ matrix.target.suffix }}
+    runs-on: ${{ matrix.target.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        target:
           - os: ubuntu-latest
-            archive: segnale-debole-linux-x86_64.tar.gz
+            suffix: linux-x86_64.tar.gz
             exe: ""
           - os: windows-latest
-            archive: segnale-debole-windows-x86_64.zip
+            suffix: windows-x86_64.zip
             exe: ".exe"
           - os: macos-latest
-            archive: segnale-debole-macos-aarch64.tar.gz
+            suffix: macos-aarch64.tar.gz
             exe: ""
+        # Standard raster build + GPU ray-traced lighting build (Bevy Solari;
+        # falls back to raster at runtime on GPUs without ray queries).
+        variant:
+          - prefix: segnale-debole
+            features: audio
+          - prefix: segnale-debole-raytracing
+            features: audio,raytracing
+    env:
+      ARCHIVE: ${{ matrix.variant.prefix }}-${{ matrix.target.suffix }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,32 +49,32 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.os }}
+          key: release-${{ matrix.target.os }}-${{ matrix.variant.prefix }}
 
-      - name: Build release binary (with procedural audio)
-        run: cargo build --release --features audio
+      - name: Build release binary (features ${{ matrix.variant.features }})
+        run: cargo build --release --features ${{ matrix.variant.features }}
 
       - name: Stage package
         shell: bash
         run: |
           mkdir -p dist/segnale-debole
-          cp "target/release/${BIN}${{ matrix.exe }}" dist/segnale-debole/
+          cp "target/release/${BIN}${{ matrix.target.exe }}" dist/segnale-debole/
           cp README.md dist/segnale-debole/
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
         shell: bash
-        run: tar -C dist -czf "${{ matrix.archive }}" segnale-debole
+        run: tar -C dist -czf "$ARCHIVE" segnale-debole
 
       - name: Package (zip)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path dist/segnale-debole -DestinationPath "${{ matrix.archive }}"
+        run: Compress-Archive -Path dist/segnale-debole -DestinationPath "$env:ARCHIVE"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
   publish:

@@ -169,7 +169,9 @@ impl Plugin for PerfPlugin {
             .get_resource::<RenderAdapter>()
             .map(adapter_supports_msaa_2x)
             .unwrap_or(true);
-        let chosen = select_msaa(supports_2x, env_override.as_deref());
+        let rt = app.world().get_resource::<crate::raytracing::RaytracingActive>().is_some_and(|r| r.0);
+        // Solari's deferred G-buffer needs single-sample targets on every camera.
+        let chosen = if rt { Msaa::Off } else { select_msaa(supports_2x, env_override.as_deref()) };
         if app.world().contains_resource::<RenderAdapter>() {
             info!("perf: MSAA selected {:?} (adapter 2x support: {})", chosen, supports_2x);
         }

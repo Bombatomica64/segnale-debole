@@ -42,7 +42,20 @@ cargo run --features audio
 
 # Optimized build
 cargo build --release --features audio
+
+# GPU ray-traced lighting (Bevy Solari): hardware ray queries, ReSTIR GI,
+# emissive lamps / lava / plasma as real area lights with ray-traced shadows
+cargo run --release --features raytracing
 ```
+
+Each GitHub release ships two archives per OS: `segnale-debole-*` (standard) and `segnale-debole-raytracing-*` (this feature on).
+
+Ray tracing needs a GPU with ray-query support on Vulkan or DX12 (NVIDIA RTX, AMD RDNA2+, Intel Arc). On other GPUs the game logs a warning and falls back to raster lighting. Runtime switches:
+- `SEGNALE_RT=off` disables it in a `raytracing` build.
+- `SEGNALE_RT_LAMP=<gain>` (default `30`) sets ceiling-lamp emission.
+- `SEGNALE_RT_SKY=<nits>` (default `4`) sets sky brightness through the atrium roof.
+
+With ray tracing, world point lights and distance fog are off: Solari lights only from the sun and emissive meshes. MSAA is forced off. Expect some grain, because ReSTIR is the only denoising.
 
 Linux build dependencies: `libasound2-dev pkg-config libx11-dev libwayland-dev libxkbcommon-dev`.
 
