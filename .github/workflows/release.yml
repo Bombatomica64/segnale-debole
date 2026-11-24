@@ -16,15 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux-only native builds for now (Windows/macOS disabled to save CI time).
         target:
           - os: ubuntu-latest
             suffix: linux-x86_64.tar.gz
-            exe: ""
-          - os: windows-latest
-            suffix: windows-x86_64.zip
-            exe: ".exe"
-          - os: macos-latest
-            suffix: macos-aarch64.tar.gz
             exe: ""
         # Standard raster build + GPU ray-traced lighting build (Bevy Solari;
         # falls back to raster at runtime on GPUs without ray queries).
