@@ -376,7 +376,7 @@ pub fn new_run_player(chip: StarterChip, yaw: f32) -> Player {
     p
 }
 
-fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip, settings: &UserSettings) {
+fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip, settings: &UserSettings, msaa: bevy::render::view::Msaa) {
     let pos = grid.spawn_world();
     commands
         .spawn((
@@ -388,6 +388,7 @@ fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip, se
             p.spawn((
                 PlayerCamera,
                 Camera3d::default(),
+                msaa,
                 Projection::Perspective(PerspectiveProjection {
                     fov: base_fov_rad(settings),
                     near: 0.05,
@@ -417,13 +418,16 @@ fn ensure_player(
     grid: Option<Res<LevelGrid>>,
     loadout: Option<Res<RunLoadout>>,
     store: Option<Res<ProfileStore>>,
+    render_msaa: Option<Res<crate::perf::RenderMsaa>>,
     players: Query<(), With<Player>>,
 ) {
     if let Some(grid) = grid
-        && players.is_empty() {
-            let chip = loadout.map(|l| l.chip).unwrap_or_default();
-            spawn_player(&mut commands, &grid, chip, &live_settings(store.as_deref()));
-        }
+        && players.is_empty()
+    {
+        let chip = loadout.map(|l| l.chip).unwrap_or_default();
+        let msaa = render_msaa.map(|m| m.0).unwrap_or_default();
+        spawn_player(&mut commands, &grid, chip, &live_settings(store.as_deref()), msaa);
+    }
 }
 
 /// New floor: put the existing player at the airlock, standing still with a

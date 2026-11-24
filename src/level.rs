@@ -1065,8 +1065,15 @@ pub fn cull_world_lights(
     };
     for (entity, mut c, g, mut light, mut vis) in &mut lights {
         // Spawned since the last pass: its GlobalTransform may not be
-        // propagated yet, so keep its spawn visibility for this frame.
+        // propagated yet. When a strict light cap is active (WebGL2), hide
+        // newly spawned lights for that first frame so a floor build never
+        // exceeds the light budget on frame 1.
         if g.is_added() {
+            if cap.is_some() && *vis != Visibility::Hidden {
+                let _ = c.base_intensity.get_or_insert(light.intensity);
+                *vis = Visibility::Hidden;
+                light.intensity = 0.0;
+            }
             continue;
         }
         let base = *c.base_intensity.get_or_insert(light.intensity);

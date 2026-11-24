@@ -1,5 +1,7 @@
 # SEGNALE DEBOLE
 
+**Play live in your browser:** **https://signal.bombatomica64.dev** *(share custom bunker seeds with `#seed=MARS7`)*
+
 A Doom-style 3D retro boomer-shooter roguelike built in **Rust + Bevy 0.20** for a work game jam on the prompt **"Segnale debole"** (*Weak Signal*).
 
 Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical smartphone** hunting for a signal bar; your **right hand grips a pump shotgun**. Navigate procedural multi-elevation Mars bunkers, smash Demonic Jammers projecting Dead Zones, reach the **5-bar Extraction Signal Tower**, survive the **SOS Countdown Demon Rush**, take down **THE CARRIER DAEMON** on Floor 5, and download firmware upgrades from the **App Store** between floors. Then keep going in **Endless Overdrive**.
@@ -13,12 +15,13 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
 - **Roguelike extraction loop and meta-progression:** SOS countdown rush, orbital extraction beam, **17 App Store upgrades** (12 core, including Doppler Overdrive and Blast Thrusters, plus 5 feat-licensed signature apps) curated into a **12-card active catalog**, **4 Starter Phone OS Chips**, **4 stackable Carrier Contracts**, **4 3D Handset Skins** and **10 Feats**, persisted to JSON. A non-destructive **Jam Demo: Unlock All** toggle is included.
 - **Endless Overdrive mode:** press `E` on the Floor 5 victory screen to keep descending, with themes cycling and Carrier Daemon rematches on floors 10, 15, 20 and so on.
 - **Persistent Settings menu (`O`):** mouse sensitivity, base FOV, speed-FOV and strafe-roll toggles and scales, master volume and mute, crosshair style and color.
-- **100% procedural retro assets and audio:** nearest-neighbor 64×64 textures, sculpted 3D meshes, procedural PCM synth SFX, and a **3-layer adaptive industrial-synth soundtrack** (`--features audio`):
+- **100% procedural retro assets and spatial 3D audio:** nearest-neighbor 64×64 textures, sculpted 3D meshes, 31 procedural PCM synth SFX with **3D positional audio** (hear Phase Stalkers blink, Snipers lock on, Jammers hum through walls, surface footsteps on metal catwalks vs Mars regolith, landing thuds, shell-bounce clinks), and a **4-layer adaptive industrial-synth soundtrack** (`--features audio`):
   - **Dead-Zone Drone:** E1 sub-bass, FM shimmer and RF static.
   - **Signal Pulse:** 16th-note E-Phrygian bass, clock-tick hats and radar pings.
   - **Rush Metal:** distorted power-bass riff, kick, snare, 16th hats and lead stabs.
+  - **Boss Overdrive (Milestone 20):** relentless 16th-note bass gallop, distorted E-Phrygian Dominant alarm lead and double-kick fills for Carrier Daemon fights.
 
-  The three stems are equal-length 132 BPM looping tracks spawned in parallel. They crossfade live with signal strength, the SOS upload, the boss fight and menu or pause state.
+  All four stems are equal-length 132 BPM looping tracks spawned in parallel. They crossfade live with signal strength, the SOS upload, Time Trial, the boss fight (and Overdrive), and menu or pause state.
 - **Sculpted 3D models (Milestone 15):** procedurally sculpted meshes for all 7 demons, the Carrier Daemon and its pylons, and all 3 guns, merged into per-material batches at startup.
 - **3D world architecture (Milestone 16):** baseboards, crown trim, pilasters, overhead trusses and conduits, catwalk girders, flush wall-mounted sector props and animated hazards, baked into the static level batches.
 - **Enemy animation and combat feedback (Milestone 17):** procedural attack animations, directional hit-stagger, pooled floor and wall decals (blood, ichor, scorch marks, plasma burns) and gibs.
@@ -26,7 +29,10 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
   - **`DAILY RUN [D]`:** the UTC date picks the seed and the loadout, so every player (native or browser) gets the same bunker that day.
   - **Speedrun split timer:** per-floor splits with PB deltas.
   - **`TIME TRIAL [T]`:** a handcrafted movement course with 3 checkpoint rings and the tower finish, plus instant `R` reset.
-- **Web / itch.io build (Milestone 19):** WebGL2 in the browser, with saves in `localStorage` (see [Web / itch.io](#web--itchio)).
+- **Web / itch.io build (Milestone 19):** WebGL2 in the browser, with saves in `localStorage` (see [Web / itch.io](#web--itchio)) and a self-hosted k3s + Cloudflare deployment at **https://signal.bombatomica64.dev** (`deploy/`).
+- **Shareable Custom Seeds & 3D Bestiary / Armory (Milestone 21):**
+  - **`SEED [S]` / `#seed=CODE`:** enter or roll deterministic bunker seeds (`MARS7`, `791E-0A5A`) and share clickable `#seed=` links directly from the menu, pause, or end screens.
+  - **`BESTIARY & ARMORY [B]`:** live interactive 3D turntable inspecting all 7 sculpted demons (with lifetime kill counts and tactical tips) and all 3 weapons.
 - **90–120 FPS target:** static and demon mesh batching, a `F3` perf overlay and a `F4` VSync toggle.
 
 ## Controls
