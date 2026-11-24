@@ -2319,7 +2319,7 @@ fn enemy_ai(
             if should_start_blink(&e, dist) {
                 e.blink_timer = PHASE_BLINK_TELEGRAPH;
                 spawn_burst(&mut commands, &fx, pos + Vec3::Y * 1.3, BurstColor::Gore, 8, 3.0, 0.1);
-                sfx.play(SfxEvent::PhaseBlink);
+                sfx.play_at(SfxEvent::PhaseBlink, pos);
                 continue;
             }
         }
@@ -2454,13 +2454,13 @@ fn enemy_ai(
                             spawn_enemy_projectile(&mut commands, &fx, start, dir * e.stats.proj_speed, e.stats.proj_damage, e.stats.proj_radius, BurstColor::Spark);
                             spawn_burst(&mut commands, &fx, start, BurstColor::Spark, 6, 4.0, 0.08);
                             e.trigger_attack_anim(false);
-                            sfx.play(SfxEvent::EnemyFire);
+                            sfx.play_at(SfxEvent::EnemyFire, start);
                         }
                     }
                 } else if e.attack_timer <= 0.0 && e.sees_player && dist < e.stats.range && dist > 2.0 {
                     e.sniper_lock_timer = SNIPER_LOCK_SECS;
                     e.sniper_aim = p_chest;
-                    sfx.play(SfxEvent::SniperLock);
+                    sfx.play_at(SfxEvent::SniperLock, eye);
                 }
                 continue;
             }
@@ -2498,7 +2498,7 @@ fn enemy_ai(
                 );
             }
             e.trigger_attack_anim(false);
-            sfx.play(SfxEvent::EnemyFire);
+            sfx.play_at(SfxEvent::EnemyFire, eye);
         }
     }
 }
@@ -2878,7 +2878,7 @@ fn enemy_deaths(
             decals.push(DecalRequest::floor(kind, feet, size * (0.9 + e.stats.radius)));
         }
         run.kills += 1;
-        sfx.play(SfxEvent::EnemyDeath);
+        sfx.play_at(SfxEvent::EnemyDeath, center);
         if e.kind == EnemyKind::CarrierDaemon {
             // Massive golden / crimson multi-burst.
             for (k, off) in [Vec3::new(0.0, 1.6, 0.0), Vec3::new(1.2, 0.4, 0.3), Vec3::new(-1.1, -0.6, -0.4), Vec3::new(0.2, -1.4, 0.8)].into_iter().enumerate() {
@@ -2887,8 +2887,8 @@ fn enemy_deaths(
             }
             spawn_burst(&mut commands, &fx, center, BurstColor::Gore, 36, 9.0, 0.26);
             spawn_flash_light(&mut commands, center, Color::srgb(1.0, 0.55, 0.2), 9_000_000.0, 40.0, 0.8);
-            sfx.play(SfxEvent::JammerDestroyed);
-            sfx.play(SfxEvent::BossShield);
+            sfx.play_at(SfxEvent::JammerDestroyed, center);
+            sfx.play_at(SfxEvent::BossShield, center);
         }
         if e.vaporized {
             continue;

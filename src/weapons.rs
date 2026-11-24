@@ -2393,6 +2393,7 @@ fn fire_weapons(
             ws.recoil = 1.4;
             ws.muzzle = 0.09;
             sfx.play(SfxEvent::RocketFire);
+            sfx.play(SfxEvent::RocketWhoosh);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(1.0, 0.55, 0.15), 600_000.0, 10.0, 0.09);
             spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 3, 1.4, 0.08);
             spawn_mortar_casing(&mut commands, &fx, origin + rot * (WEAPON_REST + MORTAR_PORT_LOCAL), rot * Vec3::X, rot * Vec3::Y, fwd);
@@ -2673,7 +2674,7 @@ fn detonate_rocket(
     spawn_burst(commands, fx, blast, BurstColor::Fire, 14, 9.0, 0.16);
     spawn_particles(commands, fx, blast, BurstColor::Spark, 8, 11.0, 0.06);
     spawn_particles(commands, fx, blast + Vec3::Y * 0.3, BurstColor::Smoke, 5, 2.4, 0.3);
-    sfx.play(SfxEvent::RocketExplode);
+    sfx.play_at(SfxEvent::RocketExplode, blast);
     any_hit
 }
 
@@ -2709,7 +2710,7 @@ fn jammer_deaths(
         spawn_burst(&mut commands, &fx, base + Vec3::Y * 2.0, BurstColor::Smoke, 10, 3.0, 0.4);
         spawn_flash_light(&mut commands, base + Vec3::Y * 2.5, Color::srgb(1.0, 0.5, 0.2), 3_000_000.0, 18.0, 0.4);
         run.jammers_destroyed += 1;
-        sfx.play(SfxEvent::JammerDestroyed);
+        sfx.play_at(SfxEvent::JammerDestroyed, base + Vec3::Y * 2.0);
         feed.toast("JAMMER DESTROYED - SIGNAL BOOSTED", Color::srgb(0.3, 1.0, 0.8));
         feed.hit(true);
         if mods.jammer_hijack {
@@ -2823,7 +2824,7 @@ fn barrel_detonations(
         spawn_burst(&mut commands, &fx, blast, BurstColor::Fire, 18, 10.0, 0.18);
         spawn_particles(&mut commands, &fx, blast, BurstColor::Spark, 10, 12.0, 0.06);
         spawn_particles(&mut commands, &fx, blast + Vec3::Y * 0.4, BurstColor::Smoke, 6, 2.6, 0.32);
-        sfx.play(SfxEvent::RocketExplode);
+        sfx.play_at(SfxEvent::RocketExplode, blast);
     }
     if any_hit {
         feed.hit(false);

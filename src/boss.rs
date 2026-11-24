@@ -520,7 +520,7 @@ pub fn carrier_daemon_system(
             spawn_burst(&mut commands, &fx, base + Vec3::Y * 1.6, BurstColor::Cyan, 26, 9.0, 0.22);
             spawn_burst(&mut commands, &fx, base + Vec3::Y * 2.4, BurstColor::Spark, 14, 7.0, 0.12);
             spawn_flash_light(&mut commands, base + Vec3::Y * 2.0, Color::srgb(0.5, 0.6, 1.0), 2_500_000.0, 16.0, 0.35);
-            sfx.play(SfxEvent::JammerDestroyed);
+            sfx.play_at(SfxEvent::JammerDestroyed, base + Vec3::Y * 2.0);
             feed.hit(true);
             feed.toast("SHIELD PYLON DOWN", Color::srgb(0.55, 0.7, 1.0));
             continue;
@@ -582,7 +582,7 @@ pub fn carrier_daemon_system(
                 st.pylons_alive = 2;
                 spawn_shockwave(&mut commands, &fx, &mut materials, pos + Vec3::Y * 0.3, 9.0, 0.5, SHIELD_GLOW.0, SHIELD_GLOW.1, true);
                 spawn_burst(&mut commands, &fx, core, BurstColor::Spark, 20, 8.0, 0.16);
-                sfx.play(SfxEvent::BossShield);
+                sfx.play_at(SfxEvent::BossShield, core);
                 feed.alert("SIGNAL SHIELD UP - DESTROY THE 2 PYLONS!", Color::srgb(0.55, 0.65, 1.0), 3.0);
             }
             BossTransition::Shatter => {
@@ -591,7 +591,7 @@ pub fn carrier_daemon_system(
                 spawn_burst(&mut commands, &fx, core, BurstColor::Cyan, 34, 11.0, 0.22);
                 spawn_burst(&mut commands, &fx, core, BurstColor::Gold, 20, 8.0, 0.2);
                 spawn_flash_light(&mut commands, core, Color::srgb(0.6, 0.7, 1.0), 6_000_000.0, 30.0, 0.5);
-                sfx.play(SfxEvent::BossShield);
+                sfx.play_at(SfxEvent::BossShield, core);
                 let overdrive = st.phase == BossPhase::Overdrive;
                 feed.alert(if overdrive { "SHIELD SHATTERED - CARRIER DAEMON OVERDRIVE!" } else { "SHIELD SHATTERED - PHASE II!" }, Color::srgb(1.0, 0.75, 0.3), 3.0);
                 // Supply drop on the Signal Ring.
@@ -664,7 +664,7 @@ pub fn carrier_daemon_system(
                         fire_boss_attack(&mut commands, &fx, &e, st.phase, other, core + Vec3::Y * 0.6, chest);
                     }
                     e.trigger_attack_anim(false);
-                    sfx.play(SfxEvent::EnemyFire);
+                    sfx.play_at(SfxEvent::EnemyFire, core);
                     st.next_attack = if st.next_attack == BossAttack::HellfireBarrage { BossAttack::EmpVolley } else { BossAttack::HellfireBarrage };
                 }
             } else {

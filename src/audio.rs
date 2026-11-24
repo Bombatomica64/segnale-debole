@@ -12,11 +12,11 @@ use std::f32::consts::TAU;
 
 use bevy::prelude::*;
 
-use crate::boss::BossHud;
+use crate::boss::{BossHud, BossPhase};
 use crate::extraction::ExtractionState;
 use crate::meta::UserSettings;
 use crate::signal::SignalState;
-use crate::state::AppState;
+use crate::state::{AppState, RunStats};
 
 pub const SAMPLE_RATE: u32 = 22_050;
 
@@ -55,10 +55,22 @@ pub enum SfxEvent {
     SniperLock,
     /// Carrier Daemon Signal Shield surge / shatter: resonant crystalline chord.
     BossShield,
+    /// Gritty Mars-regolith boot step (ground floor).
+    StepRegolith,
+    /// Hollow metallic clang of a boot on a catwalk / ramp.
+    StepMetal,
+    /// Punchy low-end touchdown thud after a fall or jump.
+    LandThud,
+    /// Crisp high-pitched brass casing bounce clink.
+    ShellClink,
+    /// Propellant rush / whoosh layered over a Signal-Mortar launch.
+    RocketWhoosh,
+    /// Eerie RF static hum + harmonic pulse emitted by nearby jammers.
+    JammerHum,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 25] = [
+    pub const ALL: [SfxEvent; 31] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -84,25 +96,239 @@ impl SfxEvent {
         SfxEvent::PhaseBlink,
         SfxEvent::SniperLock,
         SfxEvent::BossShield,
+        SfxEvent::StepRegolith,
+        SfxEvent::StepMetal,
+        SfxEvent::LandThud,
+        SfxEvent::ShellClink,
+        SfxEvent::RocketWhoosh,
+        SfxEvent::JammerHum,
     ];
+
+    /// Warnings that must always be heard keep their direction but are pulled
+    /// to at most this distance (m) from the listener: never culled or faint.
+    pub fn spatial_clamp_dist(self) -> Option<f32> {
+        match self {
+            SfxEvent::BaronAlert => Some(9.0),
+            SfxEvent::BossShield => Some(12.0),
+            _ => None,
+        }
+    }
 
     /// Playback volume (0..1).
     pub fn volume(self) -> f32 {
         match self {
             SfxEvent::Hit | SfxEvent::EnemyFire | SfxEvent::Pickup | SfxEvent::WeaponSwap => 0.45,
             SfxEvent::Plasma | SfxEvent::Jump | SfxEvent::Bhop => 0.5,
+            SfxEvent::StepRegolith | SfxEvent::StepMetal => 0.28,
+            SfxEvent::ShellClink => 0.32,
+            SfxEvent::LandThud | SfxEvent::RocketWhoosh => 0.55,
+            SfxEvent::JammerHum => 0.6,
             _ => 0.75,
         }
     }
 }
 
+/// One requested sound: 2D (player-origin, `pos == None`) or world-positioned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SfxRequest {
+    pub event: SfxEvent,
+    pub pos: Option<Vec3>,
+}
+
 /// Frame queue of requested sounds (drained by the audio backend each frame).
 #[derive(Resource, Default, Debug)]
-pub struct SfxQueue(pub Vec<SfxEvent>);
+pub struct SfxQueue(pub Vec<SfxRequest>);
 
 impl SfxQueue {
+    /// 2D / player-origin sound (weapons, UI, movement, hit markers...).
     pub fn play(&mut self, sfx: SfxEvent) {
-        self.0.push(sfx);
+        self.0.push(SfxRequest { event: sfx, pos: None });
+    }
+
+    /// World-positioned 3D sound: panned and attenuated relative to the
+    /// listener on the player's head camera.
+    pub fn play_at(&mut self, sfx: SfxEvent, pos: Vec3) {
+        self.0.push(SfxRequest { event: sfx, pos: Some(pos) });
+    }
+
+    /// Queued events in request order (positions dropped).
+    pub fn events(&self) -> impl Iterator<Item = SfxEvent> + '_ {
+        self.0.iter().map(|r| r.event)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spatial audio model
+// ---------------------------------------------------------------------------
+
+/// Distance between the listener's ears (metres, on the camera's local X).
+pub const SPATIAL_LISTENER_GAP: f32 = 0.4;
+/// Distance (m) up to which a positional sound plays at full volume. Bevy /
+/// rodio attenuate with `min(1, 1 / (d * scale)^2)`, so the spatial scale is
+/// `1 / SPATIAL_REF_DIST`: 10 m = 1.0, 16 m = 0.39, 25 m = 0.16, 35 m = 0.08.
+pub const SPATIAL_REF_DIST: f32 = 10.0;
+/// Beyond this distance (m) positional sounds are culled; they fade out
+/// smoothly over the last 40% before it so nothing pops at the boundary.
+pub const SPATIAL_MAX_DIST: f32 = 55.0;
+
+/// World-to-audio position scale handed to Bevy's `SpatialScale`.
+pub const fn spatial_scale_factor() -> f32 {
+    1.0 / SPATIAL_REF_DIST
+}
+
+/// Inverse-square rolloff (same law as the rodio spatial sink), 1 inside [`SPATIAL_REF_DIST`].
+pub fn spatial_rolloff(dist: f32) -> f32 {
+    if !dist.is_finite() {
+        return 0.0;
+    }
+    (SPATIAL_REF_DIST / dist.max(1e-3)).powi(2).min(1.0)
+}
+
+/// Extra smooth fade-to-zero over `0.6 * max_dist ..= max_dist` (0 beyond).
+pub fn spatial_distance_fade(dist: f32, max_dist: f32) -> f32 {
+    if !dist.is_finite() || !max_dist.is_finite() || max_dist <= 0.0 || dist >= max_dist {
+        return 0.0;
+    }
+    let start = max_dist * 0.6;
+    if dist <= start {
+        return 1.0;
+    }
+    let x = (dist - start) / (max_dist - start);
+    1.0 - x * x * (3.0 - 2.0 * x)
+}
+
+/// Overall gain (0..1, rolloff times edge fade) and stereo pan (-1 = hard
+/// left, +1 = hard right) of a sound at `src_pos` heard from `listener_pos`
+/// whose right ear points along `listener_right`.
+pub fn spatial_gain_and_pan(listener_pos: Vec3, listener_right: Vec3, src_pos: Vec3, max_dist: f32) -> (f32, f32) {
+    let d = src_pos - listener_pos;
+    let dist = d.length();
+    if !dist.is_finite() {
+        return (0.0, 0.0);
+    }
+    let gain = spatial_rolloff(dist) * spatial_distance_fade(dist, max_dist);
+    let pan = if dist < 1e-3 { 0.0 } else { (d / dist).dot(listener_right.normalize_or_zero()).clamp(-1.0, 1.0) };
+    (gain, pan)
+}
+
+/// Where a positional `event` at `src` is actually emitted: unchanged, or
+/// for [`SfxEvent::spatial_clamp_dist`] warnings pulled toward the listener.
+pub fn emitter_position(event: SfxEvent, listener: Vec3, src: Vec3) -> Vec3 {
+    match event.spatial_clamp_dist() {
+        Some(max) if src.distance(listener) > max => listener + (src - listener).normalize_or_zero() * max,
+        _ => src,
+    }
+}
+
+/// One instance per [`SfxEvent`] per frame (8 pellet hits = 1 tick, never
+/// clipping): keeps first-request order, and for each event prefers a 2D
+/// instance, else the spatial instance nearest the listener. `out` is
+/// cleared and reused (no per-frame allocation once warm).
+pub fn dedup_sfx_requests(requests: &[SfxRequest], listener: Option<Vec3>, out: &mut Vec<SfxRequest>) {
+    out.clear();
+    let dist = |r: &SfxRequest| match (r.pos, listener) {
+        (Some(p), Some(l)) => p.distance_squared(l),
+        _ => f32::INFINITY,
+    };
+    for r in requests {
+        // Ignore requests with non-finite coordinates so they never shadow valid emitters.
+        if r.pos.is_some_and(|p| !p.is_finite()) {
+            continue;
+        }
+        match out.iter_mut().find(|o| o.event == r.event) {
+            None => out.push(*r),
+            Some(o) => {
+                let better = match (o.pos, r.pos) {
+                    (None, _) => false,
+                    (Some(_), None) => true,
+                    (Some(_), Some(_)) => dist(r) < dist(o),
+                };
+                if better {
+                    *o = *r;
+                }
+            }
+        }
+    }
+}
+
+/// Nearest of `sources` within `radius` of `from` (Jammer hum emitter).
+pub fn nearest_within(from: Vec3, sources: impl IntoIterator<Item = Vec3>, radius: f32) -> Option<Vec3> {
+    sources
+        .into_iter()
+        .map(|p| (p.distance_squared(from), p))
+        .filter(|(d2, _)| d2.is_finite() && *d2 <= radius * radius)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, p)| p)
+}
+
+/// Horizontal metres of grounded running between footsteps.
+pub const STEP_STRIDE: f32 = 2.4;
+/// Feet above this height (m) are on a catwalk / tower deck (metal steps).
+pub const STEP_METAL_HEIGHT: f32 = 0.35;
+/// Downward touchdown speed (m/s) above which a landing thuds.
+pub const LAND_THUD_SPEED: f32 = 3.5;
+/// Downward speed (m/s) a casing must hit the floor with to clink.
+pub const CLINK_MIN_SPEED: f32 = 1.2;
+
+/// Footstep sound for the surface under the feet: metal on ramps and raised
+/// catwalks / decks, regolith on the bunker floor.
+pub fn footstep_sfx(cell: crate::level::Cell, feet_y: f32) -> SfxEvent {
+    if matches!(cell, crate::level::Cell::Ramp { .. }) || feet_y > STEP_METAL_HEIGHT { SfxEvent::StepMetal } else { SfxEvent::StepRegolith }
+}
+
+/// Advance the stride accumulator by `moved` metres; true when a step lands.
+pub fn advance_stride(stride: &mut f32, moved: f32) -> bool {
+    if !moved.is_finite() || moved <= 0.0 {
+        return false;
+    }
+    *stride += moved;
+    if *stride >= STEP_STRIDE {
+        *stride = (*stride - STEP_STRIDE).min(STEP_STRIDE * 0.5);
+        true
+    } else {
+        false
+    }
+}
+
+/// A floor bounce that should clink: falling fast enough, now rebounding.
+pub fn is_clink_bounce(prev_vy: f32, new_vy: f32) -> bool {
+    prev_vy < -CLINK_MIN_SPEED && new_vy > 0.0
+}
+
+/// Seconds between Jammer hum pulses.
+pub const JAMMER_HUM_INTERVAL: f32 = 1.8;
+/// Hearing radius (m) of the Jammer hum.
+pub const JAMMER_HUM_RADIUS: f32 = 18.0;
+
+/// Every [`JAMMER_HUM_INTERVAL`] while playing, hum from the nearest living
+/// Demon Jammer / Jammer Fiend within [`JAMMER_HUM_RADIUS`] so jammers can be
+/// hunted by ear.
+pub fn jammer_hum(
+    time: Res<Time>,
+    mut timer: Local<f32>,
+    grid: Option<Res<crate::level::LevelGrid>>,
+    mut sfx: ResMut<SfxQueue>,
+    players: Query<&GlobalTransform, With<crate::player::Player>>,
+    jammers: Query<(&crate::level::DemonJammer, &GlobalTransform)>,
+    fiends: Query<(&crate::enemies::Enemy, &GlobalTransform)>,
+) {
+    if grid.is_some_and(|g| g.is_changed()) {
+        *timer = 0.0;
+    }
+    *timer -= time.delta_secs();
+    if *timer > 0.0 {
+        return;
+    }
+    *timer = JAMMER_HUM_INTERVAL;
+    let Ok(player) = players.single() else { return };
+    let from = player.translation();
+    let towers = jammers.iter().filter(|(j, _)| j.hp > 0.0).map(|(_, g)| g.translation() + Vec3::Y * 2.0);
+    let demons = fiends
+        .iter()
+        .filter(|(e, _)| e.is_alive() && e.kind == crate::enemies::EnemyKind::JammerFiend)
+        .map(|(_, g)| g.translation());
+    if let Some(pos) = nearest_within(from, towers.chain(demons), JAMMER_HUM_RADIUS) {
+        sfx.play_at(SfxEvent::JammerHum, pos);
     }
 }
 
@@ -319,6 +545,69 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
             let crack = if ts < 0.12 { lp.run(n.next(), 0.7) * (1.0 - ts / 0.12) * 0.9 } else { 0.0 };
             chord * env(t, 0.05, 1.3) + crack
         }),
+        SfxEvent::StepRegolith => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(0.13, move |ts, t, n| {
+                // Granular crunch: sparse noise grains, band-limited, over a soft heel thump.
+                let x = n.next();
+                let grain = if n.next() > 0.45 { x } else { 0.0 };
+                let crunch = (lp.run(grain, 0.5) - lp2.run(grain, 0.04)) * 1.5;
+                let thump = (o.step(110.0 - 50.0 * t) * TAU).sin() * 0.55 * decay(ts, 45.0);
+                (crunch * env(t, 0.06, 1.6) + thump) * env(t, 0.01, 1.0)
+            })
+        }
+        SfxEvent::StepMetal => render(0.24, |ts, t, n| {
+            // Hollow catwalk clang: inharmonic grating partials + a sharp heel click.
+            let p = o.step(392.0);
+            let ring = (p * TAU).sin() * 0.45 + (p * 2.76 * TAU).sin() * 0.3 * decay(ts, 18.0) + (o2.step(1_563.0) * TAU).sin() * 0.2 * decay(ts, 30.0);
+            let click = if ts < 0.006 { n.next() * 0.8 } else { 0.0 };
+            ring * decay(ts, 14.0) * env(t, 0.01, 0.8) + click
+        }),
+        SfxEvent::LandThud => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(0.34, move |ts, t, n| {
+                // Pitch-dropping body thump + low-passed dust / gear rattle.
+                let body = (o.step(34.0 + 70.0 * decay(ts, 22.0)) * TAU).sin() * decay(ts, 11.0);
+                let dust = lp.run(n.next(), 0.12) * 1.4 * decay(ts, 16.0);
+                let rattle = lp2.run(if n.next() > 0.8 { n.next() } else { 0.0 }, 0.4) * 0.5 * decay(ts, 25.0);
+                (body * 0.95 + dust + rattle) * env(t, 0.01, 1.2)
+            })
+        }
+        SfxEvent::ShellClink => render(0.17, |ts, _t, _| {
+            // Bright brass tube partials; a smaller second tap 55 ms later.
+            let p = o.step(3_150.0);
+            let tone = (p * TAU).sin() * 0.5 + (p * 1.59 * TAU).sin() * 0.3 + (p * 2.31 * TAU).sin() * 0.18;
+            let tap1 = decay(ts, 38.0);
+            let tap2 = if ts > 0.055 { decay(ts - 0.055, 46.0) * 0.55 } else { 0.0 };
+            tone * (tap1 + tap2)
+        }),
+        SfxEvent::RocketWhoosh => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(0.62, move |_, t, n| {
+                // Band-passed rush whose centre sweeps up then settles; slight flutter.
+                let x = n.next();
+                let k = 0.08 + 0.42 * (1.0 - (2.0 * t - 0.6).abs()).max(0.0);
+                let band = lp.run(x, k) - lp2.run(x, k * 0.18);
+                let flutter = 0.8 + 0.2 * (o.step(23.0) * TAU).sin();
+                band * 2.2 * flutter * env(t, 0.22, 1.5)
+            })
+        }
+        SfxEvent::JammerHum => {
+            let mut hold = 0.0f32;
+            render(0.9, move |ts, t, n| {
+                // Mains-style hum (fundamental + odd harmonics), pulsing at 6 Hz,
+                // with sample-and-hold RF static and a high harmonic whine.
+                let p = o.step(98.0);
+                let hum = (p * TAU).sin() * 0.45 + saw(p * 3.0) * 0.12 + (p * 5.0 * TAU).sin() * 0.12;
+                let pulse = 0.55 + 0.45 * (TAU * 6.0 * ts).sin().max(0.0);
+                if ((ts * 1800.0) as u32).is_multiple_of(5) {
+                    hold = n.next();
+                }
+                let stat = lp.run(hold, 0.35) * 0.35;
+                let whine = (o2.step(1_960.0 + 40.0 * (TAU * 3.0 * ts).sin()) * TAU).sin() * 0.08;
+                (hum * pulse + stat + whine) * env(t, 0.12, 0.9)
+            })
+        }
     }
 }
 
@@ -364,7 +653,7 @@ pub fn synthesize_wav(sfx: SfxEvent) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Adaptive 3-layer industrial-synth soundtrack
+// Adaptive 4-layer industrial-synth soundtrack
 // ---------------------------------------------------------------------------
 
 /// Tempo of every music stem.
@@ -374,7 +663,7 @@ pub const MUSIC_STEPS: usize = 64;
 /// Samples per 16th-note step (`SAMPLE_RATE * 60 / BPM / 4`, floored so every
 /// step, and therefore every stem, has the exact same integer length).
 pub const MUSIC_STEP_SAMPLES: usize = (SAMPLE_RATE as usize * 15 * 10) / (MUSIC_BPM as usize * 10);
-/// Exact sample count shared by all three stems (phase-locked crossfades).
+/// Exact sample count shared by all four stems (phase-locked crossfades).
 pub const MUSIC_LOOP_SAMPLES: usize = MUSIC_STEPS * MUSIC_STEP_SAMPLES;
 /// Overlap rendered past the loop end and folded back over the start (20 ms).
 const MUSIC_SEAM_SAMPLES: usize = SAMPLE_RATE as usize / 50;
@@ -385,7 +674,7 @@ pub const MUSIC_BASE_VOLUME: f32 = 0.32;
 /// Exponential crossfade rate of [`step_music_mix`] (1/s).
 pub const MUSIC_MIX_RATE: f32 = 3.0;
 
-/// The three phase-locked music stems mixed live by game state.
+/// The four phase-locked music stems mixed live by game state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MusicLayer {
     /// Low industrial sub-bass drone with RF static (Dead Zones, menus).
@@ -394,16 +683,23 @@ pub enum MusicLayer {
     SignalPulse,
     /// Industrial-metal combat stem (SOS Demon Rush, Carrier Daemon).
     RushMetal,
+    /// Carrier Daemon stem: double-time bass gallop, distorted E Phrygian
+    /// Dominant alarm lead and double-kick / snare fills.
+    BossOverdrive,
 }
 
+/// Number of music stems.
+pub const MUSIC_LAYERS: usize = 4;
+
 impl MusicLayer {
-    pub const ALL: [MusicLayer; 3] = [MusicLayer::DeadZoneDrone, MusicLayer::SignalPulse, MusicLayer::RushMetal];
+    pub const ALL: [MusicLayer; MUSIC_LAYERS] = [MusicLayer::DeadZoneDrone, MusicLayer::SignalPulse, MusicLayer::RushMetal, MusicLayer::BossOverdrive];
 
     pub fn index(self) -> usize {
         match self {
             MusicLayer::DeadZoneDrone => 0,
             MusicLayer::SignalPulse => 1,
             MusicLayer::RushMetal => 2,
+            MusicLayer::BossOverdrive => 3,
         }
     }
 }
@@ -541,6 +837,57 @@ fn music_raw(layer: MusicLayer, n: usize) -> Vec<f32> {
                 riff + kick + snare + hat + lead
             })
         }
+        MusicLayer::BossOverdrive => {
+            // Gallop bass (semitones over E1): 16th-note "da-da-DUM" figure,
+            // root per bar walks the Phrygian Dominant degrees E - F - G# - F.
+            const ROOTS: [i32; 4] = [12, 13, 16, 13];
+            const GALLOP: [i32; 16] = [0, 0, 12, 0, 0, 12, 0, 0, 12, 0, 0, 12, 0, 7, 8, 1];
+            // Alarm lead (E Phrygian Dominant: E F G# A B C D), one note per 8th,
+            // over E4; the last bar climbs into a shrieking turnaround.
+            const LEAD: [[i32; 8]; 4] = [
+                [0, 1, 0, 4, 0, 1, 0, 4],
+                [0, 1, 4, 5, 4, 1, 0, -1],
+                [0, 1, 0, 4, 0, 1, 0, 4],
+                [7, 8, 7, 4, 5, 4, 1, 0],
+            ];
+            render_music(n, move |i, _lph, nz| {
+                let (s, tl) = step_at(i);
+                let bar = s / 16;
+                let st = s % 16;
+                // Double-time gallop bass: every 16th, accents on the octave hits.
+                let f = e1_semis(ROOTS[bar] + GALLOP[st]);
+                let raw = saw(o[0].step(f)) + square(o[1].step(f * 0.501)) * 0.6;
+                let accent = if GALLOP[st] != 0 { 1.0 } else { 0.7 };
+                // 2 ms attacks on every retrigger keep the step onsets (and the loop wrap) click-free.
+                let atk = |t: f32| (t / 0.002).min(1.0);
+                let bass = (lp[0].run(raw, 0.12 + 0.3 * decay(tl, 25.0)) * 3.0).tanh() * 0.38 * accent * (0.3 + 0.7 * decay(tl, 9.0) * atk(tl));
+                // Distorted alarm lead: detuned saw pair with a siren vibrato, hard-clipped.
+                let note = LEAD[bar][st / 2];
+                let lf = e1_semis(36 + note);
+                let vib = 1.0 + 0.012 * (TAU * 7.0 * (i as f32 / SAMPLE_RATE as f32)).sin();
+                let lraw = saw(o[2].step(lf * vib)) + saw(o[3].step(lf * vib * 1.007)) * 0.8 + square(o[4].step(lf * 2.0)) * 0.25;
+                let t8 = tl + (st % 2) as f32 * MUSIC_STEP_SAMPLES as f32 / SAMPLE_RATE as f32;
+                let lead = (lp[1].run(lraw, 0.35) * 2.4).tanh() * 0.24 * (0.55 + 0.45 * decay(t8, 3.5) * atk(t8));
+                // Relentless double kick on every 16th (fills thin it to 8ths).
+                let fill = bar == 3 && st >= 12;
+                let kick_on = if fill { st % 2 == 0 } else { true };
+                let kick = if kick_on {
+                    (o[5].step(48.0 + 95.0 * decay(tl, 38.0)) * TAU).sin() * decay(tl, 20.0) * atk(tl) * if st % 4 == 0 { 0.85 } else { 0.55 }
+                } else {
+                    0.0
+                };
+                // Snare backbeat on 2 / 4, rolled 16ths through the bar-4 fill.
+                let x = nz.next();
+                let snare = if st == 4 || st == 12 || fill {
+                    let g = if fill { 0.45 + 0.1 * (st - 12) as f32 } else { 0.8 };
+                    (lp[2].run(x, 0.6) * 0.8 + (TAU * 210.0 * tl).sin() * 0.3) * decay(tl, 24.0) * atk(tl) * g
+                } else {
+                    lp[2].run(0.0, 0.6);
+                    0.0
+                };
+                bass + lead + kick + snare
+            })
+        }
     }
 }
 
@@ -568,22 +915,41 @@ pub fn synthesize_music_wav(layer: MusicLayer) -> Vec<u8> {
     encode_wav(&music_samples(layer), SAMPLE_RATE)
 }
 
-/// Target stem weights `[drone, pulse, rush]` for the current game situation.
-pub fn target_music_weights(state: AppState, bars: u8, uploading: bool, boss_active: bool) -> [f32; 3] {
-    match state {
-        AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats | AppState::Settings => [0.45, 0.15, 0.0],
-        AppState::Paused => [0.25, 0.0, 0.0],
-        AppState::UpgradeSelect | AppState::Victory => [0.15, 0.55, 0.0],
-        AppState::GameOver => [0.50, 0.0, 0.0],
-        AppState::Playing if uploading || boss_active => [0.15, 0.35, 1.0],
-        AppState::Playing if bars <= 1 => [0.95, 0.05, 0.0],
-        AppState::Playing if bars <= 3 => [0.45, 0.75, 0.0],
-        AppState::Playing => [0.20, 0.95, 0.25],
+/// Everything the soundtrack reacts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MusicCues {
+    pub state: AppState,
+    /// Signal bars at the player (0..=5).
+    pub bars: u8,
+    /// SOS Upload in progress (Demon Rush).
+    pub uploading: bool,
+    /// Carrier Daemon fight live.
+    pub boss_active: bool,
+    /// ...and in its final Overdrive phase.
+    pub boss_overdrive: bool,
+    /// Movement time trial run.
+    pub time_trial: bool,
+}
+
+/// Target stem weights `[drone, pulse, rush, boss]` for the current game situation.
+pub fn target_music_weights(c: MusicCues) -> [f32; MUSIC_LAYERS] {
+    match c.state {
+        AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats | AppState::Settings => [0.45, 0.15, 0.0, 0.0],
+        AppState::Paused => [0.25, 0.0, 0.0, 0.0],
+        AppState::UpgradeSelect | AppState::Victory => [0.15, 0.55, 0.0, 0.0],
+        AppState::GameOver => [0.50, 0.0, 0.0, 0.0],
+        AppState::Playing if c.boss_active && c.boss_overdrive => [0.05, 0.20, 1.0, 1.0],
+        AppState::Playing if c.boss_active => [0.15, 0.30, 1.0, 0.75],
+        AppState::Playing if c.uploading => [0.15, 0.35, 1.0, 0.0],
+        AppState::Playing if c.time_trial => [0.0, 0.85, 0.70, 0.0],
+        AppState::Playing if c.bars <= 1 => [0.95, 0.05, 0.0, 0.0],
+        AppState::Playing if c.bars <= 3 => [0.45, 0.75, 0.0, 0.0],
+        AppState::Playing => [0.20, 0.95, 0.25, 0.0],
     }
 }
 
 /// Exponential crossfade of the stem weights toward `target` (frame-rate independent).
-pub fn step_music_mix(current: [f32; 3], target: [f32; 3], dt: f32) -> [f32; 3] {
+pub fn step_music_mix(current: [f32; MUSIC_LAYERS], target: [f32; MUSIC_LAYERS], dt: f32) -> [f32; MUSIC_LAYERS] {
     let k = 1.0 - (-MUSIC_MIX_RATE * dt.max(0.0)).exp();
     std::array::from_fn(|i| current[i] + (target[i] - current[i]) * k)
 }
@@ -597,33 +963,39 @@ pub fn effective_music_volume(weight: f32, settings: &UserSettings) -> f32 {
     weight.clamp(0.0, 1.0) * MUSIC_BASE_VOLUME * master
 }
 
-/// Live stem weights `[drone, pulse, rush]`, indexed by [`MusicLayer::index`].
+/// Live stem weights `[drone, pulse, rush, boss]`, indexed by [`MusicLayer::index`].
 #[derive(Resource, Debug, Clone)]
 pub struct MusicMixState {
-    pub weights: [f32; 3],
+    pub weights: [f32; MUSIC_LAYERS],
 }
 
 impl Default for MusicMixState {
     fn default() -> Self {
-        MusicMixState { weights: target_music_weights(AppState::MainMenu, 0, false, false) }
+        MusicMixState { weights: target_music_weights(MusicCues { state: AppState::MainMenu, ..default() }) }
     }
 }
 
-/// Crossfade the soundtrack toward the current state / signal / SOS / boss target.
+/// Crossfade the soundtrack toward the current state / signal / SOS / boss / mode target.
+#[allow(clippy::too_many_arguments)]
 pub fn update_music_mix(
     time: Res<Time>,
     state: Option<Res<State<AppState>>>,
     signal: Option<Res<SignalState>>,
     extraction: Option<Res<ExtractionState>>,
     boss: Option<Res<BossHud>>,
+    run: Option<Res<RunStats>>,
     mut mix: ResMut<MusicMixState>,
 ) {
-    let app_state = state.map(|s| *s.get()).unwrap_or_default();
-    let bars = signal.map(|s| s.bars).unwrap_or(0);
-    let uploading = extraction.is_some_and(|e| matches!(*e, ExtractionState::Uploading { .. }));
-    let boss_active = boss.is_some_and(|b| b.active);
-    let target = target_music_weights(app_state, bars, uploading, boss_active);
-    mix.weights = step_music_mix(mix.weights, target, time.delta_secs());
+    let boss = boss.as_deref();
+    let cues = MusicCues {
+        state: state.map(|s| *s.get()).unwrap_or_default(),
+        bars: signal.map(|s| s.bars).unwrap_or(0),
+        uploading: extraction.is_some_and(|e| matches!(*e, ExtractionState::Uploading { .. })),
+        boss_active: boss.is_some_and(|b| b.active),
+        boss_overdrive: boss.is_some_and(|b| b.active && b.phase == BossPhase::Overdrive),
+        time_trial: run.is_some_and(|r| r.mode.is_time_trial()),
+    };
+    mix.weights = step_music_mix(mix.weights, target_music_weights(cues), time.delta_secs());
 }
 
 pub struct GameAudioPlugin;
@@ -632,10 +1004,11 @@ impl Plugin for GameAudioPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SfxQueue>()
             .init_resource::<MusicMixState>()
+            .add_systems(Update, jammer_hum.run_if(in_state(AppState::Playing)))
             .add_systems(Last, (drain_sfx, update_music_mix));
         #[cfg(feature = "audio")]
         app.add_systems(Startup, (backend::cache_sounds, backend::spawn_music_stems))
-            .add_systems(Last, backend::apply_music_volumes.after(update_music_mix));
+            .add_systems(Last, (backend::attach_spatial_listener.before(drain_sfx), backend::apply_music_volumes.after(update_music_mix)));
     }
 }
 
@@ -643,18 +1016,20 @@ impl Plugin for GameAudioPlugin {
 mod backend {
     use std::collections::HashMap;
 
-    use bevy::audio::{AudioPlayer, AudioSource, PlaybackSettings, Volume};
+    use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, SpatialListener, SpatialScale, Volume};
     use bevy::prelude::*;
 
-    use bevy::audio::{AudioSink, AudioSinkPlayback};
-
-    use super::{effective_music_volume, synthesize_music_wav, synthesize_wav, MusicLayer, MusicMixState, SfxEvent};
+    use super::{
+        effective_music_volume, spatial_scale_factor, synthesize_music_wav, synthesize_wav, MusicLayer, MusicMixState, SfxEvent,
+        SPATIAL_LISTENER_GAP,
+    };
+    use crate::player::PlayerCamera;
 
     /// One looping soundtrack stem.
     #[derive(Component, Debug, Clone, Copy)]
     pub struct MusicStem(pub MusicLayer);
 
-    /// Start all three stems together (silent) so they stay phase-locked.
+    /// Start all four stems together (silent) so they stay phase-locked.
     pub fn spawn_music_stems(mut commands: Commands, mut sources: ResMut<Assets<AudioSource>>) {
         for layer in MusicLayer::ALL {
             let handle = sources.add(AudioSource { bytes: synthesize_music_wav(layer).into() });
@@ -674,6 +1049,14 @@ mod backend {
         }
     }
 
+    /// The player's head camera is the spatial listener: panning and rolloff
+    /// follow its live position and yaw / pitch (it is respawned per run).
+    pub fn attach_spatial_listener(mut commands: Commands, cams: Query<Entity, (With<PlayerCamera>, Without<SpatialListener>)>) {
+        for cam in &cams {
+            commands.entity(cam).insert(SpatialListener::new(SPATIAL_LISTENER_GAP));
+        }
+    }
+
     #[derive(Resource)]
     pub struct SfxHandles(pub HashMap<SfxEvent, Handle<AudioSource>>);
 
@@ -688,6 +1071,22 @@ mod backend {
     pub fn play(commands: &mut Commands, handles: &SfxHandles, sfx: SfxEvent, volume: f32) {
         if let Some(h) = handles.0.get(&sfx) {
             commands.spawn((AudioPlayer(h.clone()), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume))));
+        }
+    }
+
+    /// World-positioned one-shot. The `GlobalTransform` is set explicitly so
+    /// the emitter is correct even before transform propagation runs.
+    pub fn play_at(commands: &mut Commands, handles: &SfxHandles, sfx: SfxEvent, volume: f32, pos: Vec3) {
+        if let Some(h) = handles.0.get(&sfx) {
+            commands.spawn((
+                AudioPlayer(h.clone()),
+                PlaybackSettings::DESPAWN
+                    .with_spatial(true)
+                    .with_spatial_scale(SpatialScale::new(spatial_scale_factor()))
+                    .with_volume(Volume::Linear(volume)),
+                Transform::from_translation(pos),
+                GlobalTransform::from_translation(pos),
+            ));
         }
     }
 }
@@ -708,20 +1107,32 @@ fn drain_sfx(
     mut queue: ResMut<SfxQueue>,
     handles: Option<Res<backend::SfxHandles>>,
     store: Option<Res<crate::meta::ProfileStore>>,
+    listeners: Query<&GlobalTransform, With<bevy::audio::SpatialListener>>,
+    mut picked: Local<Vec<SfxRequest>>,
 ) {
     let settings = crate::meta::live_settings(store.as_deref());
-    let mut played: Vec<SfxEvent> = Vec::new();
-    for sfx in queue.0.drain(..) {
-        // One instance of each sound per frame (8 pellets = 1 bang).
-        if played.contains(&sfx) {
-            continue;
-        }
-        played.push(sfx);
-        let volume = effective_sfx_volume(sfx, &settings);
-        if volume > 0.0
-            && let Some(h) = &handles
-        {
-            backend::play(&mut commands, h, sfx, volume);
+    let listener = listeners.iter().next().map(|g| g.translation());
+    dedup_sfx_requests(&queue.0, listener, &mut picked);
+    queue.0.clear();
+    let Some(h) = &handles else { return };
+    for r in picked.drain(..) {
+        let volume = effective_sfx_volume(r.event, &settings);
+        match (r.pos, listener) {
+            // Positional: rodio applies the rolloff / panning; we add the edge
+            // fade and cull anything past `SPATIAL_MAX_DIST`.
+            (Some(pos), Some(ear)) => {
+                let pos = emitter_position(r.event, ear, pos);
+                let v = volume * spatial_distance_fade(pos.distance(ear), SPATIAL_MAX_DIST);
+                if v > 0.0 {
+                    backend::play_at(&mut commands, h, r.event, v, pos);
+                }
+            }
+            // 2D, or no listener yet (menus): plain stereo playback.
+            _ => {
+                if volume > 0.0 {
+                    backend::play(&mut commands, h, r.event, volume);
+                }
+            }
         }
     }
 }
@@ -791,7 +1202,7 @@ mod tests {
 
     #[test]
     fn rocket_sfx_are_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 25);
+        assert_eq!(SfxEvent::ALL.len(), 31);
         let fire = synthesize_wav(SfxEvent::RocketFire);
         let boom = synthesize_wav(SfxEvent::RocketExplode);
         assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
@@ -805,7 +1216,7 @@ mod tests {
 
     #[test]
     fn milestone13_sfx_are_valid_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 25);
+        assert_eq!(SfxEvent::ALL.len(), 31);
         let news = [SfxEvent::PhaseBlink, SfxEvent::SniperLock, SfxEvent::BossShield];
         for sfx in news {
             assert!(SfxEvent::ALL.contains(&sfx));
@@ -836,7 +1247,7 @@ mod tests {
 
     #[test]
     fn music_layers_are_valid_phase_locked_normalized_wavs() {
-        assert_eq!(MusicLayer::ALL.len(), 3);
+        assert_eq!(MusicLayer::ALL.len(), 4);
         for (i, layer) in MusicLayer::ALL.into_iter().enumerate() {
             assert_eq!(layer.index(), i);
         }
@@ -902,48 +1313,71 @@ mod tests {
         for (layer, w) in MusicLayer::ALL.into_iter().zip(&wavs) {
             assert_eq!(*w, synthesize_music_wav(layer), "{layer:?} deterministic");
         }
-        assert_ne!(wavs[0], wavs[1]);
-        assert_ne!(wavs[1], wavs[2]);
-        assert_ne!(wavs[0], wavs[2]);
+        for a in 0..wavs.len() {
+            for b in a + 1..wavs.len() {
+                assert_ne!(wavs[a], wavs[b], "{a} vs {b}");
+            }
+        }
         // Character: the drone is the darkest (least sample-to-sample motion),
         // the rush stem the busiest.
         let motion = |l: MusicLayer| {
             let s = music_samples(l);
             s.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / s.len() as f32
         };
-        let (d, p, r) = (motion(MusicLayer::DeadZoneDrone), motion(MusicLayer::SignalPulse), motion(MusicLayer::RushMetal));
-        assert!(d < p && d < r, "drone {d} pulse {p} rush {r}");
+        let (d, p, r, b) = (motion(MusicLayer::DeadZoneDrone), motion(MusicLayer::SignalPulse), motion(MusicLayer::RushMetal), motion(MusicLayer::BossOverdrive));
+        assert!(d < p && d < r && d < b, "drone {d} pulse {p} rush {r} boss {b}");
+    }
+
+    fn cues(state: AppState, bars: u8) -> MusicCues {
+        MusicCues { state, bars, ..default() }
     }
 
     #[test]
     fn target_music_weights_cover_every_state_and_situation() {
         use AppState::*;
+        let all_on = |state| MusicCues { state, bars: 5, uploading: true, boss_active: true, boss_overdrive: true, time_trial: true };
         for st in [MainMenu, Loadout, ContractsFeats, Settings] {
-            assert_eq!(target_music_weights(st, 5, true, true), [0.45, 0.15, 0.0], "{st:?}");
+            assert_eq!(target_music_weights(all_on(st)), [0.45, 0.15, 0.0, 0.0], "{st:?}");
         }
-        assert_eq!(target_music_weights(Paused, 5, true, true), [0.25, 0.0, 0.0]);
-        assert_eq!(target_music_weights(UpgradeSelect, 0, false, false), [0.15, 0.55, 0.0]);
-        assert_eq!(target_music_weights(Victory, 0, false, false), [0.15, 0.55, 0.0]);
-        assert_eq!(target_music_weights(GameOver, 5, true, false), [0.50, 0.0, 0.0]);
+        assert_eq!(target_music_weights(all_on(Paused)), [0.25, 0.0, 0.0, 0.0]);
+        assert_eq!(target_music_weights(cues(UpgradeSelect, 0)), [0.15, 0.55, 0.0, 0.0]);
+        assert_eq!(target_music_weights(cues(Victory, 0)), [0.15, 0.55, 0.0, 0.0]);
+        assert_eq!(target_music_weights(all_on(GameOver)), [0.50, 0.0, 0.0, 0.0]);
         for bars in 0..=1 {
-            assert_eq!(target_music_weights(Playing, bars, false, false), [0.95, 0.05, 0.0], "{bars} bars");
+            assert_eq!(target_music_weights(cues(Playing, bars)), [0.95, 0.05, 0.0, 0.0], "{bars} bars");
         }
         for bars in 2..=3 {
-            assert_eq!(target_music_weights(Playing, bars, false, false), [0.45, 0.75, 0.0], "{bars} bars");
+            assert_eq!(target_music_weights(cues(Playing, bars)), [0.45, 0.75, 0.0, 0.0], "{bars} bars");
         }
         for bars in 4..=5 {
-            assert_eq!(target_music_weights(Playing, bars, false, false), [0.20, 0.95, 0.25], "{bars} bars");
+            assert_eq!(target_music_weights(cues(Playing, bars)), [0.20, 0.95, 0.25, 0.0], "{bars} bars");
         }
         for bars in 0..=5 {
-            assert_eq!(target_music_weights(Playing, bars, true, false), [0.15, 0.35, 1.0], "SOS at {bars}");
-            assert_eq!(target_music_weights(Playing, bars, false, true), [0.15, 0.35, 1.0], "boss at {bars}");
+            let sos = MusicCues { uploading: true, ..cues(Playing, bars) };
+            assert_eq!(target_music_weights(sos), [0.15, 0.35, 1.0, 0.0], "SOS at {bars}");
+            // Carrier Daemon: the Overdrive stem joins at 0.75, full in Overdrive.
+            let boss = MusicCues { boss_active: true, ..cues(Playing, bars) };
+            assert_eq!(target_music_weights(boss), [0.15, 0.30, 1.0, 0.75], "boss at {bars}");
+            let od = MusicCues { boss_overdrive: true, ..boss };
+            assert_eq!(target_music_weights(od), [0.05, 0.20, 1.0, 1.0], "overdrive at {bars}");
+            assert_eq!(target_music_weights(MusicCues { uploading: true, ..od }), [0.05, 0.20, 1.0, 1.0], "boss wins over SOS");
+            // A stale overdrive flag without a live boss is ignored.
+            assert_eq!(target_music_weights(MusicCues { boss_overdrive: true, ..cues(Playing, bars) })[3], 0.0);
+            // Time trial: energetic pulse + rush instead of the dead-zone drone.
+            let tt = MusicCues { time_trial: true, ..cues(Playing, bars) };
+            assert_eq!(target_music_weights(tt), [0.0, 0.85, 0.70, 0.0], "time trial at {bars}");
         }
+        // Only the boss ever brings in the Overdrive stem.
+        for st in [MainMenu, Loadout, ContractsFeats, Settings, Paused, UpgradeSelect, Victory, GameOver] {
+            assert_eq!(target_music_weights(MusicCues { boss_active: true, boss_overdrive: true, ..cues(st, 3) })[3], 0.0, "{st:?}");
+        }
+        assert_eq!(MusicMixState::default().weights, [0.45, 0.15, 0.0, 0.0]);
     }
 
     #[test]
     fn music_mix_crossfades_smoothly_and_converges() {
-        let from = [0.95, 0.05, 0.0];
-        let to = [0.15, 0.35, 1.0];
+        let from = [0.95, 0.05, 0.0, 0.0];
+        let to = [0.15, 0.35, 1.0, 0.75];
         assert_eq!(step_music_mix(from, to, 0.0), from);
         let mut w = from;
         let mut prev_rush = 0.0;
@@ -963,13 +1397,13 @@ mod tests {
         for _ in 0..10 {
             coarse = step_music_mix(coarse, to, 0.1);
         }
-        for i in 0..3 {
+        for i in 0..MUSIC_LAYERS {
             assert!((coarse[i] - w[i]).abs() < 1e-4);
         }
         for _ in 0..600 {
             w = step_music_mix(w, to, 1.0 / 60.0);
         }
-        for i in 0..3 {
+        for i in 0..MUSIC_LAYERS {
             assert!((w[i] - to[i]).abs() < 1e-4, "{w:?}");
         }
     }
@@ -988,5 +1422,208 @@ mod tests {
         assert_eq!(effective_music_volume(1.0, &loud), MUSIC_BASE_VOLUME, "master clamps at 1");
         let muted = UserSettings { audio_muted: true, ..full };
         assert_eq!(effective_music_volume(1.0, &muted), 0.0);
+    }
+
+    #[test]
+    fn milestone20_sfx_are_valid_distinct_short_and_deterministic() {
+        let news = [SfxEvent::StepRegolith, SfxEvent::StepMetal, SfxEvent::LandThud, SfxEvent::ShellClink, SfxEvent::RocketWhoosh, SfxEvent::JammerHum];
+        for sfx in news {
+            assert!(SfxEvent::ALL.contains(&sfx));
+            let w = synthesize_wav(sfx);
+            assert_eq!(w, synthesize_wav(sfx), "{sfx:?} deterministic");
+            for other in SfxEvent::ALL.into_iter().filter(|o| *o != sfx) {
+                assert_ne!(w, synthesize_wav(other), "{sfx:?} vs {other:?}");
+            }
+            let raw = synth_samples(sfx);
+            assert!(raw.iter().all(|v| v.is_finite()), "{sfx:?} finite");
+            assert!(raw.iter().any(|v| v.abs() > 1e-3), "{sfx:?} non-silent");
+            // RMS energy: a real sound, not a lone click.
+            let pcm: Vec<i16> = w[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            let rms = (pcm.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt();
+            assert!(rms > 1200.0, "{sfx:?} rms {rms}");
+        }
+        // Footsteps and clinks are short and quiet (they repeat a lot).
+        let secs = |e| (synthesize_wav(e).len() - 44) as f32 / 2.0 / SAMPLE_RATE as f32;
+        for e in [SfxEvent::StepRegolith, SfxEvent::StepMetal, SfxEvent::ShellClink] {
+            assert!(secs(e) < 0.3, "{e:?} {}", secs(e));
+            assert!(e.volume() < 0.4, "{e:?}");
+        }
+        assert!(secs(SfxEvent::JammerHum) < JAMMER_HUM_INTERVAL, "hum never overlaps itself");
+        // Distinct timbres: the metal step rings longer than the regolith crunch,
+        // the clink is the brightest (most sample-to-sample motion).
+        assert!(secs(SfxEvent::StepMetal) > secs(SfxEvent::StepRegolith));
+        let motion = |e| {
+            let s = synth_samples(e);
+            let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            s.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / s.len() as f32 / peak
+        };
+        assert!(motion(SfxEvent::ShellClink) > motion(SfxEvent::LandThud) * 4.0);
+        assert!(motion(SfxEvent::ShellClink) > motion(SfxEvent::StepMetal));
+    }
+
+    #[test]
+    fn every_sfx_sample_is_finite_and_never_clips() {
+        for sfx in SfxEvent::ALL {
+            let raw = synth_samples(sfx);
+            assert!(!raw.is_empty() && raw.iter().all(|v| v.is_finite()), "{sfx:?}");
+            let w = synthesize_wav(sfx);
+            let pcm: Vec<i16> = w[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            assert!(pcm.iter().all(|s| s.unsigned_abs() <= (0.91 * i16::MAX as f32) as u16), "{sfx:?} clipped");
+            assert!(pcm.last().unwrap().unsigned_abs() < 64, "{sfx:?} fades out without a click");
+        }
+    }
+
+    #[test]
+    fn boss_overdrive_stem_is_the_busiest_and_driving() {
+        let s = music_samples(MusicLayer::BossOverdrive);
+        assert_eq!(s.len(), MUSIC_LOOP_SAMPLES);
+        assert!(s.iter().all(|v| v.is_finite()));
+        let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!((peak - MUSIC_PEAK).abs() < 1e-4, "{peak}");
+        // Relentless: every 16th step has energy (double kick + gallop, no rests).
+        for k in 0..MUSIC_STEPS {
+            let step = &s[k * MUSIC_STEP_SAMPLES..(k + 1) * MUSIC_STEP_SAMPLES];
+            let rms = (step.iter().map(|v| v * v).sum::<f32>() / step.len() as f32).sqrt();
+            assert!(rms > 0.05, "step {k} rms {rms}");
+        }
+    }
+
+    #[test]
+    fn spatial_gain_rolls_off_with_distance_and_fades_to_zero() {
+        let (l, right) = (Vec3::new(3.0, 1.6, -2.0), Vec3::X);
+        let gain = |d: f32| spatial_gain_and_pan(l, right, l + Vec3::new(0.0, 0.0, -d), SPATIAL_MAX_DIST).0;
+        assert_eq!(gain(0.0), 1.0);
+        assert_eq!(gain(SPATIAL_REF_DIST), 1.0);
+        assert!((gain(20.0) - 0.25).abs() < 1e-4, "inverse square past the reference");
+        // Monotonic falloff: 10-25 m clearly audible, > 35 m quiet, culled at max.
+        let mut prev = 1.0;
+        for d in (1..120).map(|k| k as f32 * 0.5) {
+            let g = gain(d);
+            assert!((0.0..=1.0).contains(&g) && g <= prev + 1e-6, "{d}: {g} after {prev}");
+            prev = g;
+        }
+        assert!(gain(25.0) > 0.12);
+        assert!(gain(36.0) < 0.08);
+        assert_eq!(gain(SPATIAL_MAX_DIST), 0.0);
+        assert_eq!(gain(SPATIAL_MAX_DIST + 10.0), 0.0);
+        // Rodio's sink applies the same law with the configured scale.
+        let scaled = |d: f32| (1.0 / (d * spatial_scale_factor()).powi(2)).min(1.0);
+        for d in [5.0, 12.0, 18.0, 30.0] {
+            assert!((spatial_rolloff(d) - scaled(d)).abs() < 1e-5, "{d}");
+        }
+        // Edge fade is smooth: no step at its start.
+        assert!((spatial_distance_fade(SPATIAL_MAX_DIST * 0.6, SPATIAL_MAX_DIST) - 1.0).abs() < 1e-6);
+        assert!(spatial_distance_fade(SPATIAL_MAX_DIST * 0.6 + 0.1, SPATIAL_MAX_DIST) > 0.99);
+        // Degenerate inputs never produce NaN.
+        assert_eq!(spatial_gain_and_pan(l, right, Vec3::NAN, 50.0), (0.0, 0.0));
+        assert_eq!(spatial_gain_and_pan(l, right, l + Vec3::X, 0.0).0, 0.0);
+        assert_eq!(spatial_gain_and_pan(l, Vec3::ZERO, l + Vec3::X * 3.0, 50.0).1, 0.0);
+    }
+
+    #[test]
+    fn spatial_pan_tracks_listener_yaw() {
+        let l = Vec3::new(10.0, 1.6, 10.0);
+        let pan = |right: Vec3, src: Vec3| spatial_gain_and_pan(l, right, src, SPATIAL_MAX_DIST).1;
+        // Facing -Z (right = +X): east is hard right, west hard left, ahead / above centred.
+        assert!((pan(Vec3::X, l + Vec3::X * 6.0) - 1.0).abs() < 1e-5);
+        assert!((pan(Vec3::X, l - Vec3::X * 6.0) + 1.0).abs() < 1e-5);
+        assert!(pan(Vec3::X, l - Vec3::Z * 6.0).abs() < 1e-5);
+        assert!(pan(Vec3::X, l + Vec3::Y * 6.0).abs() < 1e-5);
+        assert_eq!(pan(Vec3::X, l), 0.0);
+        // Turn 90 deg left (yaw +90: right becomes -Z): the east source is now ahead,
+        // a source to the north is on the right.
+        let right = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2) * Vec3::X;
+        assert!(pan(right, l + Vec3::X * 6.0).abs() < 1e-5);
+        assert!((pan(right, l - Vec3::Z * 6.0) - 1.0).abs() < 1e-5);
+        // 45 deg off-axis pans partially; scale-invariant in distance.
+        let p = pan(Vec3::X, l + Vec3::new(4.0, 0.0, -4.0));
+        assert!((p - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!((pan(Vec3::X, l + Vec3::new(20.0, 0.0, -20.0)) - p).abs() < 1e-5);
+    }
+
+    #[test]
+    fn queue_records_2d_and_positional_requests() {
+        let mut q = SfxQueue::default();
+        q.play(SfxEvent::Shotgun);
+        q.play_at(SfxEvent::EnemyFire, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(q.0, vec![SfxRequest { event: SfxEvent::Shotgun, pos: None }, SfxRequest { event: SfxEvent::EnemyFire, pos: Some(Vec3::new(1.0, 2.0, 3.0)) }]);
+        assert_eq!(q.events().collect::<Vec<_>>(), vec![SfxEvent::Shotgun, SfxEvent::EnemyFire]);
+    }
+
+    #[test]
+    fn dedup_keeps_one_instance_per_event_preferring_2d_then_nearest() {
+        let l = Vec3::new(0.0, 1.6, 0.0);
+        let at = |e, x: f32| SfxRequest { event: e, pos: Some(Vec3::new(x, 0.0, 0.0)) };
+        let flat = |e| SfxRequest { event: e, pos: None };
+        let mut out = Vec::new();
+        // 8 simultaneous enemy shots at various ranges -> only the nearest plays.
+        let shots: Vec<_> = [30.0, 12.0, -4.0, 22.0, 7.0, -40.0, 15.0, 9.0].into_iter().map(|x| at(SfxEvent::EnemyFire, x)).collect();
+        dedup_sfx_requests(&shots, Some(l), &mut out);
+        assert_eq!(out, vec![at(SfxEvent::EnemyFire, -4.0)]);
+        // A 2D instance (e.g. the player's own) wins over any positional one.
+        let mixed = [at(SfxEvent::RocketExplode, 2.0), flat(SfxEvent::RocketExplode), at(SfxEvent::RocketExplode, 1.0)];
+        dedup_sfx_requests(&mixed, Some(l), &mut out);
+        assert_eq!(out, vec![flat(SfxEvent::RocketExplode)]);
+        // Distinct events all survive, in first-request order; 8 pellets = 1 hit.
+        let mut reqs = vec![flat(SfxEvent::Shotgun)];
+        reqs.extend(std::iter::repeat_n(flat(SfxEvent::Hit), 8));
+        reqs.extend([at(SfxEvent::EnemyDeath, 5.0), at(SfxEvent::ShellClink, 0.5), at(SfxEvent::EnemyDeath, 3.0)]);
+        dedup_sfx_requests(&reqs, Some(l), &mut out);
+        assert_eq!(out, vec![flat(SfxEvent::Shotgun), flat(SfxEvent::Hit), at(SfxEvent::EnemyDeath, 3.0), at(SfxEvent::ShellClink, 0.5)]);
+        // No listener yet: the first positional instance is kept.
+        dedup_sfx_requests(&shots, None, &mut out);
+        assert_eq!(out, vec![at(SfxEvent::EnemyFire, 30.0)]);
+        // The output buffer is reused, empty input -> empty output.
+        dedup_sfx_requests(&[], Some(l), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn warnings_keep_direction_but_are_never_out_of_earshot() {
+        let l = Vec3::new(5.0, 1.6, 5.0);
+        let far = l + Vec3::new(80.0, 0.0, -60.0);
+        let p = emitter_position(SfxEvent::BaronAlert, l, far);
+        assert!((p.distance(l) - 9.0).abs() < 1e-4);
+        assert!((p - l).normalize().dot((far - l).normalize()) > 0.9999, "same direction");
+        assert!(spatial_gain_and_pan(l, Vec3::X, p, SPATIAL_MAX_DIST).0 > 0.99);
+        // Near warnings and ordinary combat sounds are untouched (and far ones cull).
+        let near = l + Vec3::X * 4.0;
+        assert_eq!(emitter_position(SfxEvent::BaronAlert, l, near), near);
+        assert_eq!(emitter_position(SfxEvent::EnemyFire, l, far), far);
+        assert_eq!(spatial_gain_and_pan(l, Vec3::X, far, SPATIAL_MAX_DIST).0, 0.0);
+        assert!(emitter_position(SfxEvent::BossShield, l, far).distance(l) <= 12.0 + 1e-4);
+    }
+
+    #[test]
+    fn nearest_within_picks_the_closest_source_in_range() {
+        let p = Vec3::new(10.0, 0.0, 10.0);
+        let srcs = [Vec3::new(30.0, 0.0, 10.0), Vec3::new(10.0, 2.0, 22.0), Vec3::new(4.0, 0.0, 10.0), Vec3::NAN];
+        assert_eq!(nearest_within(p, srcs, JAMMER_HUM_RADIUS), Some(Vec3::new(4.0, 0.0, 10.0)));
+        assert_eq!(nearest_within(p, [Vec3::new(10.0, 2.0, 22.0)], JAMMER_HUM_RADIUS), Some(Vec3::new(10.0, 2.0, 22.0)));
+        assert_eq!(nearest_within(p, [Vec3::new(30.0, 0.0, 10.0)], JAMMER_HUM_RADIUS), None, "out of earshot");
+        assert_eq!(nearest_within(p, [], JAMMER_HUM_RADIUS), None);
+    }
+
+    #[test]
+    fn footstep_surface_and_stride_rules() {
+        use crate::level::{Cell, RampDir};
+        assert_eq!(footstep_sfx(Cell::Floor { height: 0.0 }, 0.0), SfxEvent::StepRegolith);
+        assert_eq!(footstep_sfx(Cell::Floor { height: 0.0 }, 0.3), SfxEvent::StepRegolith);
+        assert_eq!(footstep_sfx(Cell::Floor { height: 2.4 }, 2.4), SfxEvent::StepMetal, "catwalk deck");
+        assert_eq!(footstep_sfx(Cell::Ramp { low_height: 0.0, high_height: 2.4, dir: RampDir::North }, 0.1), SfxEvent::StepMetal, "ramp foot");
+        // One step every STEP_STRIDE metres of travel, whatever the frame slicing.
+        let mut stride = 0.0;
+        let steps = (0..600).filter(|_| advance_stride(&mut stride, 0.12)).count();
+        assert!((29..=30).contains(&steps), "{steps}");
+        let mut stride = 0.0;
+        assert!(!advance_stride(&mut stride, 0.0) && !advance_stride(&mut stride, f32::NAN) && !advance_stride(&mut stride, -3.0));
+        assert_eq!(stride, 0.0);
+        // A teleport-sized jump yields a single step, never a burst.
+        assert!(advance_stride(&mut stride, 50.0));
+        assert!(stride < STEP_STRIDE && !advance_stride(&mut stride, 0.1));
+        // Casing clinks: only real rebounds from a fast enough fall.
+        assert!(is_clink_bounce(-3.0, 1.2));
+        assert!(!is_clink_bounce(-0.8, 0.2), "resting jitter is silent");
+        assert!(!is_clink_bounce(-3.0, -3.2), "still falling");
     }
 }

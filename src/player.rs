@@ -17,7 +17,7 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::apps::{HijackedHotspot, HIJACK_STRENGTH};
 use crate::assets_gen::{FloorTheme, GameAssets};
-use crate::audio::{SfxEvent, SfxQueue};
+use crate::audio::{advance_stride, footstep_sfx, SfxEvent, SfxQueue, LAND_THUD_SPEED, STEP_STRIDE};
 use crate::bot_input::{take_flag, BotControl};
 use crate::enemies::{fiend_jammer_fields_iter, Enemy};
 use crate::fx::{spawn_burst, spawn_flash_light, spawn_particles, spawn_shockwave, BurstColor, FxAssets, HudFeed};
@@ -69,6 +69,11 @@ pub const MAX_AIR_SPEED: f32 = 36.0;
 pub const AIR_SPEED_HARD_CAP: f32 = 48.0;
 /// Grace period to still jump after running off a ledge.
 pub const COYOTE_TIME: f32 = 0.10;
+/// Seconds grounded before footsteps count (longer than a bhop's landing substep).
+const FOOTSTEP_MIN_GROUND_TIME: f32 = 0.06;
+/// Horizontal speed (m/s) below which the player is standing, not walking.
+const FOOTSTEP_MIN_SPEED: f32 = 1.5;
+
 /// A `Space` tap this early before landing still hops on touchdown.
 pub const JUMP_BUFFER_TIME: f32 = 0.12;
 /// Bhop chain breaks after standing on the ground this long without jumping.
@@ -203,6 +208,8 @@ pub struct Player {
     pub strafe_tilt: f32,
     /// Feet position before this frame's `move_player` step (for swept pad contact).
     pub prev_pos: Option<Vec3>,
+    /// Grounded running distance (m) since the last footstep.
+    pub stride: f32,
 }
 
 impl Default for Player {
@@ -236,6 +243,7 @@ impl Default for Player {
             ground_time: 0.0,
             strafe_tilt: 0.0,
             prev_pos: None,
+            stride: 0.0,
         }
     }
 }
@@ -439,6 +447,7 @@ fn snap_player_to_spawn(
         p.jump_buffer_timer = 0.0;
         p.bhop_chain = 0;
         p.ground_time = 0.0;
+        p.stride = 0.0;
         p.strafe_tilt = 0.0;
         p.bob_phase = 0.0;
         p.prev_pos = Some(tf.translation);
@@ -790,6 +799,7 @@ fn move_player(
     // exact 60 Hz frame at two substeps despite float rounding).
     let substeps = ((dt / MOVE_SUBSTEP_DT - 1e-3).ceil().max(1.0)) as u32;
     let sub_dt = dt / substeps as f32;
+    let mut thud = false;
     for i in 0..substeps {
         // Spread this frame's mouse turn across the substeps.
         let yaw_i = p.prev_yaw + (p.yaw - p.prev_yaw) * ((i + 1) as f32 / substeps as f32);
@@ -856,7 +866,15 @@ fn move_player(
         vel.x = h.x;
         vel.z = h.y;
 
+        let (was_grounded, fall_vy) = (p.grounded, vel.y);
         let r = resolve_player_movement(&grid, tf.translation, vel, sub_dt, PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_STEP_HEIGHT, p.grounded);
+        if r.grounded && !was_grounded {
+            // Touchdown: thud unless the next substep chains a zero-friction hop.
+            let chaining = space_held || p.jump_buffer_timer > 0.0;
+            thud |= !chaining && -fall_vy > LAND_THUD_SPEED;
+            // The first step after landing comes a half stride later.
+            p.stride = STEP_STRIDE * 0.5;
+        }
         tf.translation = r.pos;
         p.velocity = r.vel;
         p.grounded = r.grounded;
@@ -879,6 +897,20 @@ fn move_player(
         }
     }
     p.prev_yaw = p.yaw;
+    if thud {
+        sfx.play(SfxEvent::LandThud);
+    }
+    // Footsteps: grounded running only (a clean bhop never settles on the
+    // ground long enough, and a dash slide is silent).
+    let moved = p.prev_pos.map_or(0.0, |prev| Vec2::new(tf.translation.x - prev.x, tf.translation.z - prev.z).length());
+    if p.grounded
+        && p.ground_time >= FOOTSTEP_MIN_GROUND_TIME
+        && p.dash_timer <= 0.0
+        && Vec2::new(p.velocity.x, p.velocity.z).length() > FOOTSTEP_MIN_SPEED
+        && advance_stride(&mut p.stride, moved)
+    {
+        sfx.play(footstep_sfx(grid.cell(grid.world_to_cell(tf.translation)), tf.translation.y));
+    }
 
     // Strafe roll toward the strafe key / sideways drift (applied by `view_bob`).
     let right_xz = Vec2::new(p.yaw.cos(), -p.yaw.sin());
@@ -1008,8 +1040,11 @@ pub fn update_jump_pads(
             continue;
         }
         apply_jump_pad(p, pad.launch_vel);
+        p.stride = 0.0;
         pad.cooldown = JUMP_PAD_COOLDOWN;
-        sfx.play(SfxEvent::JumpPad);
+        // Launching off a powered pad replaces any same-frame ground footstep / landing thud.
+        sfx.0.retain(|r| !matches!(r.event, SfxEvent::StepRegolith | SfxEvent::StepMetal | SfxEvent::LandThud));
+        sfx.play_at(SfxEvent::JumpPad, pad.pos);
         let base = pad.pos + Vec3::Y * 0.25;
         spawn_shockwave(&mut commands, &fx, &mut materials, base, 2.4, 0.3, JUMP_PAD_GLOW.0, JUMP_PAD_GLOW.1, true);
         spawn_particles(&mut commands, &fx, base, BurstColor::Cyan, 8, 7.0, 0.06);
@@ -1394,7 +1429,7 @@ mod tests {
     }
 
     fn sfx(app: &mut App) -> Vec<SfxEvent> {
-        std::mem::take(&mut app.world_mut().resource_mut::<SfxQueue>().0)
+        std::mem::take(&mut app.world_mut().resource_mut::<SfxQueue>().0).into_iter().map(|r| r.event).collect()
     }
 
     /// 88 m east-west corridor.
@@ -1424,6 +1459,8 @@ mod tests {
         let hops_sfx: Vec<_> = sounds.iter().filter(|s| matches!(s, SfxEvent::Jump | SfxEvent::Bhop)).collect();
         assert_eq!(hops_sfx.first(), Some(&&SfxEvent::Jump), "{sounds:?}");
         assert!(hops_sfx[1..].iter().all(|s| **s == SfxEvent::Bhop) && hops_sfx.len() >= 3, "{sounds:?}");
+        // A clean bhop chain is silent underfoot: no footsteps, no landing thuds.
+        assert!(!sounds.iter().any(|s| matches!(s, SfxEvent::StepRegolith | SfxEvent::StepMetal | SfxEvent::LandThud)), "{sounds:?}");
 
         // Letting go: the player lands, friction bites and the chain breaks.
         keys(&mut app).release(KeyCode::Space);
@@ -1432,6 +1469,60 @@ mod tests {
         }
         let p = hp(&mut app);
         assert!(p.grounded && xz(p.velocity).length() < 1.0 && p.bhop_chain == 0, "{p:?}");
+    }
+
+    fn feet(app: &mut App) -> Vec3 {
+        app.world_mut().query_filtered::<&Transform, With<Player>>().single(app.world()).unwrap().translation
+    }
+
+    #[test]
+    fn running_steps_once_per_stride_on_regolith() {
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 0.0, 6.0), Vec3::ZERO);
+        tick(&mut app);
+        let x0 = feet(&mut app).x;
+        keys(&mut app).press(KeyCode::KeyD);
+        let mut sounds = Vec::new();
+        for _ in 0..120 {
+            tick(&mut app);
+            sounds.extend(sfx(&mut app));
+        }
+        let run = feet(&mut app).x - x0;
+        assert!(run > 8.0, "ran {run} m");
+        let steps = sounds.iter().filter(|s| **s == SfxEvent::StepRegolith).count();
+        let expected = (run / STEP_STRIDE) as usize;
+        assert!(steps + 1 >= expected && steps <= expected + 1, "{steps} steps over {run} m");
+        assert!(!sounds.iter().any(|s| matches!(s, SfxEvent::StepMetal | SfxEvent::LandThud)), "{sounds:?}");
+        // Standing still: silence.
+        keys(&mut app).release(KeyCode::KeyD);
+        for _ in 0..60 {
+            tick(&mut app);
+        }
+        sfx(&mut app);
+        for _ in 0..60 {
+            tick(&mut app);
+        }
+        assert!(sfx(&mut app).is_empty());
+    }
+
+    #[test]
+    fn hard_landing_thuds_once_and_soft_drop_is_silent() {
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 4.0, 6.0), Vec3::ZERO);
+        let mut sounds = Vec::new();
+        for _ in 0..90 {
+            tick(&mut app);
+            sounds.extend(sfx(&mut app));
+        }
+        assert!(hp(&mut app).grounded);
+        assert_eq!(sounds.iter().filter(|s| **s == SfxEvent::LandThud).count(), 1, "{sounds:?}");
+        assert!(!sounds.iter().any(|s| matches!(s, SfxEvent::StepRegolith | SfxEvent::StepMetal)), "falling is not walking: {sounds:?}");
+
+        let mut app = harness(&CORRIDOR, Vec3::new(6.0, 0.15, 6.0), Vec3::ZERO);
+        let mut sounds = Vec::new();
+        for _ in 0..30 {
+            tick(&mut app);
+            sounds.extend(sfx(&mut app));
+        }
+        assert!(hp(&mut app).grounded && sounds.is_empty(), "{sounds:?}");
     }
 
     /// Hop once at 20 m/s and fall until about `ticks_before_land` ticks remain, then tap Space.

@@ -405,7 +405,7 @@ fn update_extraction(
                         spawn_burst(&mut commands, &fx, pos + Vec3::Y * 2.2, BurstColor::Gold, 40, 10.0, 0.3);
                         spawn_burst(&mut commands, &fx, pos + Vec3::Y * 1.2, BurstColor::Gore, 28, 8.0, 0.24);
                         spawn_flash_light(&mut commands, pos + Vec3::Y * 3.0, Color::srgb(1.0, 0.45, 0.25), 8_000_000.0, 36.0, 0.9);
-                        sfx.play(SfxEvent::BaronAlert);
+                        sfx.play_at(SfxEvent::BaronAlert, pos + Vec3::Y * 2.2);
                         feed.alert(BOSS_ARRIVAL_TEXT, Color::srgb(1.0, 0.45, 0.2), 4.0);
                     }
                 }
@@ -534,7 +534,7 @@ fn update_extraction(
                 let pos = spawn_pos_for(EnemyKind::HellBaron, &grid, c);
                 spawn_enemy(&mut commands, &ea, &mut materials, EnemyKind::HellBaron, pos, floor, true);
                 spawn_burst(&mut commands, &fx, pos + Vec3::Y * 1.5, BurstColor::Gold, 24, 6.0, 0.2);
-                sfx.play(SfxEvent::BaronAlert);
+                sfx.play_at(SfxEvent::BaronAlert, pos + Vec3::Y * 1.5);
                 feed.alert("WARNING: HELL BARON INBOUND!", Color::srgb(1.0, 0.55, 0.1), 3.5);
                 // Emergency medkit on the ring edge.
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);

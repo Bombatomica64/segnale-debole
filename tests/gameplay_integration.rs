@@ -3436,20 +3436,20 @@ fn relay_sniper_locks_on_with_a_laser_then_fires_a_rail_bolt() {
 // Milestone 14: adaptive soundtrack mix
 // ---------------------------------------------------------------------------
 
-fn music_weights(app: &App) -> [f32; 3] {
+fn music_weights(app: &App) -> [f32; 4] {
     app.world().resource::<segnale_debole::audio::MusicMixState>().weights
 }
 
 #[test]
 fn adaptive_music_mix_follows_dead_zone_signal_sos_and_pause() {
-    use segnale_debole::audio::target_music_weights;
-    let close = |w: [f32; 3], t: [f32; 3], tol: f32| (0..3).all(|i| (w[i] - t[i]).abs() < tol);
+    use segnale_debole::audio::{target_music_weights, MusicCues};
+    let close = |w: [f32; 4], t: [f32; 4], tol: f32| (0..4).all(|i| (w[i] - t[i]).abs() < tol);
 
     // Main menu: tense drone bed.
     let mut app = build_headless_test_app();
     step(&mut app, 2 * FPS);
     let w = music_weights(&app);
-    assert!(close(w, [0.45, 0.15, 0.0], 0.01), "menu mix {w:?}");
+    assert!(close(w, [0.45, 0.15, 0.0, 0.0], 0.01), "menu mix {w:?}");
 
     begin_run(&mut app, 41);
     godmode(&mut app);
@@ -3484,7 +3484,8 @@ fn adaptive_music_mix_follows_dead_zone_signal_sos_and_pause() {
     step(&mut app, 2 * FPS);
     let w = music_weights(&app);
     assert!(w[2] > 0.9 && w[2] > w[1] && w[1] > w[0], "SOS rush mix {w:?}");
-    assert!(close(w, target_music_weights(AppState::Playing, 5, true, false), 0.05), "{w:?}");
+    assert!(close(w, target_music_weights(MusicCues { state: AppState::Playing, bars: 5, uploading: true, ..Default::default() }), 0.05), "{w:?}");
+    assert!(w[3] < 0.02, "no boss stem without the boss {w:?}");
 
     // Pause: everything ducks to a quiet drone.
     app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Paused);
@@ -3508,11 +3509,23 @@ fn adaptive_music_mix_goes_rush_during_boss_fight() {
     app.world_mut().run_system_once(segnale_debole::audio::update_music_mix).unwrap();
     let after = music_weights(&app);
     let dt = app.world().resource::<Time>().delta_secs();
-    let expect = step_music_mix(before, [0.15, 0.35, 1.0], dt);
-    for i in 0..3 {
+    let expect = step_music_mix(before, [0.15, 0.30, 1.0, 0.75], dt);
+    for i in 0..4 {
         assert!((after[i] - expect[i]).abs() < 1e-5, "{after:?} vs {expect:?}");
     }
     assert!(after[2] > before[2], "rush rises under the boss");
+    assert!(after[3] > before[3], "the Boss Overdrive stem rises too");
+
+    // Overdrive: the boss stem heads for full weight.
+    app.world_mut().insert_resource(BossHud { active: true, phase: BossPhase::Overdrive, hp_frac: 0.2, pylons: 0 });
+    let before = music_weights(&app);
+    app.world_mut().run_system_once(segnale_debole::audio::update_music_mix).unwrap();
+    let after = music_weights(&app);
+    let dt = app.world().resource::<Time>().delta_secs();
+    let expect = step_music_mix(before, [0.05, 0.20, 1.0, 1.0], dt);
+    for i in 0..4 {
+        assert!((after[i] - expect[i]).abs() < 1e-5, "{after:?} vs {expect:?}");
+    }
 }
 
 #[test]
@@ -3728,7 +3741,7 @@ fn debris_bounces_on_real_floor_height_catwalk_vs_ground() {
         app.world_mut()
             .spawn((
                 LevelEntity,
-                Fx::new(5.0, FxMotion::Debris { vel: Vec3::new(0.2, 3.0, -0.1), spin: Vec3::new(8.0, 3.0, -6.0), gravity: 18.0, bounce: 0.45 }, Vec3::ONE),
+                Fx::new(5.0, FxMotion::Debris { vel: Vec3::new(0.2, 3.0, -0.1), spin: Vec3::new(8.0, 3.0, -6.0), gravity: 18.0, bounce: 0.45, clinks: 0 }, Vec3::ONE),
                 Transform::from_translation(at + Vec3::Y * 1.8),
             ))
             .id()

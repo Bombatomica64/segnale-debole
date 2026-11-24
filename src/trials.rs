@@ -689,6 +689,7 @@ pub fn place_player(grid: &LevelGrid, p: &mut Player, tf: &mut Transform, cell: 
     p.jump_buffer_timer = 0.0;
     p.bhop_chain = 0;
     p.ground_time = 0.0;
+    p.stride = 0.0;
     p.strafe_tilt = 0.0;
     p.hazard_timer = 0.0;
     p.prev_pos = Some(pos);

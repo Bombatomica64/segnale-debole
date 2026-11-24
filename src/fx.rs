@@ -12,6 +12,7 @@ use rand::Rng;
 
 use std::sync::{Arc, Mutex};
 
+use crate::audio::{is_clink_bounce, SfxEvent, SfxQueue};
 use crate::level::{CullableLight, LevelEntity, LevelGrid};
 use crate::physics::sample_floor_height;
 use crate::state::GameSet;
@@ -29,7 +30,9 @@ pub enum FxMotion {
     /// Ballistic particle; shrinks over its life and optionally bounces off floors.
     Particle { vel: Vec3, gravity: f32 },
     /// Tumbling debris / brass shell casing that bounces off level floors.
-    Debris { vel: Vec3, spin: Vec3, gravity: f32, bounce: f32 },
+    /// `clinks` is the casing's remaining budget of positional
+    /// [`SfxEvent::ShellClink`]s, spent one per real floor bounce (0 = silent).
+    Debris { vel: Vec3, spin: Vec3, gravity: f32, bounce: f32, clinks: u8 },
     /// Rising expanding smoke puff.
     Smoke { vel: Vec3, grow: f32 },
     /// Uniform scale from `from` to `to` over its life (ease-out cubic).
@@ -449,6 +452,7 @@ pub fn spawn_particles(commands: &mut Commands, fx: &FxAssets, pos: Vec3, color:
                 spin: Vec3::new(rng.random_range(-10.0..10.0), rng.random_range(-10.0..10.0), rng.random_range(-10.0..10.0)),
                 gravity: 20.0,
                 bounce: 0.35,
+                clinks: 0,
             }
         } else {
             FxMotion::Particle { vel, gravity: 11.0 }
@@ -465,6 +469,9 @@ pub fn spawn_particles(commands: &mut Commands, fx: &FxAssets, pos: Vec3, color:
     }
 }
 
+/// Floor bounces of an ejected casing that clink (the rest rattle silently).
+pub const CASING_CLINKS: u8 = 2;
+
 /// Spinning red-and-brass shotgun shell ejected from the breach on fire.
 pub fn spawn_ejected_shell(commands: &mut Commands, fx: &FxAssets, pos: Vec3, right: Vec3, up: Vec3, fwd: Vec3) {
     let mut rng = rand::rng();
@@ -473,7 +480,7 @@ pub fn spawn_ejected_shell(commands: &mut Commands, fx: &FxAssets, pos: Vec3, ri
     let root = commands
         .spawn((
             LevelEntity,
-            Fx::new(1.15, FxMotion::Debris { vel, spin, gravity: 16.0, bounce: 0.45 }, Vec3::ONE),
+            Fx::new(1.15, FxMotion::Debris { vel, spin, gravity: 16.0, bounce: 0.45, clinks: CASING_CLINKS }, Vec3::ONE),
             Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
             Visibility::default(),
         ))
@@ -499,7 +506,7 @@ pub fn spawn_mortar_casing(commands: &mut Commands, fx: &FxAssets, pos: Vec3, ri
     let spin = Vec3::new(rng.random_range(-9.0..9.0), rng.random_range(-6.0..6.0), rng.random_range(-14.0..-7.0));
     commands.spawn((
         LevelEntity,
-        Fx::new(1.6, FxMotion::Debris { vel, spin, gravity: 15.0, bounce: 0.32 }, Vec3::ONE),
+        Fx::new(1.6, FxMotion::Debris { vel, spin, gravity: 15.0, bounce: 0.32, clinks: CASING_CLINKS }, Vec3::ONE),
         Mesh3d(fx.mortar_sleeve.clone()),
         MeshMaterial3d(fx.shell_brass.clone()),
         Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
@@ -541,7 +548,7 @@ pub fn spawn_death_gibs(commands: &mut Commands, fx: &FxAssets, center: Vec3, ma
         let offset = Vec3::new(rng.random_range(-0.3..0.3), rng.random_range(-0.3..0.3), rng.random_range(-0.3..0.3)) * size * 3.0;
         commands.spawn((
             LevelEntity,
-            Fx::new(rng.random_range(1.4..2.2), FxMotion::Debris { vel, spin, gravity: 19.0, bounce: 0.3 }, scale),
+            Fx::new(rng.random_range(1.4..2.2), FxMotion::Debris { vel, spin, gravity: 19.0, bounce: 0.3, clinks: 0 }, scale),
             Mesh3d(meshes[i % meshes.len()].clone()),
             MeshMaterial3d(fx.gib_mats[mats[i % mats.len()].index()].clone()),
             Transform::from_translation(center + offset)
@@ -814,6 +821,7 @@ fn animate_fx(
     mut commands: Commands,
     time: Res<Time>,
     grid: Option<Res<LevelGrid>>,
+    mut sfx: Option<ResMut<SfxQueue>>,
     mut q: Query<(
         Entity,
         &mut Fx,
@@ -848,7 +856,8 @@ fn animate_fx(
                 tf.scale = fx.base_scale * (1.0 - t * t);
                 tf.rotate_x(dt * 8.0);
             }
-            FxMotion::Debris { vel, spin, gravity, bounce } => {
+            FxMotion::Debris { vel, spin, gravity, bounce, clinks } => {
+                let prev_vy = vel.y;
                 let (p, v, s) = match grid.as_deref() {
                     Some(g) => debris_step(tf.translation, *vel, *spin, *gravity, *bounce, dt, |x, z| sample_floor_height(g, x, z)),
                     None => debris_step(tf.translation, *vel, *spin, *gravity, *bounce, dt, |_, _| Some(0.0)),
@@ -856,6 +865,12 @@ fn animate_fx(
                 tf.translation = p;
                 *vel = v;
                 *spin = s;
+                if *clinks > 0 && is_clink_bounce(prev_vy, v.y) {
+                    *clinks -= 1;
+                    if let Some(q) = sfx.as_deref_mut() {
+                        q.play_at(SfxEvent::ShellClink, p);
+                    }
+                }
                 tf.rotate_x(spin.x * dt);
                 tf.rotate_y(spin.y * dt);
                 tf.rotate_z(spin.z * dt);
