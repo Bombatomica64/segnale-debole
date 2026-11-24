@@ -3430,3 +3430,86 @@ fn relay_sniper_locks_on_with_a_laser_then_fires_a_rail_bolt() {
     step(&mut app, 1);
     assert!(!laser_visible(&mut app), "laser drops after the shot");
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 14: adaptive soundtrack mix
+// ---------------------------------------------------------------------------
+
+fn music_weights(app: &App) -> [f32; 3] {
+    app.world().resource::<segnale_debole::audio::MusicMixState>().weights
+}
+
+#[test]
+fn adaptive_music_mix_follows_dead_zone_signal_sos_and_pause() {
+    use segnale_debole::audio::target_music_weights;
+    let close = |w: [f32; 3], t: [f32; 3], tol: f32| (0..3).all(|i| (w[i] - t[i]).abs() < tol);
+
+    // Main menu: tense drone bed.
+    let mut app = build_headless_test_app();
+    step(&mut app, 2 * FPS);
+    let w = music_weights(&app);
+    assert!(close(w, [0.45, 0.15, 0.0], 0.01), "menu mix {w:?}");
+
+    begin_run(&mut app, 41);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+
+    // Dead Zone: the drone takes over.
+    find_blackout(&mut app);
+    assert!(signal(&app).bars <= 1);
+    step(&mut app, 2 * FPS);
+    let w = music_weights(&app);
+    assert!(signal(&app).bars <= 1, "still in the dead zone");
+    assert!(w[0] > 0.85 && w[1] < 0.15 && w[2] < 0.05, "dead-zone mix {w:?}");
+
+    // Walk into the Signal Ring (strong signal, uplink not yet started): Signal Pulse leads.
+    let g = grid(&app);
+    teleport(&mut app, g.cell_center(ring_cell(&g)), g.tower_world() + Vec3::Y * 2.0);
+    step(&mut app, FPS);
+    assert!(matches!(extraction(&app), ExtractionState::Searching { .. }), "{:?}", extraction(&app));
+    assert!(signal(&app).bars >= 4);
+    let w = music_weights(&app);
+    assert!(w[1] > 0.8 && w[1] > w[0] && w[2] < 0.3, "strong-signal mix {w:?}");
+
+    // SOS upload: the Rush Metal stem slams in.
+    bot(&mut app).interact = true;
+    step(&mut app, 2);
+    let mut up = 0;
+    while !matches!(extraction(&app), ExtractionState::Uploading { .. }) && up < FPS {
+        step(&mut app, 1);
+        up += 1;
+    }
+    assert!(matches!(extraction(&app), ExtractionState::Uploading { .. }), "{:?}", extraction(&app));
+    step(&mut app, 2 * FPS);
+    let w = music_weights(&app);
+    assert!(w[2] > 0.9 && w[2] > w[1] && w[1] > w[0], "SOS rush mix {w:?}");
+    assert!(close(w, target_music_weights(AppState::Playing, 5, true, false), 0.05), "{w:?}");
+
+    // Pause: everything ducks to a quiet drone.
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Paused);
+    step(&mut app, 2 * FPS);
+    assert_eq!(app_state(&app), AppState::Paused);
+    let w = music_weights(&app);
+    assert!(w[2] < 0.05 && w[1] < 0.02 && (w[0] - 0.25).abs() < 0.02, "paused mix {w:?}");
+}
+
+#[test]
+fn adaptive_music_mix_goes_rush_during_boss_fight() {
+    use segnale_debole::audio::{step_music_mix, MusicMixState};
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 5);
+    // A live boss snapshot drives the rush stem even before any SOS upload.
+    app.world_mut().insert_resource(BossHud { active: true, phase: BossPhase::default(), hp_frac: 1.0, pylons: 0 });
+    let before = music_weights(&app);
+    app.world_mut().resource_mut::<MusicMixState>().weights = before;
+    // The boss system rewrites BossHud each frame on non-boss floors, so check the
+    // mix system's single-frame response from the staged snapshot directly.
+    app.world_mut().run_system_once(segnale_debole::audio::update_music_mix).unwrap();
+    let after = music_weights(&app);
+    let dt = app.world().resource::<Time>().delta_secs();
+    let expect = step_music_mix(before, [0.15, 0.35, 1.0], dt);
+    for i in 0..3 {
+        assert!((after[i] - expect[i]).abs() < 1e-5, "{after:?} vs {expect:?}");
+    }
+    assert!(after[2] > before[2], "rush rises under the boss");
+}

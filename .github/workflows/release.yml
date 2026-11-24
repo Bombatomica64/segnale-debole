@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: segnale_debole
+
+jobs:
+  build:
+    name: Build ${{ matrix.archive }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: segnale-debole-linux-x86_64.tar.gz
+            exe: ""
+          - os: windows-latest
+            archive: segnale-debole-windows-x86_64.zip
+            exe: ".exe"
+          - os: macos-latest
+            archive: segnale-debole-macos-aarch64.tar.gz
+            exe: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pkg-config libx11-dev libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.os }}
+
+      - name: Build release binary (with procedural audio)
+        run: cargo build --release --features audio
+
+      - name: Stage package
+        shell: bash
+        run: |
+          mkdir -p dist/segnale-debole
+          cp "target/release/${BIN}${{ matrix.exe }}" dist/segnale-debole/
+          cp README.md dist/segnale-debole/
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -C dist -czf "${{ matrix.archive }}" segnale-debole
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/segnale-debole -DestinationPath "${{ matrix.archive }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
