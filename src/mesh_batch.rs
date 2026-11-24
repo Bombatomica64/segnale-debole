@@ -94,10 +94,12 @@ impl MeshBatch {
             let order = if flip { [tri[0], tri[2], tri[1]] } else { tri };
             let [a, b, c] = order.map(|i| affine.transform_point3(Vec3::from(pos[i])));
             let cross = (b - a).cross(c - a);
-            if cross.length_squared() <= 1e-16 {
+            let len_sq = cross.length_squared();
+            let edge_scale = (b - a).length_squared().max((c - a).length_squared()).max(1e-24);
+            if len_sq <= edge_scale * 1e-12 || len_sq <= 1e-28 {
                 continue;
             }
-            let geo_n = cross.normalize();
+            let geo_n = cross / len_sq.sqrt();
             let face_n = if use_src_normals {
                 let sum = world_normal(order[0]) + world_normal(order[1]) + world_normal(order[2]);
                 sum.try_normalize().unwrap_or(geo_n)

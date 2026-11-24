@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use rand::Rng;
 
 use crate::audio::{SfxEvent, SfxQueue};
-use crate::enemies::{spawn_enemy, spawn_enemy_projectile, spawn_pos_for, standable, Enemy, EnemyAssets, EnemyKind};
+use crate::enemies::{spawn_enemy, spawn_enemy_projectile, spawn_pos_for, spawn_rig, standable, Enemy, EnemyAssets, EnemyKind};
 use crate::fx::{spawn_burst, spawn_flash_light, spawn_shockwave, BurstColor, FxAssets, HudFeed};
 use crate::level::{Cell, CullableLight, LevelEntity, LevelGrid};
 use crate::physics::has_line_of_sight;
@@ -37,12 +37,20 @@ pub const BOSS_SHIELD_STUN: f32 = 1.8;
 /// Seconds after raising a shield before "0 pylons alive" can shatter it
 /// (the pylons are spawned through deferred commands).
 const PYLON_GRACE: f32 = 0.3;
-/// Pylon hit volumes `(height above base, radius)`.
-pub const PYLON_SPHERES: [(f32, f32); 3] = [(0.5, 0.8), (1.5, 0.5), (2.6, 0.48)];
+/// Pylon hit volumes `(height above base, radius)`: overlapping so a
+/// horizontal ray at every height from the base plinth (0.05) to the crystal
+/// crown (2.95) hits — no gap at the upper collar (y ~ 2.06).
+pub const PYLON_SPHERES: [(f32, f32); 3] = [(0.55, 0.85), (1.45, 0.65), (2.48, 0.62)];
 /// Height of the tether emitter on a pylon.
 const PYLON_TOP: f32 = 2.6;
-/// Height of the boss's Signal Core (tether anchor, attack origin).
-const CORE_HEIGHT: f32 = 2.6;
+/// Height of the boss's recessed Signal Core (attack origin; matches the sculpt).
+const CORE_HEIGHT: f32 = 2.74;
+/// Height of the upper Signal Shield collar the pylon tethers lock onto (kept
+/// above the chest core so the beams never cross over it).
+const TETHER_ANCHOR_HEIGHT: f32 = 3.55;
+/// Signal Shield shell centre height and rest scale (fits the colossus + halo).
+const SHELL_HEIGHT: f32 = 2.55;
+const SHELL_SCALE: Vec3 = Vec3::new(2.25, 2.85, 2.25);
 
 const SHIELD_GLOW: (Color, f32) = (Color::srgb(0.55, 0.6, 1.0), 0.85);
 const SHATTER_GLOW: (Color, f32) = (Color::srgb(1.0, 0.75, 0.3), 0.85);
@@ -273,6 +281,27 @@ pub struct BossTether;
 #[derive(Component)]
 pub struct BossShieldShell;
 
+/// Carrier Daemon multi-tiered broadcast halo rig (spun in `enemy_visuals`).
+#[derive(Component)]
+pub struct BossHaloPivot;
+
+/// Carrier Daemon twin shoulder plasma cannon rig (breathes / recoils in `enemy_visuals`).
+#[derive(Component)]
+pub struct BossCannonPivot;
+
+/// Shield Pylon orbiting containment ring (spun in [`carrier_daemon_system`]).
+#[derive(Component)]
+pub struct PylonRingPivot;
+
+/// Baked Shield Pylon obelisk (child of the [`BossPylon`] root). Only this
+/// visual pulses on hit flash, so the root — and the [`BossTether`] living in
+/// its space — always stays unscaled and locked onto the boss.
+#[derive(Component)]
+pub struct PylonVisual;
+
+/// Height the pylon ring orbits around.
+const PYLON_RING_HEIGHT: f32 = 2.55;
+
 /// Boss plate HUD snapshot (updated every frame by [`carrier_daemon_system`]).
 #[derive(Resource, Debug, Clone, Default, PartialEq)]
 pub struct BossHud {
@@ -294,9 +323,9 @@ pub fn attach_boss(commands: &mut Commands, a: &EnemyAssets, root: Entity, enemy
         .spawn((
             ChildOf(root),
             BossShieldShell,
-            Mesh3d(a.sphere.clone()),
+            Mesh3d(a.boss_shield_mesh.clone()),
             MeshMaterial3d(a.boss_shield.clone()),
-            Transform::from_xyz(0.0, 2.3, 0.0).with_scale(Vec3::new(2.1, 2.7, 2.1)),
+            Transform::from_xyz(0.0, SHELL_HEIGHT, 0.0).with_scale(SHELL_SCALE),
             Visibility::Hidden,
         ))
         .id();
@@ -304,16 +333,30 @@ pub fn attach_boss(commands: &mut Commands, a: &EnemyAssets, root: Entity, enemy
     commands.entity(root).insert(BossState::new(shell));
 }
 
-/// Spawn one Shield Pylon (pre-baked model + tether + light).
+/// Spawn one Shield Pylon (pre-baked relay obelisk + orbiting ring + tether + light).
 pub fn spawn_pylon(commands: &mut Commands, a: &EnemyAssets, pos: Vec3, boss: Entity, floor: u32) -> Entity {
     let hp = pylon_hp(floor);
     let root = commands
         .spawn((LevelEntity, BossPylon { hp, max_hp: hp, hit_flash: 0.0, boss }, Transform::from_translation(pos), Visibility::default()))
         .id();
-    for part in &a.pylon_model {
-        commands.spawn((ChildOf(root), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY));
+    // The visual carries the first baked part itself; further materials are its children.
+    let mut visual = commands.spawn((ChildOf(root), PylonVisual, Transform::IDENTITY, Visibility::default()));
+    if let Some(first) = a.pylon_model.first() {
+        visual.insert((Mesh3d(first.mesh.clone()), MeshMaterial3d(first.material.clone())));
     }
-    commands.spawn((ChildOf(root), BossTether, Mesh3d(a.cylinder.clone()), MeshMaterial3d(a.boss_tether.clone()), Transform::from_xyz(0.0, PYLON_TOP, 0.0)));
+    let visual = visual.id();
+    for part in a.pylon_model.iter().skip(1) {
+        commands.spawn((ChildOf(visual), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY));
+    }
+    spawn_rig(commands, root, &a.pylon_ring);
+    commands.spawn((
+        ChildOf(root),
+        BossTether,
+        Mesh3d(a.cylinder.clone()),
+        MeshMaterial3d(a.boss_tether.clone()),
+        Transform::from_xyz(0.0, PYLON_TOP, 0.0),
+        Visibility::Hidden,
+    ));
     commands.spawn((
         ChildOf(root),
         CullableLight::for_range(9.0),
@@ -443,12 +486,20 @@ pub fn carrier_daemon_system(
     grid: Res<LevelGrid>,
     (ea, fx, pickups): (Res<EnemyAssets>, Res<FxAssets>, Option<Res<PickupAssets>>),
     mut materials: ResMut<Assets<StandardMaterial>>,
-    (mut sfx, mut feed, mut hud): (ResMut<SfxQueue>, ResMut<HudFeed>, ResMut<BossHud>),
+    (mut sfx, mut feed, mut hud, freeze): (ResMut<SfxQueue>, ResMut<HudFeed>, ResMut<BossHud>, Option<Res<crate::dev::DevFreezeAi>>),
     players: Query<&Transform, With<Player>>,
     mut bosses: Query<(Entity, &mut Enemy, &mut BossState, &Transform), Without<Player>>,
-    mut pylons: Query<(Entity, &mut BossPylon, &mut Transform, &Children), (Without<Enemy>, Without<Player>)>,
-    mut tethers: Query<&mut Transform, (With<BossTether>, Without<BossPylon>, Without<Enemy>, Without<Player>)>,
+    mut pylons: Query<(Entity, &mut BossPylon, &Transform, &Children), (Without<Enemy>, Without<Player>)>,
+    mut tethers: Query<(&mut Transform, &mut Visibility), (With<BossTether>, Without<BossPylon>, Without<Enemy>, Without<Player>)>,
+    mut visuals: Query<
+        &mut Transform,
+        (With<PylonVisual>, Without<PylonRingPivot>, Without<BossShieldShell>, Without<BossTether>, Without<BossPylon>, Without<Enemy>, Without<Player>),
+    >,
     mut shells: Query<(&mut Transform, &mut Visibility), (With<BossShieldShell>, Without<BossTether>, Without<BossPylon>, Without<Enemy>, Without<Player>)>,
+    mut rings: Query<
+        &mut Transform,
+        (With<PylonRingPivot>, Without<BossShieldShell>, Without<BossTether>, Without<BossPylon>, Without<Enemy>, Without<Player>),
+    >,
 ) {
     let dt = time.delta_secs().min(1.0 / 20.0);
     let t = time.elapsed_secs();
@@ -456,7 +507,7 @@ pub fn carrier_daemon_system(
     let mut rng = rand::rng();
 
     // Pylons: deaths, strays, hit flash and tethers.
-    for (pe, mut py, mut ptf, children) in &mut pylons {
+    for (pe, mut py, ptf, children) in &mut pylons {
         let boss = bosses.get(py.boss).ok().filter(|(_, e, _, _)| e.is_alive()).map(|(_, e, _, tf)| (e.stats.eye_height, tf.translation));
         let Some((_, boss_pos)) = boss else {
             // Boss gone (killed / vaporized): no stray pylons or tethers.
@@ -475,18 +526,39 @@ pub fn carrier_daemon_system(
             continue;
         }
         py.hit_flash = (py.hit_flash - dt).max(0.0);
+        // Hit flash pulses only the obelisk visual; the root (and the tether in
+        // its space) stays unscaled so the beam stays locked onto the boss.
         let s = 1.0 + py.hit_flash * 1.2;
-        ptf.scale = Vec3::new(s, 1.0, s);
+        let flash_scale = Vec3::new(s, 1.0, s);
         let top = base + Vec3::Y * PYLON_TOP;
-        let delta = boss_pos + Vec3::Y * CORE_HEIGHT - top;
-        let len = delta.length().max(0.1);
+        let delta = boss_pos + Vec3::Y * TETHER_ANCHOR_HEIGHT - top;
+        let len_sq = delta.length_squared();
         for c in children.iter() {
-            if let Ok(mut ttf) = tethers.get_mut(c) {
-                let w = 0.07 + 0.03 * (t * 12.0 + base.x).sin().abs();
+            if let Ok(mut vtf) = visuals.get_mut(c)
+                && vtf.scale != flash_scale
+            {
+                vtf.scale = flash_scale;
+            }
+            if let Ok((mut ttf, mut tvis)) = tethers.get_mut(c) {
+                let want = if len_sq < 1e-4 { Visibility::Hidden } else { Visibility::Inherited };
+                if *tvis != want {
+                    *tvis = want;
+                }
+                if len_sq < 1e-4 {
+                    continue;
+                }
+                let len = len_sq.sqrt();
+                // Slim, crisp electric-cobalt beam.
+                let w = 0.032 + 0.012 * (t * 12.0 + base.x).sin().abs();
                 ttf.translation = Vec3::Y * PYLON_TOP + delta * 0.5;
                 ttf.rotation = Quat::from_rotation_arc(Vec3::Y, delta / len);
-                // Undo the pylon's flash scale so the beam still reaches the boss.
-                ttf.scale = Vec3::new(w / s, len, w / s);
+                ttf.scale = Vec3::new(w, len, w);
+            }
+            if let Ok(mut rtf) = rings.get_mut(c) {
+                // Precessing orbit of the containment ring around the crystal crown.
+                let spin = t * 1.8 + base.x;
+                rtf.rotation = Quat::from_rotation_y(spin) * Quat::from_rotation_x(0.35 + 0.08 * (t * 2.3).sin());
+                rtf.translation = Vec3::Y * (PYLON_RING_HEIGHT + 0.05 * (t * 2.0 + base.z).sin());
             }
         }
     }
@@ -566,13 +638,15 @@ pub fn carrier_daemon_system(
             }
             if e.shielded {
                 let k = 1.0 + 0.05 * (t * 6.0).sin() + 0.25 * (st.spark_cooldown / 0.12);
-                stf.scale = Vec3::new(2.1 * k, 2.7 * k, 2.1 * k);
+                stf.scale = SHELL_SCALE * k;
                 stf.rotation = Quat::from_rotation_y(t * 0.8);
             }
         }
 
         // Attack patterns (telegraph -> fire), alternating Hellfire / EMP.
+        // Frozen by `DevFreezeAi` (showcase shots never fire mid-pose).
         if let Some(pp) = ppos
+            && freeze.is_none()
             && e.alerted
             && e.stun_timer <= 0.0
         {
@@ -732,6 +806,25 @@ mod tests {
         let t = pylon_ray_hit(base, Vec3::new(0.0, 1.5, 0.0), Vec3::NEG_Z).unwrap();
         assert!(t > 9.0 && t < 10.0);
         assert!(pylon_ray_hit(base, Vec3::new(0.0, 6.0, 0.0), Vec3::NEG_Z).is_none());
+    }
+
+    #[test]
+    fn pylon_hit_spheres_leave_no_unhittable_band() {
+        let base = Vec3::new(0.0, 0.0, -10.0);
+        // The old gap: upper collar band at y = 2.06 (center + collar outer edge).
+        for x in [0.0f32, 0.35, -0.35] {
+            assert!(pylon_ray_hit(base, Vec3::new(x, 2.06, 0.0), Vec3::NEG_Z).is_some(), "collar band at x = {x}");
+        }
+        // Every height through base, shaft, collar and crystal crown, from 4 sides.
+        for i in 0..=58 {
+            let y = 0.05 + i as f32 * 0.05;
+            for dir in [Vec3::NEG_Z, Vec3::Z, Vec3::X, Vec3::NEG_X] {
+                let origin = base - dir * 10.0 + Vec3::Y * y;
+                assert!(pylon_ray_hit(base, origin, dir).is_some(), "horizontal ray at y = {y:.2} dir {dir}");
+            }
+            // Shaft outer edge (r = 0.3) from the front.
+            assert!(pylon_ray_hit(base, Vec3::new(0.3, y, 0.0), Vec3::NEG_Z).is_some(), "shaft edge at y = {y:.2}");
+        }
     }
 
     #[test]

@@ -23,11 +23,15 @@
 //!   `06_game_over.png` (a separate staged Floor 2 death with its own
 //!   summary), then exits. Never touches the on-disk profile.
 
+//! - `SEGNALE_MODEL_SHOTS=<dir>`: dedicated 3D model showcase (lit close-ups of
+//!   all 3 right-hand guns, all 7 enemies + Shield Pylon, and Floor 5 Obsidian
+//!   Core contrast check), then exits. Keeps `SEGNALE_SHOTS` untouched.
+
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 use crate::apps::PhoneApps;
-use crate::boss::{spawn_pylon, BossPhase, BossState, PHASE1_THRESHOLD};
+use crate::boss::{spawn_pylon, BossPhase, BossPylon, BossState, PHASE1_THRESHOLD};
 use crate::fx::HudFeed;
 use crate::meta::{
     start_run_with_loadout, CarrierContract, FeatId, HandsetSkin, LifetimeStats, PlayerProfile, ProfileStore, RunLoadout, StarterChip,
@@ -38,7 +42,7 @@ use crate::level::{yaw_facing, LevelGrid};
 use crate::physics::sample_floor_height;
 use crate::player::Player;
 use crate::state::{complete_floor, AppState, GameSet, PlayerModifiers, RunStats, UpgradeId, FINAL_FLOOR};
-use crate::weapons::{Weapon, WeaponState};
+use crate::weapons::{PhoneViewmodel, Weapon, WeaponState, WeaponViewmodel};
 
 /// Screenshot staging only: freezes demon AI so a posed shot stays posed.
 #[derive(Resource)]
@@ -58,6 +62,13 @@ impl Plugin for DevPlugin {
     fn build(&self, app: &mut App) {
         if let Ok(dir) = std::env::var("SEGNALE_BOT_TEST") {
             app.add_plugins(crate::playtest_bot::PlaytestBotPlugin::from_env(dir));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_MODEL_SHOTS") {
+            app.insert_resource(ModelShots { dir, stage: 0, timer: 0.0 })
+                .add_systems(Update, model_shots_autostart.run_if(in_state(AppState::MainMenu)))
+                .add_systems(Update, model_shots_tour.after(GameSet::Ui).run_if(in_state(AppState::Playing)))
+                .add_systems(Update, model_shots_resume_playing.run_if(in_state(AppState::UpgradeSelect)));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_META_SHOTS") {
@@ -491,6 +502,282 @@ fn meta_shots_tour(
             true
         }
         (15, AppState::GameOver) if t > 1.5 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_MODEL_SHOTS — dedicated 3D models showcase (guns + 7 enemies + pylon)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct ModelShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+#[derive(Component)]
+struct ModelShowcaseProp;
+
+fn model_shots_autostart(
+    mut run: ResMut<RunStats>,
+    mut mods: ResMut<PlayerModifiers>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    crate::state::start_run(&mut run, &mut mods, &mut next, 1234);
+}
+
+fn model_shots_resume_playing(mut next: ResMut<NextState<AppState>>) {
+    next.set(AppState::Playing);
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn model_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<ModelShots>,
+    grid: Option<Res<LevelGrid>>,
+    mut player: Query<(&mut Player, &mut Transform)>,
+    (mut ws, mut run, mut next): (ResMut<WeaponState>, ResMut<RunStats>, ResMut<NextState<AppState>>),
+    ea: Res<EnemyAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    existing_enemies: Query<Entity, With<Enemy>>,
+    existing_pylons: Query<Entity, With<BossPylon>>,
+    showcase_props: Query<Entity, With<ModelShowcaseProp>>,
+    mut bosses: Query<(Entity, &mut Enemy, &mut BossState)>,
+    mut vms: Query<&mut Visibility, Or<(With<WeaponViewmodel>, With<PhoneViewmodel>)>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(grid) = grid else { return };
+    cfg.timer += time.delta_secs();
+    if let Ok((mut p, _)) = player.single_mut() {
+        p.invuln_timer = 999.0;
+        p.hp = p.max_hp;
+        p.ammo_shells = p.max_shells;
+        p.ammo_plasma = p.max_plasma;
+        p.ammo_rockets = p.max_rockets;
+    }
+    let dir = cfg.dir.clone();
+    let snap = |commands: &mut Commands, name: &str| {
+        let path = format!("{dir}/{name}");
+        info!("dev: model showcase -> {path}");
+        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+    };
+    let mut place_world = |pos: Vec3, look_at: Vec3| {
+        if let Ok((mut p, mut tf)) = player.single_mut() {
+            tf.translation = pos;
+            let d = look_at - pos;
+            p.yaw = yaw_facing(Vec2::new(d.x, d.z));
+            let eye = crate::player::PLAYER_EYE_HEIGHT;
+            p.pitch = (d.y - eye).atan2(Vec2::new(d.x, d.z).length()).clamp(-1.2, 1.2);
+            p.velocity = Vec3::ZERO;
+        }
+    };
+    let clear_stage = |commands: &mut Commands| {
+        for e in &existing_enemies {
+            commands.entity(e).try_despawn();
+        }
+        for e in &existing_pylons {
+            commands.entity(e).try_despawn();
+        }
+        for e in &showcase_props {
+            commands.entity(e).try_despawn();
+        }
+    };
+    let atrium_anchor = || {
+        // Use the open west edge of the Signal Atrium (same clear corridor as
+        // `combat.png`, unobstructed by atrium pillars or the tower pedestal).
+        let from = grid.rooms[0].min;
+        let mut start = grid.cell_center(from);
+        start.y = sample_floor_height(&grid, start.x, start.z).unwrap_or(0.0);
+        start
+    };
+    let t = cfg.timer;
+    let advance = match cfg.stage {
+        // Stage 0: settle in lit atrium with Shotgun equipped.
+        0 if t > 2.5 => {
+            commands.insert_resource(DevFreezeAi);
+            clear_stage(&mut commands);
+            let start = atrium_anchor();
+            place_world(start, start + Vec3::new(0.0, 1.5, 10.0));
+            ws.current = Weapon::Shotgun;
+            ws.previous = Weapon::Shotgun;
+            ws.swap_timer = 0.0;
+            true
+        }
+        1 if t > 1.2 => {
+            snap(&mut commands, "01_gun_shotgun.png");
+            true
+        }
+        2 if t > 0.6 => {
+            ws.current = Weapon::Plasma;
+            ws.previous = Weapon::Plasma;
+            ws.swap_timer = 0.0;
+            true
+        }
+        3 if t > 1.0 => {
+            snap(&mut commands, "02_gun_plasma.png");
+            true
+        }
+        4 if t > 0.6 => {
+            ws.current = Weapon::Rocket;
+            ws.previous = Weapon::Rocket;
+            ws.swap_timer = 0.0;
+            true
+        }
+        5 if t > 1.0 => {
+            snap(&mut commands, "03_gun_rocket.png");
+            true
+        }
+        // Stage 6: Close-up lit gallery of Classic 4 Enemies (Imp, Cacodemon, Jammer Fiend, Hell Baron).
+        6 if t > 0.6 => {
+            clear_stage(&mut commands);
+            for mut v in &mut vms {
+                *v = Visibility::Hidden;
+            }
+            let start = atrium_anchor();
+            let fwd = Vec3::Z;
+            let side = Vec3::X;
+            let floor = grid.floor;
+            for (kind, dist, lat, y_off) in [
+                (EnemyKind::Imp, 4.7, -0.75, 0.0),
+                (EnemyKind::Cacodemon, 5.2, 0.35, 2.35),
+                (EnemyKind::JammerFiend, 5.3, 0.85, 0.0),
+                (EnemyKind::HellBaron, 6.2, 2.55, 0.0),
+            ] {
+                let mut pos = start + fwd * dist + side * lat;
+                pos.y = sample_floor_height(&grid, pos.x, pos.z).unwrap_or(0.0) + 0.05 + y_off;
+                let e = spawn_enemy(&mut commands, &ea, &mut materials, kind, pos, floor, true);
+                let to = start - pos;
+                commands.entity(e).insert(Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_facing(Vec2::new(to.x, to.z)))));
+            }
+            // Neutral showcase fill light so geometry & materials read crisply.
+            commands.spawn((
+                ModelShowcaseProp,
+                PointLight { color: Color::srgb(1.0, 0.96, 0.92), intensity: 1_200_000.0, range: 18.0, shadow_maps_enabled: false, ..default() },
+                Transform::from_translation(start + fwd * 2.4 + side * 1.5 + Vec3::Y * 3.8),
+            ));
+            place_world(start, start + fwd * 5.6 + side * 1.7 + Vec3::Y * 1.55);
+            true
+        }
+        7 if t > 1.2 => {
+            snap(&mut commands, "04_enemies_classic.png");
+            true
+        }
+        // Stage 8: Close-up lit gallery of Phase Stalker, Relay Sniper, and Shield Pylon.
+        8 if t > 0.6 => {
+            clear_stage(&mut commands);
+            let start = atrium_anchor();
+            let fwd = Vec3::Z;
+            let side = Vec3::X;
+            let floor = grid.floor;
+            for (kind, dist, lat) in [
+                (EnemyKind::PhaseStalker, 4.5, -0.35),
+                (EnemyKind::RelaySniper, 5.1, 1.35),
+            ] {
+                let mut pos = start + fwd * dist + side * lat;
+                pos.y = sample_floor_height(&grid, pos.x, pos.z).unwrap_or(0.0) + 0.05;
+                let e = spawn_enemy(&mut commands, &ea, &mut materials, kind, pos, floor, true);
+                let to = start - pos;
+                commands.entity(e).insert(Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_facing(Vec2::new(to.x, to.z)))));
+            }
+            // Spawn a Boss off to the far right (out of frame) as tether anchor, and a Shield Pylon up close.
+            let boss_pos = start + fwd * 6.0 + side * 14.0;
+            let be = spawn_enemy(&mut commands, &ea, &mut materials, EnemyKind::CarrierDaemon, boss_pos, FINAL_FLOOR, false);
+            let mut pylon_pos = start + fwd * 5.0 + side * 3.2;
+            pylon_pos.y = sample_floor_height(&grid, pylon_pos.x, pylon_pos.z).unwrap_or(0.0);
+            spawn_pylon(&mut commands, &ea, pylon_pos, be, FINAL_FLOOR);
+            commands.spawn((
+                ModelShowcaseProp,
+                PointLight { color: Color::srgb(0.95, 0.96, 1.0), intensity: 1_200_000.0, range: 18.0, shadow_maps_enabled: false, ..default() },
+                Transform::from_translation(start + fwd * 2.2 + side * 1.4 + Vec3::Y * 3.6),
+            ));
+            place_world(start, start + fwd * 4.9 + side * 1.35 + Vec3::Y * 1.45);
+            true
+        }
+        9 if t > 1.2 => {
+            snap(&mut commands, "05_enemies_advanced_pylon.png");
+            true
+        }
+        // Stage 10: Close-up hero shot of The Carrier Daemon Boss (unshielded) in neutral light.
+        10 if t > 0.6 => {
+            clear_stage(&mut commands);
+            let start = atrium_anchor();
+            let fwd = Vec3::Z;
+            let side = Vec3::X;
+            let mut pos = start + fwd * 6.8 + side * 1.2;
+            pos.y = sample_floor_height(&grid, pos.x, pos.z).unwrap_or(0.0) + 0.05;
+            let e = spawn_enemy(&mut commands, &ea, &mut materials, EnemyKind::CarrierDaemon, pos, FINAL_FLOOR, false);
+            let to = start - pos;
+            commands.entity(e).insert(Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_facing(Vec2::new(to.x, to.z)))));
+            commands.spawn((
+                ModelShowcaseProp,
+                PointLight { color: Color::srgb(1.0, 0.94, 0.9), intensity: 1_800_000.0, range: 20.0, shadow_maps_enabled: false, ..default() },
+                Transform::from_translation(start + fwd * 3.0 + side * 0.8 + Vec3::Y * 4.5),
+            ));
+            place_world(start, pos + Vec3::Y * 2.35);
+            true
+        }
+        11 if t > 1.2 => {
+            snap(&mut commands, "06_boss_closeup.png");
+            true
+        }
+        // Stage 12: Jump to Floor 5 Obsidian Core (real lighting!) to check Boss Shield + Pylons + Sniper + Stalker + Signal-Mortar contrast.
+        12 if t > 0.6 => {
+            run.floor = FINAL_FLOOR;
+            next.set(AppState::UpgradeSelect);
+            true
+        }
+        _ if cfg.stage == 13 && grid.floor != FINAL_FLOOR => {
+            next.set(AppState::Playing);
+            false
+        }
+        13 if t > 2.0 && grid.floor == FINAL_FLOOR => {
+            clear_stage(&mut commands);
+            for mut v in &mut vms {
+                *v = Visibility::Inherited;
+            }
+            let start = boss_arena_point(&grid, 0.0, 0.0);
+            for (kind, dist, lat) in [
+                (EnemyKind::CarrierDaemon, 10.5, 0.4),
+                (EnemyKind::PhaseStalker, 5.5, -1.5),
+                (EnemyKind::RelaySniper, 8.2, 2.7),
+            ] {
+                let pos = boss_arena_point(&grid, dist, lat) + Vec3::Y * 0.05;
+                let e = spawn_enemy(&mut commands, &ea, &mut materials, kind, pos, FINAL_FLOOR, kind != EnemyKind::CarrierDaemon);
+                let to = start - pos;
+                commands.entity(e).insert(Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_facing(Vec2::new(to.x, to.z)))));
+            }
+            place_world(start, boss_arena_point(&grid, 11.0, 0.8).with_y(2.8));
+            ws.current = Weapon::Rocket;
+            ws.previous = Weapon::Rocket;
+            ws.swap_timer = 0.0;
+            true
+        }
+        14 if t > 0.8 => {
+            if let Ok((be, mut e, mut st)) = bosses.single_mut() {
+                e.hp = e.max_hp * PHASE1_THRESHOLD;
+                st.phase = BossPhase::Shielded1;
+                st.raise_grace = 0.5;
+                for (dist, lat) in [(6.2, -3.2), (8.8, 4.8)] {
+                    spawn_pylon(&mut commands, &ea, boss_arena_point(&grid, dist, lat), be, FINAL_FLOOR);
+                }
+            }
+            true
+        }
+        15 if t > 1.5 => {
+            snap(&mut commands, "07_floor5_obsidian_contrast.png");
+            true
+        }
+        16 if t > 1.0 => {
             exit.write(AppExit::Success);
             true
         }

@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
+use bevy::math::Affine2;
 use bevy::prelude::*;
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -14,9 +15,10 @@ use crate::audio::{SfxEvent, SfxQueue};
 use crate::fx::{spawn_burst, spawn_flash_light, BurstColor, FxAssets, HudFeed};
 use crate::apps::spawn_hijack_hotspot;
 use crate::level::{Cell, CullableLight, DemonJammer, LevelEntity, LevelGrid, RampDir, SignalTower, CEILING_HEIGHT};
-use crate::mesh_batch::MaterialBatches;
+use crate::mesh_batch::{MaterialBatches, MeshBatch};
 use crate::physics::{count_wall_occlusions, has_line_of_sight, raycast_grid, resolve_player_movement, sample_floor_height, PLAYER_RADIUS};
 use crate::player::{Player, PLAYER_EYE_HEIGHT};
+use crate::sculpt;
 use crate::apps::{DecoyHandset, PhoneApps, CALLBACK_SECS, DECOY_LURE_RADIUS, STORE_FORWARD_MAX_PACKETS};
 use crate::signal::{active_jammer_fields_iter, bars_from_strength, compute_signal_at, JammerField, SignalState};
 use crate::state::{GameSet, PlayerModifiers, RunStats};
@@ -108,7 +110,7 @@ impl EnemyKind {
                 proj_radius: 0.28,
                 range: 30.0,
                 melee_damage: 10.0,
-                hit_spheres: &[(0.55, 0.42), (1.15, 0.48), (1.65, 0.34)],
+                hit_spheres: &[(0.55, 0.42), (1.15, 0.5), (1.62, 0.4)],
             },
             EnemyKind::Cacodemon => EnemyStats {
                 hp: 110.0 + 12.0 * f,
@@ -166,7 +168,7 @@ impl EnemyKind {
                 proj_radius: 0.24,
                 range: 30.0,
                 melee_damage: 12.0,
-                hit_spheres: &[(0.6, 0.4), (1.25, 0.46), (1.8, 0.32)],
+                hit_spheres: &[(0.6, 0.42), (1.28, 0.50), (1.78, 0.42)],
             },
             EnemyKind::RelaySniper => EnemyStats {
                 hp: 95.0 + 12.0 * f,
@@ -180,7 +182,7 @@ impl EnemyKind {
                 proj_radius: 0.2,
                 range: 44.0,
                 melee_damage: 10.0,
-                hit_spheres: &[(0.7, 0.5), (1.55, 0.55), (2.35, 0.42)],
+                hit_spheres: &[(0.7, 0.52), (1.65, 0.62), (2.35, 0.50)],
             },
             EnemyKind::CarrierDaemon => EnemyStats {
                 hp: carrier_daemon_hp(floor),
@@ -581,10 +583,20 @@ pub struct EnemyAssets {
     pub dark: Handle<StandardMaterial>,
     pub metal_plate: Handle<StandardMaterial>,
     pub imp_dark: Handle<StandardMaterial>,
+    /// Electric-cyan Cacodemon iris (lit, saturated glow).
     pub caco_iris: Handle<StandardMaterial>,
     pub caco_maw: Handle<StandardMaterial>,
     pub fiend_green: Handle<StandardMaterial>,
+    /// Engraved molten-gold armor (Hell Baron, Carrier Daemon).
     pub baron_gold: Handle<StandardMaterial>,
+    /// Saturated orange-gold hellfire (Hell Baron gauntlets, maw, buckle gem).
+    pub baron_hellfire: Handle<StandardMaterial>,
+    /// Black-and-amber industrial hazard stripes.
+    pub hazard: Handle<StandardMaterial>,
+    /// Dark engraved obsidian-iron (pylon shafts).
+    pub obsidian: Handle<StandardMaterial>,
+    /// Bright brushed titanium (Relay Sniper dish rig; static twin of its body).
+    pub sniper_ti: Handle<StandardMaterial>,
     pub ping_ring: Handle<StandardMaterial>,
     pub enrage_halo: Handle<StandardMaterial>,
     pub fiend_ring: Handle<StandardMaterial>,
@@ -593,24 +605,32 @@ pub struct EnemyAssets {
     pub phase_core: Handle<StandardMaterial>,
     /// Relay Sniper crimson scope lens / rail glow.
     pub sniper_lens: Handle<StandardMaterial>,
+    /// Near-black (`#14161A`) armored dish liner / dark-metal tripod struts.
+    pub sniper_liner: Handle<StandardMaterial>,
     /// Relay Sniper lock-on laser sight (additive crimson rod).
     pub sniper_laser: Handle<StandardMaterial>,
     /// Carrier Daemon pulsing crimson-violet Signal Core reactor.
     pub carrier_core: Handle<StandardMaterial>,
     /// Translucent cyan-violet Signal Shield shell (boss, while shielded).
     pub boss_shield: Handle<StandardMaterial>,
+    /// Faceted geodesic shield shell + 2 tilted containment bands (unit radius).
+    pub boss_shield_mesh: Handle<Mesh>,
     /// Cyan-violet tether beam from a Shield Pylon to the boss.
     pub boss_tether: Handle<StandardMaterial>,
     /// Shield Pylon glowing emitter.
     pub pylon_core: Handle<StandardMaterial>,
     /// Per-kind state materials (indexed by [`EnemyKind::index`]).
     pub looks: [EnemyLookMaterials; KIND_COUNT],
-    /// Per-kind models: rigid parts merged per material (~5 per demon).
+    /// Per-kind models: rigid sculpted parts merged per material (5-6 per demon).
     pub models: [Vec<EnemyPart>; KIND_COUNT],
+    /// Per-kind articulated sub-pivots (Fiend emitter, Sniper dish, boss halo + cannons).
+    pub rigs: [Vec<RigModel>; KIND_COUNT],
     /// Rigid parts each model was baked from (one entity each before batching).
     pub source_part_counts: [usize; KIND_COUNT],
     /// Pre-baked Shield Pylon model (all `PartRole::Static`).
     pub pylon_model: Vec<EnemyPart>,
+    /// Pre-baked orbiting Shield Pylon ring rig.
+    pub pylon_ring: RigModel,
 }
 
 impl EnemyAssets {
@@ -653,55 +673,324 @@ pub fn look_pulse(t: f32) -> f32 {
     (t * 10.0).sin() * 0.5 + 0.5
 }
 
+// ---------------------------------------------------------------------------
+// Materials, sculpted models and articulated rigs (all baked once at startup)
+// ---------------------------------------------------------------------------
+
 fn solid(r: f32, g: f32, b: f32, rough: f32, metal: f32) -> StandardMaterial {
     StandardMaterial { base_color: Color::srgb(r, g, b), perceptual_roughness: rough, metallic: metal, ..default() }
 }
 
-fn eye(e: LinearRgba) -> StandardMaterial {
-    StandardMaterial { base_color: Color::WHITE, emissive: e, unlit: true, ..default() }
+/// Lit, saturated glowing material: a deep `base` hue plus a channel-pure
+/// `emissive`. (An `unlit` material outputs only its `base_color` and ignores
+/// `emissive`, which is what turned every white-based glow into flat chalk.)
+fn glow(base: Color, emissive: LinearRgba) -> StandardMaterial {
+    StandardMaterial { base_color: base, emissive, perceptual_roughness: 0.3, reflectance: 0.45, ..default() }
 }
 
-fn create_enemy_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
-    let mut caco = solid(0.42, 0.025, 0.10, 0.42, 0.05);
-    caco.emissive = LinearRgba::rgb(0.14, 0.0, 0.03);
-    let mut caco_maw = solid(0.16, 0.01, 0.04, 0.5, 0.0);
-    caco_maw.emissive = LinearRgba::rgb(0.6, 0.02, 0.12);
-    let mut green = solid(0.28, 0.65, 0.12, 0.4, 0.25);
-    green.emissive = LinearRgba::rgb(0.35, 1.8, 0.08);
-    let mut gold = solid(0.95, 0.68, 0.16, 0.28, 0.85);
-    gold.emissive = LinearRgba::rgb(1.1, 0.55, 0.05);
+/// Tiny glowing eye / optic (Eye role): saturated hue, brighter emissive.
+fn eye(base: Color, emissive: LinearRgba) -> StandardMaterial {
+    StandardMaterial { perceptual_roughness: 0.2, ..glow(base, emissive) }
+}
+
+/// Pixel-art texture (neutral-bright) multiplied by `tint`, tiled 2x over the sculpt UVs.
+fn skinned(img: &Handle<Image>, tint: Color, rough: f32, metal: f32) -> StandardMaterial {
+    StandardMaterial {
+        base_color: tint,
+        base_color_texture: Some(img.clone()),
+        perceptual_roughness: rough,
+        metallic: metal,
+        uv_transform: Affine2::from_scale(Vec2::splat(2.0)),
+        ..default()
+    }
+}
+
+/// Articulated sub-pivot kinds (animated in [`enemy_visuals`] and, for the
+/// pylon ring, in [`crate::boss::carrier_daemon_system`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigKind {
+    FiendEmitter,
+    SniperDish,
+    BossHalo,
+    BossCannon,
+    PylonRing,
+}
+
+/// An animated sub-pivot (child of a demon's [`EnemyBody`], or of a pylon).
+#[derive(Component, Debug, Clone, Copy)]
+pub struct RigPivot {
+    pub kind: RigKind,
+    pub rest: Transform,
+    /// Accumulated spin (halo).
+    pub angle: f32,
+}
+
+/// Jammer Fiend rotating transceiver ring + pulsing broadcast antenna.
+#[derive(Component)]
+pub struct FiendEmitterPivot;
+
+/// Relay Sniper scanning parabolic targeting dish head.
+#[derive(Component)]
+pub struct SniperDishPivot;
+
+/// A demon's articulated pivots (for the per-frame animation).
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct EnemyRig {
+    pub pivots: [Option<Entity>; 2],
+}
+
+/// Pre-baked articulated sub-model. The pivot entity carries the first baked
+/// part itself (saves an entity); any further materials are its children.
+#[derive(Clone)]
+pub struct RigModel {
+    pub kind: RigKind,
+    pub rest: Transform,
+    pub parts: Vec<EnemyPart>,
+}
+
+/// Spawn a pre-baked rig under `parent` (no asset allocation).
+pub fn spawn_rig(commands: &mut Commands, parent: Entity, rig: &RigModel) -> Entity {
+    let mut ec = commands.spawn((ChildOf(parent), RigPivot { kind: rig.kind, rest: rig.rest, angle: 0.0 }, rig.rest, Visibility::default()));
+    match rig.kind {
+        RigKind::FiendEmitter => ec.insert(FiendEmitterPivot),
+        RigKind::SniperDish => ec.insert(SniperDishPivot),
+        RigKind::BossHalo => ec.insert(crate::boss::BossHaloPivot),
+        RigKind::BossCannon => ec.insert(crate::boss::BossCannonPivot),
+        RigKind::PylonRing => ec.insert(crate::boss::PylonRingPivot),
+    };
+    if let Some(first) = rig.parts.first() {
+        ec.insert((Mesh3d(first.mesh.clone()), MeshMaterial3d(first.material.clone())));
+    }
+    let id = ec.id();
+    for part in rig.parts.iter().skip(1) {
+        commands.spawn((ChildOf(id), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY));
+    }
+    id
+}
+
+type Mat = Handle<StandardMaterial>;
+
+/// Place a part once (centered) ...
+const MID: bool = false;
+/// ... or on the right (+X) and mirrored onto the left.
+const SYM: bool = true;
+
+fn rx(a: f32) -> Quat {
+    Quat::from_rotation_x(a)
+}
+
+fn ry(a: f32) -> Quat {
+    Quat::from_rotation_y(a)
+}
+
+fn rz(a: f32) -> Quat {
+    Quat::from_rotation_z(a)
+}
+
+fn v3(x: f32, y: f32, z: f32) -> Vec3 {
+    Vec3::new(x, y, z)
+}
+
+/// `tf` mirrored across the YZ plane (`M * tf` with `M = diag(-1, 1, 1)`):
+/// the batcher flips the winding of the resulting negative-determinant transform.
+fn mirror_x(tf: Transform) -> Transform {
+    let q = tf.rotation;
+    Transform {
+        translation: tf.translation * v3(-1.0, 1.0, 1.0),
+        rotation: Quat::from_xyzw(q.x, -q.y, -q.z, q.w),
+        scale: tf.scale * v3(-1.0, 1.0, 1.0),
+    }
+}
+
+/// Rotation taking local +Y to `up` and local -Z toward `toward`
+/// (orthogonalized), so `curved_horn` bends and `curved_blade` edges curl
+/// toward `toward`.
+fn orient(up: Vec3, toward: Vec3) -> Quat {
+    let y = up.normalize_or(Vec3::Y);
+    let f = (toward - y * toward.dot(y)).try_normalize().unwrap_or_else(|| y.any_orthonormal_vector());
+    let z = -f;
+    Quat::from_mat3(&Mat3::from_cols(y.cross(z), y, z))
+}
+
+/// Rotation taking local +Y along `dir`.
+fn along(dir: Vec3) -> Quat {
+    Quat::from_rotation_arc(Vec3::Y, dir.normalize_or(Vec3::Y))
+}
+
+/// Smooth ellipsoid (muscle, eyeball, knob).
+fn blob(r: Vec3) -> Mesh {
+    sculpt::ridged_sphere(r, 8, 12, 0.0, 0.0, false)
+}
+
+/// Faceted glowing gem / node.
+fn gem(r: f32) -> Mesh {
+    sculpt::ridged_sphere(Vec3::splat(r), 6, 8, 0.1, 4.0, true)
+}
+
+fn bbox(x: f32, y: f32, z: f32, bevel: f32) -> Mesh {
+    sculpt::beveled_box(v3(x, y, z), bevel)
+}
+
+/// Startup sculpting context: arbitrary meshes appended per material into
+/// [`MaterialBatches`], counting every rigid source part.
+#[derive(Default)]
+struct Sculptor {
+    batches: MaterialBatches,
+    parts: usize,
+}
+
+impl Sculptor {
+    fn tf(&mut self, mesh: &Mesh, mat: &Mat, tf: Transform, sym: bool) {
+        self.batches.add(mesh, mat, tf);
+        self.parts += 1;
+        if sym {
+            self.batches.add(mesh, mat, mirror_x(tf));
+            self.parts += 1;
+        }
+    }
+
+    fn at(&mut self, mesh: &Mesh, mat: &Mat, pos: Vec3, rot: Quat, sym: bool) {
+        self.tf(mesh, mat, Transform::from_translation(pos).with_rotation(rot), sym);
+    }
+
+    fn scaled(&mut self, mesh: &Mesh, mat: &Mat, pos: Vec3, scale: Vec3, rot: Quat, sym: bool) {
+        self.tf(mesh, mat, Transform::from_translation(pos).with_rotation(rot).with_scale(scale), sym);
+    }
+
+    /// Tapered limb / strut joining joint `a` (radius `r.0`) to joint `b`
+    /// (radius `r.1`): faceted below 10 sides, smooth from 10 up.
+    fn limb(&mut self, mat: &Mat, a: Vec3, b: Vec3, r: (f32, f32), sides: usize, sym: bool) {
+        let d = b - a;
+        let len = d.length();
+        if len < 1e-3 {
+            return;
+        }
+        let mesh = sculpt::tapered_prism(sides, r.0, r.1, len, sides < 10);
+        self.at(&mesh, mat, (a + b) * 0.5, along(d), sym);
+    }
+
+    /// Curved horn / claw / fang rooted at `base`, growing along `up` and
+    /// curling by `bend` toward `toward`.
+    #[allow(clippy::too_many_arguments)]
+    fn horn(&mut self, mat: &Mat, base: Vec3, up: Vec3, toward: Vec3, r: (f32, f32), len: f32, bend: f32, sym: bool) {
+        let mesh = sculpt::curved_horn(r.0, r.1, len, 0.0, -bend, 8, 7);
+        self.at(&mesh, mat, base, orient(up, toward), sym);
+    }
+
+    /// Two-tone sweeping horn rooted at `base`: a continuous cubic-Bezier spine
+    /// `0 -> p[0] -> p[1] -> p[2]` (model-space offsets from `base`), split at
+    /// `split` (de Casteljau) into a `mat` root and a `tip_mat` tip.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep(&mut self, mat: &Mat, tip_mat: &Mat, base: Vec3, r: (f32, f32), p: [Vec3; 3], split: f32, sym: bool) {
+        let [p1, p2, p3] = p;
+        let id = Quat::IDENTITY;
+        if split >= 1.0 {
+            self.at(&sculpt::curved_horn_sweep(r.0, r.1, p1, p2, p3, 12, 9), mat, base, id, sym);
+            return;
+        }
+        let t = split.clamp(0.05, 0.95);
+        let (q0, q1, q2) = (Vec3::ZERO.lerp(p1, t), p1.lerp(p2, t), p2.lerp(p3, t));
+        let (r0, r1) = (q0.lerp(q1, t), q1.lerp(q2, t));
+        let m = r0.lerp(r1, t);
+        let r_mid = r.0 * (1.0 - t).powf(0.85) + r.1 * t;
+        self.at(&sculpt::curved_horn_sweep(r.0, r_mid, q0, r0, m, 9, 9), mat, base, id, sym);
+        self.at(&sculpt::curved_horn_sweep(r_mid, r.1, r1 - m, q2 - m, p3 - m, 6, 9), tip_mat, base + m, id, sym);
+    }
+
+    /// Curved blade rooted at `base`, extending along `up`, edge curling toward `toward`.
+    #[allow(clippy::too_many_arguments)]
+    fn blade(&mut self, mat: &Mat, base: Vec3, up: Vec3, toward: Vec3, len: f32, width: f32, thick: f32, curve: f32, sym: bool) {
+        let mesh = sculpt::curved_blade(len, width, thick, curve, 6);
+        self.at(&mesh, mat, base, orient(up, toward), sym);
+    }
+
+    /// Bake one merged mesh per material (Body / Eye roles from `look`).
+    fn bake(self, meshes: &mut Assets<Mesh>, look: Option<&EnemyLookMaterials>) -> Vec<EnemyPart> {
+        self.batches
+            .finish(meshes)
+            .into_iter()
+            .map(|(mesh, material)| {
+                let role = match look {
+                    Some(l) if material.id() == l.body[0].id() => PartRole::Body,
+                    Some(l) if material.id() == l.eye.id() => PartRole::Eye,
+                    _ => PartRole::Static,
+                };
+                EnemyPart { mesh, material, role }
+            })
+            .collect()
+    }
+}
+
+/// One rig under construction: kind, rest pose (in body-pivot space), parts (in pivot space).
+type RigBuild = (RigKind, Transform, Sculptor);
+
+fn create_enemy_assets(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let hide = images.add(crate::assets_gen::demon_hide_texture().into_image());
+    let gunmetal = images.add(crate::assets_gen::gunmetal_plate_texture().into_image());
+    let hazard = images.add(crate::assets_gen::hazard_stripe_texture().into_image());
+    let obsidian = images.add(crate::assets_gen::obsidian_tech_texture().into_image());
+    let engraved = images.add(crate::assets_gen::engraved_gold_texture().into_image());
+
     let mut ping = crate::fx::additive_glow(Color::srgb(0.25, 1.0, 1.0), 0.92);
     ping.emissive = LinearRgba::rgb(1.5, 7.0, 9.0);
     let mut enrage_halo = crate::fx::additive_glow(Color::srgb(1.0, 0.22, 0.95), 0.85);
     enrage_halo.emissive = LinearRgba::rgb(6.0, 0.8, 7.5);
     let mut fiend_ring = crate::fx::additive_glow(Color::srgb(0.35, 1.0, 0.18), 0.72);
     fiend_ring.emissive = LinearRgba::rgb(1.0, 5.5, 0.4);
-    let mut phase_obsidian = solid(0.07, 0.03, 0.1, 0.25, 0.7);
-    phase_obsidian.emissive = LinearRgba::rgb(0.08, 0.0, 0.14);
     let mut sniper_laser = crate::fx::additive_glow(Color::srgb(1.0, 0.12, 0.12), 0.85);
     sniper_laser.emissive = LinearRgba::rgb(14.0, 0.6, 0.5);
-    let mut boss_shield = crate::fx::additive_glow(Color::srgb(0.45, 0.6, 1.0), 0.28);
-    boss_shield.emissive = LinearRgba::rgb(1.2, 1.8, 4.2);
-    let mut boss_tether = crate::fx::additive_glow(Color::srgb(0.5, 0.8, 1.0), 0.9);
-    boss_tether.emissive = LinearRgba::rgb(3.0, 6.0, 12.0);
+    // Crisp sci-fi containment barrier: lit additive so the faceted shell and its
+    // bands shade, while the boss's sculpted details stay readable inside.
+    let boss_shield = StandardMaterial {
+        base_color: Color::srgba(0.18, 0.45, 1.0, 0.11),
+        emissive: LinearRgba::rgb(0.28, 0.65, 1.8),
+        perceptual_roughness: 0.2,
+        alpha_mode: AlphaMode::Add,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    };
+    // Slim saturated electric-cobalt tether (no white-hot washout over the boss).
+    let mut boss_tether = crate::fx::additive_glow(Color::srgb(0.15, 0.55, 1.0), 0.85);
+    boss_tether.emissive = LinearRgba::rgb(0.25, 1.1, 2.8);
 
     // Per-kind body / eye templates -> shared state material tables.
+    let titanium = StandardMaterial {
+        emissive: LinearRgba::rgb(0.035, 0.038, 0.045),
+        ..skinned(&gunmetal, Color::srgb(0.58, 0.62, 0.68), 0.34, 0.72)
+    };
     let templates = [
-        (solid(0.32, 0.055, 0.028, 0.72, 0.0), eye(LinearRgba::rgb(18.0, 5.5, 0.35))),
-        (caco, eye(LinearRgba::rgb(3.5, 14.0, 1.4))),
-        (solid(0.15, 0.17, 0.18, 0.4, 0.78), eye(LinearRgba::rgb(2.0, 15.0, 1.2))),
-        (solid(0.38, 0.055, 0.028, 0.65, 0.05), eye(LinearRgba::rgb(18.0, 12.5, 1.2))),
-        // Phase Stalker: gaunt obsidian-violet wraith, razor static visor.
+        // Static Imp: charred demonic umber-crimson hide (separates from the red
+        // Rust Bunker floor), crisp ember-orange eyes.
+        (skinned(&hide, Color::srgb(0.24, 0.085, 0.05), 0.62, 0.05), eye(Color::srgb(1.0, 0.36, 0.02), LinearRgba::rgb(3.6, 0.75, 0.02))),
+        // Cacodemon: ridged crimson carapace, deep emerald sclera.
         (
-            StandardMaterial { emissive: LinearRgba::rgb(0.12, 0.0, 0.2), ..solid(0.16, 0.06, 0.22, 0.3, 0.55) },
-            eye(LinearRgba::rgb(10.0, 2.0, 16.0)),
+            StandardMaterial { emissive: LinearRgba::rgb(0.12, 0.0, 0.025), ..skinned(&hide, Color::srgb(0.72, 0.06, 0.13), 0.45, 0.05) },
+            eye(Color::srgb(0.05, 0.55, 0.12), LinearRgba::rgb(0.12, 1.6, 0.18)),
         ),
-        // Relay Sniper: gunmetal industrial sentinel, crimson optic.
-        (solid(0.22, 0.2, 0.19, 0.38, 0.82), eye(LinearRgba::rgb(20.0, 1.2, 0.8))),
+        // Jammer Fiend: dark obsidian-tech chassis, toxic-green optics.
+        (skinned(&obsidian, Color::srgb(0.24, 0.27, 0.28), 0.4, 0.65), eye(Color::srgb(0.3, 1.0, 0.1), LinearRgba::rgb(0.5, 5.0, 0.1))),
+        // Hell Baron: muscular crimson-mahogany hide, molten eyes.
+        (
+            StandardMaterial { emissive: LinearRgba::rgb(0.03, 0.0, 0.0), ..skinned(&hide, Color::srgb(0.6, 0.13, 0.07), 0.62, 0.05) },
+            eye(Color::srgb(1.0, 0.55, 0.05), LinearRgba::rgb(6.0, 2.2, 0.08)),
+        ),
+        // Phase Stalker: rich deep obsidian-violet hide, razor violet-magenta visor.
+        (
+            StandardMaterial { emissive: LinearRgba::rgb(0.05, 0.0, 0.09), ..skinned(&obsidian, Color::srgb(0.11, 0.03, 0.18), 0.35, 0.45) },
+            eye(Color::srgb(0.62, 0.06, 0.85), LinearRgba::rgb(2.4, 0.1, 3.6)),
+        ),
+        // Relay Sniper: bright brushed titanium (pops on dark Floor 5 walls), deep laser-crimson optic.
+        (titanium.clone(), eye(Color::srgb(0.68, 0.03, 0.02), LinearRgba::rgb(2.4, 0.06, 0.03))),
         // Carrier Daemon: blackened iron chassis, molten-gold eyes.
         (
-            StandardMaterial { emissive: LinearRgba::rgb(0.1, 0.0, 0.03), ..solid(0.12, 0.05, 0.05, 0.45, 0.7) },
-            eye(LinearRgba::rgb(20.0, 9.0, 1.0)),
+            StandardMaterial { emissive: LinearRgba::rgb(0.08, 0.0, 0.03), ..skinned(&obsidian, Color::srgb(0.2, 0.11, 0.11), 0.45, 0.7) },
+            eye(Color::srgb(1.0, 0.6, 0.08), LinearRgba::rgb(6.0, 2.6, 0.1)),
         ),
     ];
     let looks = templates.map(|(body, eye_tpl)| {
@@ -715,417 +1004,662 @@ fn create_enemy_assets(mut commands: Commands, mut materials: ResMut<Assets<Stan
                 std::array::from_fn(|step| materials.add(with(body_flash_emissive(base, state, 1.0, step))))
             }),
             eye: materials.add(eye_tpl.clone()),
-            eye_enraged: materials.add(StandardMaterial { emissive: LinearRgba::rgb(16.0, 4.0, 20.0), ..eye_tpl }),
+            eye_enraged: materials.add(StandardMaterial {
+                base_color: Color::srgb(0.8, 0.12, 1.0),
+                emissive: LinearRgba::rgb(4.0, 0.35, 6.0),
+                ..eye_tpl
+            }),
         }
     });
 
-    // Source primitives (identical to the shared mesh handles below).
-    let src = [
-        Mesh::from(Cuboid::new(1.0, 1.0, 1.0)),
-        Sphere::new(1.0).mesh().uv(20, 14),
-        Mesh::from(Capsule3d::new(0.5, 1.0)),
-        Mesh::from(Cone::new(1.0, 1.0)),
-        Mesh::from(Cylinder::new(1.0, 1.0)),
-        Mesh::from(Torus::new(0.8, 1.0)),
-    ];
+    // Faceted geodesic shield shell + 2 tilted equatorial containment bands (one mesh).
+    let mut shell = MeshBatch::new();
+    shell.append(&sculpt::ridged_sphere(Vec3::ONE, 8, 12, 0.03, 6.0, true), &Transform::IDENTITY);
+    let band = sculpt::armored_ring(1.02, 0.025, 0.035, 24, true);
+    shell.append(&band, &Transform::from_rotation(rx(0.35)));
+    shell.append(&band, &Transform::from_rotation(rz(-0.35)));
+    // Crisp equatorial orbital ring.
+    shell.append(&sculpt::armored_ring(1.05, 0.035, 0.05, 32, true), &Transform::IDENTITY);
+    let boss_shield_mesh = meshes.add(shell.build().expect("shield shell has triangles"));
+
     let mut a = EnemyAssets {
-        cube: meshes.add(src[0].clone()),
-        sphere: meshes.add(src[1].clone()),
-        capsule: meshes.add(src[2].clone()),
-        cone: meshes.add(src[3].clone()),
-        cylinder: meshes.add(src[4].clone()),
-        ring: meshes.add(src[5].clone()),
-        bone: materials.add(solid(0.76, 0.68, 0.52, 0.55, 0.0)),
-        horn: materials.add(solid(0.08, 0.045, 0.04, 0.48, 0.15)),
+        cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+        sphere: meshes.add(Sphere::new(1.0).mesh().uv(20, 14)),
+        capsule: meshes.add(Capsule3d::new(0.5, 1.0)),
+        cone: meshes.add(Cone::new(1.0, 1.0)),
+        cylinder: meshes.add(Cylinder::new(1.0, 1.0)),
+        ring: meshes.add(Torus::new(0.8, 1.0)),
+        bone: materials.add(solid(0.78, 0.7, 0.54, 0.5, 0.0)),
+        horn: materials.add(solid(0.11, 0.06, 0.05, 0.42, 0.15)),
         dark: materials.add(solid(0.035, 0.01, 0.012, 0.88, 0.05)),
-        metal_plate: materials.add(solid(0.24, 0.26, 0.28, 0.36, 0.85)),
-        imp_dark: materials.add(solid(0.09, 0.025, 0.018, 0.85, 0.05)),
-        caco_iris: materials.add(eye(LinearRgba::rgb(0.5, 7.0, 12.0))),
-        caco_maw: materials.add(caco_maw),
-        fiend_green: materials.add(green),
-        baron_gold: materials.add(gold),
+        metal_plate: materials.add(skinned(&gunmetal, Color::srgb(0.46, 0.48, 0.52), 0.36, 0.8)),
+        imp_dark: materials.add(skinned(&hide, Color::srgb(0.2, 0.05, 0.035), 0.8, 0.0)),
+        caco_iris: materials.add(glow(Color::srgb(0.02, 0.42, 0.68), LinearRgba::rgb(0.04, 1.15, 1.75))),
+        caco_maw: materials.add(glow(Color::srgb(0.14, 0.01, 0.03), LinearRgba::rgb(1.2, 0.03, 0.16))),
+        fiend_green: materials.add(StandardMaterial { metallic: 0.2, ..glow(Color::srgb(0.08, 0.6, 0.04), LinearRgba::rgb(0.1, 1.9, 0.04)) }),
+        baron_gold: materials.add(StandardMaterial {
+            emissive: LinearRgba::rgb(0.45, 0.22, 0.02),
+            ..skinned(&engraved, Color::srgb(1.0, 0.86, 0.62), 0.3, 0.85)
+        }),
+        baron_hellfire: materials.add(glow(Color::srgb(0.75, 0.14, 0.01), LinearRgba::rgb(2.1, 0.38, 0.02))),
+        hazard: materials.add(skinned(&hazard, Color::WHITE, 0.55, 0.3)),
+        obsidian: materials.add(skinned(&obsidian, Color::srgb(0.2, 0.19, 0.25), 0.4, 0.6)),
+        sniper_ti: materials.add(titanium),
         ping_ring: materials.add(ping),
         enrage_halo: materials.add(enrage_halo),
         fiend_ring: materials.add(fiend_ring),
-        phase_obsidian: materials.add(phase_obsidian),
-        phase_core: materials.add(eye(LinearRgba::rgb(9.0, 0.8, 12.0))),
-        sniper_lens: materials.add(eye(LinearRgba::rgb(22.0, 1.5, 1.0))),
+        // Polished metallic-obsidian armor plates (catch speculars against the dark violet hide).
+        phase_obsidian: materials.add(StandardMaterial {
+            emissive: LinearRgba::rgb(0.03, 0.0, 0.05),
+            ..skinned(&obsidian, Color::srgb(0.3, 0.24, 0.38), 0.22, 0.88)
+        }),
+        phase_core: materials.add(glow(Color::srgb(0.42, 0.04, 0.58), LinearRgba::rgb(1.20, 0.06, 1.75))),
+        sniper_lens: materials.add(glow(Color::srgb(0.68, 0.03, 0.02), LinearRgba::rgb(2.1, 0.05, 0.03))),
+        sniper_liner: materials.add(solid(0.078, 0.086, 0.102, 0.38, 0.75)),
         sniper_laser: materials.add(sniper_laser),
-        carrier_core: materials.add(eye(LinearRgba::rgb(14.0, 1.0, 9.0))),
+        // Matte reactor surface: no white specular sheen from the boss's own aura light.
+        carrier_core: materials.add(StandardMaterial {
+            perceptual_roughness: 0.62,
+            reflectance: 0.18,
+            ..glow(Color::srgb(0.45, 0.02, 0.24), LinearRgba::rgb(1.45, 0.03, 0.72))
+        }),
         boss_shield: materials.add(boss_shield),
         boss_tether: materials.add(boss_tether),
-        pylon_core: materials.add(eye(LinearRgba::rgb(4.0, 7.0, 16.0))),
+        pylon_core: materials.add(glow(Color::srgb(0.03, 0.22, 0.72), LinearRgba::rgb(0.05, 0.58, 1.85))),
+        boss_shield_mesh,
         looks,
         models: Default::default(),
+        rigs: Default::default(),
         source_part_counts: [0; KIND_COUNT],
         pylon_model: Vec::new(),
+        pylon_ring: RigModel { kind: RigKind::PylonRing, rest: Transform::IDENTITY, parts: Vec::new() },
     };
     for kind in EnemyKind::ALL {
-        a.source_part_counts[kind.index()] = build_parts(kind, &a, &a.looks[kind.index()].body[0], &a.looks[kind.index()].eye).len();
-        a.models[kind.index()] = bake_model(kind, &a, &src, &mut meshes);
+        let i = kind.index();
+        let look = a.looks[i].clone();
+        let (body, rigs) = sculpt_model(kind, &a, &look.body[0], &look.eye);
+        a.source_part_counts[i] = body.parts + rigs.iter().map(|(_, _, s)| s.parts).sum::<usize>();
+        a.models[i] = body.bake(&mut meshes, Some(&look));
+        a.rigs[i] = rigs.into_iter().map(|(kind, rest, s)| RigModel { kind, rest, parts: s.bake(&mut meshes, Some(&look)) }).collect();
     }
-    a.pylon_model = bake_parts(pylon_parts(&a), &a, &src, &mut meshes, None);
+    let (pylon, ring) = sculpt_pylon(&a);
+    a.pylon_model = pylon.bake(&mut meshes, None);
+    a.pylon_ring = RigModel { kind: ring.0, rest: ring.1, parts: ring.2.bake(&mut meshes, None) };
     commands.insert_resource(a);
 }
 
-/// Shield Pylon: armored base, glowing emitter column, crown ring + spikes.
-fn pylon_parts(a: &EnemyAssets) -> Vec<Part> {
+/// Shield Pylon: armored relay obelisk + its orbiting ring rig.
+fn sculpt_pylon(a: &EnemyAssets) -> (Sculptor, RigBuild) {
+    let (mp, hz, ob, core, horn, bone) = (&a.metal_plate, &a.hazard, &a.obsidian, &a.pylon_core, &a.horn, &a.bone);
     let id = Quat::IDENTITY;
-    let (core, mp, dark) = (a.pylon_core.clone(), a.metal_plate.clone(), a.dark.clone());
-    let mut p: Vec<Part> = vec![
-        (a.cylinder.clone(), mp.clone(), Vec3::new(0.0, 0.2, 0.0), Vec3::new(0.85, 0.4, 0.85), id),
-        (a.cylinder.clone(), dark.clone(), Vec3::new(0.0, 1.2, 0.0), Vec3::new(0.32, 1.9, 0.32), id),
-        (a.sphere.clone(), core.clone(), Vec3::new(0.0, 1.6, 0.0), Vec3::new(0.38, 0.62, 0.38), id),
-        (a.ring.clone(), a.boss_tether.clone(), Vec3::new(0.0, 2.55, 0.0), Vec3::new(0.55, 0.12, 0.55), id),
-        (a.sphere.clone(), core, Vec3::new(0.0, 2.6, 0.0), Vec3::splat(0.26), id),
-    ];
+    let oct = ry(PI / 8.0);
+    let diag = |k: usize| {
+        let ang = k as f32 * FRAC_PI_2 + PI / 4.0;
+        v3(ang.cos(), 0.0, ang.sin())
+    };
+    let mut p = Sculptor::default();
+    // Multi-tiered octagonal base + hazard warning collar.
+    p.at(&sculpt::tapered_prism(8, 0.86, 0.76, 0.22, true), mp, v3(0.0, 0.11, 0.0), oct, MID);
+    p.at(&sculpt::tapered_prism(8, 0.66, 0.56, 0.2, true), ob, v3(0.0, 0.32, 0.0), oct, MID);
+    p.at(&sculpt::tapered_prism(8, 0.5, 0.46, 0.12, true), hz, v3(0.0, 0.48, 0.0), oct, MID);
+    // Four sloped armored buttress fins leaning into the shaft.
+    let fin = sculpt::wedge_plate(0.14, 0.8, 0.5, 0.6, 0.35, -0.14);
     for k in 0..4 {
-        let ang = k as f32 * FRAC_PI_2;
-        let o = Vec3::new(ang.cos(), 0.0, ang.sin());
-        p.push((a.cube.clone(), mp.clone(), o * 0.62 + Vec3::Y * 0.65, Vec3::new(0.18, 0.9, 0.18), id));
-        p.push((a.cone.clone(), a.horn.clone(), o * 0.45 + Vec3::Y * 2.95, Vec3::new(0.08, 0.5, 0.08), Quat::from_rotation_arc(Vec3::Y, (o * 0.5 + Vec3::Y).normalize())));
+        let o = diag(k);
+        p.at(&fin, mp, o * 0.52 + Vec3::Y * 0.62, orient(Vec3::Y, -o), MID);
     }
-    p
-}
-
-/// Merge a kind's rigid parts per material into a few baked meshes (same
-/// placement under the body pivot, same UVs / normals).
-fn bake_model(kind: EnemyKind, a: &EnemyAssets, src: &[Mesh; 6], meshes: &mut Assets<Mesh>) -> Vec<EnemyPart> {
-    let look = a.look(kind);
-    bake_parts(build_parts(kind, a, &look.body[0], &look.eye), a, src, meshes, Some(look))
-}
-
-/// Merge rigid parts per material (body / eye roles from `look`, if any).
-fn bake_parts(parts: Vec<Part>, a: &EnemyAssets, src: &[Mesh; 6], meshes: &mut Assets<Mesh>, look: Option<&EnemyLookMaterials>) -> Vec<EnemyPart> {
-    let handles = [&a.cube, &a.sphere, &a.capsule, &a.cone, &a.cylinder, &a.ring];
-    let mut batches = MaterialBatches::new();
-    for (mesh, mat, t, s, r) in parts {
-        let i = handles.iter().position(|h| h.id() == mesh.id()).expect("demon part uses a shared primitive");
-        batches.add(&src[i], &mat, Transform::from_translation(t).with_scale(s).with_rotation(r));
+    // Tapered obsidian-iron obelisk: lower shaft, containment cage, upper shaft, emitter cap.
+    p.at(&sculpt::tapered_prism(8, 0.32, 0.27, 0.52, true), ob, v3(0.0, 0.8, 0.0), oct, MID);
+    let collar = sculpt::armored_ring(0.31, 0.06, 0.06, 8, true);
+    p.at(&collar, mp, v3(0.0, 1.06, 0.0), oct, MID);
+    p.at(&collar, mp, v3(0.0, 2.1, 0.0), oct, MID);
+    // Thick beveled armor cage struts (wedged, wider at the collars) + mid clamp bands.
+    let strut = sculpt::wedge_plate(0.13, 1.04, 0.1, 0.72, 0.8, 0.0);
+    let clamp = bbox(0.17, 0.07, 0.13, 0.02);
+    for k in 0..4 {
+        let o = diag(k);
+        p.at(&strut, ob, o * 0.3 + Vec3::Y * 1.58, orient(Vec3::Y, -o), MID);
+        p.at(&clamp, mp, o * 0.31 + Vec3::Y * 1.58, orient(Vec3::Y, -o), MID);
     }
-    batches
-        .finish(meshes)
-        .into_iter()
-        .map(|(mesh, material)| {
-            let role = match look {
-                Some(l) if material.id() == l.body[0].id() => PartRole::Body,
-                Some(l) if material.id() == l.eye.id() => PartRole::Eye,
-                _ => PartRole::Static,
-            };
-            EnemyPart { mesh, material, role }
-        })
-        .collect()
+    // Deep electric-cobalt faceted crystal core inside the cage.
+    p.at(&sculpt::ridged_sphere(v3(0.2, 0.5, 0.2), 6, 6, 0.0, 0.0, true), core, v3(0.0, 1.58, 0.0), id, MID);
+    p.at(&sculpt::tapered_prism(8, 0.26, 0.2, 0.36, true), ob, v3(0.0, 2.28, 0.0), oct, MID);
+    p.at(&sculpt::tapered_prism(8, 0.22, 0.1, 0.18, true), mp, v3(0.0, 2.55, 0.0), oct, MID);
+    p.at(&gem(0.09), core, v3(0.0, 2.68, 0.0), id, MID);
+    // Crown of four smoothly curved charred spikes with bone tips.
+    for k in 0..4 {
+        let o = diag(k);
+        p.sweep(horn, bone, o * 0.16 + Vec3::Y * 2.56, (0.05, 0.006), [o * 0.12 + Vec3::Y * 0.12, o * 0.3 + Vec3::Y * 0.26, o * 0.24 + Vec3::Y * 0.48], 0.66, MID);
+    }
+    // Orbiting beveled ring (spun in the boss system).
+    let mut ring = Sculptor::default();
+    ring.at(&sculpt::armored_ring(0.52, 0.05, 0.07, 16, true), core, Vec3::ZERO, id, MID);
+    (p, (RigKind::PylonRing, Transform::from_xyz(0.0, 2.55, 0.0), ring))
 }
 
-/// Mesh part: (mesh, material, translation, scale, rotation).
-type Part = (Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3, Quat);
-
-fn rz(a: f32) -> Quat {
-    Quat::from_rotation_z(a)
-}
-
-fn rx(a: f32) -> Quat {
-    Quat::from_rotation_x(a)
-}
-
-fn build_parts(kind: EnemyKind, a: &EnemyAssets, body: &Handle<StandardMaterial>, eye: &Handle<StandardMaterial>) -> Vec<Part> {
-    let (cube, sph, cap, cone, cyl, ring) = (
-        a.cube.clone(),
-        a.sphere.clone(),
-        a.capsule.clone(),
-        a.cone.clone(),
-        a.cylinder.clone(),
-        a.ring.clone(),
-    );
-    let b = body.clone();
-    let e = eye.clone();
+/// Sculpt one demon kind: the rigid body (baked under the body pivot) plus its
+/// articulated rigs. Heights / widths follow [`EnemyStats::hit_spheres`];
+/// forward is `-Z`, feet at `y = 0` (hover center for the Cacodemon).
+fn sculpt_model(kind: EnemyKind, a: &EnemyAssets, body: &Mat, eye_m: &Mat) -> (Sculptor, Vec<RigBuild>) {
+    let mut s = Sculptor::default();
+    let mut rigs: Vec<RigBuild> = Vec::new();
     let id = Quat::IDENTITY;
-    let mut p: Vec<Part> = Vec::new();
+    let y = Vec3::Y;
     match kind {
-        EnemyKind::Imp => {
-            let d = a.imp_dark.clone();
-            // Sculpted muscular hunched torso + rib/chest plates + waist.
-            p.push((cap.clone(), b.clone(), Vec3::new(0.0, 1.15, -0.02), Vec3::new(0.56, 0.36, 0.36), rx(0.14)));
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 1.32, -0.06), Vec3::new(0.34, 0.24, 0.24), id));
-            p.push((cap.clone(), d.clone(), Vec3::new(0.0, 0.84, 0.02), Vec3::new(0.42, 0.22, 0.28), id));
-            for k in 0..3 {
-                let y = 1.02 + k as f32 * 0.14;
-                p.push((cube.clone(), d.clone(), Vec3::new(0.0, y, -0.19), Vec3::new(0.34 - k as f32 * 0.03, 0.045, 0.06), id));
-                p.push((cone.clone(), a.bone.clone(), Vec3::new(0.0, y + 0.05, 0.21), Vec3::new(0.055, 0.22, 0.055), rx(1.25)));
-            }
-            // Digitigrade legs (thigh + angled shin + dark hooves) & muscular clawed arms + curved two-segment horns.
-            for s in [-1.0f32, 1.0] {
-                // Leg
-                p.push((cap.clone(), b.clone(), Vec3::new(0.18 * s, 0.58, -0.05), Vec3::new(0.19, 0.26, 0.20), rx(-0.26)));
-                p.push((cap.clone(), d.clone(), Vec3::new(0.18 * s, 0.26, 0.02), Vec3::new(0.15, 0.26, 0.16), rx(0.2)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.18 * s, 0.06, -0.06), Vec3::new(0.11, 0.12, 0.14), id));
-                // Shoulder + upper arm + forearm + splayed bone claws
-                p.push((sph.clone(), b.clone(), Vec3::new(0.36 * s, 1.38, -0.04), Vec3::splat(0.15), id));
-                p.push((cap.clone(), b.clone(), Vec3::new(0.45 * s, 1.15, -0.08), Vec3::new(0.13, 0.22, 0.13), rz(0.28 * s) * rx(0.25)));
-                p.push((cap.clone(), d.clone(), Vec3::new(0.48 * s, 0.88, -0.18), Vec3::new(0.11, 0.20, 0.11), rz(-0.1 * s) * rx(0.55)));
-                for c_off in [-0.045f32, 0.0, 0.045] {
-                    p.push((
-                        cone.clone(),
-                        a.bone.clone(),
-                        Vec3::new(0.48 * s + c_off, 0.72, -0.25),
-                        Vec3::new(0.028, 0.18, 0.028),
-                        rx(PI - 0.35),
-                    ));
-                }
-                // Swept two-segment dark horns + recessed glowing eyes
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.14 * s, 1.84, 0.0), Vec3::new(0.065, 0.28, 0.065), rz(-0.55 * s) * rx(-0.2)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.25 * s, 2.02, 0.06), Vec3::new(0.04, 0.22, 0.04), rz(-0.2 * s) * rx(-0.45)));
-                p.push((sph.clone(), e.clone(), Vec3::new(0.075 * s, 1.67, -0.20), Vec3::new(0.05, 0.036, 0.035), id));
-            }
-            // Sculpted demonic skull + brow ridge + fanged jaw.
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 1.65, -0.06), Vec3::new(0.21, 0.22, 0.22), id));
-            p.push((cube.clone(), d.clone(), Vec3::new(0.0, 1.74, -0.19), Vec3::new(0.26, 0.055, 0.10), rx(0.2)));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 1.53, -0.21), Vec3::new(0.19, 0.06, 0.08), id));
-            for k in 0..3 {
-                p.push((cone.clone(), a.bone.clone(), Vec3::new(-0.06 + k as f32 * 0.06, 1.54, -0.24), Vec3::new(0.018, 0.055, 0.018), rx(PI)));
-            }
-        }
-        EnemyKind::Cacodemon => {
-            // Iconic ridged crimson floating sphere + brow crest + side jowls.
-            p.push((sph.clone(), b.clone(), Vec3::ZERO, Vec3::new(0.92, 0.88, 0.90), id));
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 0.36, -0.62), Vec3::new(0.56, 0.22, 0.28), rx(0.25))); // heavy brow ridge
-            // Multi-layered cyclops eye: dark socket, glowing green sclera, cyan iris, slit pupil.
-            p.push((sph.clone(), a.dark.clone(), Vec3::new(0.0, 0.14, -0.74), Vec3::splat(0.35), id));
-            p.push((sph.clone(), e.clone(), Vec3::new(0.0, 0.14, -0.79), Vec3::splat(0.29), id));
-            p.push((sph.clone(), a.caco_iris.clone(), Vec3::new(0.0, 0.14, -0.97), Vec3::splat(0.15), id));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 0.14, -1.09), Vec3::new(0.045, 0.19, 0.05), id));
-            // Wide gaping cavern maw with glowing inner throat + upper & lower rows of fangs.
-            p.push((sph.clone(), a.caco_maw.clone(), Vec3::new(0.0, -0.36, -0.64), Vec3::new(0.54, 0.24, 0.32), id));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, -0.36, -0.76), Vec3::new(0.76, 0.22, 0.18), id));
-            for k in 0..6 {
-                let x = -0.32 + k as f32 * 0.128;
-                let curve_z = -0.84 + (x * x) * 0.6;
-                p.push((cone.clone(), a.bone.clone(), Vec3::new(x, -0.25, curve_z), Vec3::new(0.045, 0.13, 0.045), rx(PI)));
-                p.push((cone.clone(), a.bone.clone(), Vec3::new(x * 0.88, -0.47, curve_z + 0.02), Vec3::new(0.038, 0.10, 0.038), id));
-            }
-            // Sweeping upper horns, cheek spikes & dorsal horn crown + dangling under-tendrils.
-            for s in [-1.0f32, 1.0] {
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.52 * s, 0.78, -0.05), Vec3::new(0.15, 0.58, 0.15), rz(-0.55 * s)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.78 * s, 1.06, 0.08), Vec3::new(0.08, 0.36, 0.08), rz(-0.18 * s) * rx(-0.3)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.84 * s, 0.18, -0.08), Vec3::new(0.11, 0.40, 0.11), rz(-1.35 * s)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.74 * s, -0.32, 0.04), Vec3::new(0.09, 0.32, 0.09), rz(-2.1 * s)));
-            }
-            for k in 0..5 {
-                let ang = -0.9 + k as f32 * 0.45;
-                p.push((
-                    cone.clone(),
-                    a.horn.clone(),
-                    Vec3::new(ang.sin() * 0.48, 0.86, 0.25 + ang.cos() * 0.22),
-                    Vec3::new(0.075, 0.30, 0.075),
-                    rx(-0.35),
-                ));
-                p.push((
-                    cone.clone(),
-                    b.clone(),
-                    Vec3::new(ang.sin() * 0.42, -0.88, ang.cos() * 0.25),
-                    Vec3::new(0.07, 0.32, 0.07),
-                    rx(PI),
-                ));
-            }
-        }
+        EnemyKind::Imp => sculpt_imp(&mut s, a, body, eye_m),
+        EnemyKind::Cacodemon => sculpt_cacodemon(&mut s, a, body, eye_m),
         EnemyKind::JammerFiend => {
-            let g = a.fiend_green.clone();
-            let mp = a.metal_plate.clone();
-            // Hulking beveled armored chest + exposed glowing toxic reactor core + steel rib cage.
-            p.push((cap.clone(), b.clone(), Vec3::new(0.0, 1.42, 0.0), Vec3::new(0.95, 0.48, 0.62), id));
-            p.push((cube.clone(), mp.clone(), Vec3::new(0.0, 1.56, -0.26), Vec3::new(0.82, 0.46, 0.22), id));
-            p.push((sph.clone(), g.clone(), Vec3::new(0.0, 1.52, -0.35), Vec3::splat(0.22), id));
-            p.push((ring.clone(), mp.clone(), Vec3::new(0.0, 1.52, -0.37), Vec3::new(0.26, 0.08, 0.26), rx(FRAC_PI_2)));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 0.96, 0.0), Vec3::new(0.76, 0.22, 0.50), id));
-            for s in [-1.0f32, 1.0] {
-                // Armored hydraulic legs + heavy boots
-                p.push((cap.clone(), b.clone(), Vec3::new(0.28 * s, 0.66, 0.0), Vec3::new(0.28, 0.30, 0.30), id));
-                p.push((cyl.clone(), mp.clone(), Vec3::new(0.28 * s, 0.28, 0.02), Vec3::new(0.16, 0.46, 0.16), id));
-                p.push((cube.clone(), a.dark.clone(), Vec3::new(0.28 * s, 0.07, -0.05), Vec3::new(0.32, 0.14, 0.40), id));
-                // Massive sloped shoulder pauldrons + glowing side vents + hydraulic arms + claw gauntlets
-                p.push((sph.clone(), mp.clone(), Vec3::new(0.66 * s, 1.84, 0.0), Vec3::new(0.32, 0.24, 0.34), rz(0.2 * s)));
-                p.push((cube.clone(), g.clone(), Vec3::new(0.72 * s, 1.86, -0.18), Vec3::new(0.18, 0.12, 0.08), rz(0.2 * s)));
-                p.push((cap.clone(), b.clone(), Vec3::new(0.68 * s, 1.38, -0.03), Vec3::new(0.22, 0.34, 0.22), rz(0.14 * s)));
-                p.push((cyl.clone(), mp.clone(), Vec3::new(0.72 * s, 0.96, -0.10), Vec3::new(0.15, 0.36, 0.15), rx(0.35)));
-                p.push((cube.clone(), g.clone(), Vec3::new(0.72 * s, 0.76, -0.16), Vec3::new(0.26, 0.18, 0.26), id));
-                // Cyber-visor head horns + optics
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.20 * s, 2.34, -0.02), Vec3::new(0.07, 0.32, 0.07), rz(-0.4 * s)));
-                p.push((sph.clone(), e.clone(), Vec3::new(0.095 * s, 2.10, -0.24), Vec3::new(0.06, 0.04, 0.04), id));
-                // Power conduits linking backpack to shoulders
-                p.push((cap.clone(), g.clone(), Vec3::new(0.36 * s, 1.90, 0.26), Vec3::new(0.07, 0.34, 0.07), rx(0.95) * rz(0.4 * s)));
-            }
-            // Armored cyber-demon head + jaw grille
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 2.08, -0.06), Vec3::new(0.24, 0.22, 0.24), id));
-            p.push((cube.clone(), mp.clone(), Vec3::new(0.0, 2.00, -0.22), Vec3::new(0.28, 0.11, 0.12), id));
-            // Intricate demonic router backpack with LED rack, twin antennas, glowing emitter orbs + jammer halo ring!
-            p.push((cube.clone(), mp.clone(), Vec3::new(0.0, 1.56, 0.44), Vec3::new(0.68, 0.68, 0.36), id));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 1.56, 0.63), Vec3::new(0.54, 0.48, 0.04), id));
-            for k in 0..3 {
-                p.push((cube.clone(), g.clone(), Vec3::new(0.0, 1.40 + k as f32 * 0.16, 0.66), Vec3::new(0.42, 0.05, 0.03), id));
-            }
-            p.push((cyl.clone(), mp.clone(), Vec3::new(0.20, 2.58, 0.48), Vec3::new(0.042, 1.6, 0.042), rz(-0.14)));
-            p.push((cyl.clone(), mp.clone(), Vec3::new(-0.20, 2.38, 0.48), Vec3::new(0.042, 1.2, 0.042), rz(0.20)));
-            p.push((sph.clone(), e.clone(), Vec3::new(0.31, 3.36, 0.48), Vec3::splat(0.14), id));
-            p.push((sph.clone(), e.clone(), Vec3::new(-0.32, 2.96, 0.48), Vec3::splat(0.11), id));
-            p.push((ring.clone(), g.clone(), Vec3::new(0.31, 3.36, 0.48), Vec3::new(0.28, 0.06, 0.28), rx(0.4)));
+            sculpt_fiend(&mut s, a, body, eye_m);
+            // Rotating transceiver ring + glowing broadcast antenna (one entity, one material).
+            let g = &a.fiend_green;
+            let mut r = Sculptor::default();
+            r.at(&sculpt::armored_ring(0.24, 0.035, 0.045, 16, true), g, v3(0.0, 0.34, 0.0), rx(0.28), MID);
+            r.at(&sculpt::tapered_prism(6, 0.035, 0.018, 0.62, true), g, v3(0.0, 0.31, 0.0), id, MID);
+            r.at(&sculpt::armored_ring(0.12, 0.02, 0.03, 10, true), g, v3(0.0, 0.52, 0.0), rx(-0.35), MID);
+            r.at(&gem(0.075), g, v3(0.0, 0.66, 0.0), id, MID);
+            rigs.push((RigKind::FiendEmitter, Transform::from_xyz(0.0, 1.99, 0.44), r));
         }
-        EnemyKind::HellBaron => {
-            let gold = a.baron_gold.clone();
-            // Towering muscular torso + sculpted pectoral armor + glowing molten belt + spine ridge.
-            p.push((cap.clone(), b.clone(), Vec3::new(0.0, 2.02, 0.0), Vec3::new(1.25, 0.68, 0.78), rx(0.08)));
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 2.34, -0.10), Vec3::new(0.72, 0.42, 0.46), id));
-            p.push((cube.clone(), gold.clone(), Vec3::new(0.0, 2.18, -0.44), Vec3::new(0.96, 0.42, 0.14), id));
-            p.push((cube.clone(), gold.clone(), Vec3::new(0.0, 1.38, 0.0), Vec3::new(1.06, 0.20, 0.82), id));
-            p.push((sph.clone(), e.clone(), Vec3::new(0.0, 1.38, -0.44), Vec3::splat(0.14), id)); // glowing belt buckle
-            for k in 0..4 {
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.0, 1.6 + k as f32 * 0.28, 0.44), Vec3::new(0.09, 0.34, 0.09), rx(1.2)));
-            }
-            for s in [-1.0f32, 1.0] {
-                // Muscular digitigrade satyr legs + heavy cloven hooves
-                p.push((cap.clone(), b.clone(), Vec3::new(0.38 * s, 0.96, -0.06), Vec3::new(0.42, 0.42, 0.44), rx(-0.22)));
-                p.push((cap.clone(), a.imp_dark.clone(), Vec3::new(0.38 * s, 0.42, 0.04), Vec3::new(0.32, 0.40, 0.34), rx(0.18)));
-                p.push((cube.clone(), a.dark.clone(), Vec3::new(0.38 * s, 0.10, -0.08), Vec3::new(0.44, 0.20, 0.56), id));
-                // Molten-gold spiked pauldrons + massive arms + blazing fists
-                p.push((sph.clone(), gold.clone(), Vec3::new(0.86 * s, 2.48, 0.0), Vec3::new(0.44, 0.34, 0.46), rz(0.22 * s)));
-                p.push((cone.clone(), gold.clone(), Vec3::new(0.94 * s, 2.86, 0.0), Vec3::new(0.12, 0.48, 0.12), rz(-0.35 * s)));
-                p.push((cap.clone(), b.clone(), Vec3::new(0.96 * s, 1.92, -0.05), Vec3::new(0.34, 0.52, 0.36), rz(0.15 * s)));
-                p.push((cap.clone(), b.clone(), Vec3::new(1.02 * s, 1.38, -0.16), Vec3::new(0.30, 0.42, 0.32), rx(0.38)));
-                p.push((ring.clone(), gold.clone(), Vec3::new(1.02 * s, 1.30, -0.20), Vec3::new(0.24, 0.10, 0.24), rx(0.38)));
-                p.push((sph.clone(), e.clone(), Vec3::new(1.02 * s, 1.06, -0.26), Vec3::splat(0.26), id)); // blazing hellfire fists!
-                // Sweeping 3-segment curved bull-demon horns
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.34 * s, 3.16, -0.04), Vec3::new(0.13, 0.56, 0.13), rz(-0.85 * s)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.66 * s, 3.44, -0.08), Vec3::new(0.095, 0.52, 0.095), rz(-0.32 * s) * rx(0.25)));
-                p.push((cone.clone(), a.bone.clone(), Vec3::new(0.76 * s, 3.78, -0.20), Vec3::new(0.06, 0.36, 0.06), rz(0.12 * s) * rx(0.45)));
-                p.push((sph.clone(), e.clone(), Vec3::new(0.13 * s, 2.94, -0.32), Vec3::new(0.08, 0.055, 0.05), id));
-            }
-            // Ferocious horned skull + brow + snarling fanged jaw
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 2.90, -0.08), Vec3::new(0.34, 0.32, 0.34), id));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 3.04, -0.28), Vec3::new(0.42, 0.09, 0.16), rx(0.18)));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 2.72, -0.32), Vec3::new(0.32, 0.11, 0.14), id));
-            for k in 0..4 {
-                p.push((cone.clone(), a.bone.clone(), Vec3::new(-0.12 + k as f32 * 0.08, 2.75, -0.37), Vec3::new(0.032, 0.09, 0.032), rx(PI)));
-            }
-        }
-        EnemyKind::PhaseStalker => {
-            let ob = a.phase_obsidian.clone();
-            let core = a.phase_core.clone();
-            // Gaunt, forward-leaning wraith torso + exposed magenta phase core.
-            p.push((cap.clone(), b.clone(), Vec3::new(0.0, 1.3, 0.0), Vec3::new(0.42, 0.42, 0.28), rx(0.22)));
-            p.push((cube.clone(), ob.clone(), Vec3::new(0.0, 1.36, -0.16), Vec3::new(0.36, 0.34, 0.1), rx(0.22)));
-            p.push((sph.clone(), core.clone(), Vec3::new(0.0, 1.34, -0.22), Vec3::splat(0.12), id));
-            p.push((ring.clone(), ob.clone(), Vec3::new(0.0, 1.34, -0.23), Vec3::new(0.16, 0.05, 0.16), rx(FRAC_PI_2)));
-            p.push((cap.clone(), ob.clone(), Vec3::new(0.0, 0.92, 0.04), Vec3::new(0.26, 0.2, 0.2), id));
-            for k in 0..4 {
-                p.push((cone.clone(), ob.clone(), Vec3::new(0.0, 1.0 + k as f32 * 0.2, 0.22), Vec3::new(0.05, 0.22, 0.05), rx(1.1)));
-            }
-            for s in [-1.0f32, 1.0] {
-                // Stilted reverse-jointed legs ending in blade feet.
-                p.push((cap.clone(), b.clone(), Vec3::new(0.15 * s, 0.68, -0.04), Vec3::new(0.12, 0.3, 0.12), rx(-0.3)));
-                p.push((cap.clone(), ob.clone(), Vec3::new(0.15 * s, 0.3, 0.05), Vec3::new(0.09, 0.3, 0.09), rx(0.28)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.15 * s, 0.06, -0.1), Vec3::new(0.07, 0.16, 0.12), rx(-1.2)));
-                // Thin shoulders + long forearms + scythe blades.
-                p.push((sph.clone(), ob.clone(), Vec3::new(0.32 * s, 1.56, -0.02), Vec3::new(0.12, 0.1, 0.12), id));
-                p.push((cap.clone(), b.clone(), Vec3::new(0.38 * s, 1.3, -0.12), Vec3::new(0.08, 0.26, 0.08), rz(0.25 * s) * rx(0.5)));
-                p.push((cap.clone(), ob.clone(), Vec3::new(0.42 * s, 1.0, -0.42), Vec3::new(0.07, 0.28, 0.07), rx(1.1)));
-                p.push((cone.clone(), a.bone.clone(), Vec3::new(0.44 * s, 0.98, -0.88), Vec3::new(0.05, 0.62, 0.02), rx(-1.9) * rz(0.12 * s)));
-                p.push((cube.clone(), core.clone(), Vec3::new(0.44 * s, 1.02, -0.74), Vec3::new(0.012, 0.02, 0.4), rx(0.3)));
-                // Swept horns + visor eye slits.
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.12 * s, 2.04, 0.04), Vec3::new(0.05, 0.34, 0.05), rz(-0.35 * s) * rx(-0.6)));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.2 * s, 2.24, 0.22), Vec3::new(0.03, 0.24, 0.03), rx(-1.1)));
-                p.push((cube.clone(), e.clone(), Vec3::new(0.06 * s, 1.83, -0.17), Vec3::new(0.08, 0.018, 0.03), rz(0.18 * s)));
-            }
-            // Narrow skull + razor static visor band.
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 1.82, -0.04), Vec3::new(0.15, 0.2, 0.17), id));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 1.83, -0.15), Vec3::new(0.24, 0.05, 0.06), id));
-        }
+        EnemyKind::HellBaron => sculpt_baron(&mut s, a, body, eye_m),
+        EnemyKind::PhaseStalker => sculpt_stalker(&mut s, a, body, eye_m),
         EnemyKind::RelaySniper => {
-            let mp = a.metal_plate.clone();
-            let lens = a.sniper_lens.clone();
-            // Armored tripod: three splayed hydraulic legs under a turret hub.
-            p.push((cyl.clone(), mp.clone(), Vec3::new(0.0, 1.25, 0.0), Vec3::new(0.3, 0.5, 0.3), id));
-            for k in 0..3 {
-                let ang = k as f32 * TAU / 3.0 + FRAC_PI_2;
-                let o = Vec3::new(ang.cos(), 0.0, ang.sin());
-                let tilt = Quat::from_rotation_arc(Vec3::Y, (Vec3::Y * 1.0 + o * 0.6).normalize());
-                p.push((cap.clone(), b.clone(), o * 0.3 + Vec3::Y * 0.75, Vec3::new(0.12, 0.42, 0.12), tilt));
-                p.push((cyl.clone(), mp.clone(), o * 0.58 + Vec3::Y * 0.28, Vec3::new(0.08, 0.5, 0.08), tilt));
-                p.push((cube.clone(), a.dark.clone(), o * 0.72 + Vec3::Y * 0.05, Vec3::new(0.22, 0.1, 0.22), id));
-            }
-            // Armored torso + chest vent.
-            p.push((cap.clone(), b.clone(), Vec3::new(0.0, 1.7, 0.0), Vec3::new(0.55, 0.42, 0.42), id));
-            p.push((cube.clone(), mp.clone(), Vec3::new(0.0, 1.72, -0.2), Vec3::new(0.46, 0.36, 0.08), id));
-            p.push((cube.clone(), lens.clone(), Vec3::new(0.0, 1.6, -0.25), Vec3::new(0.3, 0.03, 0.02), id));
-            // Elevated parabolic relay dish (head) + crimson scope lens.
-            p.push((cyl.clone(), mp.clone(), Vec3::new(0.0, 2.12, 0.0), Vec3::new(0.08, 0.3, 0.08), id));
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 2.36, 0.02), Vec3::new(0.24, 0.2, 0.22), id));
-            p.push((cone.clone(), mp.clone(), Vec3::new(0.0, 2.36, -0.18), Vec3::new(0.34, 0.12, 0.34), rx(-FRAC_PI_2)));
-            p.push((sph.clone(), e.clone(), Vec3::new(0.0, 2.36, -0.3), Vec3::splat(0.08), id));
-            p.push((cyl.clone(), lens.clone(), Vec3::new(0.0, 2.36, -0.42), Vec3::new(0.035, 0.22, 0.035), rx(FRAC_PI_2)));
-            for s in [-1.0f32, 1.0] {
-                // Twin stabilizing antenna fins.
-                p.push((cube.clone(), mp.clone(), Vec3::new(0.28 * s, 2.56, 0.12), Vec3::new(0.03, 0.5, 0.18), rz(-0.3 * s)));
-                p.push((sph.clone(), lens.clone(), Vec3::new(0.4 * s, 2.8, 0.12), Vec3::splat(0.04), id));
-                // Shoulders + arms.
-                p.push((sph.clone(), mp.clone(), Vec3::new(0.48 * s, 1.95, 0.0), Vec3::new(0.18, 0.15, 0.2), id));
-                p.push((cap.clone(), b.clone(), Vec3::new(0.52 * s, 1.62, -0.1), Vec3::new(0.1, 0.24, 0.1), rx(0.6)));
-            }
-            // Shoulder rail barrel (right) with glowing coils.
-            p.push((cyl.clone(), a.dark.clone(), Vec3::new(0.5, 2.1, -0.42), Vec3::new(0.07, 1.1, 0.07), rx(FRAC_PI_2)));
-            for k in 0..3 {
-                p.push((ring.clone(), lens.clone(), Vec3::new(0.5, 2.1, -0.2 - k as f32 * 0.26), Vec3::new(0.1, 0.04, 0.1), rx(FRAC_PI_2)));
-            }
+            sculpt_sniper(&mut s, a, body);
+            // Parabolic relay targeting dish (opens toward -Z) on a scanning neck pivot.
+            // Bright brushed-titanium shell + rim, near-black armored concave liner,
+            // ONE large deep-crimson targeting optic dead centre.
+            let (ti, liner) = (&a.sniper_ti, &a.sniper_liner);
+            let face = rx(-FRAC_PI_2);
+            let mut r = Sculptor::default();
+            r.at(&sculpt::flared_dish(0.08, 0.36, 0.17, 0.03, 16), ti, v3(0.0, 0.16, 0.0), face, MID);
+            r.at(&sculpt::flared_dish(0.07, 0.3, 0.125, 0.02, 16), liner, v3(0.0, 0.16, -0.032), face, MID);
+            r.at(&sculpt::armored_ring(0.36, 0.026, 0.03, 16, true), ti, v3(0.0, 0.16, -0.17), rx(FRAC_PI_2), MID);
+            r.blade(ti, v3(0.12, 0.24, 0.12), v3(0.35, 1.0, 0.45), v3(0.0, 0.0, 1.0), 0.3, 0.1, 0.025, 0.06, SYM);
+            r.at(&bbox(0.22, 0.22, 0.18, 0.04), liner, v3(0.0, 0.16, 0.08), id, MID);
+            r.at(&sculpt::tapered_prism(8, 0.06, 0.08, 0.08, true), liner, v3(0.0, 0.03, 0.02), id, MID);
+            r.at(&sculpt::armored_ring(0.105, 0.022, 0.03, 12, true), ti, v3(0.0, 0.16, -0.07), rx(FRAC_PI_2), MID);
+            r.at(&sculpt::ridged_sphere(v3(0.1, 0.1, 0.06), 6, 10, 0.04, 5.0, true), eye_m, v3(0.0, 0.16, -0.075), id, MID);
+            r.at(&sculpt::tapered_prism(6, 0.024, 0.012, 0.2, true), liner, v3(0.0, 0.16, -0.2), face, MID);
+            rigs.push((RigKind::SniperDish, Transform::from_xyz(0.0, 2.2, 0.0), r));
         }
         EnemyKind::CarrierDaemon => {
-            let gold = a.baron_gold.clone();
-            let core = a.carrier_core.clone();
-            let mp = a.metal_plate.clone();
-            // Massive blackened-iron torso + molten-gold ribcage around the Signal Core.
-            p.push((cap.clone(), b.clone(), Vec3::new(0.0, 2.55, 0.0), Vec3::new(1.7, 1.0, 1.1), id));
-            p.push((sph.clone(), core.clone(), Vec3::new(0.0, 2.6, -0.42), Vec3::splat(0.46), id));
-            p.push((ring.clone(), gold.clone(), Vec3::new(0.0, 2.6, -0.5), Vec3::new(0.6, 0.16, 0.6), rx(FRAC_PI_2)));
-            for k in 0..4 {
-                let y = 2.05 + k as f32 * 0.34;
-                for s in [-1.0f32, 1.0] {
-                    p.push((cube.clone(), gold.clone(), Vec3::new(0.52 * s, y, -0.5), Vec3::new(0.46, 0.08, 0.12), rz(0.35 * s)));
-                }
+            sculpt_carrier(&mut s, a, body, eye_m);
+            let (gold, core, dk) = (&a.baron_gold, &a.carrier_core, &a.dark);
+            // Twin shoulder plasma cannons on one breathing / recoiling pivot.
+            let mut c = Sculptor::default();
+            c.at(&sculpt::wedge_plate(0.72, 0.34, 0.84, 0.62, 0.8, 0.0), gold, v3(1.08, 0.06, 0.0), rz(-0.32), SYM);
+            let cooling = sculpt::armored_ring(0.2, 0.04, 0.05, 8, true);
+            for z in [-0.5, -0.82] {
+                c.at(&cooling, gold, v3(1.16, 0.3, z), rx(FRAC_PI_2), SYM);
             }
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 1.62, 0.0), Vec3::new(1.3, 0.3, 0.9), id));
-            p.push((cube.clone(), gold.clone(), Vec3::new(0.0, 1.62, -0.46), Vec3::new(0.7, 0.2, 0.06), id));
-            for s in [-1.0f32, 1.0] {
-                // Pillar legs + armored hooves.
-                p.push((cap.clone(), b.clone(), Vec3::new(0.55 * s, 1.1, 0.0), Vec3::new(0.5, 0.55, 0.52), id));
-                p.push((cyl.clone(), mp.clone(), Vec3::new(0.55 * s, 0.45, 0.02), Vec3::new(0.34, 0.75, 0.34), id));
-                p.push((cube.clone(), a.dark.clone(), Vec3::new(0.55 * s, 0.12, -0.1), Vec3::new(0.62, 0.24, 0.78), id));
-                // Shoulder plasma cannons: gold mantles + iron barrels + glowing muzzles.
-                p.push((sph.clone(), gold.clone(), Vec3::new(1.2 * s, 3.25, 0.0), Vec3::new(0.55, 0.42, 0.55), id));
-                p.push((cyl.clone(), a.dark.clone(), Vec3::new(1.25 * s, 3.4, -0.55), Vec3::new(0.2, 1.0, 0.2), rx(FRAC_PI_2)));
-                p.push((ring.clone(), gold.clone(), Vec3::new(1.25 * s, 3.4, -0.95), Vec3::new(0.26, 0.1, 0.26), rx(FRAC_PI_2)));
-                p.push((sph.clone(), core.clone(), Vec3::new(1.25 * s, 3.4, -1.06), Vec3::splat(0.16), id));
-                // Heavy arms + gold-clawed fists.
-                p.push((cap.clone(), b.clone(), Vec3::new(1.3 * s, 2.45, -0.05), Vec3::new(0.4, 0.6, 0.42), rz(0.12 * s)));
-                p.push((cap.clone(), b.clone(), Vec3::new(1.38 * s, 1.75, -0.22), Vec3::new(0.34, 0.5, 0.36), rx(0.4)));
-                for c in [-0.12f32, 0.0, 0.12] {
-                    p.push((cone.clone(), gold.clone(), Vec3::new(1.38 * s + c, 1.3, -0.42), Vec3::new(0.05, 0.3, 0.05), rx(PI - 0.4)));
-                }
+            c.at(&sculpt::armored_ring(0.15, 0.035, 0.06, 8, true), gold, v3(1.16, 0.3, -1.14), rx(FRAC_PI_2), SYM);
+            c.at(&bbox(0.42, 0.38, 0.5, 0.07), dk, v3(1.16, 0.3, 0.12), id, SYM);
+            c.at(&sculpt::tapered_prism(8, 0.17, 0.14, 1.1, true), dk, v3(1.16, 0.3, -0.62), rx(-FRAC_PI_2), SYM);
+            c.at(&gem(0.12), core, v3(1.16, 0.3, -1.16), id, SYM);
+            // Rolled slightly forward so the twin barrels aim at the player.
+            rigs.push((RigKind::BossCannon, Transform::from_xyz(0.0, 3.42, -0.04).with_rotation(rx(-0.09)), c));
+            // Multi-tiered octagonal broadcast halo behind the head (spins about its axis).
+            let mut h = Sculptor::default();
+            h.at(&sculpt::armored_ring(0.95, 0.07, 0.09, 8, true), gold, Vec3::ZERO, id, MID);
+            h.at(&sculpt::armored_ring(0.68, 0.04, 0.06, 8, true), gold, Vec3::ZERO, ry(PI / 8.0), MID);
+            let node = gem(0.1);
+            for k in 0..6 {
+                let ang = k as f32 * TAU / 6.0;
+                let o = v3(ang.cos(), 0.0, -ang.sin());
+                h.blade(gold, o * 0.98, o, y.cross(o), 0.48, 0.16, 0.05, 0.12, MID);
+                h.limb(gold, o * 0.7, o * 0.92, (0.03, 0.03), 6, MID);
+                let n = ang + PI / 6.0;
+                h.at(&node, core, v3(n.cos(), 0.0, -n.sin()) * 0.82, id, MID);
             }
-            // Horned skull + molten eyes.
-            p.push((sph.clone(), b.clone(), Vec3::new(0.0, 3.72, -0.1), Vec3::new(0.42, 0.38, 0.42), id));
-            p.push((cube.clone(), a.dark.clone(), Vec3::new(0.0, 3.86, -0.42), Vec3::new(0.5, 0.1, 0.16), rx(0.2)));
-            for s in [-1.0f32, 1.0] {
-                p.push((sph.clone(), e.clone(), Vec3::new(0.15 * s, 3.74, -0.44), Vec3::new(0.09, 0.06, 0.05), id));
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.38 * s, 4.0, -0.04), Vec3::new(0.13, 0.55, 0.13), rz(-0.7 * s)));
-            }
-            // 4-spoked demonic satellite crown / halo.
-            p.push((ring.clone(), gold.clone(), Vec3::new(0.0, 4.32, 0.25), Vec3::new(0.95, 0.14, 0.95), rx(1.2)));
-            for k in 0..4 {
-                let ang = k as f32 * FRAC_PI_2 + 0.785;
-                let o = Quat::from_rotation_x(1.2) * Vec3::new(ang.cos(), 0.0, ang.sin());
-                p.push((cone.clone(), a.horn.clone(), Vec3::new(0.0, 4.32, 0.25) + o * 1.05, Vec3::new(0.09, 0.48, 0.09), Quat::from_rotation_arc(Vec3::Y, o)));
-                p.push((sph.clone(), core.clone(), Vec3::new(0.0, 4.32, 0.25) + o * 0.78, Vec3::splat(0.1), id));
-            }
+            rigs.push((RigKind::BossHalo, Transform::from_xyz(0.0, 4.0, 0.74).with_rotation(rx(FRAC_PI_2 - 0.3)), h));
         }
     }
-    p
+    (s, rigs)
+}
+
+/// Hunched, sinewy predatory Mars demon (height ~1.9): torso pitched forward,
+/// snarling snout thrust out, clawed arms held out and forward.
+fn sculpt_imp(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+    let (dark, horn, bone, maw) = (&a.imp_dark, &a.horn, &a.bone, &a.dark);
+    let id = Quat::IDENTITY;
+    let hunch = rx(-0.45);
+    // Pelvis, forward-slanted abdomen, V-tapered ribcage + pecs + rib bands.
+    s.at(&bbox(0.34, 0.2, 0.25, 0.05), dark, v3(0.0, 0.9, 0.05), rx(-0.15), MID);
+    s.limb(body, v3(0.0, 0.95, 0.05), v3(0.0, 1.2, -0.05), (0.15, 0.19), 10, MID);
+    s.at(&sculpt::wedge_plate(0.36, 0.42, 0.27, 1.55, 1.1, -0.08), body, v3(0.0, 1.3, -0.1), hunch, MID);
+    s.at(&sculpt::angled_shield(0.44, 0.2, 0.07, 0.07), body, v3(0.0, 1.33, -0.27), hunch, MID);
+    let rib = bbox(0.13, 0.025, 0.04, 0.008);
+    for k in 0..3 {
+        let kf = k as f32;
+        s.at(&rib, dark, v3(0.13, 1.13 + kf * 0.07, -0.2 - kf * 0.04), ry(-0.45) * rz(-0.25) * hunch, SYM);
+    }
+    // Dorsal bone spine spikes along the hunched back.
+    for k in 0..4 {
+        let kf = k as f32;
+        s.horn(bone, v3(0.0, 1.14 + kf * 0.11, 0.1 - kf * 0.06), v3(0.0, 0.7, 1.0), Vec3::Y, (0.038, 0.006), 0.18, 0.05, MID);
+    }
+    // Sloped predatory shoulders + arms held out and forward, spread bone talons.
+    s.at(&sculpt::wedge_plate(0.2, 0.14, 0.24, 0.6, 0.8, 0.0), body, v3(0.26, 1.44, -0.2), rz(-0.4) * hunch, SYM);
+    s.at(&blob(v3(0.1, 0.1, 0.11)), body, v3(0.31, 1.39, -0.2), id, SYM);
+    let (sh, el, wr) = (v3(0.31, 1.38, -0.2), v3(0.47, 1.2, -0.34), v3(0.52, 1.12, -0.6));
+    s.limb(body, sh, el, (0.078, 0.062), 10, SYM);
+    s.at(&blob(Vec3::splat(0.058)), dark, el, id, SYM);
+    s.horn(bone, el, v3(0.3, 0.1, 1.0), Vec3::Y, (0.026, 0.005), 0.14, 0.03, SYM);
+    s.limb(dark, el, wr, (0.062, 0.05), 8, SYM);
+    s.at(&bbox(0.12, 0.07, 0.12, 0.02), dark, wr + v3(0.0, -0.01, -0.04), rx(-0.2), SYM);
+    let talon = sculpt::curved_horn(0.022, 0.004, 0.22, 0.0, -0.09, 8, 6);
+    for c in [-0.05f32, -0.017, 0.017, 0.05] {
+        s.at(&talon, bone, wr + v3(c, -0.02, -0.09), orient(v3(c * 5.0, -0.12, -1.0), Vec3::NEG_Y), SYM);
+    }
+    // Bent digitigrade legs: thick umber thighs, bone kneecaps, charred shins + hooves, bone toe talons.
+    let (hip, knee, hock, foot) = (v3(0.15, 0.88, 0.05), v3(0.21, 0.56, -0.2), v3(0.21, 0.26, 0.12), v3(0.21, 0.07, -0.04));
+    s.limb(body, hip, knee, (0.115, 0.08), 10, SYM);
+    s.at(&blob(v3(0.12, 0.18, 0.13)), body, hip.lerp(knee, 0.42), along(knee - hip), SYM);
+    s.at(&blob(Vec3::splat(0.07)), bone, knee + v3(0.0, 0.0, -0.03), id, SYM);
+    s.limb(horn, knee, hock, (0.065, 0.05), 8, SYM);
+    s.limb(horn, hock, foot, (0.05, 0.044), 8, SYM);
+    s.at(&blob(Vec3::splat(0.05)), horn, hock, id, SYM);
+    let hoof = sculpt::wedge_plate(0.07, 0.08, 0.16, 0.7, 0.75, -0.02);
+    for dx in [-0.038f32, 0.038] {
+        s.at(&hoof, horn, v3(0.21 + dx, 0.04, -0.08), id, SYM);
+    }
+    let toe = sculpt::curved_horn(0.018, 0.003, 0.11, 0.0, -0.04, 6, 6);
+    for dx in [-0.045f32, 0.0, 0.045] {
+        s.at(&toe, bone, v3(0.21 + dx, 0.035, -0.15), orient(v3(dx * 3.0, -0.05, -1.0), Vec3::NEG_Y), SYM);
+    }
+    // Snarling head thrust forward: dark brow, snout, open fanged jaw, ember eyes.
+    s.limb(body, v3(0.0, 1.46, -0.14), v3(0.0, 1.55, -0.2), (0.08, 0.07), 10, MID);
+    s.at(&sculpt::ridged_sphere(v3(0.14, 0.13, 0.16), 8, 10, 0.04, 5.0, true), body, v3(0.0, 1.6, -0.22), id, MID);
+    s.at(&sculpt::angled_shield(0.3, 0.06, 0.07, 0.08), dark, v3(0.0, 1.66, -0.31), rx(-0.25), MID);
+    s.at(&bbox(0.15, 0.085, 0.14, 0.025), body, v3(0.0, 1.565, -0.34), rx(0.12), MID);
+    s.at(&bbox(0.13, 0.035, 0.1, 0.01), maw, v3(0.0, 1.515, -0.35), id, MID);
+    s.at(&sculpt::wedge_plate(0.15, 0.05, 0.14, 0.75, 0.8, 0.0), dark, v3(0.0, 1.475, -0.33), rx(0.22), MID);
+    s.horn(bone, v3(0.04, 1.535, -0.4), v3(0.0, -1.0, -0.15), Vec3::Z, (0.014, 0.002), 0.08, 0.012, SYM);
+    s.horn(bone, v3(0.055, 1.49, -0.38), v3(0.1, 1.0, -0.2), Vec3::NEG_Z, (0.013, 0.002), 0.075, 0.015, SYM);
+    s.at(&blob(v3(0.036, 0.02, 0.02)), eye_m, v3(0.062, 1.615, -0.355), rz(-0.3), SYM);
+    // Short aggressive horns swept cleanly back and slightly outward (charred -> bone).
+    s.sweep(horn, bone, v3(0.08, 1.69, -0.25), (0.05, 0.006), [v3(0.03, 0.09, 0.04), v3(0.08, 0.14, 0.17), v3(0.13, 0.12, 0.33)], 0.6, SYM);
+}
+
+/// Fierce ridged floating carapace with a cyclops eye and a fanged maw (radius ~0.9).
+fn sculpt_cacodemon(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+    let (maw, iris, horn, bone) = (&a.caco_maw, &a.caco_iris, &a.horn, &a.bone);
+    let id = Quat::IDENTITY;
+    s.at(&sculpt::ridged_sphere(v3(0.92, 0.86, 0.90), 12, 18, 0.085, 7.0, true), body, Vec3::ZERO, id, MID);
+    // Heavy overhanging armored brow crest + ridged cheek jowls.
+    s.at(&sculpt::angled_shield(1.04, 0.2, 0.2, 0.2), body, v3(0.0, 0.44, -0.7), rx(-0.5), MID);
+    s.at(&sculpt::wedge_plate(0.9, 0.14, 0.34, 0.75, 0.6, 0.1), body, v3(0.0, 0.56, -0.56), rx(-0.35), MID);
+    s.at(&sculpt::ridged_sphere(v3(0.24, 0.2, 0.3), 6, 8, 0.08, 4.0, true), body, v3(0.5, -0.18, -0.56), ry(-0.4), SYM);
+    // Recessed dark socket, deep emerald sclera, electric-cyan iris, crisp dark slit pupil.
+    s.at(&sculpt::ridged_sphere(v3(0.38, 0.34, 0.2), 8, 12, 0.05, 6.0, true), maw, v3(0.0, 0.12, -0.74), id, MID);
+    s.at(&blob(v3(0.27, 0.26, 0.16)), eye_m, v3(0.0, 0.12, -0.84), id, MID);
+    s.at(&blob(v3(0.15, 0.15, 0.07)), iris, v3(0.0, 0.12, -0.97), id, MID);
+    s.at(&bbox(0.045, 0.22, 0.03, 0.008), horn, v3(0.0, 0.12, -1.04), id, MID);
+    // Cavernous maw: dark glowing crimson throat, beveled gum ridges, huge interlocking curved fangs.
+    s.at(&blob(v3(0.54, 0.22, 0.3)), maw, v3(0.0, -0.38, -0.64), id, MID);
+    s.at(&sculpt::angled_shield(0.92, 0.07, 0.12, 0.12), body, v3(0.0, -0.24, -0.78), id, MID);
+    s.at(&sculpt::angled_shield(0.86, 0.07, 0.12, 0.12), body, v3(0.0, -0.53, -0.72), id, MID);
+    let (fang_big, fang_small) = (sculpt::curved_horn(0.08, 0.006, 0.38, 0.0, -0.07, 8, 7), sculpt::curved_horn(0.055, 0.005, 0.24, 0.0, -0.045, 8, 7));
+    for k in 0..5 {
+        let x = -0.32 + k as f32 * 0.16;
+        let z = -0.84 - 0.12 * (1.0 - x.abs() / 0.46) + 0.03;
+        s.at(if k % 2 == 0 { &fang_big } else { &fang_small }, bone, v3(x, -0.25, z), orient(v3(x * 0.25, -1.0, 0.08), Vec3::Z), MID);
+    }
+    let lower_big = sculpt::curved_horn(0.07, 0.006, 0.3, 0.0, -0.06, 8, 7);
+    for k in 0..4 {
+        let x = -0.24 + k as f32 * 0.16;
+        let z = -0.78 - 0.12 * (1.0 - x.abs() / 0.43) + 0.03;
+        s.at(if k % 3 == 0 { &fang_small } else { &lower_big }, bone, v3(x, -0.52, z), orient(v3(x * 0.25, 1.0, -0.05), Vec3::Z), MID);
+    }
+    // Sweeping crown of curved charred horns with bone tips: primary, dorsal, cheek, jowl + crest.
+    s.sweep(horn, bone, v3(0.42, 0.64, -0.08), (0.13, 0.012), [v3(0.22, 0.2, 0.05), v3(0.52, 0.5, 0.02), v3(0.46, 0.82, -0.36)], 0.62, SYM);
+    s.sweep(horn, bone, v3(0.3, 0.7, 0.32), (0.085, 0.01), [v3(0.1, 0.18, 0.1), v3(0.26, 0.38, 0.3), v3(0.2, 0.48, 0.56)], 0.6, SYM);
+    s.sweep(horn, bone, v3(0.82, 0.05, -0.2), (0.09, 0.01), [v3(0.2, 0.04, 0.0), v3(0.42, 0.1, -0.04), v3(0.55, 0.34, -0.26)], 0.62, SYM);
+    s.sweep(horn, bone, v3(0.62, -0.5, -0.25), (0.07, 0.008), [v3(0.12, -0.12, 0.0), v3(0.26, -0.3, -0.04), v3(0.2, -0.48, -0.3)], 0.62, SYM);
+    for k in 0..3 {
+        let kf = k as f32;
+        s.horn(horn, v3(0.0, 0.84 - kf * 0.12, 0.12 + kf * 0.22), v3(0.0, 0.7, 0.7), Vec3::Y, (0.07, 0.01), 0.32 - kf * 0.04, 0.1, MID);
+    }
+    // Tapered fleshy underside tendrils.
+    for k in 0..5 {
+        let ang = -0.9 + k as f32 * 0.45;
+        let (sx, cz) = (ang.sin(), ang.cos());
+        s.horn(body, v3(sx * 0.38, -0.7, cz * 0.25 + 0.05), v3(sx * 0.3, -1.0, cz * 0.25 + 0.15), Vec3::Z, (0.065, 0.008), 0.45, 0.16, MID);
+    }
+}
+
+/// Heavy cyber-armored industrial demon with a router backpack (height ~2.4).
+fn sculpt_fiend(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+    let (mp, g, hz, horn) = (&a.metal_plate, &a.fiend_green, &a.hazard, &a.horn);
+    let id = Quat::IDENTITY;
+    // Hips, hazard waist band, beveled torso.
+    s.at(&bbox(0.6, 0.22, 0.42, 0.05), body, v3(0.0, 0.98, 0.0), id, MID);
+    s.at(&bbox(0.66, 0.1, 0.46, 0.02), hz, v3(0.0, 1.12, 0.0), id, MID);
+    s.at(&bbox(0.92, 0.66, 0.6, 0.09), body, v3(0.0, 1.5, 0.02), id, MID);
+    // Chest armor flanking a recessed cage around the toxic-green reactor core.
+    s.at(&bbox(0.3, 0.5, 0.1, 0.03), mp, v3(0.27, 1.53, -0.3), ry(-0.3), SYM);
+    s.at(&sculpt::angled_shield(0.84, 0.16, 0.09, 0.1), mp, v3(0.0, 1.76, -0.3), id, MID);
+    s.at(&sculpt::armored_ring(0.17, 0.045, 0.06, 12, true), mp, v3(0.0, 1.5, -0.33), rx(FRAC_PI_2), MID);
+    s.at(&sculpt::ridged_sphere(Vec3::splat(0.14), 8, 10, 0.08, 5.0, true), g, v3(0.0, 1.5, -0.28), id, MID);
+    let cage = bbox(0.025, 0.34, 0.03, 0.006);
+    for x in [-0.06f32, 0.06] {
+        s.at(&cage, mp, v3(x, 1.5, -0.45), id, MID);
+    }
+    // Sloped heavy pauldrons with hazard trim + glowing vents.
+    s.at(&sculpt::wedge_plate(0.42, 0.26, 0.52, 0.55, 0.75, 0.0), mp, v3(0.6, 1.95, 0.0), rz(-0.42), SYM);
+    s.at(&sculpt::wedge_plate(0.46, 0.05, 0.56, 0.92, 0.95, 0.0), hz, v3(0.57, 1.8, 0.0), rz(-0.42), SYM);
+    s.at(&bbox(0.18, 0.05, 0.04, 0.01), g, v3(0.6, 1.9, -0.27), rz(-0.42), SYM);
+    // Hydraulic armored arms with glowing energy knuckles.
+    let (sh, el, wr) = (v3(0.62, 1.78, 0.0), v3(0.7, 1.36, -0.04), v3(0.72, 1.0, -0.16));
+    s.limb(body, sh, el, (0.13, 0.11), 8, SYM);
+    s.limb(mp, v3(0.76, 1.72, 0.1), v3(0.78, 1.4, 0.06), (0.035, 0.03), 6, SYM);
+    s.at(&sculpt::armored_ring(0.11, 0.03, 0.05, 10, true), mp, el, along(sh - el), SYM);
+    s.at(&bbox(0.24, 0.4, 0.26, 0.05), mp, (el + wr) * 0.5, along(el - wr), SYM);
+    s.at(&bbox(0.26, 0.2, 0.26, 0.05), body, v3(0.72, 0.88, -0.2), rx(0.25), SYM);
+    s.at(&bbox(0.22, 0.05, 0.06, 0.012), g, v3(0.72, 0.9, -0.33), rx(0.25), SYM);
+    // Hydraulic piston legs + beveled stomper boots (hazard toe caps) at y = 0.
+    let (hip, knee, ank) = (v3(0.27, 0.96, 0.0), v3(0.29, 0.56, -0.07), v3(0.29, 0.16, 0.02));
+    s.limb(body, hip, knee, (0.17, 0.14), 8, SYM);
+    s.at(&sculpt::wedge_plate(0.24, 0.26, 0.12, 0.7, 0.8, -0.03), mp, knee + v3(0.0, 0.02, -0.13), id, SYM);
+    s.limb(mp, knee, ank, (0.12, 0.1), 8, SYM);
+    s.limb(g, v3(0.29, 0.5, 0.1), v3(0.29, 0.2, 0.1), (0.025, 0.025), 6, SYM);
+    s.at(&bbox(0.34, 0.16, 0.46, 0.04), body, v3(0.29, 0.08, -0.06), id, SYM);
+    s.at(&bbox(0.35, 0.07, 0.1, 0.015), hz, v3(0.29, 0.1, -0.27), id, SYM);
+    // Horned cyber-skull: DARK face plate + jaw grille so the twin green optics pop.
+    s.limb(body, v3(0.0, 1.82, -0.02), v3(0.0, 1.95, -0.05), (0.1, 0.09), 8, MID);
+    s.at(&bbox(0.36, 0.3, 0.36, 0.06), body, v3(0.0, 2.08, -0.05), id, MID);
+    s.at(&bbox(0.3, 0.2, 0.04, 0.012), horn, v3(0.0, 2.06, -0.235), id, MID);
+    s.at(&sculpt::angled_shield(0.4, 0.09, 0.06, 0.08), mp, v3(0.0, 2.17, -0.25), rx(-0.15), MID);
+    s.at(&blob(v3(0.065, 0.03, 0.025)), eye_m, v3(0.08, 2.07, -0.26), rz(-0.25), SYM);
+    s.at(&bbox(0.28, 0.12, 0.1, 0.02), horn, v3(0.0, 1.97, -0.22), id, MID);
+    let slot = bbox(0.2, 0.016, 0.02, 0.004);
+    for k in 0..3 {
+        s.at(&slot, mp, v3(0.0, 1.94 + k as f32 * 0.03, -0.275), id, MID);
+    }
+    // Smoothly curved charred horn-antennas, tipped with glowing transmitter spines.
+    s.sweep(horn, g, v3(0.13, 2.2, -0.06), (0.06, 0.008), [v3(0.12, 0.12, 0.05), v3(0.3, 0.24, 0.02), v3(0.36, 0.44, -0.2)], 0.8, SYM);
+    // Demonic router backpack: server chassis, signal-bar LEDs, twin heat vents, power cables.
+    s.at(&bbox(0.62, 0.66, 0.32, 0.05), mp, v3(0.0, 1.56, 0.44), id, MID);
+    s.at(&bbox(0.5, 0.5, 0.04, 0.01), body, v3(0.0, 1.56, 0.61), id, MID);
+    let led = bbox(0.36, 0.035, 0.03, 0.006);
+    for k in 0..4 {
+        s.at(&led, g, v3(0.0, 1.38 + k as f32 * 0.12, 0.635), id, MID);
+    }
+    s.at(&sculpt::tapered_prism(8, 0.09, 0.11, 0.24, true), mp, v3(0.2, 1.98, 0.5), id, SYM);
+    s.at(&sculpt::armored_ring(0.09, 0.025, 0.03, 8, true), hz, v3(0.2, 2.09, 0.5), id, SYM);
+    s.at(&sculpt::tapered_prism(8, 0.07, 0.07, 0.02, true), g, v3(0.2, 2.1, 0.5), id, SYM);
+    s.limb(g, v3(0.22, 1.86, 0.32), v3(0.5, 1.98, 0.1), (0.03, 0.03), 6, SYM);
+    s.at(&bbox(0.16, 0.1, 0.16, 0.03), mp, v3(0.0, 1.94, 0.44), id, MID);
+}
+
+/// Towering muscular bruiser in engraved molten-gold armor (height ~3.3).
+fn sculpt_baron(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+    let (gold, horn, bone, fire) = (&a.baron_gold, &a.horn, &a.bone, &a.baron_hellfire);
+    let id = Quat::IDENTITY;
+    // Charred waist, engraved belt with demonic buckle + hellfire gem.
+    s.at(&bbox(0.86, 0.3, 0.6, 0.06), horn, v3(0.0, 1.42, 0.0), id, MID);
+    s.at(&bbox(1.0, 0.15, 0.7, 0.04), gold, v3(0.0, 1.45, 0.0), id, MID);
+    s.at(&sculpt::angled_shield(0.32, 0.26, 0.07, 0.08), gold, v3(0.0, 1.44, -0.38), id, MID);
+    s.at(&gem(0.06), fire, v3(0.0, 1.44, -0.48), id, MID);
+    // Massive V-tapered torso: abdomen, thorax, pecs, gold gorget + plackart, traps, spine spikes.
+    s.scaled(&sculpt::tapered_prism(10, 0.36, 0.44, 0.42, false), body, v3(0.0, 1.76, 0.0), v3(1.0, 1.0, 0.78), id, MID);
+    s.at(&sculpt::wedge_plate(0.92, 0.7, 0.6, 1.45, 1.05, -0.03), body, v3(0.0, 2.27, 0.0), rx(-0.06), MID);
+    s.at(&blob(v3(0.28, 0.19, 0.14)), body, v3(0.23, 2.33, -0.27), id, SYM);
+    s.at(&sculpt::angled_shield(0.92, 0.18, 0.08, 0.16), gold, v3(0.0, 2.55, -0.3), rx(-0.2), MID);
+    s.at(&sculpt::angled_shield(0.66, 0.28, 0.06, 0.1), gold, v3(0.0, 2.02, -0.31), rx(0.08), MID);
+    s.at(&sculpt::wedge_plate(0.62, 0.24, 0.44, 0.5, 0.7, 0.0), body, v3(0.0, 2.7, 0.03), id, MID);
+    for k in 0..5 {
+        let kf = k as f32;
+        s.horn(horn, v3(0.0, 1.72 + kf * 0.2, 0.28), v3(0.0, 0.6, 1.0), Vec3::Y, (0.06, 0.01), 0.3 - kf * 0.02, 0.1, MID);
+    }
+    // Flared angular spiked molten-gold pauldrons.
+    s.at(&sculpt::wedge_plate(0.6, 0.3, 0.72, 0.55, 0.8, 0.0), gold, v3(0.86, 2.6, 0.0), rz(-0.45), SYM);
+    s.at(&sculpt::angled_shield(0.66, 0.24, 0.07, 0.12), gold, v3(1.02, 2.38, 0.0), orient(v3(0.4, 1.0, 0.0), v3(1.0, -0.3, 0.0)), SYM);
+    for (dz, up, len) in [(-0.2f32, v3(0.3, 1.0, -0.25), 0.42f32), (0.0, v3(0.55, 0.9, 0.0), 0.55), (0.2, v3(0.3, 1.0, 0.25), 0.42)] {
+        s.blade(gold, v3(0.9, 2.72, dz), up, Vec3::X, len, 0.14, 0.05, 0.12, SYM);
+    }
+    // Muscular arms, gold wrist bracers, blazing molten-ember gauntlets with splayed claws.
+    let (sh, el, wr) = (v3(0.94, 2.32, 0.0), v3(1.02, 1.8, -0.02), v3(1.05, 1.38, -0.2));
+    s.at(&blob(v3(0.24, 0.22, 0.25)), body, v3(0.92, 2.36, 0.0), id, SYM);
+    s.limb(body, sh, el, (0.2, 0.16), 10, SYM);
+    s.at(&blob(v3(0.16, 0.22, 0.16)), body, v3(0.99, 2.05, -0.07), rz(0.1), SYM);
+    s.limb(body, el, wr, (0.16, 0.13), 10, SYM);
+    s.at(&sculpt::armored_ring(0.15, 0.04, 0.09, 10, true), gold, wr.lerp(el, 0.18), along(el - wr), SYM);
+    s.at(&bbox(0.3, 0.26, 0.3, 0.06), fire, v3(1.05, 1.22, -0.25), rx(0.25), SYM);
+    let claw = sculpt::curved_horn(0.03, 0.006, 0.2, 0.0, -0.07, 8, 6);
+    for c in [-0.09f32, -0.03, 0.03, 0.09] {
+        s.at(&claw, horn, v3(1.05 + c, 1.12, -0.36), orient(v3(c * 2.0, -0.6, -1.0), v3(0.0, -1.0, 0.3)), SYM);
+    }
+    for (dx, dz) in [(-0.1f32, 0.05f32), (0.1, -0.05), (0.0, 0.1)] {
+        s.blade(fire, v3(1.05 + dx, 1.3, -0.25 + dz), v3(dx * 2.0, 1.0, dz), Vec3::NEG_Z, 0.32, 0.1, 0.03, 0.08, SYM);
+    }
+    // Digitigrade satyr legs: thick haunches, shaggy charred shins, cloven hooves at y = 0.
+    let (hip, knee, hock, foot) = (v3(0.38, 1.32, 0.0), v3(0.42, 0.84, -0.22), v3(0.42, 0.38, 0.14), v3(0.42, 0.12, -0.04));
+    s.at(&blob(v3(0.28, 0.36, 0.32)), body, v3(0.38, 1.12, 0.02), id, SYM);
+    s.limb(body, hip, knee, (0.25, 0.18), 10, SYM);
+    s.at(&sculpt::ridged_sphere(v3(0.17, 0.22, 0.17), 6, 8, 0.18, 9.0, true), horn, v3(0.42, 0.66, -0.06), id, SYM);
+    s.limb(horn, knee, hock, (0.15, 0.1), 8, SYM);
+    s.limb(horn, hock, foot, (0.1, 0.09), 8, SYM);
+    let hoof = sculpt::wedge_plate(0.12, 0.14, 0.28, 0.72, 0.78, -0.03);
+    for dx in [-0.065f32, 0.065] {
+        s.at(&hoof, bone, v3(0.42 + dx, 0.07, -0.1), id, SYM);
+    }
+    // Bull-demon skull: DARK face mask + muzzle so the two molten eyes and the angular
+    // brow / jaw pop; glowing maw, gold fangs + tusks.
+    s.limb(body, v3(0.0, 2.62, 0.0), v3(0.0, 2.82, -0.08), (0.2, 0.17), 10, MID);
+    s.at(&sculpt::ridged_sphere(v3(0.3, 0.27, 0.32), 8, 12, 0.05, 5.0, true), body, v3(0.0, 2.95, -0.1), id, MID);
+    s.at(&sculpt::angled_shield(0.44, 0.24, 0.08, 0.1), horn, v3(0.0, 2.9, -0.33), rx(0.05), MID);
+    s.at(&sculpt::angled_shield(0.56, 0.1, 0.13, 0.13), body, v3(0.0, 3.05, -0.38), rx(-0.3), MID);
+    s.at(&bbox(0.3, 0.18, 0.24, 0.05), horn, v3(0.0, 2.82, -0.36), rx(0.1), MID);
+    s.at(&bbox(0.26, 0.04, 0.2, 0.01), fire, v3(0.0, 2.725, -0.38), id, MID);
+    s.at(&sculpt::wedge_plate(0.32, 0.08, 0.26, 0.8, 0.8, 0.0), horn, v3(0.0, 2.68, -0.36), rx(0.12), MID);
+    for x in [0.05f32, 0.11] {
+        s.horn(gold, v3(x, 2.74, -0.47), v3(0.0, -1.0, -0.1), Vec3::Z, (0.02, 0.004), 0.1, 0.02, SYM);
+    }
+    s.horn(gold, v3(0.13, 2.7, -0.44), v3(0.3, 1.0, -0.25), Vec3::X, (0.03, 0.006), 0.18, 0.06, SYM);
+    s.at(&blob(v3(0.055, 0.03, 0.03)), eye_m, v3(0.1, 2.95, -0.44), rz(-0.3), SYM);
+    // Massive Doom bull horns: wide outward, then sweeping forward and up (charred -> bone-ivory).
+    s.at(&sculpt::armored_ring(0.13, 0.035, 0.045, 8, true), gold, v3(0.3, 3.1, -0.08), along(v3(1.0, 0.1, 0.1)), SYM);
+    s.sweep(horn, bone, v3(0.24, 3.1, -0.08), (0.14, 0.012), [v3(0.5, 0.02, 0.08), v3(0.98, 0.34, -0.04), v3(0.86, 0.8, -0.5)], 0.6, SYM);
+}
+
+/// Razor-sharp hunched obsidian-violet cyber-wraith (height ~2.1) with giant
+/// raised crescent scythes splayed outward in a mantis slash posture.
+fn sculpt_stalker(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+    let (ob, core, horn) = (&a.phase_obsidian, &a.phase_core, &a.horn);
+    let id = Quat::IDENTITY;
+    let hunch = rx(-0.45);
+    // Hip armor, forward-slanted spine, hunched thorax, rib plates, phase core in a containment ring.
+    s.at(&bbox(0.3, 0.14, 0.2, 0.03), ob, v3(0.0, 0.98, 0.04), rx(-0.2), MID);
+    s.at(&sculpt::wedge_plate(0.12, 0.2, 0.18, 0.6, 0.8, 0.0), ob, v3(0.17, 0.96, 0.0), rz(-0.35), SYM);
+    s.limb(body, v3(0.0, 1.02, 0.04), v3(0.0, 1.24, -0.04), (0.1, 0.13), 6, MID);
+    s.at(&sculpt::wedge_plate(0.3, 0.42, 0.24, 1.6, 1.1, -0.1), body, v3(0.0, 1.42, -0.08), hunch, MID);
+    let strut = sculpt::wedge_plate(0.16, 0.03, 0.05, 0.5, 1.0, 0.0);
+    for k in 0..3 {
+        let kf = k as f32;
+        s.at(&strut, ob, v3(0.11, 1.28 + kf * 0.09, -0.2 - kf * 0.045), ry(-0.5) * rz(-0.35), SYM);
+    }
+    s.at(&sculpt::armored_ring(0.1, 0.025, 0.035, 12, true), ob, v3(0.0, 1.4, -0.25), rx(FRAC_PI_2 - 0.45), MID);
+    s.at(&gem(0.085), core, v3(0.0, 1.4, -0.24), id, MID);
+    s.at(&sculpt::angled_shield(0.54, 0.12, 0.05, 0.12), ob, v3(0.0, 1.6, -0.2), rx(-0.5), MID);
+    // Swept-back dorsal blade fins along the hunched spine.
+    for k in 0..4 {
+        let kf = k as f32;
+        s.blade(ob, v3(0.0, 1.18 + kf * 0.12, 0.08 - kf * 0.07), v3(0.0, 0.6, 1.0), Vec3::Y, 0.32 + kf * 0.04, 0.12, 0.025, 0.08, MID);
+    }
+    // Bent reverse-jointed raptor legs with talon-blade feet at y = 0.
+    let (hip, knee, hock, ank) = (v3(0.13, 0.96, 0.04), v3(0.18, 0.64, -0.22), v3(0.17, 0.3, 0.12), v3(0.17, 0.08, -0.02));
+    s.limb(body, hip, knee, (0.08, 0.058), 6, SYM);
+    s.horn(horn, knee, v3(0.1, 0.5, -1.0), Vec3::Y, (0.032, 0.005), 0.17, 0.05, SYM);
+    s.limb(ob, knee, hock, (0.05, 0.04), 6, SYM);
+    s.limb(ob, hock, ank, (0.04, 0.035), 6, SYM);
+    for yaw in [-0.3f32, 0.3] {
+        s.blade(ob, ank, v3(yaw.sin(), -0.12, -yaw.cos()), Vec3::NEG_Y, 0.24, 0.07, 0.03, 0.05, SYM);
+    }
+    s.blade(ob, ank, v3(0.0, -0.2, 1.0), Vec3::NEG_Y, 0.12, 0.05, 0.025, 0.03, SYM);
+    // Angular shoulder plates, forearms RAISED, giant crescent scythes splayed ~45 deg
+    // outward and hooking inward over the head, with a glowing plasma cutting edge.
+    s.at(&sculpt::wedge_plate(0.18, 0.13, 0.22, 0.55, 0.8, 0.0), ob, v3(0.23, 1.62, -0.2), rz(-0.5), SYM);
+    let (sh, el, wr) = (v3(0.25, 1.58, -0.2), v3(0.38, 1.36, -0.3), v3(0.46, 1.6, -0.42));
+    s.limb(body, sh, el, (0.052, 0.042), 6, SYM);
+    s.at(&blob(Vec3::splat(0.045)), ob, el, id, SYM);
+    s.limb(ob, el, wr, (0.048, 0.036), 6, SYM);
+    s.at(&bbox(0.08, 0.1, 0.09, 0.018), ob, wr, along(wr - el), SYM);
+    let q = orient(v3(0.66, 0.72, -0.2), v3(-1.0, 0.25, -0.15));
+    s.at(&sculpt::curved_blade(0.95, 0.24, 0.045, 0.36, 7), ob, wr, q, SYM);
+    s.at(&sculpt::curved_blade(0.93, 0.27, 0.014, 0.36, 7), core, wr + q * v3(0.0, 0.0, -0.02), q, SYM);
+    // Blade-crested skull pulled in over the chest, faceplate, V-angled glowing visor, swept antennae.
+    s.limb(body, v3(0.0, 1.6, -0.1), v3(0.0, 1.72, -0.12), (0.05, 0.045), 6, MID);
+    s.at(&sculpt::ridged_sphere(v3(0.11, 0.11, 0.16), 6, 10, 0.05, 5.0, true), body, v3(0.0, 1.79, -0.14), id, MID);
+    s.at(&sculpt::angled_shield(0.22, 0.1, 0.04, 0.09), ob, v3(0.0, 1.77, -0.25), rx(0.1), MID);
+    s.at(&bbox(0.08, 0.018, 0.02, 0.004), eye_m, v3(0.045, 1.805, -0.31), ry(-0.69) * rz(0.3), SYM);
+    s.blade(ob, v3(0.0, 1.9, -0.2), v3(0.0, 0.35, 1.0), Vec3::Y, 0.5, 0.12, 0.03, 0.1, MID);
+    s.horn(horn, v3(0.06, 1.88, -0.18), v3(0.3, 0.55, 0.8), Vec3::Y, (0.025, 0.004), 0.48, 0.12, SYM);
+}
+
+/// High-contrast titanium tripod sentinel with a twin-rail cannon (height ~2.7;
+/// the dish head is a separate rig).
+fn sculpt_sniper(s: &mut Sculptor, a: &EnemyAssets, body: &Mat) {
+    let (mp, hz, lens, dk) = (&a.metal_plate, &a.hazard, &a.sniper_lens, &a.sniper_liner);
+    let id = Quat::IDENTITY;
+    // Turret hub + hazard collar.
+    s.at(&sculpt::tapered_prism(8, 0.3, 0.24, 0.32, true), mp, v3(0.0, 1.22, 0.0), id, MID);
+    s.at(&sculpt::armored_ring(0.3, 0.04, 0.05, 8, true), hz, v3(0.0, 1.1, 0.0), id, MID);
+    // Three splayed dark-metal hydraulic legs with brushed knee joints: hub -> knee -> planted foot.
+    let (actuator, knee_box, band, pad) = (
+        bbox(0.14, 0.14, 0.16, 0.03),
+        bbox(0.17, 0.17, 0.17, 0.04),
+        sculpt::armored_ring(0.075, 0.02, 0.03, 8, true),
+        bbox(0.26, 0.09, 0.32, 0.03),
+    );
+    for k in 0..3 {
+        let ang = k as f32 * TAU / 3.0 + FRAC_PI_2;
+        let o = v3(ang.cos(), 0.0, ang.sin());
+        let (hip, knee, foot) = (o * 0.22 + Vec3::Y * 1.16, o * 0.62 + Vec3::Y * 0.68, o * 0.82 + Vec3::Y * 0.08);
+        s.at(&actuator, mp, hip, orient(Vec3::Y, o), MID);
+        s.limb(dk, hip, knee, (0.075, 0.062), 6, MID);
+        s.at(&band, hz, hip.lerp(knee, 0.7), along(knee - hip), MID);
+        s.limb(mp, o * 0.12 + Vec3::Y * 1.02, hip.lerp(knee, 0.8) - Vec3::Y * 0.06, (0.025, 0.022), 6, MID);
+        s.at(&knee_box, mp, knee, orient(Vec3::Y, o), MID);
+        s.limb(dk, knee, foot, (0.062, 0.05), 6, MID);
+        s.at(&pad, dk, o * 0.84 + Vec3::Y * 0.045, orient(Vec3::Y, o), MID);
+    }
+    // Sentinel torso + angled front armor with saturated crimson vent slats + shoulder mounts.
+    s.at(&sculpt::tapered_prism(8, 0.2, 0.26, 0.16, true), dk, v3(0.0, 1.42, 0.0), id, MID);
+    s.at(&bbox(0.62, 0.5, 0.46, 0.06), body, v3(0.0, 1.72, 0.0), id, MID);
+    s.at(&sculpt::angled_shield(0.6, 0.4, 0.07, 0.1), body, v3(0.0, 1.74, -0.27), id, MID);
+    let slat = bbox(0.14, 0.03, 0.03, 0.005);
+    for k in 0..3 {
+        s.at(&slat, lens, v3(0.1, 1.64 + k as f32 * 0.075, -0.375), ry(-0.32), SYM);
+    }
+    s.at(&bbox(0.2, 0.22, 0.3, 0.04), mp, v3(0.4, 1.86, 0.0), id, SYM);
+    s.at(&sculpt::wedge_plate(0.22, 0.06, 0.32, 0.8, 0.9, 0.0), hz, v3(0.4, 2.0, 0.0), id, SYM);
+    s.limb(body, v3(0.42, 1.76, -0.04), v3(0.48, 1.48, -0.16), (0.06, 0.05), 6, SYM);
+    s.limb(dk, v3(0.48, 1.48, -0.16), v3(0.44, 1.44, -0.42), (0.05, 0.045), 6, SYM);
+    s.at(&bbox(0.1, 0.09, 0.12, 0.02), mp, v3(0.44, 1.44, -0.47), id, SYM);
+    s.at(&sculpt::tapered_prism(6, 0.08, 0.06, 0.26, true), dk, v3(0.0, 2.08, 0.0), id, MID);
+    // Bold shoulder-mounted twin-rail cannon (right): wide-set dark-steel rails, four
+    // glowing crimson accelerator coils, muzzle brake; hazard counterweight (left).
+    let (cx, cy) = (0.48, 2.16);
+    s.at(&bbox(0.26, 0.24, 0.72, 0.05), mp, v3(cx, cy, -0.1), id, MID);
+    s.at(&bbox(0.27, 0.25, 0.08, 0.02), hz, v3(cx, cy, 0.2), id, MID);
+    s.at(&bbox(0.07, 0.07, 0.34, 0.012), mp, v3(cx, cy + 0.16, -0.12), id, MID);
+    s.limb(dk, v3(0.4, 2.0, 0.0), v3(cx, cy - 0.06, -0.05), (0.06, 0.06), 6, MID);
+    let rail = bbox(0.05, 0.06, 1.34, 0.01);
+    for dx in [-0.075f32, 0.075] {
+        s.at(&rail, dk, v3(cx + dx, cy, -1.08), id, MID);
+    }
+    let coil = sculpt::armored_ring(0.12, 0.026, 0.04, 8, true);
+    for k in 0..4 {
+        s.at(&coil, lens, v3(cx, cy, -0.52 - k as f32 * 0.3), rx(FRAC_PI_2), MID);
+    }
+    s.at(&bbox(0.26, 0.15, 0.1, 0.025), dk, v3(cx, cy, -1.76), id, MID);
+    s.at(&bbox(0.16, 0.16, 0.24, 0.03), hz, v3(-cx + 0.04, 2.1, 0.08), id, MID);
+}
+
+/// Doom-industrial broadcast colossus (height ~4.4; halo + cannons are rigs):
+/// long grounded legs, wedged gorget + gold ribcage around a recessed reactor,
+/// an enlarged forward-thrust dread-skull crowned by thick ram horns.
+fn sculpt_carrier(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+    let (gold, core, mp, horn) = (&a.baron_gold, &a.carrier_core, &a.metal_plate, &a.horn);
+    let id = Quat::IDENTITY;
+    // Pelvis + gold belt plate + abdomen.
+    s.at(&bbox(1.4, 0.42, 0.9, 0.08), body, v3(0.0, 1.95, 0.0), id, MID);
+    s.at(&sculpt::angled_shield(1.0, 0.28, 0.08, 0.12), gold, v3(0.0, 1.95, -0.48), id, MID);
+    s.scaled(&sculpt::tapered_prism(8, 0.58, 0.72, 0.38, true), body, v3(0.0, 2.3, 0.0), v3(1.0, 1.0, 0.72), id, MID);
+    // Wedged V-thorax (broad at the shoulders) + back hump.
+    s.at(&sculpt::wedge_plate(1.5, 1.04, 1.04, 1.34, 1.0, -0.04), body, v3(0.0, 2.88, 0.08), id, MID);
+    s.at(&sculpt::ridged_sphere(v3(0.9, 0.55, 0.5), 8, 12, 0.06, 5.0, true), body, v3(0.0, 3.2, 0.48), id, MID);
+    // Sculpted layered gorget: heavy upper plate, gold lip, lower gold band, sternum trim.
+    s.at(&sculpt::angled_shield(1.62, 0.3, 0.14, 0.24), body, v3(0.0, 3.27, -0.46), rx(-0.2), MID);
+    s.at(&sculpt::angled_shield(1.68, 0.07, 0.15, 0.24), gold, v3(0.0, 3.45, -0.5), rx(-0.2), MID);
+    s.at(&sculpt::angled_shield(1.34, 0.08, 0.12, 0.2), gold, v3(0.0, 3.13, -0.53), rx(-0.15), MID);
+    s.at(&sculpt::angled_shield(1.2, 0.07, 0.1, 0.16), gold, v3(0.0, 2.3, -0.5), id, MID);
+    // Recessed deep magenta-crimson Signal Core: dark iron iris baffles, gold containment
+    // ring, dark outer ring, overlapping curved gold ribcage.
+    let ch = 2.74;
+    s.at(&sculpt::ridged_sphere(Vec3::splat(0.36), 10, 14, 0.08, 6.0, true), core, v3(0.0, ch, -0.44), id, MID);
+    s.at(&sculpt::armored_ring(0.64, 0.05, 0.08, 16, true), body, v3(0.0, ch, -0.5), rx(FRAC_PI_2), MID);
+    s.at(&sculpt::armored_ring(0.52, 0.06, 0.09, 16, true), gold, v3(0.0, ch, -0.6), rx(FRAC_PI_2), MID);
+    let baffle = sculpt::wedge_plate(0.17, 0.2, 0.05, 0.45, 1.0, 0.0);
+    for k in 0..8 {
+        let ang = k as f32 * TAU / 8.0 + PI / 8.0;
+        let o = v3(ang.cos(), ang.sin(), 0.0);
+        s.at(&baffle, horn, v3(0.0, ch, -0.62) + o * 0.41, orient(-o + Vec3::Z * 0.45, Vec3::NEG_Z), MID);
+    }
+    for ry_ in [2.28f32, 2.5, 2.98, 3.18] {
+        let tilt = (ch - ry_) * 0.5;
+        s.blade(gold, v3(0.84, ry_, -0.3), v3(-0.55, tilt, -1.0), Vec3::NEG_X, 0.6, 0.2, 0.05, 0.15, SYM);
+    }
+    // Long armored dread-mech legs in a wide grounded stance: gold knee guards,
+    // hydraulic shins + pistons, clawed war-boots at y = 0.
+    let (hip, knee, ank) = (v3(0.74, 1.85, 0.02), v3(0.8, 1.15, -0.2), v3(0.82, 0.36, 0.0));
+    s.limb(body, hip, knee, (0.36, 0.28), 8, SYM);
+    s.at(&sculpt::wedge_plate(0.46, 0.42, 0.22, 0.7, 0.8, -0.05), gold, v3(0.8, 1.17, -0.44), id, SYM);
+    s.limb(mp, knee, ank, (0.25, 0.21), 8, SYM);
+    s.limb(mp, v3(0.8, 1.05, 0.2), v3(0.82, 0.42, 0.18), (0.055, 0.055), 6, SYM);
+    s.at(&bbox(0.66, 0.3, 0.88, 0.06), body, v3(0.82, 0.15, -0.12), id, SYM);
+    s.at(&bbox(0.68, 0.08, 0.2, 0.02), gold, v3(0.82, 0.28, -0.48), id, SYM);
+    let talon = sculpt::curved_horn(0.065, 0.01, 0.26, 0.0, -0.08, 8, 6);
+    for c in [-0.2f32, 0.0, 0.2] {
+        s.at(&talon, horn, v3(0.82 + c, 0.15, -0.54), orient(v3(0.0, -0.12, -1.0), Vec3::NEG_Y), SYM);
+    }
+    // Hunched armored arms: pauldrons, biceps, gold elbow rings + cuffs, forward-curled talon fists.
+    let (sh, el, wr) = (v3(1.18, 3.2, 0.0), v3(1.4, 2.55, 0.08), v3(1.44, 2.02, -0.42));
+    s.at(&sculpt::ridged_sphere(v3(0.42, 0.38, 0.44), 8, 10, 0.05, 5.0, true), body, v3(1.16, 3.24, 0.0), id, SYM);
+    s.limb(body, sh, el, (0.3, 0.24), 10, SYM);
+    s.at(&blob(v3(0.22, 0.3, 0.22)), body, v3(1.3, 2.85, -0.04), id, SYM);
+    s.at(&sculpt::armored_ring(0.24, 0.05, 0.07, 10, true), gold, el, along(sh - el), SYM);
+    s.limb(mp, el, wr, (0.25, 0.22), 8, SYM);
+    s.at(&bbox(0.48, 0.44, 0.5, 0.08), body, v3(1.44, 1.86, -0.52), rx(0.35), SYM);
+    s.at(&sculpt::armored_ring(0.27, 0.05, 0.12, 10, true), gold, wr, along(el - wr), SYM);
+    let finger = sculpt::curved_horn(0.058, 0.01, 0.38, 0.0, -0.16, 8, 6);
+    for c in [-0.15f32, -0.05, 0.05, 0.15] {
+        s.at(&finger, horn, v3(1.44 + c, 1.76, -0.74), orient(v3(0.0, -0.45, -1.0), v3(0.0, -1.0, 0.6)), SYM);
+    }
+    // Enlarged forward-thrust dread-skull: neck block, DARK iron face plate, gold brow,
+    // blazing molten eyes + maw slit, angular jaw, gold mandible tusks, rear crest.
+    s.at(&bbox(0.56, 0.3, 0.52, 0.06), body, v3(0.0, 3.5, -0.1), id, MID);
+    s.at(&sculpt::ridged_sphere(v3(0.5, 0.45, 0.48), 8, 12, 0.06, 5.0, true), body, v3(0.0, 3.82, -0.2), id, MID);
+    s.at(&sculpt::angled_shield(0.66, 0.36, 0.1, 0.1), horn, v3(0.0, 3.78, -0.6), rx(0.05), MID);
+    s.at(&sculpt::angled_shield(0.84, 0.14, 0.13, 0.1), gold, v3(0.0, 3.98, -0.58), rx(-0.25), MID);
+    s.at(&blob(v3(0.1, 0.05, 0.035)), eye_m, v3(0.17, 3.86, -0.72), rz(-0.25), SYM);
+    s.at(&bbox(0.3, 0.04, 0.04, 0.01), eye_m, v3(0.0, 3.64, -0.72), id, MID);
+    s.at(&sculpt::wedge_plate(0.52, 0.14, 0.34, 0.8, 0.8, 0.0), horn, v3(0.0, 3.52, -0.5), rx(0.1), MID);
+    s.horn(gold, v3(0.22, 3.52, -0.6), v3(0.2, -0.9, -0.5), Vec3::NEG_X, (0.06, 0.01), 0.42, 0.14, SYM);
+    s.horn(horn, v3(0.14, 4.18, -0.02), v3(0.25, 0.9, 0.5), Vec3::Z, (0.08, 0.015), 0.46, 0.15, SYM);
+    // Thick heavy ram/bull curl: out from the temples, back and down, then curling
+    // forward and up around the skull, ringed by gold bands.
+    let (h0, rr) = (v3(0.42, 3.92, -0.18), (0.32f32, 0.03f32));
+    let hp = [v3(0.45, 0.35, 0.25), v3(1.2, 0.05, 0.35), v3(0.95, 0.5, -0.55)];
+    s.sweep(horn, horn, h0, rr, hp, 1.0, SYM);
+    let bez = |t: f32| {
+        let u = 1.0 - t;
+        hp[0] * (3.0 * u * u * t) + hp[1] * (3.0 * u * t * t) + hp[2] * (t * t * t)
+    };
+    for t in [0.14f32, 0.34] {
+        let r = rr.0 * (1.0 - t).powf(0.85) + rr.1 * t;
+        let dir = bez(t + 0.02) - bez(t - 0.02);
+        s.at(&sculpt::armored_ring(r + 0.015, 0.035, 0.05, 10, true), gold, h0 + bez(t), along(dir), SYM);
+    }
 }
 
 /// Spawn one demon. `pos` is the feet position (hover center for Cacodemons).
@@ -1170,13 +1704,25 @@ pub fn spawn_enemy(
         .id();
     let pivot = commands.spawn((ChildOf(root), EnemyBody, Transform::default(), Visibility::default())).id();
     let (mut body_part, mut eye_part) = (Entity::PLACEHOLDER, Entity::PLACEHOLDER);
-    for part in &a.models[kind.index()] {
+    let model = &a.models[kind.index()];
+    // The body pivot carries the first static (never re-tinted) part itself:
+    // one entity fewer per demon. Tintable Body / Eye parts stay children.
+    let pivot_part = model.iter().position(|p| p.role == PartRole::Static);
+    for (i, part) in model.iter().enumerate() {
+        if Some(i) == pivot_part {
+            commands.entity(pivot).insert((Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone())));
+            continue;
+        }
         let e = commands.spawn((ChildOf(pivot), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY)).id();
         match part.role {
             PartRole::Body => body_part = e,
             PartRole::Eye => eye_part = e,
             PartRole::Static => {}
         }
+    }
+    let mut rig = EnemyRig::default();
+    for (slot, model) in rig.pivots.iter_mut().zip(&a.rigs[kind.index()]) {
+        *slot = Some(spawn_rig(commands, pivot, model));
     }
     if reacts_to_dead_zones(kind) {
         // Distinct crackling electric-violet halo shown only while Static-Enraged!
@@ -1209,6 +1755,9 @@ pub fn spawn_enemy(
         crate::boss::attach_boss(commands, a, root, &mut enemy);
     }
     commands.entity(root).insert((enemy, EnemyLook { body_part, eye_part, aura }));
+    if rig.pivots[0].is_some() {
+        commands.entity(root).insert(rig);
+    }
     root
 }
 
@@ -1905,14 +2454,16 @@ fn enemy_visuals(
     time: Res<Time>,
     ea: Res<EnemyAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    enemies: Query<(&Enemy, &EnemyLook, Option<&PingMarked>, &Children)>,
+    enemies: Query<(&Enemy, &EnemyLook, Option<&PingMarked>, &Children, Option<&EnemyRig>, Option<&crate::boss::BossState>)>,
     mut bodies: Query<&mut Transform, (With<EnemyBody>, Without<EnrageHalo>, Without<FiendFieldRing>)>,
+    mut rigs: Query<(&mut Transform, &mut RigPivot), (Without<EnemyBody>, Without<EnrageHalo>, Without<FiendFieldRing>)>,
     mut halos: Query<(&mut Transform, &mut Visibility), (With<EnrageHalo>, Without<EnemyBody>, Without<FiendFieldRing>)>,
     mut fiend_rings: Query<&mut Transform, (With<FiendFieldRing>, Without<EnemyBody>, Without<EnrageHalo>)>,
     mut auras: Query<(&mut PointLight, &mut CullableLight), With<EnemyAura>>,
     mut parts: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
     let t = time.elapsed_secs();
+    let dt = time.delta_secs().min(0.1);
     let pulse = look_pulse(t);
     // Pulsing (enraged / stunned) shared materials in use this frame.
     let mut pulsing = [[false; 8]; KIND_COUNT];
@@ -1924,7 +2475,14 @@ fn enemy_visuals(
             m.0 = want.clone();
         }
     };
-    for (e, look, marked, children) in &enemies {
+    for (e, look, marked, children, rig, boss) in &enemies {
+        if let Some(rig) = rig {
+            for pe in rig.pivots.iter().flatten() {
+                if let Ok((mut tf, mut rp)) = rigs.get_mut(*pe) {
+                    animate_rig(&mut tf, &mut rp, e, boss, t, dt);
+                }
+            }
+        }
         // Bob / stagger animation on the body pivot.
         let moving = Vec2::new(e.velocity.x, e.velocity.z).length() > 0.5;
         let bob = if e.kind.flying() {
@@ -2015,6 +2573,57 @@ fn enemy_visuals(
                 }
             }
         }
+    }
+}
+
+/// Per-frame pose of one articulated sub-pivot.
+fn animate_rig(tf: &mut Transform, rp: &mut RigPivot, e: &Enemy, boss: Option<&crate::boss::BossState>, t: f32, dt: f32) {
+    let rest = rp.rest;
+    let ease = |k: f32| 1.0 - (-k * dt).exp();
+    match rp.kind {
+        RigKind::FiendEmitter => {
+            // Continuous transceiver spin + pulsing broadcast emitter.
+            let beat = (t * 6.0 + e.phase).sin() * 0.5 + 0.5;
+            tf.rotation = rest.rotation * Quat::from_rotation_y(t * 2.6 + e.phase);
+            tf.scale = Vec3::splat(1.0 + 0.08 * beat);
+            tf.translation = rest.translation + Vec3::Y * (0.025 * beat);
+        }
+        RigKind::SniperDish => {
+            // Idle: slow left/right scan. Lock-on: snap straight forward and tilt aggressively.
+            let locking = e.sniper_lock_timer > 0.0;
+            let target = if locking {
+                Quat::from_euler(EulerRot::YXZ, 0.0, -0.22, (t * 45.0).sin() * 0.03)
+            } else {
+                Quat::from_euler(EulerRot::YXZ, (t * 0.6 + e.phase).sin() * 0.65, 0.05 * (t * 0.9 + e.phase).sin(), 0.0)
+            };
+            tf.rotation = tf.rotation.slerp(rest.rotation * target, ease(if locking { 18.0 } else { 4.0 }));
+        }
+        RigKind::BossHalo => {
+            // Broadcast halo spins about its axis; faster in Overdrive and while telegraphing.
+            let mut speed = 0.9;
+            if let Some(st) = boss {
+                if st.phase == crate::boss::BossPhase::Overdrive {
+                    speed *= 2.8;
+                }
+                if st.telegraph > 0.0 {
+                    speed += 3.0;
+                }
+            }
+            if e.stun_timer > 0.0 {
+                speed *= 0.2;
+            }
+            rp.angle = (rp.angle + speed * dt) % TAU;
+            tf.rotation = rest.rotation * Quat::from_rotation_y(rp.angle);
+        }
+        RigKind::BossCannon => {
+            // Idle breathing pitch; recoil backward (and pitch up) while charging an attack.
+            let charging = boss.is_some_and(|st| st.telegraph > 0.0);
+            let breathe = (t * 1.7 + e.phase).sin();
+            let (offset, pitch) = if charging { (Vec3::new(0.0, 0.04, 0.2), 0.12) } else { (Vec3::Y * (0.03 * breathe), 0.035 * breathe) };
+            tf.translation = tf.translation.lerp(rest.translation + offset, ease(if charging { 14.0 } else { 6.0 }));
+            tf.rotation = tf.rotation.slerp(rest.rotation * Quat::from_rotation_x(pitch), ease(8.0));
+        }
+        RigKind::PylonRing => {}
     }
 }
 
@@ -2158,15 +2767,22 @@ fn sniper_lasers(
         if !on {
             continue;
         }
-        let scope = tf.transform_point(Vec3::new(0.0, e.stats.eye_height, -0.45));
+        let scope = tf.transform_point(Vec3::new(0.0, e.stats.eye_height, -0.22));
         let d = e.sniper_aim - scope;
-        let len = d.length().max(0.1);
+        let len = d.length();
+        // Degenerate aim (target inside the scope): no direction to point along.
+        let Some(dir) = d.try_normalize().filter(|_| len >= 0.05) else {
+            if *vis != Visibility::Hidden {
+                *vis = Visibility::Hidden;
+            }
+            continue;
+        };
         let inv = tf.rotation.inverse();
         let mid_world = scope + d * 0.5;
         // Thin (and thinning as the lock completes) glowing crimson rod.
         let w = 0.03 + 0.04 * (e.sniper_lock_timer / SNIPER_LOCK_SECS);
         ltf.translation = inv * (mid_world - tf.translation);
-        ltf.rotation = inv * Quat::from_rotation_arc(Vec3::Z, d / len);
+        ltf.rotation = inv * Quat::from_rotation_arc(Vec3::Z, dir);
         ltf.scale = Vec3::new(w, w, len);
     }
 }
@@ -2524,5 +3140,95 @@ mod tests {
         assert!(last_flash.blue > steady.blue);
         assert!(last_flash.blue > plain_last_flash.blue + 1.0);
         assert!(last_flash.green > plain_last_flash.green + 0.5);
+    }
+
+    /// World-space AABB of baked parts placed by `tf`, merged into `out`.
+    fn grow_bounds(meshes: &Assets<Mesh>, parts: &[EnemyPart], tf: Transform, out: &mut (Vec3, Vec3)) {
+        for part in parts {
+            let m = meshes.get(&part.mesh).expect("baked mesh");
+            for p in m.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().as_float3().unwrap() {
+                let w = tf.transform_point(Vec3::from(*p));
+                out.0 = out.0.min(w);
+                out.1 = out.1.max(w);
+            }
+        }
+    }
+
+    #[test]
+    fn sculpted_models_bake_few_materials_and_fit_their_hit_spheres() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(Assets::<Image>::default());
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<StandardMaterial>::default());
+        world.run_system_once(create_enemy_assets).unwrap();
+        let a = world.resource::<EnemyAssets>();
+        let meshes = world.resource::<Assets<Mesh>>();
+        for kind in EnemyKind::ALL {
+            let model = &a.models[kind.index()];
+            let roles = |r: PartRole| model.iter().filter(|p| p.role == r).count();
+            assert!((4..=6).contains(&model.len()), "{kind:?}: {} baked materials", model.len());
+            assert_eq!(roles(PartRole::Body), 1, "{kind:?}: one tintable body part");
+            assert!(roles(PartRole::Eye) <= 1, "{kind:?}: at most one eye part");
+            assert!(a.source_part_counts[kind.index()] > 3 * model.len(), "{kind:?}: sculpted from many parts");
+            let mut b = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            grow_bounds(meshes, model, Transform::IDENTITY, &mut b);
+            for rig in &a.rigs[kind.index()] {
+                assert!(!rig.parts.is_empty() && rig.parts.len() <= 3, "{kind:?}: rig {:?} has {} parts", rig.kind, rig.parts.len());
+                grow_bounds(meshes, &rig.parts, rig.rest, &mut b);
+            }
+            let st = kind.stats(1);
+            println!("{kind:?}: {} parts -> {} materials + {} rigs, bounds {:.2} .. {:.2}", a.source_part_counts[kind.index()], model.len(), a.rigs[kind.index()].len(), b.0, b.1);
+            if kind.flying() {
+                let r = st.hit_spheres[0].1;
+                assert!(b.0.y > -r * 1.4 && b.1.y < r * 1.9, "{kind:?}: vertical extent {:.2}..{:.2}", b.0.y, b.1.y);
+            } else {
+                assert!(b.0.y > -0.03 && b.0.y < 0.06, "{kind:?}: feet grounded at y = 0 (min y {:.3})", b.0.y);
+                assert!(b.1.y > st.height * 0.92 && b.1.y < st.height * 1.3, "{kind:?}: top {:.2} vs height {}", b.1.y, st.height);
+            }
+            let widest = st.hit_spheres.iter().map(|h| h.1).fold(0.0, f32::max);
+            assert!(b.1.x.max(-b.0.x) < widest * 2.2 + 0.6, "{kind:?}: half-width {:.2}", b.1.x.max(-b.0.x));
+        }
+        // Articulated rigs where the design calls for them.
+        let rig_kinds = |k: EnemyKind| a.rigs[k.index()].iter().map(|r| r.kind).collect::<Vec<_>>();
+        assert_eq!(rig_kinds(EnemyKind::JammerFiend), vec![RigKind::FiendEmitter]);
+        assert_eq!(a.rigs[EnemyKind::JammerFiend.index()][0].parts.len(), 1, "emitter is a single entity");
+        assert_eq!(rig_kinds(EnemyKind::RelaySniper), vec![RigKind::SniperDish]);
+        assert_eq!(rig_kinds(EnemyKind::CarrierDaemon), vec![RigKind::BossCannon, RigKind::BossHalo]);
+        for k in [EnemyKind::Imp, EnemyKind::Cacodemon, EnemyKind::HellBaron, EnemyKind::PhaseStalker] {
+            assert!(a.rigs[k.index()].is_empty(), "{k:?} stays rigid");
+        }
+        // Pylon obelisk: grounded, crowned above the tether origin.
+        let mut b = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        grow_bounds(meshes, &a.pylon_model, Transform::IDENTITY, &mut b);
+        println!("pylon: {} materials, bounds {:.2} .. {:.2}", a.pylon_model.len(), b.0, b.1);
+        assert!(b.0.y.abs() < 0.02 && b.1.y > 2.6 && b.1.y < 3.4 && a.pylon_model.len() <= 6);
+        assert_eq!(a.pylon_ring.parts.len(), 1);
+    }
+
+    #[test]
+    fn glowing_materials_stay_lit_and_saturated() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(Assets::<Image>::default());
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<StandardMaterial>::default());
+        world.run_system_once(create_enemy_assets).unwrap();
+        let a = world.resource::<EnemyAssets>();
+        let mats = world.resource::<Assets<StandardMaterial>>();
+        let mut glows = vec![&a.pylon_core, &a.carrier_core, &a.phase_core, &a.sniper_lens, &a.caco_iris, &a.baron_hellfire, &a.fiend_green];
+        glows.extend(a.looks.iter().flat_map(|l| [&l.eye, &l.eye_enraged]));
+        for h in glows {
+            let m = mats.get(h).unwrap();
+            // Unlit materials output only `base_color` (emissive ignored) -> chalky white.
+            assert!(!m.unlit, "glow must be lit so emissive applies");
+            let c = m.base_color.to_srgba();
+            let (hi, lo) = (c.red.max(c.green).max(c.blue), c.red.min(c.green).min(c.blue));
+            // Deep, richly saturated base (dark is fine: chroma relative to the peak channel).
+            assert!(hi - lo > 0.4 && (hi - lo) / hi > 0.75, "saturated base color, got {c:?}");
+            let e = m.emissive;
+            let (ehi, elo) = (e.red.max(e.green).max(e.blue), e.red.min(e.green).min(e.blue));
+            assert!((0.8..=8.0).contains(&ehi) && elo < ehi * 0.12, "channel-pure emissive, got {e:?}");
+        }
     }
 }
