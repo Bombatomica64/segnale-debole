@@ -16,6 +16,8 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::trials::DailyDate;
+
 /// Last floor of a standard run. Clearing it means victory.
 pub const FINAL_FLOOR: u32 = 5;
 
@@ -328,6 +330,33 @@ pub enum FloorAdvance {
     Victory,
 }
 
+/// What kind of run is live. Every mode shares the same `Playing` loop; the
+/// mode only swaps the seed / loadout source (Daily), or the level and rules
+/// (Time Trial, see `trials.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RunMode {
+    /// Regular run (main menu PLAY, playtest bot, Endless Overdrive).
+    #[default]
+    Standard,
+    /// Daily Seeded Run: the same bunker and ruleset for everyone on that UTC date.
+    Daily(DailyDate),
+    /// Movement / rocket-jump time trial on the handcrafted course.
+    TimeTrial,
+}
+
+impl RunMode {
+    pub fn is_time_trial(self) -> bool {
+        self == RunMode::TimeTrial
+    }
+
+    pub fn daily_date(self) -> Option<DailyDate> {
+        match self {
+            RunMode::Daily(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Resource, Debug, Clone)]
 pub struct RunStats {
     /// Current floor, `1..=FINAL_FLOOR` (beyond it in Endless Overdrive).
@@ -359,6 +388,10 @@ pub struct RunStats {
     pub endless: bool,
     /// Counters already folded into the profile at the Floor 5 Victory.
     pub recorded_snapshot: Option<RecordedRunTotals>,
+    /// Standard / Daily / Time Trial.
+    pub mode: RunMode,
+    /// Cumulative `time_elapsed` at the end of each cleared floor (speedrun splits).
+    pub floor_splits: Vec<f32>,
 }
 
 impl Default for RunStats {
@@ -380,6 +413,8 @@ impl Default for RunStats {
             max_bhop_chain: 0,
             endless: false,
             recorded_snapshot: None,
+            mode: RunMode::Standard,
+            floor_splits: Vec::new(),
         }
     }
 }
@@ -411,6 +446,7 @@ impl RunStats {
     /// Mark the current floor cleared. Returns where the game should go next.
     pub fn advance_floor(&mut self) -> FloorAdvance {
         self.floors_cleared += 1;
+        self.floor_splits.push(self.time_elapsed);
         if self.endless {
             self.floor += 1;
             FloorAdvance::NextFloor(self.floor)
@@ -533,6 +569,20 @@ mod tests {
         run.sos_completed = 7;
         let d = RecordedRunTotals::of(&run).delta_since(&snap);
         assert_eq!((d.kills, d.sos_completed, d.jammers), (4, 2, 0));
+    }
+
+    #[test]
+    fn advance_floor_records_cumulative_splits() {
+        let mut run = RunStats::default();
+        assert_eq!(run.mode, RunMode::Standard);
+        for f in 1..=FINAL_FLOOR {
+            run.time_elapsed = f as f32 * 60.0 + 0.5;
+            run.advance_floor();
+        }
+        assert_eq!(run.floor_splits, vec![60.5, 120.5, 180.5, 240.5, 300.5]);
+        run.start_new_run(7);
+        assert!(run.floor_splits.is_empty() && run.mode == RunMode::Standard, "a fresh run clears splits and mode");
+        assert!(RunMode::TimeTrial.is_time_trial() && RunMode::Daily(DailyDate::EPOCH).daily_date() == Some(DailyDate::EPOCH));
     }
 
     #[test]

@@ -28,7 +28,11 @@ use crate::meta_ui::{
 };
 use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::SignalState;
-use crate::state::{complete_floor, continue_into_endless, AppState, GameSet, PlayerModifiers, RunStats, SettingsReturn, FINAL_FLOOR};
+use crate::state::{complete_floor, continue_into_endless, AppState, GameSet, PlayerModifiers, RunMode, RunStats, SettingsReturn, FINAL_FLOOR};
+use crate::trials::{
+    begin_daily_attempt, daily_loadout, daily_record, daily_rules_line, floor_splits_line, format_split_delta, format_split_time, split_plate_view,
+    split_timer_visible, start_daily_run, start_time_trial, trial_splits_line, DailyDate, TimeTrialState, SPLIT_GOLD,
+};
 use crate::ui_kit::{
     hard_shadow, hazard_strip, hero_title, hud_plate, inset_border, keycap, plate_border, plate_rect, punk_button, punk_screen_root,
     punk_screen_root_tinted, recessed_bezel, screen_rails, section_crate, signal_bars, stamped_tag, stencil_title, stencil_title_layers,
@@ -75,6 +79,12 @@ pub enum MenuAction {
     CloseSettings,
     /// Victory: keep descending into Endless Overdrive (Floor 6+).
     ContinueEndless,
+    /// Main menu: today's Daily Seeded Run.
+    StartDaily,
+    /// Main menu: the movement Time Trial course.
+    StartTimeTrial,
+    /// Time Trial finish card: instant retry (no level rebuild).
+    RetryTimeTrial,
 }
 
 /// A clickable menu switch (see [`crate::ui_kit::punk_button`]).
@@ -121,6 +131,17 @@ pub fn menu_hotkey_action(state: AppState, o: bool, e: bool) -> Option<MenuActio
     }
 }
 
+/// Mode hotkeys: `D` Daily Run / `T` Time Trial from `MainMenu`, `R` retry
+/// from the Time Trial finish card (`Victory` in [`RunMode::TimeTrial`]).
+pub fn mode_hotkey_action(state: AppState, mode: RunMode, d: bool, t: bool, r: bool) -> Option<MenuAction> {
+    match state {
+        AppState::MainMenu if d => Some(MenuAction::StartDaily),
+        AppState::MainMenu if t => Some(MenuAction::StartTimeTrial),
+        AppState::Victory if r && mode == RunMode::TimeTrial => Some(MenuAction::RetryTimeTrial),
+        _ => None,
+    }
+}
+
 /// App Store card for offer `n` (0..3).
 #[derive(Component)]
 struct UpgradeCard(usize);
@@ -147,6 +168,7 @@ impl Plugin for HudPlugin {
                     update_hud,
                     update_hud_boxes,
                     refresh_hud_crosshair,
+                    update_split_plate,
                     pause_input,
                     debug_skip_floor,
                 )
@@ -225,7 +247,7 @@ fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option
     // One poster column, exactly as wide as the wordmark: every block below
     // the title shares its left and right edges.
     let column = commands
-        .spawn((ChildOf(root), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(13.0), ..default() }))
+        .spawn((ChildOf(root), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(10.0), ..default() }))
         .id();
 
     // Hero lockup: firmware stamp + a dying 1-bar signal above the wordmark,
@@ -244,7 +266,7 @@ fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option
     let weak = commands.spawn((ChildOf(stamp_row), Node { column_gap: Val::Px(10.0), align_items: AlignItems::FlexEnd, ..default() })).id();
     commands.spawn((ChildOf(weak), text("SIGNAL 1/5", 12.0, PUNK_RED)));
     signal_bars(&mut commands, weak, 1, PUNK_RED, 6.0);
-    hero_title(&mut commands, lockup, "SEGNALE DEBOLE", 100.0, BONE_TEXT, PUNK_RED);
+    hero_title(&mut commands, lockup, "SEGNALE DEBOLE", 92.0, BONE_TEXT, PUNK_RED);
     commands.spawn((
         ChildOf(lockup),
         Node { margin: UiRect::top(Val::Px(2.0)), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
@@ -310,6 +332,38 @@ fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option
     commands.spawn((ChildOf(actions), punk_button("LOADOUT  [L]", MenuAction::OpenLoadout, 19.0, ButtonStyle::HazardAmber)));
     commands.spawn((ChildOf(actions), punk_button("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, 19.0, ButtonStyle::DangerRed)));
     commands.spawn((ChildOf(actions), punk_button("SETTINGS  [O]", MenuAction::OpenSettings, 19.0, ButtonStyle::ScrapSteel)));
+
+    // Alternate modes: one compact strip of two doors, each with its live subtitle.
+    let modes = commands.spawn((ChildOf(column), Node { column_gap: Val::Px(14.0), align_items: AlignItems::Center, ..default() })).id();
+    let today = DailyDate::today_utc();
+    let (daily_sub, trial_sub) = mode_subtitles(&store.profile, today);
+    for (label, action, style, sub, color) in [
+        ("DAILY RUN  [D]", MenuAction::StartDaily, ButtonStyle::HazardAmber, daily_sub, HAZARD_YELLOW),
+        ("TIME TRIAL  [T]", MenuAction::StartTimeTrial, ButtonStyle::PrimaryAcid, trial_sub, ARC_CYAN),
+    ] {
+        commands.spawn((ChildOf(modes), punk_button(label, action, 16.0, style)));
+        commands.spawn((
+            ChildOf(modes),
+            Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() },
+            children![text(sub, 12.0, color.with_alpha(0.9))],
+        ));
+    }
+}
+
+/// Main menu subtitles of the DAILY RUN and TIME TRIAL doors.
+pub fn mode_subtitles(profile: &crate::meta::PlayerProfile, today: DailyDate) -> (String, String) {
+    let rules = daily_rules_line(&daily_loadout(today));
+    let best = match daily_record(&profile.daily_records, today) {
+        Some(r) if r.victory => format!("BEST {}", r.best_time_secs.map_or_else(|| "CLEAR".to_string(), format_split_time)),
+        Some(r) => format!("BEST FL {}", r.best_floor.max(1)),
+        None => "NOT PLAYED".to_string(),
+    };
+    let daily = format!("{} // {rules} // {best}", today.format_short());
+    let trial = match profile.time_trial_best_secs {
+        Some(t) => format!("COURSE PB {}", format_split_time(t)),
+        None => "3 CP + TOWER // NO PB YET".to_string(),
+    };
+    (daily, trial)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +733,9 @@ fn spawn_end_screen(
     // crate: it runs a tighter title and button row so the stack clears both
     // tape rails at 720p.
     let compact = endless_cta;
+    // The floor-splits line (+ Daily badge) costs a readout row: tighten the
+    // title so the stack still clears both tape rails at 720p.
+    let show_splits = split_timer_visible(&store.profile.settings, run.mode);
     let root = punk_screen_root_tinted(commands, state, tex, look.bg, look.backdrop, (look.link, look.accent));
     screen_rails(commands, root, tex, 16.0, look.tape);
 
@@ -705,9 +762,15 @@ fn spawn_end_screen(
     let stamp = commands.spawn((ChildOf(band), Node { column_gap: Val::Px(14.0), align_items: AlignItems::FlexEnd, ..default() })).id();
     signal_bars(commands, stamp, look.bars, look.accent, 8.0);
     commands.spawn((ChildOf(stamp), text(look.stamp, 13.0, look.accent)));
-    stencil_title_layers(commands, band, look.title, if compact { 76.0 } else { 84.0 }, look.title_color, look.title_color, &[(8.0, Color::BLACK), (4.0, look.title_slab)]);
+    let title_font = match (compact, show_splits) {
+        (true, true) => 62.0,
+        (true, false) => 76.0,
+        (false, true) => 76.0,
+        (false, false) => 84.0,
+    };
+    stencil_title_layers(commands, band, look.title, title_font, look.title_color, look.title_color, &[(8.0, Color::BLACK), (4.0, look.title_slab)]);
 
-    commands.spawn((ChildOf(root), text(look.flavor, 19.0, BONE_TEXT)));
+    commands.spawn((ChildOf(root), text(look.flavor, if show_splits { 17.0 } else { 19.0 }, BONE_TEXT)));
     let readout = commands
         .spawn((
             ChildOf(root),
@@ -727,7 +790,19 @@ fn spawn_end_screen(
     commands.spawn((ChildOf(readout), text(summary(run), 18.0, BONE_TEXT)));
     commands.spawn((ChildOf(readout), text(movement_line(run), 14.0, ARC_CYAN)));
     commands.spawn((ChildOf(readout), text(installed_list(run), 14.0, look.apps)));
-    commands.spawn((ChildOf(readout), text(end_loadout_line(loadout), 13.0, ASH_DIM)));
+    match run.mode.daily_date() {
+        Some(date) => {
+            let row = commands.spawn((ChildOf(readout), Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() })).id();
+            commands.spawn((ChildOf(row), stamped_tag(&format!("DAILY {}", date.format_iso()), HAZARD_YELLOW, INK_BLACK, 11.0)));
+            commands.spawn((ChildOf(row), text(end_loadout_line(loadout), 13.0, ASH_DIM)));
+        }
+        None => {
+            commands.spawn((ChildOf(readout), text(end_loadout_line(loadout), 13.0, ASH_DIM)));
+        }
+    }
+    if show_splits {
+        commands.spawn((ChildOf(readout), text(floor_splits_line(&run.floor_splits), 13.0, ACID_GREEN.with_alpha(0.85))));
+    }
 
     let summary = store.last_run_summary.clone().unwrap_or_default();
     let (panel, header) = section_crate(
@@ -804,8 +879,99 @@ fn spawn_game_over(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunL
     spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), false, &run, &loadout, &store, tex.as_deref());
 }
 
-fn spawn_victory(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
+fn spawn_victory(
+    mut commands: Commands,
+    run: Res<RunStats>,
+    loadout: Res<RunLoadout>,
+    store: Res<ProfileStore>,
+    trial: Res<TimeTrialState>,
+    tex: Option<Res<UiKitTextures>>,
+) {
+    if run.mode == RunMode::TimeTrial {
+        spawn_trial_finish(&mut commands, &run, &trial, &store, tex.as_deref());
+        return;
+    }
     spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), true, &run, &loadout, &store, tex.as_deref());
+}
+
+/// Time Trial finish card: final time, PB delta / NEW PB, movement telemetry,
+/// checkpoint splits and RETRY [R] / MAIN MENU [ENTER].
+fn spawn_trial_finish(commands: &mut Commands, run: &RunStats, trial: &TimeTrialState, store: &ProfileStore, tex: Option<&UiKitTextures>) {
+    let look = full_signal_look();
+    let root = punk_screen_root_tinted(commands, AppState::Victory, tex, look.bg, look.backdrop, ("RF-LINK: COURSE CLEAR", ARC_CYAN));
+    screen_rails(commands, root, tex, 16.0, look.tape);
+    let band = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(4.0),
+                padding: UiRect { top: Val::Px(6.0), bottom: Val::Px(8.0), ..default() },
+                border: UiRect::vertical(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor::all(ARC_CYAN.with_alpha(0.55)),
+            BackgroundColor(look.band.0),
+        ))
+        .id();
+    if let Some(t) = tex {
+        commands.entity(band).insert(tiled_image(t.noise_strip.clone(), look.band.1, 2.0));
+    }
+    let stamp = commands.spawn((ChildOf(band), Node { column_gap: Val::Px(14.0), align_items: AlignItems::FlexEnd, ..default() })).id();
+    signal_bars(commands, stamp, 5, ARC_CYAN, 8.0);
+    commands.spawn((ChildOf(stamp), text("TIME TRIAL  //  SIGNAL TOWER REACHED  //  3 CP + FINISH", 13.0, ARC_CYAN)));
+    stencil_title_layers(commands, band, "COURSE CLEAR", 72.0, ACID_GREEN, ACID_GREEN, &[(8.0, Color::BLACK), (4.0, look.title_slab)]);
+
+    let final_time = trial.final_time().unwrap_or(trial.elapsed);
+    let result = trial.result;
+    commands.spawn((ChildOf(root), text(format_split_time(final_time), 64.0, BONE_TEXT)));
+    let (pb_line, pb_color) = match result {
+        Some(r) if r.new_pb => match r.previous_best {
+            Some(prev) => (format!("NEW PB!  {}  (WAS {})", format_split_delta(final_time - prev), format_split_time(prev)), SPLIT_GOLD),
+            None => ("NEW PB!  FIRST CLEAR ON RECORD".to_string(), SPLIT_GOLD),
+        },
+        Some(r) => match (r.delta, r.previous_best) {
+            (Some(d), Some(prev)) => (format!("{}  VS PB {}", format_split_delta(d), format_split_time(prev)), PUNK_RED),
+            _ => ("NO PB ON RECORD".to_string(), ASH_DIM),
+        },
+        None => ("NO PB ON RECORD".to_string(), ASH_DIM),
+    };
+    commands.spawn((ChildOf(root), stamped_tag(&pb_line, pb_color, INK_BLACK, 18.0)));
+    let readout = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                max_width: Val::Px(1000.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(3.0),
+                padding: UiRect::axes(Val::Px(22.0), Val::Px(8.0)),
+                border: plate_rect((4.0, 2.0, 2.0, 2.0)),
+                ..default()
+            },
+            BorderColor { left: ARC_CYAN, ..inset_border() },
+            BackgroundColor(INK_BLACK.with_alpha(0.74)),
+        ))
+        .id();
+    commands.spawn((ChildOf(readout), text(movement_line(run), 16.0, ARC_CYAN)));
+    // Compare against the PB splits that stood before this attempt finished.
+    commands.spawn((ChildOf(readout), text(trial_splits_line(&trial.splits, &trial.previous_splits), 14.0, BONE_TEXT)));
+    commands.spawn((
+        ChildOf(readout),
+        text(format!("PIT RESCUES {}  |  RUNS & FEATS UNTOUCHED - MOVEMENT RECORDS ONLY", trial.rescues), 12.0, ASH_DIM),
+    ));
+    if let Some(err) = &store.last_save_error {
+        commands.spawn((ChildOf(root), text(format!("SAVE PENDING ({err}) - will retry at menu"), 13.0, PUNK_RED)));
+    }
+    button_row(
+        commands,
+        root,
+        &[("RETRY  [R]", MenuAction::RetryTimeTrial, ButtonStyle::HeroAcid), ("MAIN MENU  [ENTER]", MenuAction::BackToMenu, ButtonStyle::ScrapSteel)],
+        20.0,
+        8.0,
+    );
 }
 
 /// In-run pause overlay (`Esc` / `P`): keeps the frozen 3D scene behind a dark
@@ -877,7 +1043,7 @@ fn perform(
     action: MenuAction,
     run: &mut RunStats,
     mods: &mut PlayerModifiers,
-    (store, loadout): (&mut ProfileStore, &mut RunLoadout),
+    (store, loadout, trial): (&mut ProfileStore, &mut RunLoadout, &mut TimeTrialState),
     time: &Time,
     (state, ret): (AppState, &mut SettingsReturn),
     next: &mut NextState<AppState>,
@@ -893,13 +1059,44 @@ fn perform(
             let seed = time.elapsed().as_nanos() as u64 ^ 0xA5A5_5A5A_1234_5678;
             start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
         }
+        MenuAction::RestartRun if run.mode == RunMode::TimeTrial => {
+            // Instant reset on the same course (no level rebuild).
+            trial.reset_requested = true;
+            next.set(AppState::Playing);
+        }
         MenuAction::RestartRun => {
             finalize_endless(run, loadout, store);
             for e in players.iter() {
                 commands.entity(e).despawn();
             }
-            let seed = time.elapsed().as_nanos() as u64 ^ run.run_seed.wrapping_add(0x9E37_79B9);
-            start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
+            if let RunMode::Daily(date) = run.mode {
+                // Same date = same seed: force a fresh build of Floor 1.
+                commands.remove_resource::<crate::level::LevelGrid>();
+                begin_daily_attempt(&mut store.profile.daily_records, date);
+                let _ = store.try_save();
+                start_daily_run(run, mods, loadout, next, date, store.profile.build_loadout().skin);
+            } else {
+                let seed = time.elapsed().as_nanos() as u64 ^ run.run_seed.wrapping_add(0x9E37_79B9);
+                start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
+            }
+        }
+        MenuAction::StartDaily => {
+            let date = DailyDate::today_utc();
+            begin_daily_attempt(&mut store.profile.daily_records, date);
+            if let Err(e) = store.try_save() {
+                warn!("profile save failed (marked dirty for retry): {e}");
+            }
+            start_daily_run(run, mods, loadout, next, date, store.profile.build_loadout().skin);
+        }
+        MenuAction::StartTimeTrial => {
+            start_time_trial(run, mods, loadout, trial, next, store.profile.build_loadout().skin);
+        }
+        MenuAction::RetryTimeTrial => {
+            if run.mode == RunMode::TimeTrial {
+                trial.reset_requested = true;
+                run.run_recorded = false;
+                next.set(AppState::Playing);
+            }
         }
         MenuAction::Continue => next.set(AppState::Playing),
         MenuAction::BackToMenu => {
@@ -919,7 +1116,7 @@ fn perform(
         }
         MenuAction::CloseSettings => next.set(ret.0),
         MenuAction::ContinueEndless => {
-            if state == AppState::Victory {
+            if state == AppState::Victory && run.mode != RunMode::TimeTrial {
                 continue_into_endless(run, next);
             }
         }
@@ -939,7 +1136,7 @@ fn menu_buttons(
     mut labels: Query<&mut TextColor>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
-    (mut store, mut loadout): (ResMut<ProfileStore>, ResMut<RunLoadout>),
+    (mut store, mut loadout, mut trial): (ResMut<ProfileStore>, ResMut<RunLoadout>, ResMut<TimeTrialState>),
     time: Res<Time>,
     (state, mut ret): (Res<State<AppState>>, ResMut<SettingsReturn>),
     mut next: ResMut<NextState<AppState>>,
@@ -965,7 +1162,17 @@ fn menu_buttons(
             }
         }
         if hovered && mouse.just_released(MouseButton::Left) {
-            perform(&mut commands, &players, *action, &mut run, &mut mods, (&mut store, &mut loadout), &time, (*state.get(), &mut ret), &mut next);
+            perform(
+                &mut commands,
+                &players,
+                *action,
+                &mut run,
+                &mut mods,
+                (&mut store, &mut loadout, &mut trial),
+                &time,
+                (*state.get(), &mut ret),
+                &mut next,
+            );
             return;
         }
     }
@@ -979,7 +1186,7 @@ fn menu_keys(
     state: Res<State<AppState>>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
-    (mut store, mut loadout): (ResMut<ProfileStore>, ResMut<RunLoadout>),
+    (mut store, mut loadout, mut trial): (ResMut<ProfileStore>, ResMut<RunLoadout>, ResMut<TimeTrialState>),
     time: Res<Time>,
     mut ret: ResMut<SettingsReturn>,
     mut next: ResMut<NextState<AppState>>,
@@ -994,9 +1201,28 @@ fn menu_keys(
         keys.just_pressed(KeyCode::KeyR),
         keys.just_pressed(KeyCode::KeyM),
     )
-    .or_else(|| menu_hotkey_action(*state.get(), keys.just_pressed(KeyCode::KeyO), keys.just_pressed(KeyCode::KeyE)));
+    .or_else(|| menu_hotkey_action(*state.get(), keys.just_pressed(KeyCode::KeyO), keys.just_pressed(KeyCode::KeyE)))
+    .or_else(|| {
+        mode_hotkey_action(
+            *state.get(),
+            run.mode,
+            keys.just_pressed(KeyCode::KeyD),
+            keys.just_pressed(KeyCode::KeyT),
+            keys.just_pressed(KeyCode::KeyR),
+        )
+    });
     if let Some(action) = action {
-        perform(&mut commands, &players, action, &mut run, &mut mods, (&mut store, &mut loadout), &time, (*state.get(), &mut ret), &mut next);
+        perform(
+            &mut commands,
+            &players,
+            action,
+            &mut run,
+            &mut mods,
+            (&mut store, &mut loadout, &mut trial),
+            &time,
+            (*state.get(), &mut ret),
+            &mut next,
+        );
     }
 }
 
@@ -1837,6 +2063,9 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
         ));
     }
 
+    // Right edge, below the toast stack: speedrun split timer plate.
+    spawn_split_plate(&mut commands, root);
+
     // Bottom-center: VEL telemetry strip docked above the vitals panel.
     commands.insert_resource(VelGauge::default());
     spawn_vel_plate(&mut commands, root);
@@ -2024,6 +2253,102 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
 }
 
 /// Stamped buff pill of the weapon card header (hidden until its buff is live).
+/// Split timer plate fields.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitText {
+    Tag,
+    Time,
+    Progress,
+    Delta,
+}
+
+/// Root of the split timer plate (hidden unless splits are on / non-standard mode).
+#[derive(Component)]
+pub struct SplitPlate;
+
+/// Top of the split plate: clears the full 5-slot toast stack (12 px + 5 x
+/// ~39 px chips, last one ending near 200 px at 720p) with a 14 px gap.
+pub const SPLIT_PLATE_TOP: f32 = 214.0;
+pub const SPLIT_PLATE_WIDTH: f32 = 236.0;
+
+fn spawn_split_plate(commands: &mut Commands, root: Entity) {
+    commands.spawn((
+        ChildOf(root),
+        SplitPlate,
+        hud_plate(
+            Node {
+                display: Display::None,
+                position_type: PositionType::Absolute,
+                right: Val::Px(14.0),
+                top: Val::Px(SPLIT_PLATE_TOP),
+                width: Val::Px(SPLIT_PLATE_WIDTH),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexEnd,
+                row_gap: Val::Px(1.0),
+                ..default()
+            },
+            ARC_CYAN,
+        ),
+        children![
+            (SplitText::Tag, text("SPLITS", 11.0, ARC_CYAN)),
+            (SplitText::Time, text("00:00.0", 30.0, COLOR_TEXT)),
+            (SplitText::Progress, text("", 12.0, COLOR_DIM)),
+            (SplitText::Delta, text("", 15.0, COLOR_TEXT)),
+        ],
+    ));
+}
+
+/// Live split timer: `RunStats::time_elapsed` / `TimeTrialState::elapsed`
+/// only advance in `Playing`, so the plate freezes with the simulation.
+fn update_split_plate(
+    run: Res<RunStats>,
+    trial: Res<TimeTrialState>,
+    store: Option<Res<ProfileStore>>,
+    mut plates: Query<(&mut Node, &mut BorderColor), With<SplitPlate>>,
+    mut texts: Query<(&SplitText, &mut Text, &mut TextColor)>,
+) {
+    let settings = live_settings(store.as_deref());
+    let show = split_timer_visible(&settings, run.mode);
+    for (mut node, mut border) in &mut plates {
+        set_display(&mut node, show);
+        let rail = match run.mode {
+            RunMode::Standard => ACID_GREEN,
+            RunMode::Daily(_) => HAZARD_YELLOW,
+            RunMode::TimeTrial => ARC_CYAN,
+        };
+        let want = plate_border(rail, STEEL_BORDER.with_alpha(0.45));
+        if *border != want {
+            *border = want;
+        }
+    }
+    if !show {
+        return;
+    }
+    let default_profile;
+    let profile = match store.as_deref() {
+        Some(s) => &s.profile,
+        None => {
+            default_profile = crate::meta::PlayerProfile::default();
+            &default_profile
+        }
+    };
+    let v = split_plate_view(&run, &trial, profile);
+    for (field, mut t, mut c) in &mut texts {
+        let (want, color) = match field {
+            SplitText::Tag => (&v.tag, v.tag_color),
+            SplitText::Time => (&v.time, COLOR_TEXT),
+            SplitText::Progress => (&v.progress, COLOR_DIM),
+            SplitText::Delta => (&v.delta, v.delta_color),
+        };
+        if t.0 != *want {
+            t.0.clone_from(want);
+        }
+        if c.0 != color {
+            c.0 = color;
+        }
+    }
+}
+
 fn buff_pill(tag: HudBox, label: &'static str, color: Color) -> impl Bundle {
     (
         tag,
@@ -2048,6 +2373,7 @@ fn update_hud(
     loadout: Res<RunLoadout>,
     gauge: Res<VelGauge>,
     boss: Option<Res<BossHud>>,
+    trial: Res<TimeTrialState>,
     players: Query<&Player>,
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
     (mut buf, mut tags): (Local<String>, Local<LoadoutTags>),
@@ -2078,13 +2404,24 @@ fn update_hud(
                 boss_tag_color(&h)
             }
             HudText::Floor => {
-                if run.endless {
+                if run.mode == RunMode::TimeTrial {
+                    b.push_str("TIME TRIAL");
+                    ARC_CYAN
+                } else if run.endless {
                     let _ = write!(b, "ENDLESS FL {}", run.floor);
                     COLOR_ENDLESS
                 } else {
                     let _ = write!(b, "FLOOR {}/{}", run.floor, FINAL_FLOOR);
                     COLOR_TEXT
                 }
+            }
+            HudText::Sector if run.mode == RunMode::TimeTrial => {
+                b.push_str("COURSE // SIGNAL RUN");
+                HAZARD_YELLOW
+            }
+            HudText::Stats if run.mode == RunMode::TimeTrial => {
+                let _ = write!(b, "CP {}/{}  |  RESCUES {}", trial.next_gate.min(3), crate::trials::TRIAL_CHECKPOINTS, trial.rescues);
+                COLOR_DIM
             }
             HudText::Sector => {
                 let _ = write!(b, "SECTOR {:02} // {}", run.floor, FloorTheme::for_floor(run.floor).name());
@@ -2102,6 +2439,14 @@ fn update_hud(
                 b.push_str(contract_tags.as_deref().unwrap_or_default());
                 contract_color
             }
+            HudText::Status if run.mode == RunMode::TimeTrial => {
+                b.push_str(if trial.next_gate >= crate::trials::TRIAL_CHECKPOINTS {
+                    "FINAL STRETCH - LAND ON THE TOWER PAD"
+                } else {
+                    "TIME TRIAL - 3 CHECKPOINTS, THEN THE TOWER"
+                });
+                ARC_CYAN
+            }
             HudText::Status => {
                 let (s, c) = match *ext {
                     ExtractionState::Uploading { .. } => (uplink_status_text(&ext), COLOR_SIGNAL_RED),
@@ -2114,6 +2459,7 @@ fn update_hud(
                 c
             }
             HudText::Prompt => match *ext {
+                _ if run.mode == RunMode::TimeTrial => Color::NONE,
                 ExtractionState::Searching { hold } if signal.near_tower => {
                     let a = 0.6 + 0.4 * (t * 5.0).sin();
                     b.push_str("PRESS [E] TO TRIGGER SOS UPLINK");
@@ -2533,7 +2879,7 @@ fn pause_input(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppSt
 /// F9: debug-complete the current floor (exercises the floor transition flow).
 /// Marks the run as debug-skipped so it cannot award permanent feats or stats.
 fn debug_skip_floor(keys: Res<ButtonInput<KeyCode>>, mut run: ResMut<RunStats>, mut next: ResMut<NextState<AppState>>) {
-    if keys.just_pressed(KeyCode::F9) {
+    if keys.just_pressed(KeyCode::F9) && run.mode != RunMode::TimeTrial {
         run.debug_skipped = true;
         complete_floor(&mut run, &mut next);
     }

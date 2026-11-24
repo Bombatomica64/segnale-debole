@@ -914,7 +914,11 @@ pub fn build_level_if_needed(
     for e in &existing {
         commands.entity(e).despawn();
     }
-    let mut g = generate_level(run.floor, run.floor_seed());
+    let mut g = if run.mode == crate::state::RunMode::TimeTrial {
+        crate::trials::build_time_trial_grid()
+    } else {
+        generate_level(run.floor, run.floor_seed())
+    };
     g.run_seed = run.run_seed;
     spawn_level_geometry(&mut commands, &g, &assets, &mut meshes);
     info!(

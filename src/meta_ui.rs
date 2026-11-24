@@ -1289,6 +1289,8 @@ pub enum SettingToggle {
     SpeedFov,
     StrafeRoll,
     Mute,
+    /// Speedrun split timer plate on Standard runs.
+    SpeedrunSplits,
 }
 
 impl SettingToggle {
@@ -1297,6 +1299,7 @@ impl SettingToggle {
             SettingToggle::SpeedFov => "DYNAMIC SPEED FOV",
             SettingToggle::StrafeRoll => "STRAFE ROLL",
             SettingToggle::Mute => "MUTE ALL AUDIO",
+            SettingToggle::SpeedrunSplits => "SPEEDRUN SPLITS",
         }
     }
 
@@ -1305,6 +1308,7 @@ impl SettingToggle {
             SettingToggle::SpeedFov => &mut s.speed_fov_enabled,
             SettingToggle::StrafeRoll => &mut s.strafe_roll_enabled,
             SettingToggle::Mute => &mut s.audio_muted,
+            SettingToggle::SpeedrunSplits => &mut s.speedrun_splits,
         }
     }
 
@@ -1313,6 +1317,7 @@ impl SettingToggle {
             SettingToggle::SpeedFov => s.speed_fov_enabled,
             SettingToggle::StrafeRoll => s.strafe_roll_enabled,
             SettingToggle::Mute => s.audio_muted,
+            SettingToggle::SpeedrunSplits => s.speedrun_splits,
         }
     }
 
@@ -1738,9 +1743,10 @@ fn spawn_settings_screen(
     let (audio, audio_head) =
         section_crate(&mut commands, split, "AUDIO & RETICLE", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
     commands.spawn((ChildOf(audio_head), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(audio_head), text("SFX BUS // HUD RETICLE", 11.0, ASH_DIM)));
+    commands.spawn((ChildOf(audio_head), text("SFX BUS // HUD", 11.0, ASH_DIM)));
     knob_row(&mut commands, audio, SettingKnob::Volume, &s);
     toggle_row(&mut commands, audio, SettingToggle::Mute, "silence every sound effect", &s);
+    toggle_row(&mut commands, audio, SettingToggle::SpeedrunSplits, "HUD timer + PB deltas on standard runs", &s);
 
     // Reticle block: style pills + color swatches beside the live preview.
     let reticle = commands

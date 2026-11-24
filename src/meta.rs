@@ -24,7 +24,8 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::player::Player;
-use crate::state::{start_run, AppState, PlayerModifiers, RecordedRunTotals, RunStats, UpgradeId};
+use crate::state::{start_run, AppState, PlayerModifiers, RecordedRunTotals, RunMode, RunStats, UpgradeId};
+use crate::trials::{DailyDate, DailyRecord};
 
 /// Current on-disk profile schema.
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
@@ -617,6 +618,9 @@ pub struct UserSettings {
     pub audio_muted: bool,
     pub crosshair_style: CrosshairStyle,
     pub crosshair_color: CrosshairColor,
+    /// Speedrun split timer plate on Standard runs (always on in Daily / Time Trial).
+    #[serde(default)]
+    pub speedrun_splits: bool,
 }
 
 impl Default for UserSettings {
@@ -632,6 +636,7 @@ impl Default for UserSettings {
             audio_muted: false,
             crosshair_style: CrosshairStyle::Cross,
             crosshair_color: CrosshairColor::White,
+            speedrun_splits: false,
         }
     }
 }
@@ -706,6 +711,9 @@ pub struct RunRecord {
     pub endless: bool,
     pub peak_speed: f32,
     pub max_bhop_chain: u32,
+    /// UTC date of a Daily Seeded Run (`None` = standard run).
+    #[serde(default)]
+    pub daily_date: Option<DailyDate>,
 }
 
 /// What the last finished run unlocked (for the end screens / Milestone B).
@@ -744,6 +752,21 @@ pub struct PlayerProfile {
     pub history: Vec<RunRecord>,
     /// Input / camera / audio / reticle options.
     pub settings: UserSettings,
+    /// Daily Seeded Run results, oldest first (last [`crate::trials::DAILY_RECORDS_KEPT`] dates).
+    #[serde(default)]
+    pub daily_records: Vec<DailyRecord>,
+    /// Cumulative floor splits of the fastest Standard 5-floor victory.
+    #[serde(default)]
+    pub standard_pb_splits: Vec<f32>,
+    /// Fastest single-floor segment per floor across recorded Standard runs.
+    #[serde(default)]
+    pub best_floor_segments: [Option<f32>; 5],
+    /// Fastest Time Trial completion (seconds).
+    #[serde(default)]
+    pub time_trial_best_secs: Option<f32>,
+    /// Checkpoint + finish splits of that fastest Time Trial.
+    #[serde(default)]
+    pub time_trial_best_splits: Vec<f32>,
 }
 
 impl Default for PlayerProfile {
@@ -759,6 +782,11 @@ impl Default for PlayerProfile {
             stats: LifetimeStats::default(),
             history: Vec::new(),
             settings: UserSettings::default(),
+            daily_records: Vec::new(),
+            standard_pb_splits: Vec::new(),
+            best_floor_segments: [None; 5],
+            time_trial_best_secs: None,
+            time_trial_best_splits: Vec::new(),
         }
     }
 }
@@ -885,6 +913,7 @@ impl PlayerProfile {
             let extra = self.history.len() - RUN_HISTORY_LEN;
             self.history.drain(..extra);
         }
+        crate::trials::sanitize_trial_records(self);
     }
 
     /// Snapshot the equipped choices for a new run (locked picks fall back).
@@ -948,6 +977,7 @@ impl PlayerProfile {
             endless: run.endless,
             peak_speed: run.peak_speed,
             max_bhop_chain: run.max_bhop_chain,
+            daily_date: run.mode.daily_date(),
         });
         if self.history.len() > RUN_HISTORY_LEN {
             let extra = self.history.len() - RUN_HISTORY_LEN;
@@ -982,6 +1012,7 @@ impl PlayerProfile {
             endless: true,
             peak_speed: run.peak_speed,
             max_bhop_chain: run.max_bhop_chain,
+            daily_date: run.mode.daily_date(),
         };
         match self.history.last_mut() {
             Some(last) if last.victory && last.chip == rec.chip && last.skin == rec.skin && last.floor <= rec.floor => *last = rec,
@@ -1102,7 +1133,7 @@ pub fn profile_path_policy(
 /// `$XDG_DATA_HOME/segnale-debole/profile.json` (or `~/.local/share/...`).
 pub fn resolve_profile_path(windowed: bool) -> Option<PathBuf> {
     let var = |k: &str| std::env::var(k).ok();
-    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS"].into_iter().any(|k| var(k).is_some());
+    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS"].into_iter().any(|k| var(k).is_some());
     profile_path_policy(var("SEGNALE_PROFILE").as_deref(), windowed, bot_or_shots, var("XDG_DATA_HOME").as_deref(), var("HOME").as_deref())
 }
 
@@ -1207,6 +1238,13 @@ pub fn record_run_outcome(victory: bool, run: &mut RunStats, loadout: &RunLoadou
         return None;
     }
     run.run_recorded = true;
+    if run.mode == RunMode::TimeTrial {
+        // Time Trial completions fold their own movement records in
+        // (`trials::record_time_trial`); they never count as runs or feats.
+        let summary = RunUnlockSummary { victory, skipped_reason: Some(TIME_TRIAL_SUMMARY.to_string()), ..Default::default() };
+        store.last_run_summary = Some(summary.clone());
+        return Some(summary);
+    }
     let exhibition = if run.debug_skipped {
         Some("EXHIBITION: Debug skip (F9) used - stats & feats not recorded")
     } else if loadout.jam_demo {
@@ -1219,11 +1257,17 @@ pub fn record_run_outcome(victory: bool, run: &mut RunStats, loadout: &RunLoadou
         store.last_run_summary = Some(summary.clone());
         return Some(summary);
     }
+    let first_record = run.recorded_snapshot.is_none();
     let summary = match run.recorded_snapshot {
         // Endless continuation of a victory that was already folded in.
         Some(snap) => store.profile.record_endless_extension(run, &snap, loadout),
         None => store.profile.record_run(run, loadout, victory),
     };
+    match run.mode {
+        RunMode::Daily(date) => crate::trials::record_daily_result(&mut store.profile.daily_records, date, run, victory),
+        RunMode::Standard if first_record => crate::trials::record_standard_splits(&mut store.profile, &run.floor_splits, victory),
+        _ => {}
+    }
     if victory {
         run.recorded_snapshot = Some(RecordedRunTotals::of(run));
     }
@@ -1233,6 +1277,9 @@ pub fn record_run_outcome(victory: bool, run: &mut RunStats, loadout: &RunLoadou
     }
     Some(summary)
 }
+
+/// Run-unlock note of a Time Trial finish (no lifetime runs / feats).
+pub const TIME_TRIAL_SUMMARY: &str = "TIME TRIAL: movement records only - runs & feats untouched";
 
 /// `OnEnter(GameOver)`: the end screen orders itself after this system so
 /// [`ProfileStore::last_run_summary`] is populated when it spawns.

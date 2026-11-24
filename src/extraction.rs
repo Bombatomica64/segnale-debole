@@ -640,7 +640,12 @@ impl Plugin for ExtractionPlugin {
             .add_systems(Update, reset_extraction.run_if(resource_exists_and_changed::<LevelGrid>).in_set(GameSet::World))
             .add_systems(
                 Update,
-                (update_extraction, alarm_atmosphere).chain().in_set(GameSet::Combat).after(CombatDamage).run_if(resource_exists::<LevelGrid>),
+                (update_extraction, alarm_atmosphere)
+                    .chain()
+                    .in_set(GameSet::Combat)
+                    .after(CombatDamage)
+                    .run_if(resource_exists::<LevelGrid>)
+                    .run_if(crate::trials::not_time_trial),
             );
     }
 }

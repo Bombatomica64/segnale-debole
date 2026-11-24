@@ -2914,8 +2914,9 @@ fn settings_open_from_main_menu_and_mid_run_pause_and_apply_live() {
     tap(&mut app, KeyCode::KeyO);
     assert_eq!(app_state(&app), AppState::Settings);
     assert_eq!(app.world().resource::<SettingsReturn>().0, AppState::MainMenu);
-    // 5 knobs x (-/+), 3 toggles, the style pills, the color swatches, RESET.
-    assert_eq!(count::<SettingsControl>(&mut app), 5 * 2 + 3 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
+    // 5 knobs x (-/+), 4 toggles (incl. SPEEDRUN SPLITS), the style pills, the color swatches, RESET.
+    assert_eq!(count::<SettingsControl>(&mut app), 5 * 2 + 4 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "SPEEDRUN SPLITS"), "speedrun splits toggle row");
     assert_eq!(count::<ReticlePreview>(&mut app), 1);
     assert_eq!(count::<Camera3d>(&mut app), 1, "settings brings its own camera from the menu");
     let texts = ui_texts(&mut app);

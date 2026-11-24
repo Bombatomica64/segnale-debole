@@ -26,6 +26,10 @@
 //! - `SEGNALE_MODEL_SHOTS=<dir>`: dedicated 3D model showcase (lit close-ups of
 //!   all 3 right-hand guns, all 7 enemies + Shield Pylon, and Floor 5 Obsidian
 //!   Core contrast check), then exits. Keeps `SEGNALE_SHOTS` untouched.
+//! - `SEGNALE_TRIAL_SHOTS=<dir>`: Milestone 18 tour on an in-memory profile
+//!   with PBs on record: `01_daily_hud.png` (split plate under 5 toasts),
+//!   `02_daily_victory.png` (Daily badge + floor splits), `03_trial_hud.png`
+//!   (Time Trial plate after CP 1), `04_trial_finish.png`, then exits.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -69,6 +73,29 @@ impl Plugin for DevPlugin {
                 .add_systems(Update, model_shots_autostart.run_if(in_state(AppState::MainMenu)))
                 .add_systems(Update, model_shots_tour.after(GameSet::Ui).run_if(in_state(AppState::Playing)))
                 .add_systems(Update, model_shots_resume_playing.run_if(in_state(AppState::UpgradeSelect)));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_TRIAL_SHOTS") {
+            // PBs on record + near-threshold stats: the worst-case Daily victory
+            // gets two rows of fresh feats on top of the splits line.
+            let showcase = PlayerProfile {
+                standard_pb_splits: vec![95.0, 205.0, 330.0, 455.0, 600.0],
+                best_floor_segments: [Some(90.0), Some(105.0), Some(120.0), Some(118.0), Some(140.0)],
+                time_trial_best_secs: Some(48.6),
+                time_trial_best_splits: vec![9.8, 21.5, 36.0, 48.6],
+                stats: LifetimeStats { total_jammers: 7, total_sos_completed: 2, ..default() },
+                ..default()
+            };
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.profile = showcase;
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(showcase));
+                }
+            }
+            app.insert_resource(TrialShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, trial_shots_tour.after(GameSet::Ui));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_META_SHOTS") {
@@ -502,6 +529,117 @@ fn meta_shots_tour(
             true
         }
         (15, AppState::GameOver) if t > 1.5 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_TRIAL_SHOTS (Milestone 18)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct TrialShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+/// Daily HUD -> staged Daily victory -> Time Trial HUD -> Time Trial finish.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn trial_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<TrialShots>,
+    state: Res<State<AppState>>,
+    grid: Option<Res<LevelGrid>>,
+    (mut run, mut mods, mut loadout, mut trial): (ResMut<RunStats>, ResMut<PlayerModifiers>, ResMut<RunLoadout>, ResMut<crate::trials::TimeTrialState>),
+    mut feed: ResMut<HudFeed>,
+    mut players: Query<(&mut Player, &mut Transform)>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    cfg.timer += time.delta_secs();
+    for (mut p, _) in &mut players {
+        p.invuln_timer = 999.0;
+        p.hp = p.max_hp;
+    }
+    let dir = cfg.dir.clone();
+    let t = cfg.timer;
+    let goto_gate = |i: usize, players: &mut Query<(&mut Player, &mut Transform)>| {
+        let (Some(g), Ok((mut p, mut tf))) = (grid.as_deref(), players.single_mut()) else { return };
+        let gate = &crate::trials::time_trial_gates()[i];
+        crate::trials::place_player(g, &mut p, &mut tf, gate.cells[0], gate.respawn_yaw);
+    };
+    let advance = match (cfg.stage, *state.get()) {
+        (0, AppState::MainMenu) if t > 1.0 => {
+            commands.insert_resource(DevFreezeAi);
+            let date = crate::trials::DailyDate::today_utc();
+            crate::trials::start_daily_run(&mut run, &mut mods, &mut loadout, &mut next, date, HandsetSkin::UacOrange);
+            true
+        }
+        (1, AppState::Playing) if t > 3.0 => {
+            run.time_elapsed = 61.4;
+            for line in ["JAMMER DESTROYED", "+8 HP SIGNAL SIPHON", "IMP DOWN", "5G OVERCLOCK ONLINE", "PING: 3 DEMONS MARKED"] {
+                feed.toast(line, crate::ui_kit::BONE_TEXT);
+            }
+            true
+        }
+        (2, AppState::Playing) if t > 0.5 => {
+            meta_shot(&mut commands, &dir, "01_daily_hud.png");
+            true
+        }
+        (3, AppState::Playing) if t > 0.7 => {
+            run.floor = FINAL_FLOOR;
+            run.floors_cleared = FINAL_FLOOR - 1;
+            run.floor_splits = vec![88.2, 210.4, 318.9, 450.1];
+            run.time_elapsed = 571.3;
+            run.kills = 84;
+            run.jammers_destroyed = 6;
+            run.sos_completed = 4;
+            run.peak_speed = 27.4;
+            run.max_bhop_chain = 6;
+            complete_floor(&mut run, &mut next);
+            true
+        }
+        (4, AppState::Victory) if t > 2.0 => {
+            meta_shot(&mut commands, &dir, "02_daily_victory.png");
+            true
+        }
+        (5, AppState::Victory) if t > 0.7 => {
+            next.set(AppState::MainMenu);
+            true
+        }
+        (6, AppState::MainMenu) if t > 1.0 => {
+            crate::trials::start_time_trial(&mut run, &mut mods, &mut loadout, &mut trial, &mut next, HandsetSkin::UacOrange);
+            true
+        }
+        (7, AppState::Playing) if t > 3.0 => {
+            trial.elapsed = 9.1;
+            goto_gate(0, &mut players);
+            true
+        }
+        (8, AppState::Playing) if t > 1.2 => {
+            meta_shot(&mut commands, &dir, "03_trial_hud.png");
+            true
+        }
+        (9, AppState::Playing) if t > 0.5 && trial.next_gate < crate::trials::TRIAL_CHECKPOINTS + 1 => {
+            trial.elapsed = trial.elapsed.max(12.0 * trial.next_gate as f32) + 0.4;
+            goto_gate(trial.next_gate, &mut players);
+            cfg.timer = 0.0;
+            false
+        }
+        (9, AppState::Victory) if t > 2.0 => {
+            meta_shot(&mut commands, &dir, "04_trial_finish.png");
+            true
+        }
+        (10, AppState::Victory) if t > 1.5 => {
             exit.write(AppExit::Success);
             true
         }

@@ -26,6 +26,7 @@ pub mod raytracing;
 pub mod sculpt;
 pub mod signal;
 pub mod state;
+pub mod trials;
 pub mod upgrades;
 pub mod weapons;
 
@@ -66,7 +67,8 @@ impl Plugin for CoreGameplayPlugin {
                 perf::PerfPlugin,
             ))
             .add_plugins(boss::BossPlugin)
-            .add_plugins(decals::DecalsPlugin);
+            .add_plugins(decals::DecalsPlugin)
+            .add_plugins(trials::TrialsPlugin);
     }
 }
 

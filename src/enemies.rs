@@ -3040,7 +3040,10 @@ impl Plugin for EnemiesPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FlowField>()
             .add_systems(Startup, create_enemy_assets)
-            .add_systems(Update, spawn_garrison.run_if(resource_exists_and_changed::<LevelGrid>).in_set(GameSet::World))
+            .add_systems(
+                Update,
+                spawn_garrison.run_if(resource_exists_and_changed::<LevelGrid>).run_if(crate::trials::not_time_trial).in_set(GameSet::World),
+            )
             .add_systems(
                 Update,
                 (update_flow_field, enemy_ai, move_enemy_projectiles, tick_ping_marks, enemy_visuals, sniper_lasers)
