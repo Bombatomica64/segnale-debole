@@ -19,6 +19,7 @@ use crate::state::{AppState, PlayerModifiers, RunStats, UpgradeId};
 
 pub const BASE_MAX_SHELLS: u32 = 50;
 pub const BASE_MAX_PLASMA: u32 = 200;
+pub const BASE_MAX_ROCKETS: u32 = 20;
 
 /// The three offers of the current App Store visit.
 #[derive(Resource, Debug, Clone, Default, PartialEq)]
@@ -52,6 +53,8 @@ impl UpgradeId {
             UpgradeId::AirplaneModePhase => "[>>]",
             UpgradeId::HighCapacityCell => "[BAT]",
             UpgradeId::SubGhzPenetration => "[GHz]",
+            UpgradeId::DopplerOverdrive => "[DOP]",
+            UpgradeId::BlastThrusters => "[RKT]",
             UpgradeId::StoreAndForward => "[PKT+]",
             UpgradeId::EmergencyCallback => "[CALL]",
             UpgradeId::MissedCall => "[DECOY]",
@@ -68,7 +71,7 @@ pub fn draft_choices(owned: &[UpgradeId], rng: &mut impl Rng) -> Vec<UpgradeId> 
 }
 
 /// Draft 3 distinct upgrades from a run's active catalog only (an empty
-/// catalog falls back to the 10 core apps). Never offers a card outside it.
+/// catalog falls back to the 12 core apps). Never offers a card outside it.
 pub fn draft_choices_from_catalog(catalog: &[UpgradeId], owned: &[UpgradeId], rng: &mut impl Rng) -> Vec<UpgradeId> {
     let mut pool: Vec<UpgradeId> = Vec::new();
     for &u in catalog {
@@ -127,11 +130,21 @@ pub fn apply_upgrade(id: UpgradeId, mods: &mut PlayerModifiers, player: &mut Pla
             mods.pickup_mult *= 1.3;
             player.max_shells = (BASE_MAX_SHELLS as f32 * mods.ammo_capacity_mult).round() as u32;
             player.max_plasma = (BASE_MAX_PLASMA as f32 * mods.ammo_capacity_mult).round() as u32;
+            player.max_rockets = (BASE_MAX_ROCKETS as f32 * mods.ammo_capacity_mult).round() as u32;
         }
         UpgradeId::SubGhzPenetration => {
             // 55% less attenuation, multiplicative when stacked.
             mods.wall_penetration = 1.0 - (1.0 - mods.wall_penetration) * 0.45;
             mods.sub_ghz_route = true;
+        }
+        UpgradeId::DopplerOverdrive => {
+            mods.doppler_damage_bonus += 0.30;
+            mods.doppler_spread_mult *= 0.80;
+        }
+        UpgradeId::BlastThrusters => {
+            mods.rocket_jump_mult += 0.25;
+            mods.rocket_splash_mult += 0.20;
+            mods.rocket_self_damage_mult *= 0.50;
         }
         UpgradeId::StoreAndForward => mods.store_and_forward = true,
         UpgradeId::EmergencyCallback => mods.emergency_callback = true,
@@ -191,6 +204,17 @@ pub fn next_rank_preview(id: UpgradeId, mods: &PlayerModifiers) -> String {
             pct(1.0 - mods.wall_penetration),
             pct(1.0 - after.wall_penetration)
         ),
+        UpgradeId::DopplerOverdrive => {
+            format!("+{}% dmg, -{}% choke @20m/s", pct(after.doppler_damage_bonus), pct(1.0 - after.doppler_spread_mult))
+        }
+        UpgradeId::BlastThrusters => {
+            format!(
+                "x{:.2} jmp, {:.0}% rds, {:.0}% self",
+                after.rocket_jump_mult,
+                after.rocket_splash_mult * 100.0,
+                after.rocket_self_damage_mult * 100.0
+            )
+        }
         UpgradeId::StoreAndForward => owned_toggle(mods.store_and_forward)
             .unwrap_or_else(|| format!("Max {STORE_FORWARD_MAX_PACKETS} blackout packets, {STORE_FORWARD_DAMAGE:.0} dmg")),
         UpgradeId::EmergencyCallback => {
@@ -226,6 +250,7 @@ fn patch_player(player: &mut Player, heal: bool) {
     player.armor = (player.armor + 15.0).min(player.max_armor);
     player.ammo_shells = player.ammo_shells.max(player.max_shells / 2);
     player.ammo_plasma = player.ammo_plasma.max(player.max_plasma / 2);
+    player.ammo_rockets = player.ammo_rockets.max(player.max_rockets / 2);
 }
 
 /// Choose offer `index` (0..3): applies it, patches the player, resumes play.
@@ -246,7 +271,7 @@ pub fn pick_upgrade(
     Some(id)
 }
 
-/// App Store visit: draft from the run's active 10-card catalog.
+/// App Store visit: draft from the run's active 12-card catalog.
 pub fn draft_upgrades(mut choices: ResMut<UpgradeChoices>, run: Res<RunStats>, loadout: Option<Res<RunLoadout>>) {
     let catalog = loadout.map(|l| l.catalog.clone()).unwrap_or_default();
     choices.0 = draft_choices_from_catalog(&catalog, &run.upgrades, &mut rand::rng());
@@ -317,8 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn all_fifteen_upgrades_apply() {
-        assert_eq!(UpgradeId::ALL.len(), 15);
+    fn all_seventeen_upgrades_apply() {
+        assert_eq!(UpgradeId::ALL.len(), 17);
         for id in UpgradeId::ALL {
             let (mut m, mut p, mut r) = fresh();
             let before = m.clone();
@@ -365,6 +390,7 @@ mod tests {
         apply_upgrade(UpgradeId::HighCapacityCell, &mut m, &mut p, &mut r);
         assert_eq!(p.max_shells, 68);
         assert_eq!(p.max_plasma, 270);
+        assert_eq!(p.max_rockets, 27);
         assert_eq!(m.fire_rate_mult, 1.0, "High-Capacity Cell no longer touches fire rate");
         assert!((m.pickup_mult - 1.3).abs() < 1e-6);
 
@@ -430,6 +456,8 @@ mod tests {
         assert_eq!(next_rank_preview(UpgradeId::FirewallDaemon, &m), "+0 -> +40 armor, 0 -> 6/s");
         assert_eq!(next_rank_preview(UpgradeId::SignalSpoofer, &m), "Dash @0-1b -> 4b 2.5s (6s CD)");
         assert_eq!(next_rank_preview(UpgradeId::JammerHijack, &m), "Jammer kill -> 8s 5-bar zone");
+        assert_eq!(next_rank_preview(UpgradeId::DopplerOverdrive, &m), "+30% dmg, -20% choke @20m/s");
+        assert_eq!(next_rank_preview(UpgradeId::BlastThrusters, &m), "x1.25 jmp, 120% rds, 50% self");
 
         // Ranks stack: the preview follows the current modifiers.
         let (mut m2, mut p, mut r) = fresh();
@@ -443,6 +471,41 @@ mod tests {
             apply_upgrade(UpgradeId::CopperAntenna, &mut m2, &mut p, &mut r);
         }
         assert_eq!(next_rank_preview(UpgradeId::CopperAntenna, &m2), "Min 4 bars (MAX)");
+    }
+
+    #[test]
+    fn movement_synergy_upgrades_stack() {
+        let (mut m, mut p, mut r) = fresh();
+        apply_upgrade(UpgradeId::DopplerOverdrive, &mut m, &mut p, &mut r);
+        assert!((m.doppler_damage_bonus - 0.30).abs() < 1e-6);
+        assert!((m.doppler_spread_mult - 0.80).abs() < 1e-6);
+        apply_upgrade(UpgradeId::DopplerOverdrive, &mut m, &mut p, &mut r);
+        assert!((m.doppler_damage_bonus - 0.60).abs() < 1e-6);
+        assert!((m.doppler_spread_mult - 0.64).abs() < 1e-6);
+        assert_eq!(next_rank_preview(UpgradeId::DopplerOverdrive, &m), "+90% dmg, -49% choke @20m/s");
+
+        apply_upgrade(UpgradeId::BlastThrusters, &mut m, &mut p, &mut r);
+        assert!((m.rocket_jump_mult - 1.25).abs() < 1e-6);
+        assert!((m.rocket_splash_mult - 1.20).abs() < 1e-6);
+        assert!((m.rocket_self_damage_mult - 0.50).abs() < 1e-6);
+        apply_upgrade(UpgradeId::BlastThrusters, &mut m, &mut p, &mut r);
+        assert!((m.rocket_jump_mult - 1.50).abs() < 1e-6);
+        assert!((m.rocket_splash_mult - 1.40).abs() < 1e-6);
+        assert!((m.rocket_self_damage_mult - 0.25).abs() < 1e-6);
+        assert!(UpgradeId::DopplerOverdrive.is_stackable() && UpgradeId::BlastThrusters.is_stackable());
+        assert!(UpgradeId::DopplerOverdrive.is_core() && UpgradeId::BlastThrusters.is_core());
+        assert_eq!(UpgradeId::DopplerOverdrive.icon(), "[DOP]");
+        assert_eq!(UpgradeId::BlastThrusters.icon(), "[RKT]");
+    }
+
+    #[test]
+    fn patch_tops_up_rockets() {
+        let mut p = Player { ammo_rockets: 0, ..default() };
+        between_floor_patch(&mut p);
+        assert_eq!(p.ammo_rockets, BASE_MAX_ROCKETS / 2);
+        let mut q = Player { ammo_rockets: 18, ..default() };
+        between_floor_patch(&mut q);
+        assert_eq!(q.ammo_rockets, 18, "never lowers a fuller rack");
     }
 
     #[test]
@@ -496,7 +559,7 @@ mod tests {
             let c = draft_choices_from_catalog(&catalog, &owned, &mut rng);
             assert!(!c.contains(&UpgradeId::SignalSpoofer) && !c.contains(&UpgradeId::JammerHijack), "{c:?}");
         }
-        // Empty catalog falls back to the 10 core apps.
+        // Empty catalog falls back to the 12 core apps.
         for _ in 0..200 {
             let c = draft_choices_from_catalog(&[], &[], &mut rng);
             assert!(c.iter().all(|u| u.is_core()), "{c:?}");

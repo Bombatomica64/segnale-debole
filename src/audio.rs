@@ -37,10 +37,14 @@ pub enum SfxEvent {
     BaronAlert,
     Denied,
     UpgradeSelect,
+    /// Signal-Mortar launch: pneumatic ignition thump + propellant whoosh.
+    RocketFire,
+    /// Rocket detonation: deep sub-bass boom + low-passed debris crackle.
+    RocketExplode,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 19] = [
+    pub const ALL: [SfxEvent; 21] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -60,6 +64,8 @@ impl SfxEvent {
         SfxEvent::BaronAlert,
         SfxEvent::Denied,
         SfxEvent::UpgradeSelect,
+        SfxEvent::RocketFire,
+        SfxEvent::RocketExplode,
     ];
 
     /// Playback volume (0..1).
@@ -232,6 +238,31 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
             let note = [659.25, 987.77, 1318.5][((ts / 0.12) as usize).min(2)];
             (tri(o.step(note)) * 0.5) * env(t, 0.02, 0.8)
         }),
+        SfxEvent::RocketFire => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(0.5, move |ts, t, n| {
+                // Pneumatic thump: fast downward sine kick in the first 60ms.
+                let thump = if ts < 0.09 { (o.step(140.0 - 900.0 * ts) * TAU).sin() * env(ts / 0.09, 0.05, 2.0) } else { 0.0 };
+                // Propellant whoosh: band-ish noise (high-pass via two low-passes) rising then fading.
+                let x = n.next();
+                let band = lp.run(x, 0.45) - lp2.run(x, 0.06);
+                let whoosh = band * 1.4 * env(t, 0.18, 1.3);
+                let hiss = saw(o2.step(70.0 + 60.0 * t)) * 0.12 * env(t, 0.1, 1.5);
+                thump * 0.9 + whoosh + hiss
+            })
+        }
+        SfxEvent::RocketExplode => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(1.1, move |ts, t, n| {
+                // Sub-bass boom: pitch-dropping sine with a long tail.
+                let boom = (o.step(58.0 * (1.0 - 0.55 * t) + 18.0) * TAU).sin() * env(t, 0.008, 1.8);
+                // Low-passed debris body + sparse crackle that darkens over time.
+                let body = lp.run(n.next(), 0.22 - 0.18 * t) * 1.8 * env(t, 0.004, 2.2);
+                let crack = if ts > 0.05 && n.next() > 0.9 { n.next() } else { 0.0 };
+                let crackle = lp2.run(crack, 0.5 - 0.4 * t) * 0.9 * env(t, 0.05, 1.4);
+                boom * 0.95 + body + crackle
+            })
+        }
     }
 }
 
@@ -373,5 +404,19 @@ mod tests {
         assert_eq!(synthesize_wav(SfxEvent::Shotgun), synthesize_wav(SfxEvent::Shotgun));
         assert_ne!(synthesize_wav(SfxEvent::Shotgun), synthesize_wav(SfxEvent::Plasma));
         assert_ne!(synthesize_wav(SfxEvent::Jump), synthesize_wav(SfxEvent::Bhop));
+    }
+
+    #[test]
+    fn rocket_sfx_are_distinct_and_deterministic() {
+        assert_eq!(SfxEvent::ALL.len(), 21);
+        let fire = synthesize_wav(SfxEvent::RocketFire);
+        let boom = synthesize_wav(SfxEvent::RocketExplode);
+        assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
+        assert_eq!(boom, synthesize_wav(SfxEvent::RocketExplode));
+        assert_ne!(fire, boom);
+        assert_ne!(fire, synthesize_wav(SfxEvent::Shotgun));
+        // The explosion is the long, heavy one.
+        assert!(boom.len() > fire.len());
+        assert!(boom.len() > synthesize_wav(SfxEvent::Shotgun).len());
     }
 }

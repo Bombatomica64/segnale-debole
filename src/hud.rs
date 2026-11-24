@@ -33,7 +33,7 @@ use crate::ui_kit::{
     terminal_chassis, tiled_image, ButtonStyle, PunkButtonColors, Tape, UiKitPlugin, UiKitTextures, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_DARK, IRON_MID, PUNK_RED, STEEL_BORDER, STEEL_LIGHT,
 };
 use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeChoices};
-use crate::weapons::{Weapon, WeaponState};
+use crate::weapons::{doppler_active, Weapon, WeaponState};
 
 pub const COLOR_BG: Color = INK_BLACK;
 pub const COLOR_TITLE: Color = PUNK_RED;
@@ -174,7 +174,7 @@ pub type KeyBind = (&'static [&'static str], &'static str);
 /// Field-manual rows: `(category, bindings)`.
 pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("MOVE", &[(&["WASD"], "move"), (&["MOUSE"], "look"), (&["SPACE"], "jump / hold to bhop"), (&["SHIFT"], "airplane-mode dash")]),
-    ("FIGHT", &[(&["LMB"], "fire"), (&["1", "2", "TAB", "WHEEL"], "switch shotgun / plasma")]),
+    ("FIGHT", &[(&["LMB"], "fire"), (&["1", "2", "3", "TAB", "WHEEL"], "shotgun / plasma / mortar")]),
     ("PHONE", &[(&["RMB"], "ping scan (1+ bar)"), (&["Q"], "5G overload EMP (3+ bars)"), (&["E"], "SOS uplink at the tower")]),
     ("SYSTEM", &[(&["CLICK"], "capture mouse"), (&["ESC", "P"], "pause"), (&["F9"], "debug: skip floor")]),
 ];
@@ -902,8 +902,8 @@ fn menu_keys(
 // - top-right: killfeed toasts, each on its own backing chip
 // - bottom-center: vitals panel (HP / ARMOR / STAMINA bars), the docked VEL
 //   telemetry strip above it (with its stamped `BHOP xN` tag) and the prompt
-// - bottom-right: weapon & ammo deck (active card, shell pips or plasma bar,
-//   slot chips, 5G overclock pill)
+// - bottom-right: weapon & ammo deck (active card, shell pips, plasma bar or
+//   warhead pips, 3 slot chips, 5G overclock + Doppler pills)
 // - edges: subtle dark-red Dead-Zone frame (no scanlines across the view)
 
 const PANEL_BG: Color = Color::srgba(0.085, 0.072, 0.066, 0.8);
@@ -914,6 +914,10 @@ const COLOR_HP_GREEN: Color = Color::srgb(0.16, 0.9, 0.46);
 const COLOR_ARMOR: Color = Color::srgb(0.46, 0.74, 0.88);
 pub const COLOR_GOLD: Color = Color::srgb(1.0, 0.8, 0.28);
 const COLOR_SHOTGUN: Color = Color::srgb(1.0, 0.56, 0.14);
+/// Signal-Mortar accent: warm amber-orange, hotter than the shotgun's.
+pub const COLOR_ROCKET: Color = Color::srgb(1.0, 0.4, 0.1);
+const COLOR_WARHEAD: Color = Color::srgb(0.3, 0.32, 0.34);
+const COLOR_WARHEAD_TIP: Color = Color::srgb(1.0, 0.62, 0.18);
 const COLOR_SHELL: Color = Color::srgb(0.82, 0.13, 0.09);
 const COLOR_BRASS: Color = Color::srgb(0.95, 0.72, 0.3);
 const COLOR_PIP_OFF: Color = Color::srgba(1.0, 1.0, 1.0, 0.07);
@@ -922,7 +926,61 @@ const COLOR_PIP_OFF_BORDER: Color = Color::srgba(1.0, 1.0, 1.0, 0.16);
 const TOAST_SLOTS: u8 = 5;
 /// Shell pips shown for the shotgun magazine.
 pub const SHELL_PIPS: u8 = 10;
-const DECK_WIDTH: f32 = 272.0;
+/// Warhead pips shown for the Signal-Mortar rack.
+pub const ROCKET_PIPS: u8 = 10;
+const DECK_WIDTH: f32 = 340.0;
+/// Weapon card frame (left, right, top, bottom px) and horizontal padding.
+const CARD_BORDER: (f32, f32, f32, f32) = (5.0, 1.0, 1.0, 3.0);
+const CARD_PAD_X: f32 = 12.0;
+/// Weapon title font of the card header.
+const WEAPON_TITLE_FONT: f32 = 15.0;
+/// Buff pills docked right in the card header.
+const OVERCLOCK_PILL: &str = "5G OC";
+const DOPPLER_PILL: &str = "DOPPLER";
+const PILL_FONT: f32 = 11.0;
+const PILL_PAD_X: f32 = 6.0;
+const PILL_GAP: f32 = 5.0;
+/// Slot badge metrics: frame, padding, keycap, gaps and the two font sizes.
+const SLOT_BORDER: (f32, f32, f32, f32) = (4.0, 1.0, 1.0, 2.0);
+const SLOT_GAP: f32 = 6.0;
+const SLOT_PAD_X: f32 = 5.0;
+const SLOT_INNER_GAP: f32 = 5.0;
+const SLOT_KEY_WIDTH: f32 = 13.0;
+const SLOT_LABEL_FONT: f32 = 10.0;
+const SLOT_AMMO_FONT: f32 = 13.0;
+/// Advance of the HUD's monospace face (Fira Mono) as a fraction of font size.
+#[cfg(test)]
+const MONO_ADVANCE: f32 = 0.6;
+
+/// Width (px) of `chars` monospace glyphs at `font` px.
+#[cfg(test)]
+fn mono_width(chars: usize, font: f32) -> f32 {
+    chars as f32 * font * MONO_ADVANCE
+}
+
+/// Inner (content) width of one slot badge: the deck split three ways.
+#[cfg(test)]
+fn slot_inner_width() -> f32 {
+    let n = Weapon::ALL.len() as f32;
+    (DECK_WIDTH - SLOT_GAP * (n - 1.0)) / n - SLOT_BORDER.0 - SLOT_BORDER.1 - 2.0 * SLOT_PAD_X
+}
+
+/// Width one slot badge row needs for `name` and an ammo count of `digits`.
+#[cfg(test)]
+fn slot_row_width(name: &str, digits: usize) -> f32 {
+    SLOT_KEY_WIDTH + SLOT_INNER_GAP + mono_width(name.len(), SLOT_LABEL_FONT) + SLOT_INNER_GAP + mono_width(digits, SLOT_AMMO_FONT)
+}
+
+/// Slot badge reserve color: red when dry, bone on the equipped weapon, dim otherwise.
+fn slot_ammo_color(n: u32, active: bool) -> Color {
+    if n == 0 {
+        COLOR_SIGNAL_RED
+    } else if active {
+        COLOR_TEXT
+    } else {
+        COLOR_DIM
+    }
+}
 const VITALS_WIDTH: f32 = 312.0;
 const UPLINK_WIDTH: f32 = 440.0;
 /// Height of the danger tape rails that clamp the status plate during a rush.
@@ -1131,6 +1189,7 @@ fn weapon_accent(w: Weapon) -> Color {
     match w {
         Weapon::Shotgun => COLOR_SHOTGUN,
         Weapon::Plasma => COLOR_CYAN,
+        Weapon::Rocket => COLOR_ROCKET,
     }
 }
 
@@ -1138,6 +1197,16 @@ fn weapon_title(w: Weapon) -> &'static str {
     match w {
         Weapon::Shotgun => "SHOTGUN",
         Weapon::Plasma => "PLASMA REPEATER",
+        Weapon::Rocket => "SIGNAL-MORTAR",
+    }
+}
+
+/// Short weapon-deck slot name.
+fn weapon_slot_name(w: Weapon) -> &'static str {
+    match w {
+        Weapon::Shotgun => "SHOTGUN",
+        Weapon::Plasma => "PLASMA",
+        Weapon::Rocket => "MORTAR",
     }
 }
 
@@ -1145,6 +1214,7 @@ fn ammo(p: &Player, w: Weapon) -> (u32, u32) {
     match w {
         Weapon::Shotgun => (p.ammo_shells, p.max_shells),
         Weapon::Plasma => (p.ammo_plasma, p.max_plasma),
+        Weapon::Rocket => (p.ammo_rockets, p.max_rockets),
     }
 }
 
@@ -1173,7 +1243,12 @@ enum HudText {
     WeaponName,
     AmmoCount,
     AmmoMax,
+    /// Slot badge weapon name.
     Slot(u8),
+    /// Slot badge keycap digit.
+    SlotKey(u8),
+    /// Slot badge reserve count.
+    SlotAmmo(u8),
 }
 
 /// Every HUD box (background/size/border driven), updated by one query.
@@ -1208,9 +1283,17 @@ enum HudBox {
     ShellPip(u8),
     PlasmaTrack,
     PlasmaFill,
+    RocketRow,
+    RocketPip(u8),
     WeaponCard,
     SlotChip(u8),
+    /// Keycap block of a slot badge (weapon accent while equipped).
+    SlotKey(u8),
+    /// Reserve gauge fill of a slot badge.
+    SlotFill(u8),
     OverclockPill,
+    /// Lit while Doppler Overdrive is active (20+ m/s).
+    DopplerPill,
 }
 
 fn abs_full() -> Node {
@@ -1575,8 +1658,8 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
             Node {
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
-                padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
-                border: plate_rect((5.0, 1.0, 1.0, 3.0)),
+                padding: UiRect::axes(Val::Px(CARD_PAD_X), Val::Px(8.0)),
+                border: plate_rect(CARD_BORDER),
                 ..default()
             },
             plate_border(COLOR_SHOTGUN, PANEL_EDGE),
@@ -1585,15 +1668,14 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
         .id();
     commands.spawn((
         ChildOf(card),
-        Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
+        Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, column_gap: Val::Px(8.0), min_height: Val::Px(20.0), ..default() },
         children![
-            (HudText::WeaponName, text("SHOTGUN", 15.0, COLOR_SHOTGUN)),
+            (HudText::WeaponName, text("SHOTGUN", WEAPON_TITLE_FONT, COLOR_SHOTGUN), TextLayout::no_wrap()),
+            // Buff pills dock right as one cluster, so one or both lit never
+            // shifts the title or collides with it.
             (
-                HudBox::OverclockPill,
-                Node { display: Display::None, padding: UiRect::axes(Val::Px(6.0), Val::Px(1.0)), border: UiRect::bottom(Val::Px(2.0)), ..default() },
-                BorderColor::all(INK_BLACK),
-                BackgroundColor(ACID_GREEN),
-                children![text("5G OVERCLOCK", 11.0, INK_BLACK)],
+                Node { column_gap: Val::Px(PILL_GAP), align_items: AlignItems::Center, flex_shrink: 0.0, ..default() },
+                children![buff_pill(HudBox::OverclockPill, OVERCLOCK_PILL, ACID_GREEN), buff_pill(HudBox::DopplerPill, DOPPLER_PILL, COLOR_ROCKET)],
             ),
         ],
     ));
@@ -1633,24 +1715,94 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
         BackgroundColor(COLOR_CYAN),
     ));
     spawn_ticks(&mut commands, ptrack);
-    let slots = commands.spawn((ChildOf(deck), Node { column_gap: Val::Px(6.0), ..default() })).id();
-    for i in 0..2u8 {
+    // Signal-Mortar rack: steel warhead pips with a glowing amber nose.
+    let rockets = commands
+        .spawn((
+            ChildOf(card),
+            HudBox::RocketRow,
+            Node { display: Display::None, column_gap: Val::Px(4.0), height: Val::Px(14.0), ..default() },
+        ))
+        .id();
+    for i in 0..ROCKET_PIPS {
         commands.spawn((
-            ChildOf(slots),
-            HudBox::SlotChip(i),
-            Node {
-                flex_grow: 1.0,
-                flex_basis: Val::Px(0.0),
-                justify_content: JustifyContent::Center,
-                padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
-                border: plate_rect((4.0, 1.0, 1.0, 2.0)),
-                ..default()
-            },
-            plate_border(PANEL_EDGE, PANEL_EDGE),
-            BackgroundColor(PANEL_BG),
-            children![(HudText::Slot(i), text("", 13.0, COLOR_DIM))],
+            ChildOf(rockets),
+            HudBox::RocketPip(i),
+            Node { width: Val::Px(20.0), height: Val::Px(14.0), border: UiRect::left(Val::Px(5.0)), ..default() },
+            BorderColor::all(COLOR_WARHEAD_TIP),
+            BackgroundColor(COLOR_WARHEAD),
         ));
     }
+    // Slot deck: three identical two-row telemetry badges. Row 1 is
+    // `[keycap] NAME ...... reserve` on one never-wrapping line, row 2 a thin
+    // reserve gauge, so every chip keeps the same height and alignment
+    // whatever the ammo digits are.
+    let slots = commands.spawn((ChildOf(deck), Node { column_gap: Val::Px(SLOT_GAP), ..default() })).id();
+    for i in 0..Weapon::ALL.len() as u8 {
+        let chip = commands
+            .spawn((
+                ChildOf(slots),
+                HudBox::SlotChip(i),
+                Node {
+                    flex_grow: 1.0,
+                    flex_basis: Val::Px(0.0),
+                    min_width: Val::Px(0.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(3.0),
+                    padding: UiRect::new(Val::Px(SLOT_PAD_X), Val::Px(SLOT_PAD_X), Val::Px(3.0), Val::Px(4.0)),
+                    border: plate_rect(SLOT_BORDER),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                plate_border(PANEL_EDGE, PANEL_EDGE),
+                BackgroundColor(PANEL_BG),
+            ))
+            .id();
+        commands.spawn((
+            ChildOf(chip),
+            Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, column_gap: Val::Px(SLOT_INNER_GAP), ..default() },
+            children![
+                (
+                    Node { align_items: AlignItems::Center, column_gap: Val::Px(SLOT_INNER_GAP), ..default() },
+                    children![
+                        (
+                            HudBox::SlotKey(i),
+                            Node {
+                                width: Val::Px(SLOT_KEY_WIDTH),
+                                height: Val::Px(13.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::bottom(Val::Px(2.0)),
+                                flex_shrink: 0.0,
+                                ..default()
+                            },
+                            BorderColor::all(INK_BLACK),
+                            BackgroundColor(COLOR_PIP_OFF),
+                            children![(HudText::SlotKey(i), text((i + 1).to_string(), SLOT_LABEL_FONT, COLOR_DIM), TextLayout::no_wrap())],
+                        ),
+                        (HudText::Slot(i), text("", SLOT_LABEL_FONT, COLOR_DIM), TextLayout::no_wrap()),
+                    ],
+                ),
+                (HudText::SlotAmmo(i), text("", SLOT_AMMO_FONT, COLOR_DIM), TextLayout::no_wrap()),
+            ],
+        ));
+        commands.spawn((
+            ChildOf(chip),
+            Node { width: Val::Percent(100.0), height: Val::Px(3.0), ..default() },
+            BackgroundColor(TRACK_BG),
+            children![(HudBox::SlotFill(i), Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(COLOR_PIP_OFF))],
+        ));
+    }
+}
+
+/// Stamped buff pill of the weapon card header (hidden until its buff is live).
+fn buff_pill(tag: HudBox, label: &'static str, color: Color) -> impl Bundle {
+    (
+        tag,
+        Node { display: Display::None, padding: UiRect::axes(Val::Px(PILL_PAD_X), Val::Px(1.0)), border: UiRect::bottom(Val::Px(2.0)), flex_shrink: 0.0, ..default() },
+        BorderColor::all(INK_BLACK),
+        BackgroundColor(color),
+        children![(text(label, PILL_FONT, INK_BLACK), TextLayout::no_wrap())],
+    )
 }
 
 /// Cached `(chip tag, contract tags)` of the run loadout.
@@ -1786,11 +1938,19 @@ fn update_hud(
                 COLOR_DIM
             }
             HudText::Slot(i) => {
-                let w = if i == 0 { Weapon::Shotgun } else { Weapon::Plasma };
-                let name = if i == 0 { "SHOTGUN" } else { "PLASMA" };
-                let (n, _) = ammo(p, w);
-                let _ = write!(b, "[{}] {name} {n}", i + 1);
+                let w = Weapon::ALL[i as usize];
+                b.push_str(weapon_slot_name(w));
                 if ws.current == w { weapon_accent(w) } else { COLOR_DIM }
+            }
+            HudText::SlotKey(i) => {
+                let _ = write!(b, "{}", i + 1);
+                if ws.current == Weapon::ALL[i as usize] { INK_BLACK } else { COLOR_DIM }
+            }
+            HudText::SlotAmmo(i) => {
+                let w = Weapon::ALL[i as usize];
+                let (n, _) = ammo(p, w);
+                let _ = write!(b, "{n}");
+                slot_ammo_color(n, ws.current == w)
             }
             HudText::Toast(i) => match feed.toasts.iter().rev().nth(i as usize) {
                 Some(toast) => {
@@ -1870,6 +2030,8 @@ fn update_hud_boxes(
     let shotgun = ws.current == Weapon::Shotgun;
     let (cur, max) = ammo(p, ws.current);
     let lit = lit_pips(p.ammo_shells, p.max_shells, SHELL_PIPS);
+    let rocket_lit = lit_pips(p.ammo_rockets, p.max_rockets, ROCKET_PIPS);
+    let speed = Vec2::new(p.velocity.x, p.velocity.z).length();
     let stamina = stamina_fill(p.dash_cooldown, DASH_COOLDOWN * mods.dash_cooldown_mult);
     let vel_lit = speed_segments(gauge.speed);
     let tier_color = gauge.color();
@@ -1946,19 +2108,36 @@ fn update_hud_boxes(
                 set_bg(&mut bg, if on { COLOR_SHELL } else { COLOR_PIP_OFF });
                 set_border(BorderColor::all(if on { COLOR_BRASS } else { COLOR_PIP_OFF_BORDER }));
             }
-            HudBox::PlasmaTrack => set_display(&mut node, !shotgun),
+            HudBox::PlasmaTrack => set_display(&mut node, ws.current == Weapon::Plasma),
+            HudBox::RocketRow => set_display(&mut node, ws.current == Weapon::Rocket),
+            HudBox::RocketPip(i) => {
+                let on = i < rocket_lit;
+                set_bg(&mut bg, if on { COLOR_WARHEAD } else { COLOR_PIP_OFF });
+                set_border(BorderColor::all(if on { COLOR_WARHEAD_TIP } else { COLOR_PIP_OFF_BORDER }));
+            }
             HudBox::PlasmaFill => {
                 set_width_pct(&mut node, fraction(cur as f32, max as f32) * 100.0);
                 set_bg(&mut bg, COLOR_CYAN.with_alpha(0.8 + 0.2 * (t * 4.0).sin()));
             }
             HudBox::WeaponCard => set_border(plate_border(accent, PANEL_EDGE)),
             HudBox::SlotChip(i) => {
-                let active = (i == 0) == shotgun;
-                let w = if i == 0 { Weapon::Shotgun } else { Weapon::Plasma };
+                let w = Weapon::ALL[i as usize];
+                let active = ws.current == w;
                 set_border(if active { plate_border(weapon_accent(w), weapon_accent(w).with_alpha(0.5)) } else { plate_border(PANEL_EDGE, PANEL_EDGE) });
                 set_bg(&mut bg, if active { weapon_accent(w).with_alpha(0.18) } else { PANEL_BG });
             }
+            HudBox::SlotKey(i) => {
+                let w = Weapon::ALL[i as usize];
+                set_bg(&mut bg, if ws.current == w { weapon_accent(w) } else { COLOR_PIP_OFF });
+            }
+            HudBox::SlotFill(i) => {
+                let w = Weapon::ALL[i as usize];
+                let (n, m) = ammo(p, w);
+                set_width_pct(&mut node, fraction(n as f32, m as f32) * 100.0);
+                set_bg(&mut bg, weapon_accent(w).with_alpha(if ws.current == w { 1.0 } else { 0.4 }));
+            }
             HudBox::OverclockPill => set_display(&mut node, overclock_active(signal.bars, mods.overclock_bonus)),
+            HudBox::DopplerPill => set_display(&mut node, doppler_active(speed, &mods)),
         }
     }
 }
@@ -2236,5 +2415,32 @@ mod tests {
     fn weapon_titles_and_accents_differ() {
         assert_eq!(weapon_title(Weapon::Plasma), "PLASMA REPEATER");
         assert_ne!(weapon_accent(Weapon::Shotgun), weapon_accent(Weapon::Plasma));
+        assert_eq!(weapon_title(Weapon::Rocket), "SIGNAL-MORTAR");
+        assert_eq!(weapon_accent(Weapon::Rocket), COLOR_ROCKET);
+        assert_ne!(weapon_accent(Weapon::Rocket), weapon_accent(Weapon::Shotgun));
+        assert_eq!(weapon_slot_name(Weapon::Rocket), "MORTAR");
+        assert_eq!(lit_pips(10, 20, ROCKET_PIPS), 5);
+    }
+
+    #[test]
+    fn weapon_deck_fits_on_one_line_at_720p() {
+        // Every slot badge row (keycap + name + a 3-digit reserve) fits its chip.
+        let inner = slot_inner_width();
+        for w in Weapon::ALL {
+            let need = slot_row_width(weapon_slot_name(w), 3);
+            assert!(need <= inner, "{} slot row needs {need} px of {inner}", weapon_slot_name(w));
+        }
+        // The longest weapon title clears both buff pills lit at once.
+        let card_inner = DECK_WIDTH - CARD_BORDER.0 - CARD_BORDER.1 - 2.0 * CARD_PAD_X;
+        let pills: f32 = [OVERCLOCK_PILL, DOPPLER_PILL].iter().map(|l| mono_width(l.len(), PILL_FONT) + 2.0 * PILL_PAD_X).sum::<f32>() + PILL_GAP;
+        for w in Weapon::ALL {
+            let title = mono_width(weapon_title(w).len(), WEAPON_TITLE_FONT);
+            assert!(title + 8.0 + pills <= card_inner, "{} header overflows", weapon_title(w));
+        }
+        // Reserve readout: red when dry, bright only on the equipped weapon.
+        assert_eq!(slot_ammo_color(0, true), COLOR_SIGNAL_RED);
+        assert_eq!(slot_ammo_color(0, false), COLOR_SIGNAL_RED);
+        assert_eq!(slot_ammo_color(12, true), COLOR_TEXT);
+        assert_eq!(slot_ammo_color(12, false), COLOR_DIM);
     }
 }

@@ -1,7 +1,7 @@
 //! Meta-progression: persistent player choices, unlocks and opt-in challenges.
 //!
 //! Design rule: the profile persists *options* (starter OS chips, carrier
-//! contracts, handset skins, app licenses, the 10-card active catalog) and
+//! contracts, handset skins, app licenses, the 12-card active catalog) and
 //! lifetime stats, never raw combat power. Every run still starts on Floor 1
 //! with the same 0-bar tension; a chip is a sidegrade with a real trade-off.
 //!
@@ -29,7 +29,7 @@ use crate::state::{start_run, AppState, PlayerModifiers, RunStats, UpgradeId};
 /// Current on-disk profile schema.
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 /// Cards in the active App Store catalog drafted from during a run.
-pub const ACTIVE_CATALOG_SIZE: usize = 10;
+pub const ACTIVE_CATALOG_SIZE: usize = 12;
 /// Runs kept in [`PlayerProfile::history`].
 pub const RUN_HISTORY_LEN: usize = 8;
 /// "5G Express" feat threshold (seconds of `Playing` time).
@@ -425,7 +425,7 @@ impl HandsetSkin {
 // ---------------------------------------------------------------------------
 
 impl UpgradeId {
-    /// The 10 core apps every profile owns from the start.
+    /// The 12 core apps every profile owns from the start.
     pub fn is_core(self) -> bool {
         self.unlock_feat().is_none()
     }
@@ -447,12 +447,14 @@ impl UpgradeId {
             | UpgradeId::EmpOvercharge
             | UpgradeId::AirplaneModePhase
             | UpgradeId::HighCapacityCell
-            | UpgradeId::SubGhzPenetration => None,
+            | UpgradeId::SubGhzPenetration
+            | UpgradeId::DopplerOverdrive
+            | UpgradeId::BlastThrusters => None,
         }
     }
 }
 
-/// The default active catalog: the 10 core apps in declaration order.
+/// The default active catalog: the 12 core apps in declaration order.
 pub fn default_catalog() -> Vec<UpgradeId> {
     UpgradeId::ALL.into_iter().filter(|u| u.is_core()).collect()
 }
@@ -649,7 +651,7 @@ impl PlayerProfile {
         self.active_contracts.contains(&c)
     }
 
-    /// Distinct unlocked apps of the stored catalog (order kept, capped at 10).
+    /// Distinct unlocked apps of the stored catalog (order kept, capped at 12).
     pub fn normalized_catalog(&self) -> Vec<UpgradeId> {
         let mut out: Vec<UpgradeId> = Vec::new();
         for &id in &self.active_catalog {
@@ -1062,12 +1064,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_ten_core_and_five_signature_apps() {
-        assert_eq!(UpgradeId::ALL.len(), 15);
+    fn catalog_has_twelve_core_and_five_signature_apps() {
+        assert_eq!(UpgradeId::ALL.len(), 17);
         let core = default_catalog();
         assert_eq!(core.len(), ACTIVE_CATALOG_SIZE);
         assert_eq!(core.first(), Some(&UpgradeId::DualSimBarrels));
-        assert_eq!(core.last(), Some(&UpgradeId::SubGhzPenetration));
+        assert_eq!(core.last(), Some(&UpgradeId::BlastThrusters));
+        assert!(core.contains(&UpgradeId::DopplerOverdrive));
         let sig: Vec<UpgradeId> = UpgradeId::ALL.into_iter().filter(|u| !u.is_core()).collect();
         assert_eq!(
             sig,
@@ -1194,7 +1197,7 @@ mod tests {
         p.unlocked_feats.insert(FeatId::SignalScout);
         assert!(!p.toggle_catalog_app(UpgradeId::SignalSpoofer), "catalog full");
         assert!(p.toggle_catalog_app(UpgradeId::DualSimBarrels), "remove");
-        assert_eq!(p.normalized_catalog().len(), 9);
+        assert_eq!(p.normalized_catalog().len(), ACTIVE_CATALOG_SIZE - 1);
         assert!(p.toggle_catalog_app(UpgradeId::SignalSpoofer), "swap in");
         let eff = p.effective_catalog();
         assert_eq!(eff.len(), ACTIVE_CATALOG_SIZE);
@@ -1207,10 +1210,10 @@ mod tests {
         assert_eq!(eff.len(), ACTIVE_CATALOG_SIZE);
         assert!(eff.contains(&UpgradeId::SignalSpoofer));
         assert!(!eff.contains(&UpgradeId::JammerHijack));
-        // Padding is deterministic core-first: the 9 lowest core apps besides Copper Antenna.
+        // Padding is deterministic core-first: the 11 lowest core apps besides Copper Antenna.
         let pad: Vec<UpgradeId> = eff.iter().copied().filter(|u| u.is_core()).collect();
-        assert_eq!(pad.len(), 9);
-        assert!(!pad.contains(&UpgradeId::SubGhzPenetration));
+        assert_eq!(pad.len(), 11);
+        assert!(!pad.contains(&UpgradeId::BlastThrusters));
         assert_eq!(p.effective_catalog(), eff, "deterministic");
 
         // Oversized catalogs are capped.

@@ -1530,8 +1530,8 @@ fn enemy_deaths(
         // Drops.
         let ground = tf.translation.with_y(tf.translation.y - if e.kind.flying() { 2.0 } else { 0.0 });
         let drops: Vec<PickupKind> = match e.kind {
-            EnemyKind::HellBaron => vec![PickupKind::Health, PickupKind::Armor, PickupKind::Shells, PickupKind::Plasma],
-            EnemyKind::JammerFiend => vec![PickupKind::Plasma, PickupKind::Armor],
+            EnemyKind::HellBaron => vec![PickupKind::Health, PickupKind::Armor, PickupKind::Shells, PickupKind::Plasma, PickupKind::Rockets],
+            EnemyKind::JammerFiend => vec![PickupKind::Plasma, PickupKind::Armor, PickupKind::Rockets],
             _ => {
                 let roll: f32 = rng.random();
                 if roll < 0.22 {
@@ -1540,6 +1540,8 @@ fn enemy_deaths(
                     vec![PickupKind::Plasma]
                 } else if roll < 0.52 {
                     vec![PickupKind::Health]
+                } else if roll < 0.58 {
+                    vec![PickupKind::Rockets]
                 } else {
                     vec![]
                 }

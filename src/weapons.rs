@@ -1,5 +1,6 @@
-//! Right hand: Mars Pump Shotgun (hitscan pellets) + UAC Plasma Repeater (3D
-//! bolts). Left hand: tactical smartphone viewmodel with a live signal screen.
+//! Right hand: Mars Pump Shotgun (hitscan pellets), UAC Plasma Repeater (3D
+//! bolts) and the Signal-Mortar rocket launcher (splash + Quake rocket jumps).
+//! Left hand: tactical smartphone viewmodel with a live signal screen.
 //! Also destructible Demon Jammers and pickups.
 //!
 //! Viewmodels live on [`OVERLAY_LAYER`], drawn by a second camera (child of the
@@ -26,8 +27,8 @@ use crate::level::{Cell, CullableLight, DemonJammer, JammerCore, LevelEntity, Le
 use crate::mesh_batch::{MaterialBatches, ParentedBatches};
 use crate::meta::{HandsetSkin, RunLoadout, SkinSlot};
 use crate::phone_screen::PhoneScreenTexture;
-use crate::physics::raycast_grid;
-use crate::player::{live_eye_pose, smooth_factor, CursorCaptured, Player, PlayerCamera};
+use crate::physics::{has_line_of_sight, raycast_grid};
+use crate::player::{live_eye_pose, smooth_factor, CursorCaptured, Player, PlayerCamera, AIR_SPEED_HARD_CAP};
 use crate::signal::{overclock_factor, SignalState};
 use crate::state::{GameSet, PlayerModifiers, RunStats};
 
@@ -43,6 +44,43 @@ pub const SWAP_SECS: f32 = 0.32;
 pub const TRICKLE_SECS: f32 = 1.2;
 pub const PICKUP_RADIUS: f32 = 1.5;
 
+// --- Signal-Mortar (rocket launcher) -----------------------------------------
+pub const ROCKET_COOLDOWN: f32 = 0.85;
+pub const ROCKET_SPEED: f32 = 34.0;
+pub const ROCKET_DIRECT_DAMAGE: f32 = 115.0;
+pub const ROCKET_SPLASH_DAMAGE: f32 = 95.0;
+pub const ROCKET_SPLASH_RADIUS: f32 = 5.5;
+/// Fraction of splash damage the player takes from their own rocket.
+pub const ROCKET_SELF_DAMAGE_FRAC: f32 = 0.15;
+/// Upward rocket-jump boost (m/s) at point-blank.
+pub const ROCKET_JUMP_UP: f32 = 13.0;
+/// Radial horizontal rocket-jump push (m/s) at point-blank.
+pub const ROCKET_JUMP_PUSH: f32 = 16.0;
+pub const ROCKET_LIFE: f32 = 3.0;
+/// Seconds between rocket smoke/ember trail puffs.
+pub const ROCKET_TRAIL_SECS: f32 = 0.04;
+/// Aim distance under which a rocket starts on the eye ray (never behind geometry).
+pub const ROCKET_CLOSE_AIM: f32 = 2.0;
+
+// --- Doppler Overdrive ---------------------------------------------------------
+/// Horizontal speed (m/s) above which Doppler Overdrive kicks in.
+pub const DOPPLER_SPEED_THRESHOLD: f32 = 20.0;
+
+/// Whether Doppler Overdrive is live at this horizontal speed.
+pub fn doppler_active(speed: f32, mods: &PlayerModifiers) -> bool {
+    mods.doppler_damage_bonus > 0.0 && speed >= DOPPLER_SPEED_THRESHOLD
+}
+
+/// Weapon damage multiplier from Doppler Overdrive (1.0 when inactive).
+pub fn doppler_damage_mult(speed: f32, mods: &PlayerModifiers) -> f32 {
+    if doppler_active(speed, mods) { 1.0 + mods.doppler_damage_bonus } else { 1.0 }
+}
+
+/// Shotgun spread multiplier from Doppler Overdrive (1.0 when inactive).
+pub fn doppler_spread_mult(speed: f32, mods: &PlayerModifiers) -> f32 {
+    if doppler_active(speed, mods) { mods.doppler_spread_mult } else { 1.0 }
+}
+
 /// Weapons, apps and projectiles that deal damage; deaths run after this set.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CombatDamage;
@@ -52,26 +90,44 @@ pub enum Weapon {
     #[default]
     Shotgun,
     Plasma,
+    Rocket,
 }
 
 impl Weapon {
-    pub fn other(self) -> Weapon {
+    pub const ALL: [Weapon; 3] = [Weapon::Shotgun, Weapon::Plasma, Weapon::Rocket];
+
+    pub fn index(self) -> usize {
         match self {
-            Weapon::Shotgun => Weapon::Plasma,
-            Weapon::Plasma => Weapon::Shotgun,
+            Weapon::Shotgun => 0,
+            Weapon::Plasma => 1,
+            Weapon::Rocket => 2,
         }
+    }
+    /// Next weapon in the deck (wraps): Shotgun -> Plasma -> Rocket -> Shotgun.
+    pub fn next(self) -> Weapon {
+        Weapon::ALL[(self.index() + 1) % Weapon::ALL.len()]
+    }
+    /// Previous weapon in the deck (wraps).
+    pub fn prev(self) -> Weapon {
+        Weapon::ALL[(self.index() + Weapon::ALL.len() - 1) % Weapon::ALL.len()]
     }
     pub fn base_cooldown(self) -> f32 {
         match self {
             Weapon::Shotgun => SHOTGUN_COOLDOWN,
             Weapon::Plasma => PLASMA_COOLDOWN,
+            Weapon::Rocket => ROCKET_COOLDOWN,
         }
     }
     pub fn has_ammo(self, p: &Player) -> bool {
         match self {
             Weapon::Shotgun => p.ammo_shells > 0,
             Weapon::Plasma => p.ammo_plasma > 0,
+            Weapon::Rocket => p.ammo_rockets > 0,
         }
+    }
+    /// The first other weapon with ammo, scanning `next()` then `next().next()`.
+    pub fn auto_swap_target(self, p: &Player) -> Option<Weapon> {
+        [self.next(), self.next().next()].into_iter().find(|w| *w != self && w.has_ammo(p))
     }
 }
 
@@ -83,6 +139,8 @@ pub fn fire_cooldown(w: Weapon, mods: &PlayerModifiers, bars: u8) -> f32 {
 #[derive(Resource, Debug, Clone, Default)]
 pub struct WeaponState {
     pub current: Weapon,
+    /// Weapon being lowered during a swap (shown for the first half of it).
+    pub previous: Weapon,
     pub cooldown: f32,
     /// Remaining swap animation; the model switches at the halfway point.
     pub swap_timer: f32,
@@ -99,15 +157,23 @@ pub struct WeaponState {
 impl WeaponState {
     /// Weapon whose model is on screen (old one during the lowering half of a swap).
     pub fn displayed(&self) -> Weapon {
-        if self.swap_timer > SWAP_SECS * 0.5 { self.current.other() } else { self.current }
+        if self.swap_timer > SWAP_SECS * 0.5 { self.previous } else { self.current }
     }
 
     pub fn switch_to(&mut self, w: Weapon) -> bool {
         if w == self.current {
             return false;
         }
+        // Mid-swap re-targets keep lowering whatever is actually on screen
+        // without popping back to the raised pose.
+        self.previous = self.displayed();
         self.current = w;
-        self.swap_timer = SWAP_SECS;
+        let half = SWAP_SECS * 0.5;
+        self.swap_timer = if self.swap_timer > 0.0 {
+            half + (self.swap_timer - half).abs()
+        } else {
+            SWAP_SECS
+        };
         self.cooldown = self.cooldown.max(SWAP_SECS * 0.6);
         true
     }
@@ -123,8 +189,10 @@ pub enum HitTarget {
 }
 
 /// Jammer hit volumes relative to its base.
+pub const JAMMER_SPHERES: [(f32, f32); 3] = [(0.5, 0.5), (1.3, 0.5), (2.7, 0.8)];
+
 pub fn jammer_ray_hit(base: Vec3, origin: Vec3, dir: Vec3) -> Option<f32> {
-    [(0.5, 0.5), (1.3, 0.5), (2.7, 0.8)]
+    JAMMER_SPHERES
         .iter()
         .filter_map(|&(h, r)| ray_sphere(origin, dir, base + Vec3::Y * h, r))
         .reduce(f32::min)
@@ -218,11 +286,123 @@ pub fn knockback_scale(kind: EnemyKind) -> f32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectileKind {
+    #[default]
+    Plasma,
+    Rocket,
+}
+
 #[derive(Component, Debug, Clone)]
 pub struct PlayerProjectile {
+    pub kind: ProjectileKind,
     pub vel: Vec3,
+    /// Base damage (direct hit for rockets) before `damage_mult`.
     pub damage: f32,
     pub life: f32,
+    /// Doppler Overdrive multiplier captured at fire time (enemy damage only).
+    pub damage_mult: f32,
+    /// Seconds until the next trail puff (rockets).
+    pub trail: f32,
+}
+
+impl PlayerProjectile {
+    pub fn plasma(vel: Vec3, damage_mult: f32) -> Self {
+        PlayerProjectile { kind: ProjectileKind::Plasma, vel, damage: PLASMA_DAMAGE, life: 2.0, damage_mult, trail: 0.0 }
+    }
+    pub fn rocket(vel: Vec3, damage_mult: f32) -> Self {
+        PlayerProjectile { kind: ProjectileKind::Rocket, vel, damage: ROCKET_DIRECT_DAMAGE, life: ROCKET_LIFE, damage_mult, trail: 0.0 }
+    }
+}
+
+/// Linear splash falloff: 1 at the blast point, 0 at `radius` and beyond.
+pub fn splash_falloff(dist: f32, radius: f32) -> f32 {
+    if radius <= 0.0 { 0.0 } else { (1.0 - dist / radius).clamp(0.0, 1.0) }
+}
+
+/// Distance from a blast to the nearest hit sphere surface of a target.
+pub fn splash_distance(blast: Vec3, root: Vec3, spheres: &[(f32, f32)]) -> f32 {
+    spheres
+        .iter()
+        .map(|&(h, r)| ((root + Vec3::Y * h).distance(blast) - r).max(0.0))
+        .reduce(f32::min)
+        .unwrap_or_else(|| root.distance(blast))
+}
+
+/// Splash damage of a rocket on a non-direct-hit target `dist` away.
+pub fn rocket_splash_damage(dist: f32, radius: f32, damage_mult: f32) -> f32 {
+    ROCKET_SPLASH_DAMAGE * splash_falloff(dist, radius) * damage_mult
+}
+
+/// Effective rocket splash radius with Blast Thrusters.
+pub fn rocket_splash_radius(mods: &PlayerModifiers) -> f32 {
+    ROCKET_SPLASH_RADIUS * mods.rocket_splash_mult
+}
+
+/// The player's share of their own rocket blast.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RocketJump {
+    /// Self-damage before armor (forgiving ~15% of splash).
+    pub self_damage: f32,
+    /// Velocity impulse (m/s) added to the player.
+    pub impulse: Vec3,
+    pub falloff: f32,
+}
+
+/// Quake rocket jump: self-damage and launch impulse for a blast at `blast`
+/// on a player whose feet are at `player_pos` (`None` = out of range).
+pub fn compute_rocket_jump(player_pos: Vec3, blast: Vec3, splash_radius: f32, mods: &PlayerModifiers) -> Option<RocketJump> {
+    let center = player_pos + Vec3::Y * 0.9;
+    let d = center - blast;
+    let dist = d.length();
+    if dist > splash_radius {
+        return None;
+    }
+    let falloff = splash_falloff(dist, splash_radius);
+    // Scale horizontal thrust by the horizontal component of the 3D blast
+    // vector so steep foot shots launch predominantly upward while wall/rear
+    // blasts deliver full sideways/forward kick.
+    let horiz = if dist > 1e-4 { Vec2::new(d.x, d.z) / dist } else { Vec2::ZERO };
+    let k = falloff * mods.rocket_jump_mult;
+    let impulse = Vec3::new(horiz.x * ROCKET_JUMP_PUSH * k, ROCKET_JUMP_UP * k, horiz.y * ROCKET_JUMP_PUSH * k);
+    let self_damage = ROCKET_SPLASH_DAMAGE * falloff * ROCKET_SELF_DAMAGE_FRAC * mods.rocket_self_damage_mult;
+    Some(RocketJump { self_damage, impulse, falloff })
+}
+
+/// Apply a rocket jump: damage through armor / invuln, add the launch impulse
+/// (horizontal clamped to the hard cap so the CPMA over-cap bleed carries it)
+/// and detach from the ground. Returns the HP lost.
+pub fn apply_rocket_jump(player: &mut Player, jump: &RocketJump) -> f32 {
+    let lost = player.apply_damage(jump.self_damage);
+    let mut v = player.velocity + jump.impulse;
+    let h = Vec2::new(v.x, v.z);
+    if h.length() > AIR_SPEED_HARD_CAP {
+        let h = h.normalize() * AIR_SPEED_HARD_CAP;
+        v.x = h.x;
+        v.z = h.y;
+    }
+    player.velocity = v;
+    if player.velocity.y > 0.5 {
+        player.grounded = false;
+        player.coyote_timer = 0.0;
+    }
+    lost
+}
+
+/// Where a rocket starts and which way it flies. Starts at the muzzle unless
+/// the aim point is point-blank or the eye->muzzle segment is blocked, then
+/// it starts just in front of the eye on the aim ray, so it can never spawn
+/// behind a wall or under the floor.
+pub fn rocket_launch(grid: &LevelGrid, origin: Vec3, fwd: Vec3, muzzle: Vec3, aim_dist: f32) -> (Vec3, Vec3) {
+    let to_muzzle = muzzle - origin;
+    let blocked = raycast_grid(grid, origin, to_muzzle, to_muzzle.length() + 0.15).is_some();
+    if aim_dist <= ROCKET_CLOSE_AIM || blocked {
+        let start = origin + fwd * (aim_dist * 0.25).min(0.15);
+        (start, fwd)
+    } else {
+        let aim = origin + fwd * aim_dist;
+        (muzzle, (aim - muzzle).normalize_or(fwd))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +415,11 @@ pub enum PickupKind {
     Armor,
     Shells,
     Plasma,
+    Rockets,
 }
 
 impl PickupKind {
-    pub const ALL: [PickupKind; 4] = [PickupKind::Health, PickupKind::Armor, PickupKind::Shells, PickupKind::Plasma];
+    pub const ALL: [PickupKind; 5] = [PickupKind::Health, PickupKind::Armor, PickupKind::Shells, PickupKind::Plasma, PickupKind::Rockets];
 
     pub fn index(self) -> usize {
         match self {
@@ -246,6 +427,7 @@ impl PickupKind {
             PickupKind::Armor => 1,
             PickupKind::Shells => 2,
             PickupKind::Plasma => 3,
+            PickupKind::Rockets => 4,
         }
     }
 }
@@ -257,6 +439,7 @@ impl PickupKind {
             PickupKind::Armor => 25.0,
             PickupKind::Shells => 8.0,
             PickupKind::Plasma => 40.0,
+            PickupKind::Rockets => 4.0,
         }
     }
     pub fn label(self) -> &'static str {
@@ -265,6 +448,7 @@ impl PickupKind {
             PickupKind::Armor => "ARMOR",
             PickupKind::Shells => "SHELLS",
             PickupKind::Plasma => "PLASMA CELL",
+            PickupKind::Rockets => "ROCKETS",
         }
     }
 }
@@ -300,6 +484,11 @@ pub fn apply_pickup(kind: PickupKind, p: &mut Player, mods: &PlayerModifiers) ->
             p.ammo_plasma = (p.ammo_plasma + amt.round() as u32).min(p.max_plasma);
             (p.ammo_plasma - before) as f32
         }
+        PickupKind::Rockets => {
+            let before = p.ammo_rockets;
+            p.ammo_rockets = (p.ammo_rockets + amt.round() as u32).min(p.max_rockets).max(before);
+            (p.ammo_rockets - before) as f32
+        }
     }
 }
 
@@ -314,9 +503,13 @@ pub struct PickupAssets {
     pub brass: Handle<StandardMaterial>,
     pub plasma: Handle<StandardMaterial>,
     pub steel: Handle<StandardMaterial>,
+    /// Glowing amber warhead tip of the rocket crate.
+    pub warhead: Handle<StandardMaterial>,
+    /// Hazard-striped olive rocket crate.
+    pub crate_olive: Handle<StandardMaterial>,
     /// Per-kind models baked at startup: one merged mesh per material
     /// (indexed by [`PickupKind::index`]).
-    pub models: [Vec<(Handle<Mesh>, Handle<StandardMaterial>)>; 4],
+    pub models: [Vec<(Handle<Mesh>, Handle<StandardMaterial>)>; 5],
 }
 
 #[derive(Component)]
@@ -332,6 +525,7 @@ pub fn pickup_light(kind: PickupKind) -> Color {
         PickupKind::Armor => Color::srgb(0.2, 1.0, 0.4),
         PickupKind::Shells => Color::srgb(1.0, 0.6, 0.2),
         PickupKind::Plasma => Color::srgb(0.2, 0.9, 1.0),
+        PickupKind::Rockets => Color::srgb(1.0, 0.5, 0.12),
     }
 }
 
@@ -374,6 +568,22 @@ fn pickup_parts(a: &PickupAssets, kind: PickupKind) -> (Color, Vec<PickupPart>) 
                 (a.cyl.clone(), a.steel.clone(), Vec3::new(0.0, -0.24, 0.0), Vec3::new(0.19, 0.07, 0.19)),
             ],
         ),
+        PickupKind::Rockets => {
+            // Open olive crate with two hazard bands, cradling two upright
+            // warheads (steel casing + glowing amber nose + stubby fins).
+            let mut parts = vec![
+                (a.cube.clone(), a.crate_olive.clone(), Vec3::new(0.0, -0.17, 0.0), Vec3::new(0.52, 0.16, 0.3)),
+                (a.cube.clone(), a.shell.clone(), Vec3::new(-0.18, -0.17, 0.0), Vec3::new(0.05, 0.165, 0.305)),
+                (a.cube.clone(), a.shell.clone(), Vec3::new(0.18, -0.17, 0.0), Vec3::new(0.05, 0.165, 0.305)),
+            ];
+            for x in [-0.12f32, 0.12] {
+                parts.push((a.cyl.clone(), a.steel.clone(), Vec3::new(x, 0.04, 0.0), Vec3::new(0.075, 0.34, 0.075)));
+                parts.push((a.cyl.clone(), a.warhead.clone(), Vec3::new(x, 0.26, 0.0), Vec3::new(0.06, 0.1, 0.06)));
+                parts.push((a.cube.clone(), a.brass.clone(), Vec3::new(x, -0.06, 0.0), Vec3::new(0.2, 0.06, 0.02)));
+                parts.push((a.cube.clone(), a.brass.clone(), Vec3::new(x, -0.06, 0.0), Vec3::new(0.02, 0.06, 0.2)));
+            }
+            (Color::srgb(1.0, 0.5, 0.12), parts)
+        }
     }
 }
 
@@ -420,6 +630,8 @@ fn create_pickup_assets(mut commands: Commands, mut materials: ResMut<Assets<Sta
         brass: materials.add(glow(Color::srgb(0.9, 0.7, 0.2), LinearRgba::rgb(1.2, 0.8, 0.1))),
         plasma: materials.add(glow(Color::srgb(0.3, 0.9, 1.0), LinearRgba::rgb(0.5, 5.0, 7.0))),
         steel: materials.add(StandardMaterial { base_color: Color::srgb(0.3, 0.32, 0.35), metallic: 0.8, perceptual_roughness: 0.35, ..default() }),
+        warhead: materials.add(glow(Color::srgb(1.0, 0.55, 0.12), LinearRgba::rgb(6.0, 2.4, 0.3))),
+        crate_olive: materials.add(StandardMaterial { base_color: Color::srgb(0.24, 0.27, 0.16), perceptual_roughness: 0.75, ..default() }),
         models: Default::default(),
     };
     let src_cube = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
@@ -437,13 +649,16 @@ fn create_pickup_assets(mut commands: Commands, mut materials: ResMut<Assets<Sta
 
 /// Floor loot: a pickup in the middle of a few bunker rooms.
 pub fn floor_pickup_plan(grid: &LevelGrid) -> Vec<(PickupKind, IVec2)> {
-    let kinds = [PickupKind::Shells, PickupKind::Health, PickupKind::Plasma, PickupKind::Armor];
+    // Floors carry only a handful of loot spots: odd floors lead with shells,
+    // even floors with a rocket crate (the between-floor patch tops shells up).
+    let (lead, second) = if grid.floor.is_multiple_of(2) { (PickupKind::Rockets, PickupKind::Shells) } else { (PickupKind::Shells, PickupKind::Rockets) };
+    let kinds = [lead, PickupKind::Health, second, PickupKind::Plasma, PickupKind::Armor];
     grid.rooms
         .iter()
         .skip(1) // rooms[0] is the atrium
         .map(|r| r.center())
         .filter(|&c| matches!(grid.cell(c), Cell::Floor { .. }) && c != grid.spawn && c != grid.tower && !grid.jammers.contains(&c))
-        .take(4 + grid.floor as usize / 2)
+        .take(5 + grid.floor as usize / 2)
         .enumerate()
         .map(|(i, c)| (kinds[i % kinds.len()], c))
         .collect()
@@ -468,6 +683,9 @@ fn update_pickups(
     mut spins: Query<&mut Transform, (With<PickupSpin>, Without<Player>, Without<Pickup>)>,
 ) {
     let Ok((ptf, mut player)) = players.single_mut() else { return };
+    if player.is_dead() {
+        return;
+    }
     let dt = time.delta_secs();
     for (e, mut pk, mut tf, children) in &mut pickups {
         pk.phase += dt;
@@ -632,6 +850,8 @@ fn spawn_viewmodels(
     let flash_fire = glow(&mut materials, Color::srgb(1.0, 0.65, 0.2), LinearRgba::rgb(16.0, 6.0, 0.8));
     let flash_cyan = glow(&mut materials, Color::srgb(0.55, 1.0, 1.0), LinearRgba::rgb(4.0, 16.0, 20.0));
     let flash_cyan_halo = materials.add(additive_glow(Color::srgb(0.2, 0.92, 1.0), 0.65));
+    let warhead_glow = glow(&mut materials, Color::srgb(1.0, 0.62, 0.18), LinearRgba::rgb(9.0, 3.6, 0.5));
+    let flash_amber_halo = materials.add(additive_glow(Color::srgb(1.0, 0.5, 0.1), 0.6));
     let coil = materials.add(StandardMaterial { base_color: Color::srgb(0.35, 1.0, 1.0), emissive: LinearRgba::rgb(0.8, 6.0, 8.5), unlit: true, ..default() });
     let led = materials.add(StandardMaterial { base_color: Color::WHITE, emissive: LinearRgba::rgb(6.0, 1.0, 0.8), unlit: true, ..default() });
     let screen = materials.add(StandardMaterial {
@@ -816,6 +1036,66 @@ fn spawn_viewmodels(
     vb.part(pl_flash, &src.sphere, &flash_cyan_halo, Vec3::ZERO, Vec3::splat(0.095), id);
     vb.part(pl_flash, &src.thin_ring, &flash_cyan, Vec3::new(0.0, 0.0, -0.01), Vec3::new(0.075, 0.015, 0.075), rx);
 
+    // ---- Weapon 3: Signal-Mortar (chunky industrial Mars rocket tube) ----
+    let rk = commands.spawn((ChildOf(wroot), GunModel(Weapon::Rocket), Transform::default(), Visibility::Hidden)).id();
+    // Main launch tube + dark titanium barrel shroud + heavy muzzle collar & bore.
+    vb.part(rk, &src.cyl, &titanium, Vec3::new(0.0, 0.012, -0.20), Vec3::new(0.052, 0.62, 0.052), rx);
+    vb.part(rk, &src.cyl, &dark_steel, Vec3::new(0.0, 0.012, -0.43), Vec3::new(0.059, 0.20, 0.059), rx);
+    vb.part(rk, &src.cyl, &heat_metal, Vec3::new(0.0, 0.012, -0.535), Vec3::new(0.066, 0.045, 0.066), rx);
+    vb.part(rk, &src.cyl, &grip, Vec3::new(0.0, 0.012, -0.559), Vec3::new(0.044, 0.008, 0.044), rx);
+    for k in 0..4 {
+        let a = k as f32 * TAU / 4.0 + std::f32::consts::FRAC_PI_4;
+        vb.part(rk, &src.cube, &dark_steel, Vec3::new(a.cos() * 0.062, 0.012 + a.sin() * 0.062, -0.43), Vec3::new(0.012, 0.012, 0.18), Quat::from_rotation_z(a));
+    }
+    // Rear exhaust bell + dark venturi.
+    vb.part(rk, &src.cyl, &steel, Vec3::new(0.0, 0.012, 0.125), Vec3::new(0.06, 0.05, 0.06), rx);
+    vb.part(rk, &src.cyl, &grip, Vec3::new(0.0, 0.012, 0.151), Vec3::new(0.046, 0.006, 0.046), rx);
+    // Hazard-striped casing bands.
+    for k in 0..5 {
+        let m = if k % 2 == 0 { &hazard } else { &dark_steel };
+        vb.part(rk, &src.cyl, m, Vec3::new(0.0, 0.012, -0.30 + k as f32 * 0.04), Vec3::new(0.0545, 0.02, 0.0545), rx);
+    }
+    // Glowing amber warhead chamber: dark cradle on top with a lit window + side port.
+    vb.part(rk, &src.cube, &dark_steel, Vec3::new(0.0, 0.058, -0.05), Vec3::new(0.05, 0.03, 0.15), id);
+    vb.part(rk, &src.cyl, &warhead_glow, Vec3::new(0.0, 0.066, -0.05), Vec3::new(0.017, 0.12, 0.017), rx);
+    vb.part(rk, &src.cube, &warhead_glow, Vec3::new(0.054, 0.012, -0.06), Vec3::new(0.006, 0.026, 0.09), id);
+    vb.part(rk, &src.cube, &warhead_glow, Vec3::new(-0.054, 0.012, -0.06), Vec3::new(0.006, 0.026, 0.09), id);
+    // Rear optical sight frame + amber reticle.
+    for x in [-0.024f32, 0.024] {
+        vb.part(rk, &src.cube, &dark_steel, Vec3::new(x, 0.098, 0.03), Vec3::new(0.007, 0.05, 0.03), id);
+    }
+    vb.part(rk, &src.cube, &dark_steel, Vec3::new(0.0, 0.122, 0.03), Vec3::new(0.055, 0.007, 0.03), id);
+    vb.part(rk, &src.sphere, &warhead_glow, Vec3::new(0.0, 0.098, 0.028), Vec3::splat(0.0045), id);
+    vb.part(rk, &src.sphere, &sight_red, Vec3::new(0.0, 0.07, -0.53), Vec3::splat(0.005), id);
+    // Braced stabilizer rails under the tube + cross braces + bolts.
+    for x in [-0.052f32, 0.052] {
+        vb.part(rk, &src.cube, &steel, Vec3::new(x, -0.038, -0.25), Vec3::new(0.01, 0.014, 0.42), id);
+    }
+    for z in [-0.42f32, -0.25, -0.08] {
+        vb.part(rk, &src.cube, &brushed, Vec3::new(0.0, -0.038, z), Vec3::new(0.114, 0.01, 0.018), id);
+        for x in [-0.058f32, 0.058] {
+            vb.part(rk, &src.cyl, &bolt_silver, Vec3::new(x, -0.038, z), Vec3::new(0.005, 0.004, 0.005), rz);
+        }
+    }
+    // Front vertical grip + rear pistol grip + trigger guard + trigger.
+    vb.part(rk, &src.cap, &grip, Vec3::new(0.0, -0.09, -0.30), Vec3::new(0.034, 0.07, 0.04), Quat::from_rotation_x(0.12));
+    vb.part(rk, &src.cap, &grip, Vec3::new(0.0, -0.095, 0.035), Vec3::new(0.046, 0.072, 0.052), Quat::from_rotation_x(-0.32));
+    vb.part(rk, &src.cube, &dark_steel, Vec3::new(0.0, -0.064, -0.03), Vec3::new(0.014, 0.006, 0.075), id);
+    vb.part(rk, &src.cube, &steel, Vec3::new(0.0, -0.05, -0.01), Vec3::new(0.006, 0.022, 0.01), Quat::from_rotation_x(0.35));
+    // Gloved right hand + armored cuff.
+    vb.part(rk, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
+    vb.part(rk, &src.cube, &glove_plate, Vec3::new(0.036, -0.096, 0.03), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.28));
+    vb.part(rk, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
+    vb.part(rk, &src.cyl, &glove_plate, Vec3::new(0.048, -0.155, 0.135), Vec3::new(0.052, 0.036, 0.052), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
+    // Fiery mortar muzzle flash (cone + hot core + additive halo + ring).
+    let rk_flash = commands
+        .spawn((ChildOf(rk), MuzzleFlash(Weapon::Rocket), Transform::from_xyz(0.0, 0.012, -0.60), Visibility::Hidden))
+        .id();
+    vb.part(rk_flash, &src.cone, &flash_fire, Vec3::new(0.0, 0.0, -0.06), Vec3::new(0.06, 0.16, 0.06), Quat::from_rotation_x(-FRAC_PI_2));
+    vb.part(rk_flash, &src.sphere, &flash_core, Vec3::ZERO, Vec3::splat(0.05), id);
+    vb.part(rk_flash, &src.sphere, &flash_amber_halo, Vec3::ZERO, Vec3::splat(0.11), id);
+    vb.part(rk_flash, &src.thin_ring, &flash_fire, Vec3::new(0.0, 0.0, 0.01), Vec3::new(0.085, 0.015, 0.085), rx);
+
     // =========================================================================
     // LEFT HAND: ELABORATE TACTICAL SMARTPHONE WITH LIVE 160x240 OLED DISPLAY
     // =========================================================================
@@ -971,7 +1251,11 @@ fn animate_viewmodels(
     }
     if let Ok(mut l) = mlight.single_mut() {
         l.intensity = if ws.muzzle > 0.0 { 70_000.0 } else { 0.0 };
-        l.color = if shown == Weapon::Plasma { Color::srgb(0.3, 0.95, 1.0) } else { Color::srgb(1.0, 0.72, 0.35) };
+        l.color = match shown {
+            Weapon::Plasma => Color::srgb(0.3, 0.95, 1.0),
+            Weapon::Rocket => Color::srgb(1.0, 0.5, 0.15),
+            Weapon::Shotgun => Color::srgb(1.0, 0.72, 0.35),
+        };
     }
 
     // Animate phone status LED + antenna beacon + plasma coils.
@@ -1021,6 +1305,72 @@ fn create_bolt_assets(mut commands: Commands, mut materials: ResMut<Assets<Stand
     });
 }
 
+/// Pre-baked rocket projectile model (one merged mesh per material, built
+/// along +Y with the nose up) shared by every rocket in flight.
+#[derive(Resource, Clone)]
+pub struct RocketAssets {
+    pub models: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
+}
+
+fn create_rocket_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
+    let casing = materials.add(StandardMaterial { base_color: Color::srgb(0.32, 0.34, 0.36), metallic: 0.85, perceptual_roughness: 0.35, ..default() });
+    let fins = materials.add(StandardMaterial { base_color: Color::srgb(0.12, 0.13, 0.14), metallic: 0.7, perceptual_roughness: 0.5, ..default() });
+    let core = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.7, 0.3),
+        emissive: LinearRgba::rgb(14.0, 5.5, 0.8),
+        unlit: true,
+        ..default()
+    });
+    let flame = materials.add(additive_glow(Color::srgb(1.0, 0.45, 0.08), 0.7));
+    let cyl = Mesh::from(Cylinder::new(1.0, 1.0));
+    let cone = Mesh::from(Cone::new(1.0, 1.0));
+    let cube = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
+    let sphere = Sphere::new(1.0).mesh().uv(12, 8);
+    let mut b = MaterialBatches::new();
+    let t = |p: Vec3, s: Vec3| Transform::from_translation(p).with_scale(s);
+    b.add(&cyl, &casing, t(Vec3::ZERO, Vec3::new(0.07, 0.42, 0.07)));
+    b.add(&cone, &core, t(Vec3::new(0.0, 0.29, 0.0), Vec3::new(0.07, 0.16, 0.07)));
+    b.add(&cyl, &core, t(Vec3::new(0.0, 0.12, 0.0), Vec3::new(0.074, 0.05, 0.074)));
+    for a in [0.0f32, FRAC_PI_2] {
+        b.add(&cube, &fins, Transform::from_xyz(0.0, -0.17, 0.0).with_rotation(Quat::from_rotation_y(a)).with_scale(Vec3::new(0.24, 0.1, 0.012)));
+    }
+    b.add(&cone, &flame, Transform::from_xyz(0.0, -0.33, 0.0).with_rotation(Quat::from_rotation_x(std::f32::consts::PI)).with_scale(Vec3::new(0.06, 0.24, 0.06)));
+    b.add(&sphere, &flame, t(Vec3::new(0.0, -0.24, 0.0), Vec3::splat(0.12)));
+    commands.insert_resource(RocketAssets { models: b.finish(&mut meshes) });
+}
+
+/// World velocity of a freshly fired rocket: inherits half of the shooter's
+/// forward velocity along `dir` so high-speed bhoppers (up to 48 m/s) can never
+/// overtake their own forward rockets.
+pub fn rocket_velocity(dir: Vec3, shooter_vel: Vec3) -> Vec3 {
+    let dir = dir.normalize_or_zero();
+    let forward_carry = shooter_vel.dot(dir).max(0.0) * 0.5;
+    dir * (ROCKET_SPEED + forward_carry)
+}
+
+/// Spawn a rocket in flight at `start` heading along `dir`.
+pub fn spawn_rocket(commands: &mut Commands, assets: &RocketAssets, start: Vec3, dir: Vec3, shooter_vel: Vec3, damage_mult: f32) {
+    let mut root = commands.spawn((
+        LevelEntity,
+        PlayerProjectile::rocket(rocket_velocity(dir, shooter_vel), damage_mult),
+        Transform::from_translation(start).with_rotation(Quat::from_rotation_arc(Vec3::Y, dir)),
+        Visibility::default(),
+    ));
+    if let Some((mesh, mat)) = assets.models.first() {
+        root.insert((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone())));
+    }
+    let root = root.id();
+    for (mesh, mat) in assets.models.iter().skip(1) {
+        commands.spawn((ChildOf(root), Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY));
+    }
+    commands.spawn((
+        ChildOf(root),
+        CullableLight::for_range(7.0),
+        PointLight { color: Color::srgb(1.0, 0.55, 0.15), intensity: 120_000.0, range: 7.0, shadow_maps_enabled: false, ..default() },
+        Transform::from_xyz(0.0, -0.3, 0.0),
+    ));
+}
+
 /// Reused per-shot buffers of [`fire_weapons`].
 #[derive(Default)]
 struct FireScratch {
@@ -1041,7 +1391,7 @@ fn fire_weapons(
     mods: Res<PlayerModifiers>,
     signal: Res<SignalState>,
     mut ws: ResMut<WeaponState>,
-    (fx, bolts): (Res<FxAssets>, Res<BoltAssets>),
+    (fx, bolts, rockets): (Res<FxAssets>, Res<BoltAssets>, Res<RocketAssets>),
     (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
     cams: Query<&Transform, With<PlayerCamera>>,
     mut players: Query<(&mut Player, &Transform), Without<PlayerCamera>>,
@@ -1065,7 +1415,7 @@ fn fire_weapons(
     }
 
     // Emergency plasma trickle: combat can never soft-lock.
-    if player.ammo_shells == 0 && player.ammo_plasma < 10 {
+    if player.ammo_shells == 0 && player.ammo_rockets == 0 && player.ammo_plasma < 10 {
         ws.trickle += dt;
         if ws.trickle >= TRICKLE_SECS {
             ws.trickle -= TRICKLE_SECS;
@@ -1081,8 +1431,12 @@ fn fire_weapons(
         want = Some(Weapon::Shotgun);
     } else if keys.just_pressed(KeyCode::Digit2) {
         want = Some(Weapon::Plasma);
-    } else if keys.just_pressed(KeyCode::Tab) || scroll.delta.y.abs() > 0.0 {
-        want = Some(ws.current.other());
+    } else if keys.just_pressed(KeyCode::Digit3) {
+        want = Some(Weapon::Rocket);
+    } else if keys.just_pressed(KeyCode::Tab) || scroll.delta.y < 0.0 {
+        want = Some(ws.current.next());
+    } else if scroll.delta.y > 0.0 {
+        want = Some(ws.current.prev());
     } else if let Some(w) = bot.as_mut().and_then(|b| b.switch_weapon.take()) {
         want = Some(w);
     }
@@ -1098,8 +1452,9 @@ fn fire_weapons(
         return;
     }
     if !ws.current.has_ammo(&player) {
-        let other = ws.current.other();
-        if other.has_ammo(&player) && ws.switch_to(other) {
+        if let Some(other) = ws.current.auto_swap_target(&player)
+            && ws.switch_to(other)
+        {
             sfx.play(SfxEvent::WeaponSwap);
         } else if mouse.just_pressed(MouseButton::Left) {
             sfx.play(SfxEvent::Denied);
@@ -1113,6 +1468,9 @@ fn fire_weapons(
     let rot = cam.rotation;
     let fwd = rot * Vec3::NEG_Z;
     let muzzle = origin + rot * Vec3::new(0.2, -0.17, -0.85);
+    // Doppler Overdrive: speed at the moment of the shot sets the bonus.
+    let speed = Vec2::new(player.velocity.x, player.velocity.z).length();
+    let dmult = doppler_damage_mult(speed, &mods);
 
     // Snapshot lightweight targets for ray tests (reused buffers).
     let FireScratch { targets: refs, jammers: jam_list, enemy_dmg, enemy_kb, jam_dmg } = &mut *scratch;
@@ -1137,7 +1495,7 @@ fn fire_weapons(
             spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 2, 1.2, 0.06);
             let mut rng = rand::rng();
             let pellets = SHOTGUN_PELLETS + mods.extra_pellets;
-            let spread = PELLET_SPREAD * mods.pellet_spread_mult;
+            let spread = PELLET_SPREAD * mods.pellet_spread_mult * doppler_spread_mult(speed, &mods);
             enemy_dmg.clear();
             enemy_dmg.resize(refs.len(), 0.0);
             enemy_kb.clear();
@@ -1158,12 +1516,12 @@ fn fire_weapons(
                 }
                 match target {
                     HitTarget::Enemy(k) => {
-                        enemy_dmg[k] += PELLET_DAMAGE * falloff;
+                        enemy_dmg[k] += PELLET_DAMAGE * falloff * dmult;
                         enemy_kb[k] += dir * 1.1;
                         spawn_particles(&mut commands, &fx, hit, BurstColor::Gore, 3, 4.2, 0.075);
                     }
                     HitTarget::Jammer(k) => {
-                        jam_dmg[k] += PELLET_DAMAGE * falloff;
+                        jam_dmg[k] += PELLET_DAMAGE * falloff * dmult;
                         spawn_particles(&mut commands, &fx, hit, BurstColor::Spark, 4, 5.5, 0.07);
                     }
                     HitTarget::Wall => {
@@ -1214,7 +1572,7 @@ fn fire_weapons(
             let dir = (aim - muzzle).normalize_or_zero();
             commands.spawn((
                 LevelEntity,
-                PlayerProjectile { vel: dir * PLASMA_SPEED, damage: PLASMA_DAMAGE, life: 2.0 },
+                PlayerProjectile::plasma(dir * PLASMA_SPEED, dmult),
                 Mesh3d(bolts.core_mesh.clone()),
                 MeshMaterial3d(bolts.core_mat.clone()),
                 Transform::from_translation(muzzle).with_rotation(Quat::from_rotation_arc(Vec3::Y, dir)),
@@ -1227,6 +1585,17 @@ fn fire_weapons(
                     ),
                 ],
             ));
+        }
+        Weapon::Rocket => {
+            player.ammo_rockets -= 1;
+            ws.recoil = 1.4;
+            ws.muzzle = 0.09;
+            sfx.play(SfxEvent::RocketFire);
+            spawn_flash_light(&mut commands, muzzle, Color::srgb(1.0, 0.55, 0.15), 600_000.0, 10.0, 0.09);
+            spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 3, 1.4, 0.08);
+            let (dist, _) = resolve_hitscan_targets(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list);
+            let (start, dir) = rocket_launch(&grid, origin, fwd, muzzle, dist);
+            spawn_rocket(&mut commands, &rockets, start, dir, player.velocity, dmult);
         }
     }
 }
@@ -1241,9 +1610,10 @@ fn move_player_projectiles(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut sfx: ResMut<SfxQueue>,
     mut feed: ResMut<HudFeed>,
-    mut bolts: Query<(Entity, &mut PlayerProjectile, &mut Transform)>,
+    mut bolts: Query<(Entity, &mut PlayerProjectile, &mut Transform), Without<Player>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
+    mut players: Query<(&mut Player, &Transform)>,
 ) {
     let dt = time.delta_secs().min(1.0 / 20.0);
     for (e, mut b, mut tf) in &mut bolts {
@@ -1273,6 +1643,42 @@ fn move_player_projectiles(
             }
         }
         let hit = from + dir * best.0;
+        if b.kind == ProjectileKind::Rocket {
+            if best.1 == HitTarget::Nothing && b.life > 0.0 {
+                tf.translation = from + step;
+                b.trail -= dt;
+                if b.trail <= 0.0 {
+                    b.trail += ROCKET_TRAIL_SECS;
+                    let tail = tf.translation - dir * 0.35;
+                    spawn_particles(&mut commands, &fx, tail, BurstColor::Smoke, 1, 0.6, 0.09);
+                    spawn_particles(&mut commands, &fx, tail, BurstColor::Fire, 1, 1.2, 0.045);
+                }
+                continue;
+            }
+            let blast = if best.1 == HitTarget::Nothing { from } else { hit - dir * 0.08 };
+            let any_hit = detonate_rocket(
+                &mut commands,
+                &grid,
+                &fx,
+                &mut materials,
+                &mut sfx,
+                blast,
+                dir,
+                best.1,
+                b.damage_mult,
+                &mods,
+                &mut enemies,
+                &mut jammers,
+                &mut players,
+            );
+            if any_hit {
+                feed.hit(false);
+                sfx.play(SfxEvent::Hit);
+            }
+            commands.entity(e).try_despawn();
+            continue;
+        }
+        let damage = b.damage * b.damage_mult;
         match best.1 {
             HitTarget::Nothing => {
                 if b.life <= 0.0 {
@@ -1285,7 +1691,7 @@ fn move_player_projectiles(
             HitTarget::Enemy(i) => {
                 if let Some((mut en, _, marked)) = enemies.iter_mut().nth(i) {
                     let kb = dir * 1.5 * knockback_scale(en.kind);
-                    damage_enemy(&mut en, b.damage, marked.is_some(), &mods);
+                    damage_enemy(&mut en, damage, marked.is_some(), &mods);
                     en.knockback += Vec3::new(kb.x, 0.0, kb.z);
                     feed.hit(false);
                     sfx.play(SfxEvent::Hit);
@@ -1293,7 +1699,7 @@ fn move_player_projectiles(
             }
             HitTarget::Jammer(i) => {
                 if let Some((mut j, _)) = jammers.iter_mut().nth(i) {
-                    damage_jammer(&mut j, b.damage);
+                    damage_jammer(&mut j, damage);
                     feed.hit(false);
                     sfx.play(SfxEvent::Hit);
                 }
@@ -1304,6 +1710,87 @@ fn move_player_projectiles(
         spawn_shockwave(&mut commands, &fx, &mut materials, hit - dir * 0.12, 0.85, 0.18, BOLT_IMPACT_GLOW.0, BOLT_IMPACT_GLOW.1, false);
         commands.entity(e).try_despawn();
     }
+}
+
+/// Rocket detonation: direct hit (no splash double-dip on that target),
+/// linear-falloff splash on demons and active jammers, Quake rocket jump on
+/// the player and the explosion VFX. Returns whether any target was hurt.
+#[allow(clippy::too_many_arguments)]
+fn detonate_rocket(
+    commands: &mut Commands,
+    grid: &LevelGrid,
+    fx: &FxAssets,
+    materials: &mut Assets<StandardMaterial>,
+    sfx: &mut SfxQueue,
+    blast: Vec3,
+    dir: Vec3,
+    direct: HitTarget,
+    damage_mult: f32,
+    mods: &PlayerModifiers,
+    enemies: &mut Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
+    jammers: &mut Query<(&mut DemonJammer, &GlobalTransform)>,
+    players: &mut Query<(&mut Player, &Transform)>,
+) -> bool {
+    let radius = rocket_splash_radius(mods);
+    let mut any_hit = false;
+    for (i, (mut en, g, marked)) in enemies.iter_mut().enumerate() {
+        if !en.is_alive() {
+            continue;
+        }
+        let root = g.translation();
+        let (dmg, falloff) = if direct == HitTarget::Enemy(i) {
+            (ROCKET_DIRECT_DAMAGE * damage_mult, 1.0)
+        } else {
+            let d = splash_distance(blast, root, en.stats.hit_spheres);
+            if d > radius || !has_line_of_sight(grid, blast, en.center(root)) {
+                (0.0, 0.0)
+            } else {
+                (rocket_splash_damage(d, radius, damage_mult), splash_falloff(d, radius))
+            }
+        };
+        if dmg <= 0.0 {
+            continue;
+        }
+        let away = Vec2::new(root.x - blast.x, root.z - blast.z).normalize_or(Vec2::new(dir.x, dir.z).normalize_or_zero());
+        let kb = 14.0 * falloff * knockback_scale(en.kind);
+        damage_enemy(&mut en, dmg, marked.is_some(), mods);
+        en.knockback += Vec3::new(away.x * kb, kb * 0.15, away.y * kb);
+        any_hit = true;
+    }
+    for (i, (mut j, g)) in jammers.iter_mut().enumerate() {
+        if !j.is_active() {
+            continue;
+        }
+        let dmg = if direct == HitTarget::Jammer(i) {
+            ROCKET_DIRECT_DAMAGE * damage_mult
+        } else {
+            let base = g.translation();
+            let d = splash_distance(blast, base, &JAMMER_SPHERES);
+            if d > radius || !has_line_of_sight(grid, blast, base + Vec3::Y * 1.3) {
+                0.0
+            } else {
+                rocket_splash_damage(d, radius, damage_mult)
+            }
+        };
+        if dmg > 0.0 {
+            damage_jammer(&mut j, dmg);
+            any_hit = true;
+        }
+    }
+    if let Ok((mut p, ptf)) = players.single_mut()
+        && has_line_of_sight(grid, blast, ptf.translation + Vec3::Y * 0.9)
+        && let Some(jump) = compute_rocket_jump(ptf.translation, blast, radius, mods)
+    {
+        apply_rocket_jump(&mut p, &jump);
+    }
+    spawn_flash_light(commands, blast, Color::srgb(1.0, 0.5, 0.15), 2_600_000.0, 16.0, 0.28);
+    spawn_shockwave(commands, fx, materials, blast, radius * 0.9, 0.32, ROCKET_BLAST_GLOW.0, ROCKET_BLAST_GLOW.1, true);
+    spawn_shockwave(commands, fx, materials, blast, radius * 0.45, 0.2, ROCKET_CORE_GLOW.0, ROCKET_CORE_GLOW.1, false);
+    spawn_burst(commands, fx, blast, BurstColor::Fire, 14, 9.0, 0.16);
+    spawn_particles(commands, fx, blast, BurstColor::Spark, 8, 11.0, 0.06);
+    spawn_particles(commands, fx, blast + Vec3::Y * 0.3, BurstColor::Smoke, 5, 2.4, 0.3);
+    sfx.play(SfxEvent::RocketExplode);
+    any_hit
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1344,8 +1831,8 @@ fn jammer_deaths(
         if mods.jammer_hijack {
             spawn_hijack_hotspot(&mut commands, &fx, &mut materials, &mut feed, base);
         }
-        for (i, k) in [PickupKind::Shells, PickupKind::Health, PickupKind::Plasma].into_iter().enumerate() {
-            let a = i as f32 * TAU / 3.0;
+        for (i, k) in [PickupKind::Shells, PickupKind::Health, PickupKind::Plasma, PickupKind::Rockets].into_iter().enumerate() {
+            let a = i as f32 * TAU / 4.0;
             spawn_pickup(&mut commands, &pickups, k, base + Vec3::new(a.cos(), 0.0, a.sin()) * 1.2, true);
         }
     }
@@ -1353,9 +1840,13 @@ fn jammer_deaths(
 
 /// Plasma bolt impact shockwave glow `(color, alpha)`.
 const BOLT_IMPACT_GLOW: (Color, f32) = (Color::srgb(0.3, 0.95, 1.0), 0.7);
+/// Rocket explosion shockwave ring glow `(color, alpha)`.
+const ROCKET_BLAST_GLOW: (Color, f32) = (Color::srgb(1.0, 0.55, 0.12), 0.75);
+/// Rocket explosion fireball core glow `(color, alpha)`.
+const ROCKET_CORE_GLOW: (Color, f32) = (Color::srgb(1.0, 0.78, 0.35), 0.8);
 
 fn prewarm_weapon_fades(fx: Res<FxAssets>, mut materials: ResMut<Assets<StandardMaterial>>) {
-    fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW]);
+    fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW, ROCKET_BLAST_GLOW, ROCKET_CORE_GLOW]);
 }
 
 pub struct WeaponsPlugin;
@@ -1364,7 +1855,7 @@ impl Plugin for WeaponsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WeaponState>()
             .configure_sets(Update, CombatDamage.in_set(GameSet::Combat))
-            .add_systems(Startup, (create_pickup_assets, create_bolt_assets, prewarm_weapon_fades))
+            .add_systems(Startup, (create_pickup_assets, create_bolt_assets, create_rocket_assets, prewarm_weapon_fades))
             .add_systems(Update, spawn_viewmodels)
             .add_systems(Update, (spawn_floor_pickups.run_if(resource_exists_and_changed::<LevelGrid>)).in_set(GameSet::World))
             .add_systems(
@@ -1478,6 +1969,217 @@ mod tests {
         assert_eq!(ws.displayed(), Weapon::Shotgun);
         ws.swap_timer = SWAP_SECS * 0.2;
         assert_eq!(ws.displayed(), Weapon::Plasma);
+    }
+
+    #[test]
+    fn three_weapon_deck_cycles_both_ways() {
+        assert_eq!(Weapon::ALL, [Weapon::Shotgun, Weapon::Plasma, Weapon::Rocket]);
+        assert_eq!(Weapon::Shotgun.next(), Weapon::Plasma);
+        assert_eq!(Weapon::Plasma.next(), Weapon::Rocket);
+        assert_eq!(Weapon::Rocket.next(), Weapon::Shotgun);
+        assert_eq!(Weapon::Shotgun.prev(), Weapon::Rocket);
+        assert_eq!(Weapon::Rocket.prev(), Weapon::Plasma);
+        for w in Weapon::ALL {
+            assert_eq!(w.next().prev(), w);
+            assert_eq!(w.next().next().next(), w);
+        }
+        assert!((fire_cooldown(Weapon::Rocket, &PlayerModifiers::default(), 0) - ROCKET_COOLDOWN).abs() < 1e-6);
+    }
+
+    #[test]
+    fn swap_shows_the_actual_outgoing_weapon() {
+        let mut ws = WeaponState::default();
+        assert!(ws.switch_to(Weapon::Rocket));
+        assert_eq!(ws.previous, Weapon::Shotgun);
+        assert_eq!(ws.displayed(), Weapon::Shotgun, "lowering the shotgun, not `other()`");
+        ws.swap_timer = SWAP_SECS * 0.3;
+        assert_eq!(ws.displayed(), Weapon::Rocket);
+        ws.swap_timer = 0.0;
+        assert!(ws.switch_to(Weapon::Plasma));
+        assert_eq!(ws.displayed(), Weapon::Rocket);
+        // Re-target mid-lowering: keep lowering what is on screen.
+        assert!(ws.switch_to(Weapon::Shotgun));
+        assert_eq!(ws.previous, Weapon::Rocket);
+        assert_eq!(ws.displayed(), Weapon::Rocket);
+    }
+
+    #[test]
+    fn auto_swap_scans_the_deck_for_ammo() {
+        let p = Player { ammo_shells: 0, ammo_plasma: 0, ammo_rockets: 3, ..default() };
+        assert_eq!(Weapon::Shotgun.auto_swap_target(&p), Some(Weapon::Rocket), "skips the empty plasma");
+        let p = Player { ammo_shells: 4, ammo_plasma: 0, ammo_rockets: 0, ..default() };
+        assert_eq!(Weapon::Plasma.auto_swap_target(&p), Some(Weapon::Shotgun));
+        assert_eq!(Weapon::Rocket.auto_swap_target(&p), Some(Weapon::Shotgun));
+        let p = Player { ammo_shells: 0, ammo_plasma: 0, ammo_rockets: 0, ..default() };
+        assert_eq!(Weapon::Shotgun.auto_swap_target(&p), None);
+        let p = Player { ammo_shells: 1, ammo_plasma: 1, ammo_rockets: 0, ..default() };
+        assert_eq!(Weapon::Rocket.auto_swap_target(&p), Some(Weapon::Shotgun), "next() first");
+    }
+
+    #[test]
+    fn doppler_overdrive_scales_above_twenty_mps_only() {
+        let none = PlayerModifiers::default();
+        assert!(!doppler_active(40.0, &none));
+        assert_eq!(doppler_damage_mult(40.0, &none), 1.0);
+        assert_eq!(doppler_spread_mult(40.0, &none), 1.0);
+        let m = PlayerModifiers { doppler_damage_bonus: 0.30, doppler_spread_mult: 0.80, ..default() };
+        assert!(!doppler_active(19.9, &m));
+        assert_eq!(doppler_damage_mult(19.9, &m), 1.0);
+        assert_eq!(doppler_spread_mult(19.9, &m), 1.0);
+        assert!(doppler_active(DOPPLER_SPEED_THRESHOLD, &m));
+        assert!((doppler_damage_mult(25.0, &m) - 1.30).abs() < 1e-6);
+        assert!((doppler_spread_mult(25.0, &m) - 0.80).abs() < 1e-6);
+        // Captured into projectiles at fire time.
+        let bolt = PlayerProjectile::plasma(Vec3::X, doppler_damage_mult(25.0, &m));
+        assert!((bolt.damage * bolt.damage_mult - PLASMA_DAMAGE * 1.3).abs() < 1e-4);
+        let rocket = PlayerProjectile::rocket(Vec3::X, doppler_damage_mult(25.0, &m));
+        assert_eq!(rocket.kind, ProjectileKind::Rocket);
+        assert!((rocket.damage * rocket.damage_mult - ROCKET_DIRECT_DAMAGE * 1.3).abs() < 1e-3);
+    }
+
+    #[test]
+    fn rocket_splash_falls_off_linearly() {
+        assert_eq!(splash_falloff(0.0, 5.5), 1.0);
+        assert!((splash_falloff(2.75, 5.5) - 0.5).abs() < 1e-6);
+        assert_eq!(splash_falloff(5.5, 5.5), 0.0);
+        assert_eq!(splash_falloff(9.0, 5.5), 0.0);
+        assert!((rocket_splash_damage(0.0, 5.5, 1.0) - ROCKET_SPLASH_DAMAGE).abs() < 1e-6);
+        assert!((rocket_splash_damage(2.75, 5.5, 1.3) - ROCKET_SPLASH_DAMAGE * 0.5 * 1.3).abs() < 1e-4);
+        assert_eq!(rocket_splash_damage(6.0, 5.5, 1.0), 0.0);
+        // Direct hits out-damage the best possible splash (no double-dip needed).
+        const { assert!(ROCKET_DIRECT_DAMAGE > ROCKET_SPLASH_DAMAGE) };
+        // Distance is measured to the nearest hit-sphere surface.
+        let imp = Enemy::new(EnemyKind::Imp, 1);
+        let root = Vec3::new(10.0, 0.0, 0.0);
+        let d = splash_distance(root + Vec3::new(-3.0, 1.0, 0.0), root, imp.stats.hit_spheres);
+        assert!(d < 3.0 && d > 1.5, "{d}");
+        assert_eq!(splash_distance(Vec3::new(0.0, 1.3, 0.0), Vec3::ZERO, &JAMMER_SPHERES), 0.0);
+        let r = rocket_splash_radius(&PlayerModifiers { rocket_splash_mult: 1.2, ..default() });
+        assert!((r - ROCKET_SPLASH_RADIUS * 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rocket_jump_launches_with_forgiving_self_damage() {
+        let m = PlayerModifiers::default();
+        let feet = Vec3::new(10.0, 0.0, 10.0);
+        // Straight down at your feet: pure vertical launch.
+        let j = compute_rocket_jump(feet, feet, ROCKET_SPLASH_RADIUS, &m).expect("in range");
+        let f = 1.0 - 0.9 / ROCKET_SPLASH_RADIUS;
+        assert!((j.falloff - f).abs() < 1e-5);
+        assert!((j.impulse.y - ROCKET_JUMP_UP * f).abs() < 1e-4);
+        assert!(Vec2::new(j.impulse.x, j.impulse.z).length() < 1e-4);
+        assert!((j.self_damage - ROCKET_SPLASH_DAMAGE * f * ROCKET_SELF_DAMAGE_FRAC).abs() < 1e-4);
+        assert!(j.self_damage <= ROCKET_SPLASH_DAMAGE * ROCKET_SELF_DAMAGE_FRAC + 1e-4, "max ~14.25");
+        // Steep near-foot shot (e.g. pitch -1.5 rad, blast 0.12 m ahead): mostly vertical, no giant sideways kick.
+        let j_steep = compute_rocket_jump(feet, feet + Vec3::new(0.12, 0.0, 0.0), ROCKET_SPLASH_RADIUS, &m).unwrap();
+        assert!(j_steep.impulse.y > 10.0 && j_steep.impulse.x.abs() < 2.5, "{:?}", j_steep.impulse);
+        // Blast behind (-X) pushes forward (+X) and up.
+        let j = compute_rocket_jump(feet, feet + Vec3::new(-1.5, 0.0, 0.0), ROCKET_SPLASH_RADIUS, &m).unwrap();
+        assert!(j.impulse.x > 5.0 && j.impulse.y > 5.0 && j.impulse.z.abs() < 1e-4, "{:?}", j.impulse);
+        // Rocket velocity inherits forward speed so 48 m/s bhoppers never overtake their own rockets.
+        let fast_v = rocket_velocity(Vec3::X, Vec3::new(AIR_SPEED_HARD_CAP, 0.0, 0.0));
+        assert!(fast_v.x > AIR_SPEED_HARD_CAP + 5.0, "{fast_v:?}");
+        let back_v = rocket_velocity(Vec3::NEG_X, Vec3::new(AIR_SPEED_HARD_CAP, 0.0, 0.0));
+        assert!((back_v.length() - ROCKET_SPEED).abs() < 1e-4, "backward shots never slow down: {back_v:?}");
+        // Out of range: nothing.
+        assert!(compute_rocket_jump(feet, feet + Vec3::new(8.0, 0.0, 0.0), ROCKET_SPLASH_RADIUS, &m).is_none());
+
+        // Applying: armor takes half, ground detached.
+        let mut p = Player { armor: 50.0, hp: 100.0, grounded: true, coyote_timer: 0.1, ..default() };
+        let j = compute_rocket_jump(feet, feet, ROCKET_SPLASH_RADIUS, &m).unwrap();
+        let lost = apply_rocket_jump(&mut p, &j);
+        assert!((lost - j.self_damage * 0.5).abs() < 1e-4);
+        assert!(!p.grounded && p.coyote_timer == 0.0);
+        assert!(p.velocity.y > 10.0);
+        // Invulnerable: launched, unhurt.
+        let mut p = Player { invuln_timer: 1.0, grounded: true, ..default() };
+        assert_eq!(apply_rocket_jump(&mut p, &j), 0.0);
+        assert_eq!(p.hp, p.max_hp);
+        assert!(!p.grounded && p.velocity.y > 10.0);
+    }
+
+    #[test]
+    fn rocket_jump_keeps_momentum_and_clamps_only_horizontal() {
+        let m = PlayerModifiers::default();
+        let feet = Vec3::ZERO;
+        let j = compute_rocket_jump(feet, Vec3::new(-1.0, 0.0, 0.0), ROCKET_SPLASH_RADIUS, &m).unwrap();
+        // Bhopping at 30 m/s: the push adds on top of the carried speed.
+        let mut p = Player { velocity: Vec3::new(30.0, 0.0, 0.0), ..default() };
+        apply_rocket_jump(&mut p, &j);
+        assert!(p.velocity.x > 30.0 + 5.0, "{:?}", p.velocity);
+        // Already at the hard cap: horizontal clamps, vertical stays whole.
+        let mut p = Player { velocity: Vec3::new(AIR_SPEED_HARD_CAP, 0.0, 0.0), ..default() };
+        apply_rocket_jump(&mut p, &j);
+        assert!((Vec2::new(p.velocity.x, p.velocity.z).length() - AIR_SPEED_HARD_CAP).abs() < 1e-3);
+        assert!((p.velocity.y - j.impulse.y).abs() < 1e-4);
+        // The launch then flies through the Milestone 8 air model (no ground friction).
+        let h = crate::player::step_horizontal(
+            Vec2::new(p.velocity.x, p.velocity.z),
+            Vec2::ZERO,
+            crate::player::MoveInput::default(),
+            false,
+            crate::player::MOVE_SPEED,
+            1.0 / 120.0,
+        );
+        assert!(h.length() > AIR_SPEED_HARD_CAP - 1.0, "air bleed is smooth: {}", h.length());
+    }
+
+    #[test]
+    fn blast_thrusters_scale_the_rocket_jump() {
+        let base = PlayerModifiers::default();
+        let bt = PlayerModifiers { rocket_jump_mult: 1.25, rocket_splash_mult: 1.2, rocket_self_damage_mult: 0.5, ..default() };
+        let feet = Vec3::ZERO;
+        let blast = Vec3::new(-1.0, 0.0, 0.0);
+        let a = compute_rocket_jump(feet, blast, rocket_splash_radius(&base), &base).unwrap();
+        let b = compute_rocket_jump(feet, blast, rocket_splash_radius(&bt), &bt).unwrap();
+        assert!(b.impulse.y > a.impulse.y * 1.25 - 1e-4, "bigger boost (and wider radius)");
+        assert!(b.self_damage < a.self_damage * 0.6);
+        // Wider radius reaches further.
+        let far = Vec3::new(-5.8, 0.9, 0.0);
+        assert!(compute_rocket_jump(feet, far, rocket_splash_radius(&base), &base).is_none());
+        assert!(compute_rocket_jump(feet, far, rocket_splash_radius(&bt), &bt).is_some());
+    }
+
+    #[test]
+    fn rockets_never_spawn_behind_geometry() {
+        let g = corridor();
+        // Open corridor, aiming far: starts at the muzzle, converges on the aim.
+        let origin = Vec3::new(8.0, 1.6, 6.0);
+        let fwd = Vec3::X;
+        let muzzle = origin + Vec3::new(0.85, -0.17, 0.2);
+        let (start, dir) = rocket_launch(&g, origin, fwd, muzzle, 20.0);
+        assert_eq!(start, muzzle);
+        assert!(dir.dot(fwd) > 0.98);
+        // Straight down at your feet: starts on the eye ray, above the floor.
+        let down = Vec3::NEG_Y;
+        let (start, dir) = rocket_launch(&g, origin, down, origin + Vec3::new(0.2, -0.85, 0.17), 1.6);
+        assert_eq!(dir, down);
+        assert!(start.y > 1.0 && (start.x - origin.x).abs() < 1e-5, "{start:?}");
+        assert!(raycast_grid(&g, start, dir, 3.0).is_some_and(|h| h.distance > 1.0), "floor still ahead");
+        // Point-blank wall (x=4..? wall at world x<4): muzzle pokes through it.
+        let origin = Vec3::new(4.4, 1.6, 6.0);
+        let muzzle = origin + Vec3::new(-0.85, -0.17, 0.2);
+        let (start, dir) = rocket_launch(&g, origin, Vec3::NEG_X, muzzle, 0.4);
+        assert!(start.x > 4.0, "start stays in the open: {start:?}");
+        assert_eq!(dir, Vec3::NEG_X);
+    }
+
+    #[test]
+    fn rocket_pickups_scale_cap_and_join_the_floor_loot() {
+        let m = PlayerModifiers { pickup_mult: 1.3, ..default() };
+        let mut p = Player { ammo_rockets: 0, ..default() };
+        assert_eq!(PickupKind::Rockets.label(), "ROCKETS");
+        assert_eq!(PickupKind::ALL.len(), 5);
+        assert_eq!(apply_pickup(PickupKind::Rockets, &mut p, &PlayerModifiers::default()), 4.0);
+        assert_eq!(apply_pickup(PickupKind::Rockets, &mut p, &m), 5.0);
+        p.ammo_rockets = p.max_rockets - 1;
+        assert_eq!(apply_pickup(PickupKind::Rockets, &mut p, &m), 1.0);
+        assert_eq!(apply_pickup(PickupKind::Rockets, &mut p, &m), 0.0, "full rack leaves it on the floor");
+        assert_eq!(p.ammo_rockets, p.max_rockets);
+        assert_ne!(pickup_light(PickupKind::Rockets), pickup_light(PickupKind::Plasma));
+        let lead = |f: u32| (1..40u64).find_map(|sd| floor_pickup_plan(&crate::level::generate_level(f, sd)).first().map(|(k, _)| *k));
+        assert_eq!(lead(1), Some(PickupKind::Shells));
+        assert_eq!(lead(2), Some(PickupKind::Rockets), "even floors lead with a rocket crate");
     }
 
     #[test]

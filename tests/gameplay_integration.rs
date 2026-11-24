@@ -1647,7 +1647,7 @@ fn menu_navigates_loadout_and_contracts_screens() {
     // 4 chips + 4 skins + 15 apps + jam toggle + reset button.
     assert_eq!(count::<MetaCard>(&mut app), 4 + 4 + UpgradeId::ALL.len() + 2);
     assert_eq!(count::<Camera3d>(&mut app), 1, "screen camera replaces the menu camera");
-    assert!(ui_texts(&mut app).contains(&"10/10 READY".to_string()));
+    assert!(ui_texts(&mut app).contains(&"12/12 READY".to_string()));
 
     tap(&mut app, KeyCode::KeyC);
     assert_eq!(app_state(&app), AppState::ContractsFeats);
@@ -2289,4 +2289,259 @@ fn perf_multi_floor_budgets_and_tick_timing() {
     let fixed_run2 = mesh_count(&app) - per_floor_run2;
     assert_eq!(material_count(&app), mats0, "second run leaked StandardMaterials across MainMenu reset");
     assert_eq!(fixed_run2, static_meshes.unwrap(), "second run leaked Assets<Mesh> across MainMenu reset");
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 10: Signal-Mortar, rocket jumps, Doppler Overdrive
+// ---------------------------------------------------------------------------
+
+fn scroll(app: &mut App, y: f32) {
+    use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+    use bevy::input::touch::TouchPhase;
+    app.world_mut().write_message(MouseWheel { unit: MouseScrollUnit::Line, x: 0.0, y, window: Entity::PLACEHOLDER, phase: TouchPhase::Moved });
+    app.update();
+    step(app, 2);
+}
+
+fn weapon_state(app: &App) -> WeaponState {
+    app.world().resource::<WeaponState>().clone()
+}
+
+/// Wait out the swap animation and fire cooldown.
+fn settle_weapon(app: &mut App) {
+    step(app, FPS);
+}
+
+fn fire_once(app: &mut App) {
+    bot(app).fire = true;
+    step(app, 1);
+    bot(app).fire = false;
+}
+
+#[test]
+fn three_weapon_deck_switches_with_digits_tab_and_scroll() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 31);
+    godmode(&mut app);
+    open_arena(&mut app);
+    assert_eq!(weapon_state(&app).current, Weapon::Shotgun);
+    assert_eq!(player(&mut app).ammo_rockets, 10);
+
+    tap(&mut app, KeyCode::Digit3);
+    let ws = weapon_state(&app);
+    assert_eq!((ws.current, ws.previous), (Weapon::Rocket, Weapon::Shotgun));
+    assert_eq!(ws.displayed(), Weapon::Shotgun, "outgoing shotgun is still lowering");
+    settle_weapon(&mut app);
+    assert_eq!(weapon_state(&app).displayed(), Weapon::Rocket);
+
+    tap(&mut app, KeyCode::Digit2);
+    assert_eq!(weapon_state(&app).current, Weapon::Plasma);
+    assert_eq!(weapon_state(&app).displayed(), Weapon::Rocket, "the mortar lowers, not `other()`");
+    settle_weapon(&mut app);
+    tap(&mut app, KeyCode::Digit1);
+    assert_eq!(weapon_state(&app).current, Weapon::Shotgun);
+    settle_weapon(&mut app);
+
+    // Tab cycles forward through all three.
+    for want in [Weapon::Plasma, Weapon::Rocket, Weapon::Shotgun] {
+        tap(&mut app, KeyCode::Tab);
+        assert_eq!(weapon_state(&app).current, want);
+        settle_weapon(&mut app);
+    }
+    // Wheel down = next, wheel up = prev.
+    scroll(&mut app, -1.0);
+    assert_eq!(weapon_state(&app).current, Weapon::Plasma);
+    settle_weapon(&mut app);
+    scroll(&mut app, 1.0);
+    assert_eq!(weapon_state(&app).current, Weapon::Shotgun);
+    settle_weapon(&mut app);
+    scroll(&mut app, 1.0);
+    assert_eq!(weapon_state(&app).current, Weapon::Rocket);
+}
+
+#[test]
+fn empty_weapon_auto_swaps_to_the_next_loaded_one() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 32);
+    godmode(&mut app);
+    open_arena(&mut app);
+    with_player(&mut app, |p| {
+        p.ammo_shells = 0;
+        p.ammo_plasma = 0;
+        p.ammo_rockets = 3;
+    });
+    fire_once(&mut app);
+    assert_eq!(weapon_state(&app).current, Weapon::Rocket, "skips the empty plasma");
+    // No soft-lock trickle while rockets remain.
+    step(&mut app, 3 * FPS);
+    assert_eq!(player(&mut app).ammo_plasma, 0);
+    with_player(&mut app, |p| p.ammo_rockets = 0);
+    step(&mut app, 2 * FPS);
+    assert!(player(&mut app).ammo_plasma > 0, "emergency trickle once every heavy weapon is dry");
+}
+
+/// Stunned Hell Baron at `pos` (huge HP, never attacks).
+fn stunned_baron(app: &mut App, pos: Vec3) -> Entity {
+    let e = spawn_demon(app, EnemyKind::HellBaron, pos);
+    step(app, 1);
+    let mut en = app.world_mut().get_mut::<Enemy>(e).unwrap();
+    en.stun_timer = 1.0e3;
+    en.hp = 5_000.0;
+    e
+}
+
+#[test]
+fn rocket_direct_hit_and_linear_splash_without_double_dip() {
+    use segnale_debole::weapons::{ROCKET_DIRECT_DAMAGE, ROCKET_SPLASH_DAMAGE, ROCKET_SPLASH_RADIUS};
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 33);
+    godmode(&mut app);
+    let c = open_arena(&mut app);
+    tap(&mut app, KeyCode::Digit3);
+    settle_weapon(&mut app);
+
+    let direct = stunned_baron(&mut app, c + Vec3::new(0.0, 0.0, -14.0));
+    let side = stunned_baron(&mut app, c + Vec3::new(4.0, 0.0, -14.0));
+    let far = stunned_baron(&mut app, c + Vec3::new(-14.0, 0.0, -20.0));
+    let aim = enemy_center(&app, direct);
+    aim_at(&mut app, aim);
+    step(&mut app, 2);
+    let rockets_before = player(&mut app).ammo_rockets;
+    fire_once(&mut app);
+    assert_eq!(player(&mut app).ammo_rockets, rockets_before - 1);
+    assert_eq!(count::<PlayerProjectile>(&mut app), 1, "one rocket in flight");
+    step(&mut app, FPS);
+    assert_eq!(count::<PlayerProjectile>(&mut app), 0, "rocket detonated");
+
+    let lost = |app: &App, e: Entity| 5_000.0 - enemy(app, e).unwrap().hp;
+    assert!((lost(&app, direct) - ROCKET_DIRECT_DAMAGE).abs() < 1e-2, "direct hit only, no splash double-dip: {}", lost(&app, direct));
+    let side_lost = lost(&app, side);
+    assert!(side_lost > 0.0 && side_lost < ROCKET_SPLASH_DAMAGE, "linear splash falloff: {side_lost}");
+    assert_eq!(lost(&app, far), 0.0, "outside {ROCKET_SPLASH_RADIUS} m");
+    // Player stood 14 m away: no rocket jump.
+    assert_eq!(player(&mut app).hp, player(&mut app).max_hp);
+}
+
+/// Fire straight down at your feet and track the flight.
+fn rocket_jump_straight_down(app: &mut App) -> (f32, f32) {
+    let feet = player_feet(app);
+    {
+        let mut b = bot(app);
+        b.look_pitch = Some(-1.5);
+    }
+    step(app, 2);
+    let hp0 = player(app).hp;
+    fire_once(app);
+    let mut apex = feet.y;
+    let mut left_ground = false;
+    for _ in 0..FPS {
+        step(app, 1);
+        apex = apex.max(player_feet(app).y);
+        left_ground |= !player(app).grounded && player(app).velocity.y > 3.0;
+    }
+    assert!(left_ground, "rocket jump detached from the ground");
+    (apex - feet.y, hp0 - player(app).hp)
+}
+
+#[test]
+fn rocket_jump_launches_with_forgiving_self_damage_and_respects_invuln() {
+    use segnale_debole::physics::{GRAVITY, JUMP_VELOCITY};
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 34);
+    open_arena(&mut app);
+    with_player(&mut app, |p| {
+        p.armor = 0.0;
+        p.hp = p.max_hp;
+    });
+    tap(&mut app, KeyCode::Digit3);
+    settle_weapon(&mut app);
+    let (apex, dmg) = rocket_jump_straight_down(&mut app);
+    let plain_jump = JUMP_VELOCITY * JUMP_VELOCITY / (2.0 * GRAVITY);
+    assert!(apex > plain_jump * 1.5, "rocket jump apex {apex:.2} m vs plain jump {plain_jump:.2} m");
+    assert!(dmg > 3.0 && dmg <= 14.25 + 1e-3, "forgiving ~15% self-damage: {dmg}");
+
+    // Land, then do it again while invulnerable: launched, unhurt.
+    step(&mut app, 2 * FPS);
+    assert!(player(&mut app).grounded);
+    with_player(&mut app, |p| p.invuln_timer = 1.0e6);
+    let (apex2, dmg2) = rocket_jump_straight_down(&mut app);
+    assert!(apex2 > plain_jump * 1.5);
+    assert_eq!(dmg2, 0.0);
+
+    // Blast Thrusters: higher launch, half the self-damage.
+    step(&mut app, 2 * FPS);
+    with_player(&mut app, |p| {
+        p.invuln_timer = 0.0;
+        p.hp = p.max_hp;
+        p.armor = 0.0;
+    });
+    install(&mut app, UpgradeId::BlastThrusters);
+    let (apex3, dmg3) = rocket_jump_straight_down(&mut app);
+    assert!(apex3 > apex * 1.3, "Blast Thrusters apex {apex3:.2} vs {apex:.2}");
+    assert!(dmg3 < dmg * 0.6, "Blast Thrusters self-damage {dmg3} vs {dmg}");
+}
+
+#[test]
+fn rocket_jump_behind_carries_momentum_into_air_strafing() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 35);
+    godmode(&mut app);
+    let c = open_arena(&mut app);
+    tap(&mut app, KeyCode::Digit3);
+    settle_weapon(&mut app);
+    // Running east, fire at the floor just behind.
+    let feet = player_feet(&mut app);
+    teleport(&mut app, feet, c + Vec3::new(-1.6, 0.0, 0.0));
+    step(&mut app, 2);
+    with_player(&mut app, |p| p.velocity = Vec3::new(11.0, 0.0, 0.0));
+    fire_once(&mut app);
+    let mut peak = 0.0f32;
+    let mut airborne_frames = 0;
+    for _ in 0..30 {
+        step(&mut app, 1);
+        let p = player(&mut app);
+        if !p.grounded {
+            airborne_frames += 1;
+            peak = peak.max(horizontal_speed(&p));
+        }
+    }
+    assert!(airborne_frames > 10, "launched into the air ({airborne_frames} frames)");
+    assert!(peak > MOVE_SPEED + 3.0, "radial push adds to the run: {peak:.1} m/s");
+    assert!(player(&mut app).velocity.x > 0.0, "pushed forward, away from the blast");
+}
+
+#[test]
+fn doppler_overdrive_captures_bonus_damage_at_fire_time() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 36);
+    godmode(&mut app);
+    let c = open_arena(&mut app);
+    install(&mut app, UpgradeId::DopplerOverdrive);
+    bot(&mut app).switch_weapon = Some(Weapon::Plasma);
+    settle_weapon(&mut app);
+
+    let shoot_at_speed = |app: &mut App, speed: f32| -> f32 {
+        teleport(app, c, c + Vec3::new(0.0, PLAYER_EYE_HEIGHT, -10.0));
+        step(app, 20);
+        with_player(app, |p| p.velocity = Vec3::new(speed, 0.0, 0.0));
+        fire_once(app);
+        let mut q = app.world_mut().query::<&PlayerProjectile>();
+        let m = q.iter(app.world()).map(|b| b.damage_mult).next().expect("bolt");
+        step(app, FPS);
+        m
+    };
+    assert_eq!(shoot_at_speed(&mut app, 5.0), 1.0, "below 20 m/s: no bonus");
+    assert!((shoot_at_speed(&mut app, 25.0) - 1.3).abs() < 1e-5, "above 20 m/s: +30%");
+}
+
+#[test]
+fn high_capacity_cell_and_floor_patch_cover_rockets() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 37);
+    install(&mut app, UpgradeId::HighCapacityCell);
+    let p = player(&mut app);
+    assert_eq!(p.max_rockets, 27);
+    assert_eq!(UpgradeId::ALL.len(), 17);
+    assert_eq!(segnale_debole::meta::default_catalog().len(), segnale_debole::meta::ACTIVE_CATALOG_SIZE);
+    assert_eq!(segnale_debole::meta::ACTIVE_CATALOG_SIZE, 12);
 }

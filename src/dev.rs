@@ -259,7 +259,7 @@ struct MetaShots {
 }
 
 /// The showcase profile: jam demo on, Survey OS + 5G Chrome Gold equipped,
-/// Signal Spoofer + Jammer Hijack drafted into the 10-card catalog, ROAM +
+/// Signal Spoofer + Jammer Hijack drafted into the 12-card catalog, ROAM +
 /// PRIO contracts signed, 3 earned feats and populated lifetime stats.
 pub fn meta_showcase_profile() -> PlayerProfile {
     let mut p = PlayerProfile::default();

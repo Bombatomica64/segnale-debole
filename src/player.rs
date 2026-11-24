@@ -105,6 +105,8 @@ pub struct Player {
     pub max_shells: u32,
     pub ammo_plasma: u32,
     pub max_plasma: u32,
+    pub ammo_rockets: u32,
+    pub max_rockets: u32,
     /// Seconds until the next dash is available.
     pub dash_cooldown: f32,
     /// Remaining seconds of the active dash burst.
@@ -146,6 +148,8 @@ impl Default for Player {
             max_shells: 50,
             ammo_plasma: 80,
             max_plasma: 200,
+            ammo_rockets: 10,
+            max_rockets: crate::upgrades::BASE_MAX_ROCKETS,
             dash_cooldown: 0.0,
             dash_timer: 0.0,
             invuln_timer: 0.0,

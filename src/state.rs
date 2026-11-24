@@ -56,7 +56,7 @@ pub enum GameSet {
     Ui,
 }
 
-/// The fifteen roguelike "App Store" upgrades: 10 core apps + 5 signature
+/// The seventeen roguelike "App Store" upgrades: 12 core apps + 5 signature
 /// apps licensed by feats (see `meta.rs`). `upgrades.rs` applies them to
 /// [`PlayerModifiers`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -71,6 +71,8 @@ pub enum UpgradeId {
     AirplaneModePhase,
     HighCapacityCell,
     SubGhzPenetration,
+    DopplerOverdrive,
+    BlastThrusters,
     StoreAndForward,
     EmergencyCallback,
     MissedCall,
@@ -79,7 +81,7 @@ pub enum UpgradeId {
 }
 
 impl UpgradeId {
-    pub const ALL: [UpgradeId; 15] = [
+    pub const ALL: [UpgradeId; 17] = [
         UpgradeId::DualSimBarrels,
         UpgradeId::FiveGOverclock,
         UpgradeId::CopperAntenna,
@@ -90,6 +92,8 @@ impl UpgradeId {
         UpgradeId::AirplaneModePhase,
         UpgradeId::HighCapacityCell,
         UpgradeId::SubGhzPenetration,
+        UpgradeId::DopplerOverdrive,
+        UpgradeId::BlastThrusters,
         UpgradeId::StoreAndForward,
         UpgradeId::EmergencyCallback,
         UpgradeId::MissedCall,
@@ -109,6 +113,8 @@ impl UpgradeId {
             UpgradeId::AirplaneModePhase => "Airplane Mode Phase",
             UpgradeId::HighCapacityCell => "High-Capacity Cell",
             UpgradeId::SubGhzPenetration => "Sub-GHz Penetration",
+            UpgradeId::DopplerOverdrive => "Doppler Overdrive",
+            UpgradeId::BlastThrusters => "Blast Thrusters",
             UpgradeId::StoreAndForward => "Store & Forward",
             UpgradeId::EmergencyCallback => "Emergency Callback",
             UpgradeId::MissedCall => "Missed Call",
@@ -129,6 +135,8 @@ impl UpgradeId {
             UpgradeId::AirplaneModePhase => "Dash grants invuln, a static shockwave, and -15% cooldown.",
             UpgradeId::HighCapacityCell => "Ammo caps +35%; all pickups +30% fuller.",
             UpgradeId::SubGhzPenetration => "Walls attenuate 55% less; Ping projects a floor route to the Tower.",
+            UpgradeId::DopplerOverdrive => "At 20+ m/s: +30% weapon damage and 20% tighter shotgun choke.",
+            UpgradeId::BlastThrusters => "Rocket jump +25% boost, +20% blast radius, -50% self-damage.",
             UpgradeId::StoreAndForward => "Kills in natural 0-bar blackouts queue up to 3 packets; hitting 3+ bars fires 20-dmg arcs.",
             UpgradeId::EmergencyCallback => "Kill a ping-marked Jammer Fiend to unlock 1 any-signal 5G Overload for 6s.",
             UpgradeId::MissedCall => "Pressing Ping at 0 bars drops a ringing decoy handset drawing nearby Imps for 2.5s.",
@@ -194,6 +202,16 @@ pub struct PlayerModifiers {
     pub wave_interval_mult: f32,
     /// Low-Battery Mode contract: no HP field repair between floors.
     pub skip_floor_heal: bool,
+    /// Doppler Overdrive: weapon damage bonus while moving >= 20 m/s.
+    pub doppler_damage_bonus: f32,
+    /// Doppler Overdrive: shotgun spread multiplier while moving >= 20 m/s.
+    pub doppler_spread_mult: f32,
+    /// Blast Thrusters: rocket-jump impulse multiplier.
+    pub rocket_jump_mult: f32,
+    /// Blast Thrusters: rocket splash radius multiplier.
+    pub rocket_splash_mult: f32,
+    /// Blast Thrusters: rocket self-damage multiplier.
+    pub rocket_self_damage_mult: f32,
 }
 
 impl Default for PlayerModifiers {
@@ -234,6 +252,11 @@ impl Default for PlayerModifiers {
             upload_duration_mult: 1.0,
             wave_interval_mult: 1.0,
             skip_floor_heal: false,
+            doppler_damage_bonus: 0.0,
+            doppler_spread_mult: 1.0,
+            rocket_jump_mult: 1.0,
+            rocket_splash_mult: 1.0,
+            rocket_self_damage_mult: 1.0,
         }
     }
 }

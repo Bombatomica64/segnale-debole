@@ -1,5 +1,5 @@
 //! Pre-run meta screens: the LOADOUT editor (starter OS chip, handset skin,
-//! 10-card App Store catalog, jam-demo switch) and CARRIER CONTRACTS & FEATS
+//! 12-card App Store catalog, jam-demo switch) and CARRIER CONTRACTS & FEATS
 //! (contract toggles, lifetime stats, the feats list), plus the pure text
 //! helpers the main menu, end screens and in-game HUD share.
 //!
@@ -63,6 +63,8 @@ pub fn app_short_name(id: UpgradeId) -> &'static str {
         UpgradeId::AirplaneModePhase => "Airplane Mode",
         UpgradeId::HighCapacityCell => "Hi-Cap Cell",
         UpgradeId::SubGhzPenetration => "Sub-GHz Penetrate",
+        UpgradeId::DopplerOverdrive => "Doppler Overdrive",
+        UpgradeId::BlastThrusters => "Blast Thrusters",
         UpgradeId::StoreAndForward => "Store & Forward",
         UpgradeId::EmergencyCallback => "Emergency Call",
         UpgradeId::MissedCall => "Missed Call",
@@ -271,10 +273,10 @@ pub fn apply_meta_edit(p: &mut PlayerProfile, t: MetaTarget) -> EditOutcome {
         }
         MetaTarget::ResetCatalog => {
             if p.normalized_catalog() == default_catalog() {
-                EditOutcome::Unchanged("Catalog already at the default 10 core apps".to_string())
+                EditOutcome::Unchanged("Catalog already at the default 12 core apps".to_string())
             } else {
                 p.reset_default_catalog();
-                EditOutcome::Changed("Catalog reset to the default 10 core apps".to_string())
+                EditOutcome::Changed("Catalog reset to the default 12 core apps".to_string())
             }
         }
         MetaTarget::JamDemo => {
@@ -324,7 +326,7 @@ pub enum TargetState {
     Ready,
     Locked,
     InPool,
-    /// Not manually selected, but will auto-fill the 10-card draft pool on deploy.
+    /// Not manually selected, but will auto-fill the 12-card draft pool on deploy.
     AutoFill,
     Benched,
     Active,
@@ -364,7 +366,7 @@ fn target_feat(t: MetaTarget) -> Option<FeatId> {
 pub fn status_text(p: &PlayerProfile, t: MetaTarget) -> String {
     match (t, target_state(p, t)) {
         (MetaTarget::JamDemo, s) => format!("JAM DEMO UNLOCK ALL: {}", if s == TargetState::Active { "ON" } else { "OFF" }),
-        (MetaTarget::ResetCatalog, _) => "RESET DEFAULT 10".to_string(),
+        (MetaTarget::ResetCatalog, _) => format!("RESET DEFAULT {ACTIVE_CATALOG_SIZE}"),
         (MetaTarget::Contract(_), TargetState::Active) => "[ACTIVE]".to_string(),
         (MetaTarget::Contract(_), _) => "[OFF]".to_string(),
         (MetaTarget::App(_), TargetState::Locked) => "LOCKED".to_string(),
@@ -940,7 +942,7 @@ fn spawn_loadout_screen(
 
     // App Store catalog.
     let (cat, title_row) = section_crate(&mut commands, phone, "APP STORE CATALOG", HAZARD_YELLOW, Node { width: Val::Percent(100.0), ..default() });
-    commands.spawn((ChildOf(title_row), text("10-CARD DRAFT POOL", 11.0, ASH_DIM)));
+    commands.spawn((ChildOf(title_row), text(format!("{ACTIVE_CATALOG_SIZE}-CARD DRAFT POOL"), 11.0, ASH_DIM)));
     let (counter, _) = catalog_counter_text(p.normalized_catalog().len());
     commands.spawn((
         ChildOf(title_row),
@@ -1187,7 +1189,7 @@ mod tests {
         let mut p = PlayerProfile::default();
         assert_eq!(
             loadout_summary_line(&p),
-            "OS: STOCK OS  |  SKIN: UAC STANDARD ORANGE  |  CATALOG: 10/10  |  CONTRACTS: 0/4  |  FEATS: 0/10"
+            "OS: STOCK OS  |  SKIN: UAC STANDARD ORANGE  |  CATALOG: 12/12  |  CONTRACTS: 0/4  |  FEATS: 0/10"
         );
         p.set_jam_demo_unlock_all(true);
         p.equip_chip(StarterChip::SurveyOs);
@@ -1197,7 +1199,7 @@ mod tests {
         p.unlocked_feats.insert(FeatId::FirstExtraction);
         let s = loadout_summary_line(&p);
         assert!(s.starts_with("OS: SURVEY OS  |  SKIN: 5G CHROME GOLD"), "{s}");
-        assert!(s.contains("CATALOG: 9/10") && s.contains("CONTRACTS: 1/4") && s.contains("FEATS: 1/10"), "{s}");
+        assert!(s.contains("CATALOG: 11/12") && s.contains("CONTRACTS: 1/4") && s.contains("FEATS: 1/10"), "{s}");
     }
 
     #[test]
@@ -1240,8 +1242,8 @@ mod tests {
 
     #[test]
     fn catalog_counter_and_stats_cells() {
-        assert_eq!(catalog_counter_text(10), ("10/10 READY".to_string(), true));
-        assert_eq!(catalog_counter_text(8), ("8/10 - AUTO-FILLS TO 10 ON DEPLOY".to_string(), false));
+        assert_eq!(catalog_counter_text(12), ("12/12 READY".to_string(), true));
+        assert_eq!(catalog_counter_text(8), ("8/12 - AUTO-FILLS TO 12 ON DEPLOY".to_string(), false));
         assert_eq!(fmt_mmss(512.7), "08:32");
         let mut st = LifetimeStats { runs_played: 3, best_floor: 4, ..default() };
         let cells = lifetime_stat_cells(&st);
@@ -1253,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn edits_respect_locks_and_the_ten_card_cap() {
+    fn edits_respect_locks_and_the_twelve_card_cap() {
         let mut p = PlayerProfile::default();
         // Locked chip / skin / signature app are refused.
         assert!(matches!(apply_meta_edit(&mut p, MetaTarget::Chip(StarterChip::SurveyOs)), EditOutcome::Denied(m) if m.contains("Signal Scout")));
@@ -1269,8 +1271,8 @@ mod tests {
         assert!(matches!(apply_meta_edit(&mut p, MetaTarget::JamDemo), EditOutcome::Changed(_)));
         assert_eq!(status_text(&p, MetaTarget::JamDemo), "JAM DEMO UNLOCK ALL: ON");
         assert_eq!(status_text(&p, MetaTarget::App(UpgradeId::SignalSpoofer)), "BENCHED");
-        assert!(matches!(apply_meta_edit(&mut p, MetaTarget::App(UpgradeId::SignalSpoofer)), EditOutcome::Denied(m) if m.contains("Catalog full (10/10)")));
-        assert!(matches!(apply_meta_edit(&mut p, MetaTarget::App(UpgradeId::CopperAntenna)), EditOutcome::Changed(m) if m.contains("9/10")));
+        assert!(matches!(apply_meta_edit(&mut p, MetaTarget::App(UpgradeId::SignalSpoofer)), EditOutcome::Denied(m) if m.contains("Catalog full (12/12)")));
+        assert!(matches!(apply_meta_edit(&mut p, MetaTarget::App(UpgradeId::CopperAntenna)), EditOutcome::Changed(m) if m.contains("11/12")));
         assert_eq!(status_text(&p, MetaTarget::App(UpgradeId::CopperAntenna)), "AUTO-FILL");
         assert!(matches!(apply_meta_edit(&mut p, MetaTarget::App(UpgradeId::SignalSpoofer)), EditOutcome::Changed(_)));
         assert_eq!(status_text(&p, MetaTarget::App(UpgradeId::SignalSpoofer)), "IN POOL");
