@@ -14,6 +14,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 use crate::assets_gen::GameAssets;
+use crate::mesh_batch::{MaterialBatches, MeshBatch};
 use crate::state::{AppState, GameSet, RunStats};
 
 pub const CELL_SIZE: f32 = 4.0;
@@ -685,7 +686,8 @@ impl Plugin for LevelPlugin {
             .add_systems(OnEnter(AppState::MainMenu), teardown_level)
             .add_systems(OnEnter(AppState::Loadout), teardown_level)
             .add_systems(OnEnter(AppState::ContractsFeats), teardown_level)
-            .add_systems(Update, animate_props.in_set(GameSet::World));
+            .add_systems(Update, animate_props.in_set(GameSet::World))
+            .add_systems(Update, cull_world_lights.in_set(GameSet::Ui));
     }
 }
 
@@ -727,6 +729,162 @@ pub fn teardown_level(mut commands: Commands, existing: Query<Entity, With<Level
     commands.remove_resource::<LevelGrid>();
 }
 
+/// Distance-culled world light: fades smoothly over `fade_band` approaching
+/// `cull_dist`, then hides once beyond `cull_dist` (or while its base
+/// intensity is zero). Never on viewmodel lights.
+///
+/// [`cull_world_lights`] is the sole writer of [`PointLight::intensity`] for
+/// entities carrying this component: static lights leave `base_intensity`
+/// unset at spawn (captured once on the first pass), while dynamic writers
+/// (`EnemyAura`, `AlarmLight`, `FxLight`) update the unfaded target through
+/// [`Self::set_intensity`].
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct CullableLight {
+    pub cull_dist: f32,
+    pub fade_band: f32,
+    base_intensity: Option<f32>,
+}
+
+impl CullableLight {
+    /// Margin past the light's own range before full cull (smoothly faded over
+    /// [`Self::FADE_BAND`] so lights never pop on open sightlines).
+    pub const MARGIN: f32 = 32.0;
+    /// Width of the linear fade-out band immediately inside `cull_dist`.
+    pub const FADE_BAND: f32 = 14.0;
+
+    pub fn for_range(range: f32) -> Self {
+        CullableLight {
+            cull_dist: range + Self::MARGIN,
+            fade_band: Self::FADE_BAND,
+            base_intensity: None,
+        }
+    }
+
+    /// Update the unfaded base intensity for a dynamically driven world light.
+    pub fn set_intensity(&mut self, intensity: f32) {
+        if self.base_intensity != Some(intensity) {
+            self.base_intensity = Some(intensity);
+        }
+    }
+
+    /// Distance attenuation factor in `[0.0, 1.0]` for a light at `dist`.
+    pub fn fade_factor(self, dist: f32) -> f32 {
+        if dist >= self.cull_dist {
+            return 0.0;
+        }
+        let fade_start = (self.cull_dist - self.fade_band).max(0.0);
+        if dist <= fade_start || self.fade_band <= 0.0 {
+            1.0
+        } else {
+            ((self.cull_dist - dist) / self.fade_band).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Smoothly attenuate and hide distant world lights. Writes are change-guarded
+/// so `Changed<Visibility>` / `Changed<PointLight>` only fire when needed.
+pub fn cull_world_lights(
+    players: Query<&Transform, With<crate::player::Player>>,
+    mut lights: Query<(&mut CullableLight, Ref<GlobalTransform>, &mut PointLight, &mut Visibility)>,
+) {
+    let Ok(ptf) = players.single() else { return };
+    let eye = ptf.translation + Vec3::Y * crate::player::PLAYER_EYE_HEIGHT;
+    for (mut c, g, mut light, mut vis) in &mut lights {
+        // Spawned since the last pass: its GlobalTransform may not be
+        // propagated yet, so keep its spawn visibility for this frame.
+        if g.is_added() {
+            continue;
+        }
+        let base = *c.base_intensity.get_or_insert(light.intensity);
+        let dist = g.translation().distance(eye);
+        let fade = c.fade_factor(dist);
+        let target_vis = if fade > 0.0 && base > 0.0 { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != target_vis {
+            *vis = target_vis;
+        }
+        let target_intensity = if fade > 0.0 && base > 0.0 { base * fade } else { 0.0 };
+        if (light.intensity - target_intensity).abs() > 1e-3 || (target_intensity == 0.0 && light.intensity != 0.0) {
+            light.intensity = target_intensity;
+        }
+    }
+}
+
+/// Top of the wall block spawned at `c` (`None`: not a wall, or a wall fully
+/// enclosed by walls, which is never spawned).
+fn spawned_wall_top(g: &LevelGrid, c: IVec2) -> Option<f32> {
+    if !g.in_bounds(c) || !g.cell(c).is_wall() {
+        return None;
+    }
+    let visible = (-1..=1).any(|dz| (-1..=1).any(|dx| !g.cell(c + IVec2::new(dx, dz)).is_wall()));
+    if !visible {
+        return None;
+    }
+    let near_atrium = (-1..=1).any(|dz| (-1..=1).any(|dx| g.is_roof_open(c + IVec2::new(dx, dz))));
+    Some(if near_atrium { ATRIUM_WALL_HEIGHT } else { CEILING_HEIGHT })
+}
+
+/// Top of the floor slab of a non-wall cell.
+fn slab_top(cell: Cell) -> Option<f32> {
+    match cell {
+        Cell::Wall => None,
+        Cell::Floor { height } => Some(height),
+        Cell::AtriumFloor => Some(0.0),
+        Cell::HazardPit => Some(PIT_DEPTH),
+        Cell::Ramp { low_height, .. } => Some(low_height),
+    }
+}
+
+/// Grid side a world-space face normal points to (`None`: vertical faces).
+fn side_of(n: Vec3) -> Option<IVec2> {
+    if n.x > 0.5 {
+        Some(IVec2::X)
+    } else if n.x < -0.5 {
+        Some(IVec2::NEG_X)
+    } else if n.z > 0.5 {
+        Some(IVec2::Y)
+    } else if n.z < -0.5 {
+        Some(IVec2::NEG_Y)
+    } else {
+        None
+    }
+}
+
+/// Source meshes for the static level batches (identical to the per-entity
+/// primitives the geometry used before batching).
+struct LevelSourceMeshes {
+    block: Mesh,
+    ceiling: Mesh,
+    pillar: Mesh,
+    lamp: Mesh,
+    ramp: Mesh,
+    tower_mast: Mesh,
+    tower_panel: Mesh,
+    tower_arm: Mesh,
+    jammer_stalk: Mesh,
+    antenna: Mesh,
+}
+
+impl LevelSourceMeshes {
+    fn new() -> Self {
+        LevelSourceMeshes {
+            block: Mesh::from(Cuboid::new(CELL_SIZE, 1.0, CELL_SIZE)),
+            ceiling: Mesh::from(Cuboid::new(CELL_SIZE, 0.3, CELL_SIZE)),
+            pillar: Mesh::from(Cylinder::new(PILLAR_RADIUS, 1.0)),
+            lamp: Mesh::from(Cuboid::new(0.9, 0.12, 0.4)),
+            ramp: ramp_wedge_mesh(CELL_SIZE, CATWALK_HEIGHT),
+            tower_mast: Mesh::from(Cylinder::new(TOWER_MAST_RADIUS * 0.8, 1.0)),
+            tower_panel: Mesh::from(Cuboid::new(1.0, 2.4, 0.12)),
+            tower_arm: Mesh::from(Cuboid::new(4.0, 0.2, 0.2)),
+            jammer_stalk: Mesh::from(Cylinder::new(0.35, 2.4)),
+            antenna: Mesh::from(Cylinder::new(0.05, 1.6)),
+        }
+    }
+}
+
+/// Static level geometry batched per material (one entity per material).
+#[derive(Component)]
+pub struct LevelBatch;
+
 fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, meshes: &mut Assets<Mesh>) {
     // Atmosphere: crimson Martian moonlight + ambient. (Fog lives on the camera.)
     commands.spawn((
@@ -735,8 +893,8 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
         Transform::from_xyz(0.0, 50.0, 0.0).looking_at(Vec3::new(30.0, 0.0, 45.0), Vec3::Y),
     ));
 
-    let wall_mesh = meshes.add(Cuboid::new(CELL_SIZE, 1.0, CELL_SIZE));
-    let ramp_mesh = meshes.add(ramp_wedge_mesh(CELL_SIZE, CATWALK_HEIGHT));
+    let src = LevelSourceMeshes::new();
+    let mut batches = MaterialBatches::new();
 
     for z in 0..g.depth {
         for x in 0..g.width {
@@ -744,59 +902,66 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
             let center = Vec3::new((x as f32 + 0.5) * CELL_SIZE, 0.0, (z as f32 + 0.5) * CELL_SIZE);
             match g.cell(c) {
                 Cell::Wall => {
-                    // Skip walls fully enclosed by walls (never visible).
-                    let visible = (-1..=1).any(|dz| (-1..=1).any(|dx| !g.cell(c + IVec2::new(dx, dz)).is_wall()));
-                    if !visible {
-                        continue;
-                    }
-                    let near_atrium =
-                        (-1..=1).any(|dz| (-1..=1).any(|dx| g.is_roof_open(c + IVec2::new(dx, dz))));
-                    let top = if near_atrium { ATRIUM_WALL_HEIGHT } else { CEILING_HEIGHT };
+                    // Walls fully enclosed by walls are never visible (not spawned).
+                    let Some(top) = spawned_wall_top(g, c) else { continue };
                     let h = top - SLAB_BOTTOM;
-                    commands.spawn((
-                        LevelEntity,
-                        Mesh3d(wall_mesh.clone()),
-                        MeshMaterial3d(if near_atrium { a.wall_tall.clone() } else { a.wall.clone() }),
-                        Transform::from_translation(center.with_y(SLAB_BOTTOM + h * 0.5))
-                            .with_scale(Vec3::new(1.0, h, 1.0)),
-                    ));
+                    let mat = if top > CEILING_HEIGHT { &a.wall_tall } else { &a.wall };
+                    let tf = Transform::from_translation(center.with_y(SLAB_BOTTOM + h * 0.5)).with_scale(Vec3::new(1.0, h, 1.0));
+                    // Hidden: the bottom, and sides pressed against an equal-or-taller wall.
+                    batches.batch(mat).append_filtered(&src.block, &tf, |n| {
+                        if n.y < -0.5 {
+                            return false;
+                        }
+                        match side_of(n) {
+                            Some(o) => !spawned_wall_top(g, c + o).is_some_and(|t| t >= top),
+                            None => true,
+                        }
+                    });
                 }
                 cell => {
-                    let (top, mat) = match cell {
-                        Cell::Floor { height } if height > 0.1 => (height, a.catwalk.clone()),
-                        Cell::Floor { height } => (height, a.floor.clone()),
-                        Cell::AtriumFloor => (0.0, a.regolith.clone()),
-                        Cell::HazardPit => (PIT_DEPTH, a.lava.clone()),
-                        Cell::Ramp { low_height, .. } => (low_height, a.floor.clone()),
+                    let top = slab_top(cell).expect("non-wall cell");
+                    let mat = match cell {
+                        Cell::Floor { height } if height > 0.1 => &a.catwalk,
+                        Cell::Floor { .. } | Cell::Ramp { .. } => &a.floor,
+                        Cell::AtriumFloor => &a.regolith,
+                        Cell::HazardPit => &a.lava,
                         Cell::Wall => unreachable!(),
                     };
+                    let is_ramp = matches!(cell, Cell::Ramp { .. });
                     let slab_h = top - SLAB_BOTTOM;
-                    commands.spawn((
-                        LevelEntity,
-                        Mesh3d(a.slab_mesh.clone()),
-                        MeshMaterial3d(mat),
-                        Transform::from_translation(center.with_y(SLAB_BOTTOM + slab_h * 0.5))
-                            .with_scale(Vec3::new(1.0, slab_h, 1.0)),
-                    ));
+                    let tf = Transform::from_translation(center.with_y(SLAB_BOTTOM + slab_h * 0.5)).with_scale(Vec3::new(1.0, slab_h, 1.0));
+                    // Hidden: the bottom, a ramp slab's top (under the wedge), and sides
+                    // against walls or equal-or-taller slabs.
+                    batches.batch(mat).append_filtered(&src.block, &tf, |n| {
+                        if n.y < -0.5 || (n.y > 0.5 && is_ramp) {
+                            return false;
+                        }
+                        match side_of(n) {
+                            Some(o) => {
+                                let nb = g.cell(c + o);
+                                !(nb.is_wall() || slab_top(nb).is_some_and(|t| t >= top))
+                            }
+                            None => true,
+                        }
+                    });
                     if let Cell::Ramp { low_height, high_height, dir } = cell {
-                        let wedge_mesh = if (high_height - low_height - CATWALK_HEIGHT).abs() < 1e-3 {
-                            ramp_mesh.clone()
+                        let rise = high_height - low_height;
+                        let custom;
+                        let wedge = if (rise - CATWALK_HEIGHT).abs() < 1e-3 {
+                            &src.ramp
                         } else {
-                            meshes.add(ramp_wedge_mesh(CELL_SIZE, high_height - low_height))
+                            custom = ramp_wedge_mesh(CELL_SIZE, rise);
+                            &custom
                         };
                         // Mesh rises toward -Z; rotate so it rises along `dir`.
                         let yaw = yaw_facing(Vec2::new(dir.world_dir().x, dir.world_dir().z));
-                        commands.spawn((
-                            LevelEntity,
-                            Mesh3d(wedge_mesh),
-                            MeshMaterial3d(a.catwalk.clone()),
-                            Transform::from_translation(center.with_y(low_height))
-                                .with_rotation(Quat::from_rotation_y(yaw)),
-                        ));
+                        let tf = Transform::from_translation(center.with_y(low_height)).with_rotation(Quat::from_rotation_y(yaw));
+                        batches.batch(&a.catwalk).append_filtered(wedge, &tf, |n| n.y > -0.5);
                     }
                     if matches!(cell, Cell::HazardPit) {
                         commands.spawn((
                             LevelEntity,
+                            CullableLight::for_range(9.0),
                             PointLight {
                                 color: Color::srgb(1.0, 0.3, 0.05),
                                 intensity: 250_000.0,
@@ -808,12 +973,26 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
                         ));
                     }
                     if !g.is_roof_open(c) {
-                        commands.spawn((
-                            LevelEntity,
-                            Mesh3d(a.ceiling_mesh.clone()),
-                            MeshMaterial3d(a.ceiling.clone()),
-                            Transform::from_translation(center.with_y(CEILING_HEIGHT + 0.15)),
-                        ));
+                        let tf = Transform::from_translation(center.with_y(CEILING_HEIGHT + 0.15));
+                        // Hidden: the top, and sides shared with neighbouring ceilings
+                        // or buried in tall walls.
+                        batches.batch(&a.ceiling).append_filtered(&src.ceiling, &tf, |n| {
+                            if n.y > 0.5 {
+                                return false;
+                            }
+                            match side_of(n) {
+                                Some(o) => {
+                                    let n = c + o;
+                                    let covered = if g.cell(n).is_wall() {
+                                        spawned_wall_top(g, n).is_some_and(|t| t >= CEILING_HEIGHT + 0.3)
+                                    } else {
+                                        !g.is_roof_open(n)
+                                    };
+                                    !covered
+                                }
+                                None => true,
+                            }
+                        });
                     }
                 }
             }
@@ -828,12 +1007,8 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
         let c = g.world_to_cell(Vec3::new(p.x, 0.0, p.y));
         let top = if g.is_roof_open(c) { ATRIUM_WALL_HEIGHT - 2.0 } else { CEILING_HEIGHT };
         let h = top - SLAB_BOTTOM;
-        commands.spawn((
-            LevelEntity,
-            Mesh3d(a.pillar_mesh.clone()),
-            MeshMaterial3d(a.wall.clone()),
-            Transform::from_xyz(p.x, SLAB_BOTTOM + h * 0.5, p.y).with_scale(Vec3::new(*r / PILLAR_RADIUS, h, *r / PILLAR_RADIUS)),
-        ));
+        let tf = Transform::from_xyz(p.x, SLAB_BOTTOM + h * 0.5, p.y).with_scale(Vec3::new(*r / PILLAR_RADIUS, h, *r / PILLAR_RADIUS));
+        batches.batch(&a.wall).append_filtered(&src.pillar, &tf, |n| n.y > -0.5);
     }
 
     // Industrial bunker lights (amber, flicker-free baseline).
@@ -842,6 +1017,7 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
         let warm = i % 3 != 0;
         commands.spawn((
             LevelEntity,
+            CullableLight::for_range(16.0),
             PointLight {
                 color: if warm { Color::srgb(1.0, 0.62, 0.35) } else { Color::srgb(0.9, 0.25, 0.2) },
                 intensity: 420_000.0,
@@ -851,24 +1027,46 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
             },
             Transform::from_translation(pos),
         ));
-        commands.spawn((
-            LevelEntity,
-            Mesh3d(a.lamp_mesh.clone()),
-            MeshMaterial3d(a.lamp.clone()),
-            Transform::from_translation(pos + Vec3::Y * 0.45),
-        ));
+        batches.add(&src.lamp, &a.lamp, Transform::from_translation(pos + Vec3::Y * 0.45));
     }
 
-    spawn_signal_tower(commands, g, a);
+    spawn_signal_tower(commands, g, a, &src, &mut batches);
+    for (mesh, mat) in batches.finish(meshes) {
+        commands.spawn((LevelEntity, LevelBatch, Mesh3d(mesh), MeshMaterial3d(mat), Transform::IDENTITY));
+    }
     for &j in &g.jammers {
-        spawn_jammer(commands, g, a, j);
+        spawn_jammer(commands, g, a, &src, meshes, j);
     }
 }
 
-fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, a: &GameAssets) {
+fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, src: &LevelSourceMeshes, batches: &mut MaterialBatches) {
     let base = g.tower_world();
     let mast_h = 14.0;
     let beacon = base + Vec3::Y * (mast_h + 0.6);
+    // The static mast, signal panels and cross arms join the level batches
+    // (baked at their world placement under the tower root).
+    let at = |local: Transform| Transform::from_translation(base).mul_transform(local);
+    batches.add(&src.tower_mast, &a.wall, at(Transform::from_xyz(0.0, mast_h * 0.5, 0.0).with_scale(Vec3::new(1.0, mast_h, 1.0))));
+    // Emissive signal panels around the mast.
+    for k in 0..4 {
+        let ang = k as f32 * FRAC_PI_2;
+        for level in 0..3 {
+            let y = 2.5 + level as f32 * 4.0;
+            batches.add(
+                &src.tower_panel,
+                &a.tower_panel,
+                at(Transform::from_translation(Quat::from_rotation_y(ang) * Vec3::new(0.0, y, -0.85)).with_rotation(Quat::from_rotation_y(ang))),
+            );
+        }
+    }
+    // Cross arms.
+    for level in 0..3 {
+        batches.add(
+            &src.tower_arm,
+            &a.catwalk,
+            at(Transform::from_xyz(0.0, 4.5 + level as f32 * 4.0, 0.0).with_rotation(Quat::from_rotation_y(level as f32 * PI / 3.0))),
+        );
+    }
     commands
         .spawn((
             LevelEntity,
@@ -877,33 +1075,6 @@ fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, a: &GameAssets) {
             Visibility::default(),
         ))
         .with_children(|t| {
-            t.spawn((
-                Mesh3d(a.tower_mast_mesh.clone()),
-                MeshMaterial3d(a.wall.clone()),
-                Transform::from_xyz(0.0, mast_h * 0.5, 0.0).with_scale(Vec3::new(1.0, mast_h, 1.0)),
-            ));
-            // Emissive signal panels around the mast.
-            for k in 0..4 {
-                let ang = k as f32 * FRAC_PI_2;
-                for level in 0..3 {
-                    let y = 2.5 + level as f32 * 4.0;
-                    t.spawn((
-                        Mesh3d(a.tower_panel_mesh.clone()),
-                        MeshMaterial3d(a.tower_panel.clone()),
-                        Transform::from_translation(Quat::from_rotation_y(ang) * Vec3::new(0.0, y, -0.85))
-                            .with_rotation(Quat::from_rotation_y(ang)),
-                    ));
-                }
-            }
-            // Cross arms.
-            for level in 0..3 {
-                t.spawn((
-                    Mesh3d(a.tower_arm_mesh.clone()),
-                    MeshMaterial3d(a.catwalk.clone()),
-                    Transform::from_xyz(0.0, 4.5 + level as f32 * 4.0, 0.0)
-                        .with_rotation(Quat::from_rotation_y(level as f32 * PI / 3.0)),
-                ));
-            }
             t.spawn((
                 TowerBeacon,
                 Mesh3d(a.beacon_mesh.clone()),
@@ -931,9 +1102,22 @@ fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, a: &GameAssets) {
         });
 }
 
-fn spawn_jammer(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, c: IVec2) {
+fn spawn_jammer(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, src: &LevelSourceMeshes, meshes: &mut Assets<Mesh>, c: IVec2) {
     let base = g.cell_center(c);
     let phase = (c.x * 7 + c.y * 13) as f32 * 0.37;
+    // Stalk + 3 antennas share the flesh material: one baked mesh per jammer
+    // (its handle lives on the jammer's child and drops with it).
+    let mut shell = MeshBatch::new();
+    shell.append(&src.jammer_stalk, &Transform::from_xyz(0.0, 1.2, 0.0));
+    for k in 0..3 {
+        let ang = k as f32 * 2.0 * PI / 3.0 + phase;
+        shell.append(
+            &src.antenna,
+            &Transform::from_translation(Vec3::new(ang.cos() * 0.35, 3.6, ang.sin() * 0.35))
+                .with_rotation(Quat::from_rotation_z(0.35 * ang.cos()) * Quat::from_rotation_x(0.35 * ang.sin())),
+        );
+    }
+    let shell = meshes.add(shell.build().expect("jammer shell"));
     commands
         .spawn((
             LevelEntity,
@@ -942,27 +1126,15 @@ fn spawn_jammer(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, c: IVec2
             Visibility::default(),
         ))
         .with_children(|j| {
-            j.spawn((
-                Mesh3d(a.jammer_stalk_mesh.clone()),
-                MeshMaterial3d(a.jammer.clone()),
-                Transform::from_xyz(0.0, 1.2, 0.0),
-            ));
+            j.spawn((Mesh3d(shell), MeshMaterial3d(a.jammer.clone()), Transform::IDENTITY));
             j.spawn((
                 JammerCore { phase },
                 Mesh3d(a.jammer_core_mesh.clone()),
                 MeshMaterial3d(a.jammer_core.clone()),
                 Transform::from_xyz(0.0, 2.7, 0.0),
             ));
-            for k in 0..3 {
-                let ang = k as f32 * 2.0 * PI / 3.0 + phase;
-                j.spawn((
-                    Mesh3d(a.antenna_mesh.clone()),
-                    MeshMaterial3d(a.jammer.clone()),
-                    Transform::from_translation(Vec3::new(ang.cos() * 0.35, 3.6, ang.sin() * 0.35))
-                        .with_rotation(Quat::from_rotation_z(0.35 * ang.cos()) * Quat::from_rotation_x(0.35 * ang.sin())),
-                ));
-            }
             j.spawn((
+                CullableLight::for_range(12.0),
                 PointLight {
                     color: Color::srgb(1.0, 0.05, 0.12),
                     intensity: 500_000.0,
@@ -1134,5 +1306,55 @@ mod tests {
         assert!((r.floor_height_at_frac(Vec2::splat(0.5)).unwrap() - 1.2).abs() < 1e-5);
         assert_eq!(r.edge_height(IVec2::new(0, -1)), Some(2.4));
         assert_eq!(r.edge_height(IVec2::new(1, 0)), None);
+    }
+
+    #[test]
+    fn cullable_light_fades_smoothly_without_pop() {
+        let c = CullableLight::for_range(12.0);
+        assert_eq!(c.fade_factor(0.0), 1.0);
+        assert_eq!(c.fade_factor(c.cull_dist - c.fade_band), 1.0);
+        let mid = c.fade_factor(c.cull_dist - c.fade_band * 0.5);
+        assert!((mid - 0.5).abs() < 1e-5, "midpoint fade {mid}");
+        assert!(c.fade_factor(c.cull_dist - 0.1) > 0.0);
+        assert_eq!(c.fade_factor(c.cull_dist), 0.0);
+        assert_eq!(c.fade_factor(c.cull_dist + 20.0), 0.0);
+    }
+
+    #[test]
+    fn extinguished_aura_near_fade_boundary_stays_dark_when_approached() {
+        let mut world = World::new();
+        let mut sched = Schedule::default();
+        sched.add_systems(cull_world_lights);
+
+        let cull = CullableLight::for_range(7.0);
+        // Place the light just inside the outer edge of the fade band so the
+        // faded intensity is tiny (~0.005).
+        let near_edge = cull.cull_dist - 1e-5;
+        let player = world
+            .spawn((crate::player::Player::default(), Transform::from_xyz(0.0, 0.0, 0.0)))
+            .id();
+        let light = world
+            .spawn((
+                cull,
+                PointLight { intensity: 7_000.0, range: 7.0, ..default() },
+                GlobalTransform::from_xyz(near_edge, crate::player::PLAYER_EYE_HEIGHT, 0.0),
+                Visibility::Inherited,
+            ))
+            .id();
+
+        // First run skips `is_added`; second run evaluates the fade band near the edge.
+        sched.run(&mut world);
+        sched.run(&mut world);
+        assert_eq!(*world.entity(light).get::<Visibility>().unwrap(), Visibility::Inherited);
+        let faded = world.entity(light).get::<PointLight>().unwrap().intensity;
+        assert!(faded > 0.0 && faded < 0.01, "expected tiny faded intensity, got {faded}");
+
+        // Owner turns the aura off, then player walks right next to the light.
+        world.entity_mut(light).get_mut::<CullableLight>().unwrap().set_intensity(0.0);
+        world.entity_mut(player).get_mut::<Transform>().unwrap().translation = Vec3::new(near_edge, 0.0, 0.0);
+        sched.run(&mut world);
+
+        assert_eq!(*world.entity(light).get::<Visibility>().unwrap(), Visibility::Hidden);
+        assert_eq!(world.entity(light).get::<PointLight>().unwrap().intensity, 0.0);
     }
 }

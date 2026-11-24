@@ -11,6 +11,8 @@ pub mod fx;
 pub mod hud;
 pub mod ui_kit;
 pub mod level;
+pub mod mesh_batch;
+pub mod perf;
 pub mod meta;
 pub mod meta_ui;
 pub mod phone_screen;
@@ -54,6 +56,7 @@ impl Plugin for CoreGameplayPlugin {
                 upgrades::UpgradesPlugin,
                 audio::GameAudioPlugin,
                 meta::MetaPlugin,
+                perf::PerfPlugin,
             ));
     }
 }

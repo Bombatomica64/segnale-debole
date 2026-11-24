@@ -34,7 +34,9 @@ use segnale_debole::meta::{
     StarterChip,
 };
 use segnale_debole::phone_screen::{PhoneScreenTexture, SCREEN_W, SPOOF_CYAN};
-use segnale_debole::level::{jammer_count_for_floor, Cell, DemonJammer, LevelGrid, SignalTower};
+use segnale_debole::extraction::SignalRingFx;
+use segnale_debole::level::{jammer_count_for_floor, Cell, DemonJammer, LevelBatch, LevelGrid, SignalTower, TowerBeacon};
+use segnale_debole::perf::{PerfOverlay, PerfOverlayText, PerfSettings};
 use segnale_debole::physics::has_line_of_sight;
 use segnale_debole::player::{hazard_damage, Player, PlayerCamera, BASE_FOV_DEG, DASH_SPEED, MOVE_SPEED, PLAYER_EYE_HEIGHT};
 use segnale_debole::signal::{bars_from_strength, SignalState, TOWER_RING_RADIUS};
@@ -1995,4 +1997,296 @@ fn pause_menu_freezes_simulation_and_resumes_or_restarts_cleanly() {
     tap(&mut app, KeyCode::KeyM);
     assert_eq!(app_state(&app), AppState::MainMenu);
     assert_eq!(count::<Player>(&mut app), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Performance budgets (headless benchmark + regression guards)
+// ---------------------------------------------------------------------------
+
+/// Static level mesh entities the pre-batching renderer spawned for `g`: one
+/// per visible wall, floor slab, ramp wedge, ceiling slab, pillar and lamp,
+/// 16 signal-tower parts + beacon, and 5 mesh parts per Demon Jammer.
+fn legacy_static_mesh_entities(g: &LevelGrid) -> usize {
+    let mut n = 0;
+    for z in 0..g.depth {
+        for x in 0..g.width {
+            let c = IVec2::new(x, z);
+            match g.cell(c) {
+                Cell::Wall => {
+                    if (-1..=1).any(|dz| (-1..=1).any(|dx| !g.cell(c + IVec2::new(dx, dz)).is_wall())) {
+                        n += 1;
+                    }
+                }
+                cell => {
+                    n += 1;
+                    n += matches!(cell, Cell::Ramp { .. }) as usize;
+                    n += !g.is_roof_open(c) as usize;
+                }
+            }
+        }
+    }
+    n + (g.pillars.len() - 1) + g.lights.len() + 17 + 5 * g.jammers.len()
+}
+
+/// Static level mesh entities spawned now: level batches, the tower beacon
+/// and the per-jammer meshes.
+fn static_mesh_entities(app: &mut App) -> usize {
+    let batches = count::<LevelBatch>(app);
+    let mut q = app.world_mut().query_filtered::<&Children, With<DemonJammer>>();
+    let jammer_meshes: usize = {
+        let kids: Vec<Entity> = q.iter(app.world()).flat_map(|c| c.iter()).collect();
+        kids.into_iter().filter(|e| app.world().get::<Mesh3d>(*e).is_some()).count()
+    };
+    batches + count::<TowerBeacon>(app) + jammer_meshes
+}
+
+fn descendants(app: &App, root: Entity) -> usize {
+    let mut n = 0;
+    let mut stack = vec![root];
+    while let Some(e) = stack.pop() {
+        if let Some(ch) = app.world().get::<Children>(e) {
+            for c in ch.iter() {
+                n += 1;
+                stack.push(c);
+            }
+        }
+    }
+    n
+}
+
+fn material_count(app: &App) -> usize {
+    app.world().resource::<Assets<StandardMaterial>>().len()
+}
+
+fn mesh_count(app: &App) -> usize {
+    app.world().resource::<Assets<Mesh>>().len()
+}
+
+/// `(visible, total)` point lights (culled lights are `Visibility::Hidden`).
+fn light_counts(app: &mut App) -> (usize, usize) {
+    let mut q = app.world_mut().query_filtered::<&Visibility, With<PointLight>>();
+    let all: Vec<Visibility> = q.iter(app.world()).copied().collect();
+    (all.iter().filter(|v| **v != Visibility::Hidden).count(), all.len())
+}
+
+fn timed_step(app: &mut App, frames: usize, ticks: &mut Vec<f64>) {
+    for _ in 0..frames {
+        let t0 = std::time::Instant::now();
+        app.update();
+        ticks.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+/// Squad fight in the open atrium: shotgun, plasma, Ping / Sub-GHz route,
+/// 5G Overload (+ chain lightning), dash shockwave, then wipe the squad.
+fn combat_round(app: &mut App, ticks: &mut Vec<f64>) -> f32 {
+    let g = grid(app);
+    let stand = ring_cell(&g);
+    teleport(app, g.cell_center(stand), g.tower_world());
+    step(app, 2);
+    let atrium = g.rooms[0];
+    let mut cells: Vec<IVec2> = (0..atrium.size.y)
+        .flat_map(|z| (0..atrium.size.x).map(move |x| atrium.min + IVec2::new(x, z)))
+        .filter(|c| g.cell(*c) == Cell::AtriumFloor && (*c - stand).abs().element_sum() >= 3)
+        .collect();
+    cells.sort_by_key(|c| (*c - stand).abs().element_sum());
+    let kinds = [EnemyKind::Imp, EnemyKind::Cacodemon, EnemyKind::Imp, EnemyKind::JammerFiend, EnemyKind::Imp, EnemyKind::HellBaron];
+    let squad: Vec<Entity> = kinds.iter().zip(cells.iter().step_by(2)).map(|(k, c)| spawn_demon(app, *k, spawn_pos_for(*k, &g, *c))).collect();
+    step(app, 2);
+    let mut child_total = 0;
+    for &e in &squad {
+        child_total += descendants(app, e);
+    }
+    let avg_children = child_total as f32 / squad.len() as f32;
+
+    // Shotgun then plasma at whatever is still standing.
+    let aim_living = |app: &mut App| {
+        let target = squad.iter().copied().find(|e| enemy(app, *e).is_some_and(|en| en.is_alive()));
+        if let Some(e) = target {
+            let c = enemy_center(app, e);
+            aim_at(app, c);
+        }
+    };
+    bot(app).switch_weapon = Some(Weapon::Shotgun);
+    bot(app).fire = true;
+    for _ in 0..150 {
+        godmode(app);
+        aim_living(app);
+        timed_step(app, 1, ticks);
+    }
+    bot(app).switch_weapon = Some(Weapon::Plasma);
+    for _ in 0..120 {
+        godmode(app);
+        aim_living(app);
+        with_player(app, |p| p.ammo_plasma = p.max_plasma);
+        timed_step(app, 1, ticks);
+    }
+    bot(app).fire = false;
+
+    // Phone apps: Ping (+ Sub-GHz route & x-ray beacons), Overload, dash.
+    for _ in 0..2 {
+        {
+            let mut apps = app.world_mut().resource_mut::<PhoneApps>();
+            apps.ping_cooldown = 0.0;
+            apps.overload_cooldown = 0.0;
+        }
+        bot(app).ping = true;
+        timed_step(app, 2, ticks);
+        bot(app).overload = true;
+        timed_step(app, 2, ticks);
+        bot(app).dash = true;
+        timed_step(app, 30, ticks);
+    }
+    // Route from the airlock too (long Sub-GHz breadcrumb trail).
+    teleport(app, g.spawn_world(), g.tower_world());
+    step(app, 2);
+    app.world_mut().resource_mut::<PhoneApps>().ping_cooldown = 0.0;
+    bot(app).ping = true;
+    timed_step(app, 60, ticks);
+    for &e in &squad {
+        if enemy(app, e).is_some() {
+            kill(app, e);
+        }
+    }
+    godmode(app);
+    timed_step(app, 90, ticks);
+    avg_children
+}
+
+#[test]
+fn perf_multi_floor_budgets_and_tick_timing() {
+    let mut app = build_menu_app(None);
+
+    // F3 / F4 work from the menu and in play; overlay off by default.
+    assert!(!app.world().resource::<PerfSettings>().overlay, "telemetry overlay is off by default");
+    assert!(!app.world().resource::<PerfSettings>().vsync, "uncapped (no VSync) by default");
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    let overlay_display = |app: &mut App| {
+        let mut q = app.world_mut().query_filtered::<&Node, With<PerfOverlay>>();
+        q.single(app.world()).unwrap().display
+    };
+    assert_eq!(overlay_display(&mut app), Display::None);
+    tap(&mut app, KeyCode::F3);
+    assert!(app.world().resource::<PerfSettings>().overlay);
+    step(&mut app, 20);
+    assert_eq!(overlay_display(&mut app), Display::Flex);
+    let overlay_text = {
+        let mut q = app.world_mut().query_filtered::<&Text, With<PerfOverlayText>>();
+        q.single(app.world()).unwrap().0.clone()
+    };
+    assert!(overlay_text.contains("FPS") && overlay_text.contains("NO-VSYNC [F4]") && overlay_text.contains("LGT"), "{overlay_text}");
+    tap(&mut app, KeyCode::F4);
+    assert!(app.world().resource::<PerfSettings>().vsync);
+    assert!(app.world().resource::<HudFeed>().toasts.iter().any(|t| t.text == "VSYNC: ON"));
+    tap(&mut app, KeyCode::F4);
+    assert!(!app.world().resource::<PerfSettings>().vsync);
+    assert!(app.world().resource::<HudFeed>().toasts.iter().any(|t| t.text == "VSYNC: OFF"));
+    tap(&mut app, KeyCode::F3);
+    step(&mut app, 2);
+    assert_eq!(overlay_display(&mut app), Display::None, "F3 hides the overlay again");
+
+    godmode(&mut app);
+    step(&mut app, 10);
+    let mats0 = material_count(&app);
+    let fades0 = app.world().resource::<FxAssets>().fades.lock().unwrap().len();
+
+    // Missed Call decoy at a natural blackout before the antenna lifts the floor.
+    install(&mut app, UpgradeId::MissedCall);
+    find_blackout(&mut app);
+    bot(&mut app).ping = true;
+    step(&mut app, 2);
+    assert_eq!(count::<DecoyHandset>(&mut app), 1, "decoy deployed");
+    step(&mut app, 3 * FPS);
+    for id in [UpgradeId::CopperAntenna, UpgradeId::SubGhzPenetration, UpgradeId::EmpOvercharge, UpgradeId::AirplaneModePhase, UpgradeId::JammerHijack] {
+        install(&mut app, id);
+    }
+    assert_eq!(material_count(&app), mats0, "decoy allocates no materials");
+
+    let ea = app.world().resource::<EnemyAssets>().clone();
+    let mut report = Vec::new();
+    let mut static_meshes: Option<usize> = None;
+    let mut ticks_all = Vec::new();
+    loop {
+        let g = grid(&app);
+        let floor = g.floor;
+        godmode(&mut app);
+        step(&mut app, 3);
+        // Assets<Mesh>: everything but this floor's own meshes is constant.
+        let per_floor = count::<LevelBatch>(&mut app) + count::<DemonJammer>(&mut app) + count::<SignalRingFx>(&mut app);
+        let fixed = mesh_count(&app) - per_floor;
+        match static_meshes {
+            None => static_meshes = Some(fixed),
+            Some(s) => assert_eq!(fixed, s, "floor {floor}: Assets<Mesh> leaked across the floor transition"),
+        }
+        if [1, 3, 5].contains(&floor) {
+            let legacy = legacy_static_mesh_entities(&g);
+            let now = static_mesh_entities(&mut app);
+            let (vis0, total0) = light_counts(&mut app);
+            let mesh_before = mesh_count(&app);
+            let mut ticks = Vec::new();
+            let avg_children = combat_round(&mut app, &mut ticks);
+            let (vis1, total1) = light_counts(&mut app);
+            assert_eq!(material_count(&app), mats0, "floor {floor}: combat + abilities allocated StandardMaterials");
+            assert!(now * 10 <= legacy, "floor {floor}: static mesh entities {now} vs legacy {legacy}");
+            assert!(avg_children <= 10.0, "floor {floor}: {avg_children} child entities per demon");
+            assert!(vis0 < total0, "floor {floor}: far lights are culled ({vis0}/{total0})");
+            ticks.sort_by(f64::total_cmp);
+            let avg = ticks.iter().sum::<f64>() / ticks.len() as f64;
+            let p99 = ticks[(ticks.len() * 99 / 100).min(ticks.len() - 1)];
+            report.push(format!(
+                "floor {floor} ({}x{}): static level mesh entities {legacy} -> {now} ({} batches) | demon children avg {avg_children:.1} | \
+                 point lights visible {vis0}/{total0} idle, {vis1}/{total1} after combat | Assets<Mesh> {mesh_before} -> {} | \
+                 tick avg {avg:.3} ms p99 {p99:.3} ms over {} frames",
+                g.width,
+                g.depth,
+                count::<LevelBatch>(&mut app),
+                mesh_count(&app),
+                ticks.len(),
+            ));
+            ticks_all.extend(ticks);
+        }
+        fast_clear_floor(&mut app);
+        assert_eq!(material_count(&app), mats0, "floor {floor}: SOS / extraction allocated StandardMaterials");
+        if floor == FINAL_FLOOR {
+            assert_eq!(app_state(&app), AppState::Victory);
+            break;
+        }
+        assert_eq!(app_state(&app), AppState::UpgradeSelect);
+        bot(&mut app).pick_upgrade = Some(0);
+        step(&mut app, 3);
+        assert_eq!(app_state(&app), AppState::Playing);
+    }
+    ticks_all.sort_by(f64::total_cmp);
+    let avg = ticks_all.iter().sum::<f64>() / ticks_all.len() as f64;
+    let p99 = ticks_all[(ticks_all.len() * 99 / 100).min(ticks_all.len() - 1)];
+    let fades = app.world().resource::<FxAssets>().fades.lock().unwrap().len();
+    let parts: Vec<String> = EnemyKind::ALL
+        .iter()
+        .map(|k| format!("{:?} {} -> {}", k, ea.source_part_counts[k.index()], ea.models[k.index()].len()))
+        .collect();
+    println!("=== SEGNALE DEBOLE perf report (headless, {} fixed-step ticks) ===", ticks_all.len());
+    println!("demon mesh parts (entities per model): {}", parts.join(", "));
+    for line in &report {
+        println!("{line}");
+    }
+    println!("Assets<StandardMaterial>: {mats0} at run start -> {} after 3 measured floors of combat, Ping/Sub-GHz/Overload/Decoy/dash and 5 floor transitions", material_count(&app));
+    println!("fade palettes: {fades0} prewarmed -> {fades} after the run");
+    println!("Assets<Mesh> outside per-floor geometry: {} (constant across transitions)", static_meshes.unwrap());
+    println!("headless tick: avg {avg:.3} ms, p99 {p99:.3} ms");
+    assert_eq!(fades, fades0, "every fade palette was prewarmed at startup");
+    assert!(avg < 33.0, "headless tick avg {avg:.2} ms");
+
+    // Cross-run lifecycle check: Victory -> MainMenu -> new run Floor 1 must
+    // release every per-run mesh and material handle cleanly.
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::MainMenu);
+    step(&mut app, 6);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    tap(&mut app, KeyCode::Enter);
+    step(&mut app, 6);
+    assert_eq!(app_state(&app), AppState::Playing);
+    let per_floor_run2 = count::<LevelBatch>(&mut app) + count::<DemonJammer>(&mut app) + count::<SignalRingFx>(&mut app);
+    let fixed_run2 = mesh_count(&app) - per_floor_run2;
+    assert_eq!(material_count(&app), mats0, "second run leaked StandardMaterials across MainMenu reset");
+    assert_eq!(fixed_run2, static_meshes.unwrap(), "second run leaked Assets<Mesh> across MainMenu reset");
 }

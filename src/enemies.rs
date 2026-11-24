@@ -13,11 +13,12 @@ use rand::seq::SliceRandom;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::fx::{spawn_burst, BurstColor, FxAssets, HudFeed};
 use crate::apps::spawn_hijack_hotspot;
-use crate::level::{Cell, DemonJammer, LevelEntity, LevelGrid, RampDir, SignalTower, CEILING_HEIGHT};
+use crate::level::{Cell, CullableLight, DemonJammer, LevelEntity, LevelGrid, RampDir, SignalTower, CEILING_HEIGHT};
+use crate::mesh_batch::MaterialBatches;
 use crate::physics::{count_wall_occlusions, has_line_of_sight, raycast_grid, resolve_player_movement, sample_floor_height, PLAYER_RADIUS};
 use crate::player::{Player, PLAYER_EYE_HEIGHT};
 use crate::apps::{DecoyHandset, PhoneApps, CALLBACK_SECS, DECOY_LURE_RADIUS, STORE_FORWARD_MAX_PACKETS};
-use crate::signal::{active_jammer_fields, bars_from_strength, compute_signal_at, JammerField, SignalState};
+use crate::signal::{active_jammer_fields_iter, bars_from_strength, compute_signal_at, JammerField, SignalState};
 use crate::state::{GameSet, PlayerModifiers, RunStats};
 use crate::weapons::{spawn_pickup, PickupAssets, PickupKind};
 
@@ -43,6 +44,18 @@ pub enum EnemyKind {
 }
 
 impl EnemyKind {
+    pub const ALL: [EnemyKind; 4] = [EnemyKind::Imp, EnemyKind::Cacodemon, EnemyKind::JammerFiend, EnemyKind::HellBaron];
+
+    /// Dense index (`0..4`) for per-kind asset tables.
+    pub fn index(self) -> usize {
+        match self {
+            EnemyKind::Imp => 0,
+            EnemyKind::Cacodemon => 1,
+            EnemyKind::JammerFiend => 2,
+            EnemyKind::HellBaron => 3,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             EnemyKind::Imp => "STATIC IMP",
@@ -261,10 +274,14 @@ pub fn should_enrage(kind: EnemyKind, in_dead_zone: bool) -> bool {
 
 /// Jammer fields projected by every living Jammer Fiend.
 pub fn fiend_jammer_fields<'a>(enemies: impl Iterator<Item = (&'a Enemy, &'a GlobalTransform)>) -> Vec<JammerField> {
+    fiend_jammer_fields_iter(enemies).collect()
+}
+
+/// Allocation-free form of [`fiend_jammer_fields`] (extend a reused buffer).
+pub fn fiend_jammer_fields_iter<'a>(enemies: impl Iterator<Item = (&'a Enemy, &'a GlobalTransform)>) -> impl Iterator<Item = JammerField> {
     enemies
         .filter(|(e, _)| e.kind == EnemyKind::JammerFiend && e.is_alive())
         .map(|(_, t)| JammerField { pos: t.translation() + Vec3::Y * 1.6, radius: FIEND_FIELD_RADIUS, strength: FIEND_FIELD_STRENGTH })
-        .collect()
 }
 
 /// Pinged by the phone's Ping Scan: glows, shows through walls, takes Packet Sniffer bonus.
@@ -279,15 +296,13 @@ pub struct PingMarked {
 #[derive(Component)]
 pub struct EnemyBody;
 
-/// Per-enemy material handles for hit-flash / enrage / ping tinting.
+/// The demon's tintable baked parts (their `MeshMaterial3d` handles are
+/// swapped between the shared per-kind state materials) and its aura light.
 #[derive(Component)]
 pub struct EnemyLook {
-    pub body: Handle<StandardMaterial>,
-    pub eye: Handle<StandardMaterial>,
-    pub body_emissive: LinearRgba,
-    pub eye_emissive: LinearRgba,
+    pub body_part: Entity,
+    pub eye_part: Entity,
     pub aura: Entity,
-    pub dirty_key: u32,
 }
 
 #[derive(Component)]
@@ -311,7 +326,45 @@ pub struct EnemyProjectile {
     pub color: BurstColor,
 }
 
-/// Shared enemy meshes and template materials.
+/// Body visual state bits (index into [`EnemyLookMaterials::body`]).
+pub const LOOK_ENRAGED: usize = 1;
+pub const LOOK_MARKED: usize = 2;
+pub const LOOK_STUNNED: usize = 4;
+/// Quantized hit-flash fade steps.
+pub const FLASH_STEPS: usize = 3;
+
+/// Shared, pre-allocated state materials of one demon kind. Demons swap
+/// handles on state changes instead of owning (and mutating) materials; the
+/// pulsing enraged / stunned variants are re-tinted at most once per frame.
+#[derive(Clone)]
+pub struct EnemyLookMaterials {
+    pub body_emissive: LinearRgba,
+    pub eye_emissive: LinearRgba,
+    /// Indexed by `LOOK_ENRAGED | LOOK_MARKED | LOOK_STUNNED` bits.
+    pub body: [Handle<StandardMaterial>; 8],
+    /// Hit flash: `flash[state][step]` preserves full enraged/marked/stunned tint (step 0 = full flash).
+    pub flash: [[Handle<StandardMaterial>; FLASH_STEPS]; 8],
+    pub eye: Handle<StandardMaterial>,
+    pub eye_enraged: Handle<StandardMaterial>,
+}
+
+/// Which tintable slot a baked demon part fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartRole {
+    Static,
+    Body,
+    Eye,
+}
+
+/// One baked (per-material merged) rigid part of a demon model.
+#[derive(Clone)]
+pub struct EnemyPart {
+    pub mesh: Handle<Mesh>,
+    pub material: Handle<StandardMaterial>,
+    pub role: PartRole,
+}
+
+/// Shared enemy meshes, materials and pre-baked models.
 #[derive(Resource, Clone)]
 pub struct EnemyAssets {
     pub cube: Handle<Mesh>,
@@ -325,22 +378,60 @@ pub struct EnemyAssets {
     pub horn: Handle<StandardMaterial>,
     pub dark: Handle<StandardMaterial>,
     pub metal_plate: Handle<StandardMaterial>,
-    pub imp_body: StandardMaterial,
-    pub imp_eye: StandardMaterial,
     pub imp_dark: Handle<StandardMaterial>,
-    pub caco_body: StandardMaterial,
-    pub caco_eye: StandardMaterial,
     pub caco_iris: Handle<StandardMaterial>,
     pub caco_maw: Handle<StandardMaterial>,
-    pub fiend_body: StandardMaterial,
     pub fiend_green: Handle<StandardMaterial>,
-    pub fiend_eye: StandardMaterial,
-    pub baron_body: StandardMaterial,
     pub baron_gold: Handle<StandardMaterial>,
-    pub baron_eye: StandardMaterial,
     pub ping_ring: Handle<StandardMaterial>,
     pub enrage_halo: Handle<StandardMaterial>,
     pub fiend_ring: Handle<StandardMaterial>,
+    /// Per-kind state materials (indexed by [`EnemyKind::index`]).
+    pub looks: [EnemyLookMaterials; 4],
+    /// Per-kind models: rigid parts merged per material (~5 per demon).
+    pub models: [Vec<EnemyPart>; 4],
+    /// Rigid parts each model was baked from (one entity each before batching).
+    pub source_part_counts: [usize; 4],
+}
+
+impl EnemyAssets {
+    pub fn look(&self, kind: EnemyKind) -> &EnemyLookMaterials {
+        &self.looks[kind.index()]
+    }
+}
+
+/// Body emissive of a demon in a steady (non-flash) visual state.
+pub fn body_state_emissive(base: LinearRgba, state: usize, pulse: f32) -> LinearRgba {
+    let mut body = base;
+    if state & LOOK_ENRAGED != 0 {
+        // High-contrast electric violet-magenta static aura (pops against red Mars walls!).
+        body += LinearRgba::rgb(0.9, 0.08, 1.35) * (0.45 + 0.55 * pulse);
+    }
+    if state & LOOK_MARKED != 0 {
+        body += LinearRgba::rgb(0.0, 0.18, 0.3);
+    }
+    if state & LOOK_STUNNED != 0 {
+        body += LinearRgba::rgb(0.4, 1.2, 1.6) * pulse;
+    }
+    body
+}
+
+/// Body emissive at hit-flash fade `step` (0 = fresh hit), preserving the full
+/// active state (enraged / marked / stunned) and its pulse underneath.
+pub fn body_flash_emissive(base: LinearRgba, state: usize, pulse: f32, step: usize) -> LinearRgba {
+    let k = 1.0 - step as f32 / FLASH_STEPS as f32;
+    body_state_emissive(base, state, pulse) + LinearRgba::rgb(4.2, 3.4, 2.6) * k
+}
+
+/// Quantized flash step for a remaining `hit_flash` time.
+pub fn flash_step(hit_flash: f32) -> usize {
+    let k = (hit_flash / HIT_FLASH_SECS).clamp(0.0, 1.0);
+    (((1.0 - k) * FLASH_STEPS as f32) as usize).min(FLASH_STEPS - 1)
+}
+
+/// Pulse shared by every tinted demon this frame.
+pub fn look_pulse(t: f32) -> f32 {
+    (t * 10.0).sin() * 0.5 + 0.5
 }
 
 fn solid(r: f32, g: f32, b: f32, rough: f32, metal: f32) -> StandardMaterial {
@@ -366,34 +457,92 @@ fn create_enemy_assets(mut commands: Commands, mut materials: ResMut<Assets<Stan
     enrage_halo.emissive = LinearRgba::rgb(6.0, 0.8, 7.5);
     let mut fiend_ring = crate::fx::additive_glow(Color::srgb(0.35, 1.0, 0.18), 0.72);
     fiend_ring.emissive = LinearRgba::rgb(1.0, 5.5, 0.4);
-    commands.insert_resource(EnemyAssets {
-        cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
-        sphere: meshes.add(Sphere::new(1.0).mesh().uv(20, 14)),
-        capsule: meshes.add(Capsule3d::new(0.5, 1.0)),
-        cone: meshes.add(Cone::new(1.0, 1.0)),
-        cylinder: meshes.add(Cylinder::new(1.0, 1.0)),
-        ring: meshes.add(Torus::new(0.8, 1.0)),
+
+    // Per-kind body / eye templates -> shared state material tables.
+    let templates = [
+        (solid(0.32, 0.055, 0.028, 0.72, 0.0), eye(LinearRgba::rgb(18.0, 5.5, 0.35))),
+        (caco, eye(LinearRgba::rgb(3.5, 14.0, 1.4))),
+        (solid(0.15, 0.17, 0.18, 0.4, 0.78), eye(LinearRgba::rgb(2.0, 15.0, 1.2))),
+        (solid(0.38, 0.055, 0.028, 0.65, 0.05), eye(LinearRgba::rgb(18.0, 12.5, 1.2))),
+    ];
+    let looks = templates.map(|(body, eye_tpl)| {
+        let base = body.emissive;
+        let with = |e: LinearRgba| StandardMaterial { emissive: e, ..body.clone() };
+        EnemyLookMaterials {
+            body_emissive: base,
+            eye_emissive: eye_tpl.emissive,
+            body: std::array::from_fn(|state| materials.add(with(body_state_emissive(base, state, 1.0)))),
+            flash: std::array::from_fn(|state| {
+                std::array::from_fn(|step| materials.add(with(body_flash_emissive(base, state, 1.0, step))))
+            }),
+            eye: materials.add(eye_tpl.clone()),
+            eye_enraged: materials.add(StandardMaterial { emissive: LinearRgba::rgb(16.0, 4.0, 20.0), ..eye_tpl }),
+        }
+    });
+
+    // Source primitives (identical to the shared mesh handles below).
+    let src = [
+        Mesh::from(Cuboid::new(1.0, 1.0, 1.0)),
+        Sphere::new(1.0).mesh().uv(20, 14),
+        Mesh::from(Capsule3d::new(0.5, 1.0)),
+        Mesh::from(Cone::new(1.0, 1.0)),
+        Mesh::from(Cylinder::new(1.0, 1.0)),
+        Mesh::from(Torus::new(0.8, 1.0)),
+    ];
+    let mut a = EnemyAssets {
+        cube: meshes.add(src[0].clone()),
+        sphere: meshes.add(src[1].clone()),
+        capsule: meshes.add(src[2].clone()),
+        cone: meshes.add(src[3].clone()),
+        cylinder: meshes.add(src[4].clone()),
+        ring: meshes.add(src[5].clone()),
         bone: materials.add(solid(0.76, 0.68, 0.52, 0.55, 0.0)),
         horn: materials.add(solid(0.08, 0.045, 0.04, 0.48, 0.15)),
         dark: materials.add(solid(0.035, 0.01, 0.012, 0.88, 0.05)),
         metal_plate: materials.add(solid(0.24, 0.26, 0.28, 0.36, 0.85)),
-        imp_body: solid(0.32, 0.055, 0.028, 0.72, 0.0),
-        imp_eye: eye(LinearRgba::rgb(18.0, 5.5, 0.35)),
         imp_dark: materials.add(solid(0.09, 0.025, 0.018, 0.85, 0.05)),
-        caco_body: caco,
-        caco_eye: eye(LinearRgba::rgb(3.5, 14.0, 1.4)),
         caco_iris: materials.add(eye(LinearRgba::rgb(0.5, 7.0, 12.0))),
         caco_maw: materials.add(caco_maw),
-        fiend_body: solid(0.15, 0.17, 0.18, 0.4, 0.78),
         fiend_green: materials.add(green),
-        fiend_eye: eye(LinearRgba::rgb(2.0, 15.0, 1.2)),
-        baron_body: solid(0.38, 0.055, 0.028, 0.65, 0.05),
         baron_gold: materials.add(gold),
-        baron_eye: eye(LinearRgba::rgb(18.0, 12.5, 1.2)),
         ping_ring: materials.add(ping),
         enrage_halo: materials.add(enrage_halo),
         fiend_ring: materials.add(fiend_ring),
-    });
+        looks,
+        models: Default::default(),
+        source_part_counts: [0; 4],
+    };
+    for kind in EnemyKind::ALL {
+        a.source_part_counts[kind.index()] = build_parts(kind, &a, &a.looks[kind.index()].body[0], &a.looks[kind.index()].eye).len();
+        a.models[kind.index()] = bake_model(kind, &a, &src, &mut meshes);
+    }
+    commands.insert_resource(a);
+}
+
+/// Merge a kind's rigid parts per material into a few baked meshes (same
+/// placement under the body pivot, same UVs / normals).
+fn bake_model(kind: EnemyKind, a: &EnemyAssets, src: &[Mesh; 6], meshes: &mut Assets<Mesh>) -> Vec<EnemyPart> {
+    let look = a.look(kind);
+    let handles = [&a.cube, &a.sphere, &a.capsule, &a.cone, &a.cylinder, &a.ring];
+    let mut batches = MaterialBatches::new();
+    for (mesh, mat, t, s, r) in build_parts(kind, a, &look.body[0], &look.eye) {
+        let i = handles.iter().position(|h| h.id() == mesh.id()).expect("demon part uses a shared primitive");
+        batches.add(&src[i], &mat, Transform::from_translation(t).with_scale(s).with_rotation(r));
+    }
+    batches
+        .finish(meshes)
+        .into_iter()
+        .map(|(mesh, material)| {
+            let role = if material.id() == look.body[0].id() {
+                PartRole::Body
+            } else if material.id() == look.eye.id() {
+                PartRole::Eye
+            } else {
+                PartRole::Static
+            };
+            EnemyPart { mesh, material, role }
+        })
+        .collect()
 }
 
 /// Mesh part: (mesh, material, translation, scale, rotation).
@@ -590,24 +739,17 @@ fn build_parts(kind: EnemyKind, a: &EnemyAssets, body: &Handle<StandardMaterial>
 }
 
 /// Spawn one demon. `pos` is the feet position (hover center for Cacodemons).
+/// Allocates no materials or meshes: the model and its state materials are
+/// pre-baked in [`EnemyAssets`].
 pub fn spawn_enemy(
     commands: &mut Commands,
     a: &EnemyAssets,
-    materials: &mut Assets<StandardMaterial>,
+    _materials: &mut Assets<StandardMaterial>,
     kind: EnemyKind,
     pos: Vec3,
     floor: u32,
     alerted: bool,
 ) -> Entity {
-    let (body_tpl, eye_tpl) = match kind {
-        EnemyKind::Imp => (&a.imp_body, &a.imp_eye),
-        EnemyKind::Cacodemon => (&a.caco_body, &a.caco_eye),
-        EnemyKind::JammerFiend => (&a.fiend_body, &a.fiend_eye),
-        EnemyKind::HellBaron => (&a.baron_body, &a.baron_eye),
-    };
-    let body = materials.add(body_tpl.clone());
-    let eye = materials.add(eye_tpl.clone());
-    let parts = build_parts(kind, a, &body, &eye);
     let mut enemy = Enemy::new(kind, floor);
     enemy.alerted = alerted;
     let aura_h = enemy.stats.eye_height;
@@ -632,13 +774,22 @@ pub fn spawn_enemy(
         .spawn((
             ChildOf(root),
             EnemyAura,
+            CullableLight::for_range(7.0),
             PointLight { color: aura_color, intensity: base_aura, range: 7.0, shadow_maps_enabled: false, ..default() },
+            // Dark auras (calm Imps / Cacodemons) stay hidden until they glow.
+            if base_aura > 0.0 { Visibility::Inherited } else { Visibility::Hidden },
             Transform::from_xyz(0.0, aura_h, -0.6),
         ))
         .id();
     let pivot = commands.spawn((ChildOf(root), EnemyBody, Transform::default(), Visibility::default())).id();
-    for (mesh, mat, t, s, r) in parts {
-        commands.spawn((ChildOf(pivot), Mesh3d(mesh), MeshMaterial3d(mat), Transform::from_translation(t).with_scale(s).with_rotation(r)));
+    let (mut body_part, mut eye_part) = (Entity::PLACEHOLDER, Entity::PLACEHOLDER);
+    for part in &a.models[kind.index()] {
+        let e = commands.spawn((ChildOf(pivot), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY)).id();
+        match part.role {
+            PartRole::Body => body_part = e,
+            PartRole::Eye => eye_part = e,
+            PartRole::Static => {}
+        }
     }
     if kind == EnemyKind::Imp {
         // Distinct crackling electric-violet halo shown only while Static-Enraged!
@@ -661,9 +812,7 @@ pub fn spawn_enemy(
             Transform::from_xyz(0.0, 0.14, 0.0).with_scale(Vec3::new(2.8, 0.35, 2.8)),
         ));
     }
-    let body_emissive = body_tpl.emissive;
-    let eye_emissive = eye_tpl.emissive;
-    commands.entity(root).insert((enemy, EnemyLook { body, eye, body_emissive, eye_emissive, aura, dirty_key: u32::MAX }));
+    commands.entity(root).insert((enemy, EnemyLook { body_part, eye_part, aura }));
     root
 }
 
@@ -730,7 +879,7 @@ fn spawn_garrison(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut flow: ResMut<FlowField>,
 ) {
-    *flow = FlowField::default();
+    flow.reset();
     let mut rng = rand::rng();
     for (kind, c) in garrison_plan(&grid, &mut rng) {
         spawn_enemy(&mut commands, &a, &mut materials, kind, spawn_pos_for(kind, &grid, c), grid.floor, false);
@@ -742,23 +891,27 @@ fn spawn_garrison(
 // ---------------------------------------------------------------------------
 
 /// BFS distances toward the player's cell (walkers honour ramps/steps,
-/// flyers only avoid walls).
+/// flyers only avoid walls). Rebuilt in place: the distance buffers and the
+/// BFS queue are reused, so a player changing cells allocates nothing.
 #[derive(Resource, Debug, Default, Clone)]
 pub struct FlowField {
     pub width: i32,
     pub target: Option<IVec2>,
     pub walk: Vec<Option<u32>>,
     pub fly: Vec<Option<u32>>,
+    queue: VecDeque<IVec2>,
 }
 
-fn bfs_to(grid: &LevelGrid, target: IVec2, passable: impl Fn(IVec2, IVec2) -> bool) -> Vec<Option<u32>> {
-    let mut d = vec![None; (grid.width * grid.depth) as usize];
+fn bfs_into(grid: &LevelGrid, target: IVec2, d: &mut Vec<Option<u32>>, q: &mut VecDeque<IVec2>, passable: impl Fn(IVec2, IVec2) -> bool) {
+    d.clear();
+    d.resize((grid.width * grid.depth) as usize, None);
+    q.clear();
     if !grid.in_bounds(target) || grid.cell(target).is_wall() {
-        return d;
+        return;
     }
     let idx = |c: IVec2| (c.y * grid.width + c.x) as usize;
     d[idx(target)] = Some(0);
-    let mut q = VecDeque::from([target]);
+    q.push_back(target);
     while let Some(c) = q.pop_front() {
         let dc = d[idx(c)].unwrap();
         for o in RampDir::ALL.map(RampDir::offset) {
@@ -769,18 +922,31 @@ fn bfs_to(grid: &LevelGrid, target: IVec2, passable: impl Fn(IVec2, IVec2) -> bo
             }
         }
     }
-    d
 }
 
 impl FlowField {
     pub fn build(grid: &LevelGrid, target: IVec2) -> Self {
-        FlowField {
-            width: grid.width,
-            target: Some(target),
-            // Enemy at `from` must be able to step into `to`.
-            walk: bfs_to(grid, target, |from, to| grid.can_walk(from, to)),
-            fly: bfs_to(grid, target, |from, _| !grid.cell(from).is_wall()),
-        }
+        let mut f = FlowField::default();
+        f.rebuild(grid, target);
+        f
+    }
+
+    /// Recompute toward `target`, reusing every buffer.
+    pub fn rebuild(&mut self, grid: &LevelGrid, target: IVec2) {
+        self.width = grid.width;
+        self.target = Some(target);
+        // Enemy at `from` must be able to step into `to`.
+        bfs_into(grid, target, &mut self.walk, &mut self.queue, |from, to| grid.can_walk(from, to));
+        bfs_into(grid, target, &mut self.fly, &mut self.queue, |from, _| !grid.cell(from).is_wall());
+    }
+
+    /// Forget the target (new floor) while keeping the buffers' capacity.
+    pub fn reset(&mut self) {
+        self.width = 0;
+        self.target = None;
+        self.walk.clear();
+        self.fly.clear();
+        self.queue.clear();
     }
 
     fn get(&self, field: &[Option<u32>], c: IVec2) -> Option<u32> {
@@ -816,7 +982,7 @@ fn update_flow_field(grid: Res<LevelGrid>, mut flow: ResMut<FlowField>, player: 
         return;
     }
     if flow.target != Some(c) || flow.width != grid.width {
-        *flow = FlowField::build(&grid, c);
+        flow.rebuild(&grid, c);
     }
 }
 
@@ -838,6 +1004,7 @@ fn enemy_ai(
     tower: Query<&SignalTower>,
     decoys: Query<&GlobalTransform, (With<DecoyHandset>, Without<Enemy>)>,
     (freeze, signal, mods): (Option<Res<crate::dev::DevFreezeAi>>, Res<SignalState>, Res<PlayerModifiers>),
+    (mut snapshot, mut fields): (Local<Vec<(Entity, Vec3, f32)>>, Local<Vec<JammerField>>),
 ) {
     if freeze.is_some() {
         return;
@@ -851,9 +1018,11 @@ fn enemy_ai(
     let mut rng = rand::rng();
 
     // Snapshot for separation + jammer fields (static jammers + fiends).
-    let snapshot: Vec<(Entity, Vec3, f32)> = enemies.iter().map(|(e, en, tf, _)| (e, tf.translation, en.stats.radius)).collect();
-    let mut fields = active_jammer_fields(jammers.iter());
-    fields.extend(fiend_jammer_fields(enemies.iter().map(|(_, e, _, g)| (e, g))));
+    snapshot.clear();
+    snapshot.extend(enemies.iter().map(|(e, en, tf, _)| (e, tf.translation, en.stats.radius)));
+    fields.clear();
+    fields.extend(active_jammer_fields_iter(jammers.iter()));
+    fields.extend(fiend_jammer_fields_iter(enemies.iter().map(|(_, e, _, g)| (e, g))));
     let tower_ref = grid.tower_world() + Vec3::Y * 1.5;
     let beacon = tower.single().map(|t| t.beacon).unwrap_or(tower_ref);
     let neutral = PlayerModifiers::default();
@@ -975,7 +1144,7 @@ fn enemy_ai(
 
         // Separation from other demons.
         let mut push = Vec3::ZERO;
-        for &(other, opos, orad) in &snapshot {
+        for &(other, opos, orad) in snapshot.iter() {
             if other == entity {
                 continue;
             }
@@ -1031,17 +1200,16 @@ fn enemy_ai(
             e.attack_timer = e.fire_cooldown() * rng.random_range(0.8..1.25);
             let fwd = (p_chest - eye).normalize_or_zero();
             let side = Vec3::new(-fwd.z, 0.0, fwd.x).normalize_or_zero();
-            let (color, dirs): (BurstColor, Vec<(Vec3, Vec3)>) = match e.kind {
-                EnemyKind::Imp => (BurstColor::Fire, vec![(Vec3::ZERO, fwd)]),
-                EnemyKind::Cacodemon => (BurstColor::Cyan, vec![(side * 0.45, fwd), (-side * 0.45, fwd)]),
-                EnemyKind::JammerFiend => (BurstColor::Green, vec![(Vec3::ZERO, fwd)]),
-                EnemyKind::HellBaron => (
-                    BurstColor::Fire,
-                    [-0.21f32, 0.0, 0.21].iter().map(|a| (Vec3::ZERO, Quat::from_rotation_y(*a) * fwd)).collect(),
-                ),
+            // (offset, direction) per projectile: fixed stack array, no allocation.
+            let none = (Vec3::ZERO, Vec3::ZERO);
+            let (color, dirs, n): (BurstColor, [(Vec3, Vec3); 3], usize) = match e.kind {
+                EnemyKind::Imp => (BurstColor::Fire, [(Vec3::ZERO, fwd), none, none], 1),
+                EnemyKind::Cacodemon => (BurstColor::Cyan, [(side * 0.45, fwd), (-side * 0.45, fwd), none], 2),
+                EnemyKind::JammerFiend => (BurstColor::Green, [(Vec3::ZERO, fwd), none, none], 1),
+                EnemyKind::HellBaron => (BurstColor::Fire, [-0.21f32, 0.0, 0.21].map(|a| (Vec3::ZERO, Quat::from_rotation_y(a) * fwd)), 3),
             };
             let caco_purple = e.kind == EnemyKind::Cacodemon;
-            for (off, d) in dirs {
+            for &(off, d) in &dirs[..n] {
                 let jitter = Vec3::new(rng.random_range(-0.03..0.03), rng.random_range(-0.02..0.02), rng.random_range(-0.03..0.03));
                 let start = eye + fwd * (e.stats.radius + 0.3) + off;
                 spawn_enemy_projectile(
@@ -1186,18 +1354,31 @@ fn tick_ping_marks(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn enemy_visuals(
     time: Res<Time>,
+    ea: Res<EnemyAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut enemies: Query<(&Enemy, &mut EnemyLook, Option<&PingMarked>, &Children)>,
+    enemies: Query<(&Enemy, &EnemyLook, Option<&PingMarked>, &Children)>,
     mut bodies: Query<&mut Transform, (With<EnemyBody>, Without<EnrageHalo>, Without<FiendFieldRing>)>,
     mut halos: Query<(&mut Transform, &mut Visibility), (With<EnrageHalo>, Without<EnemyBody>, Without<FiendFieldRing>)>,
     mut fiend_rings: Query<&mut Transform, (With<FiendFieldRing>, Without<EnemyBody>, Without<EnrageHalo>)>,
-    mut auras: Query<&mut PointLight, With<EnemyAura>>,
+    mut auras: Query<(&mut PointLight, &mut CullableLight), With<EnemyAura>>,
+    mut parts: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
     let t = time.elapsed_secs();
-    for (e, mut look, marked, children) in &mut enemies {
+    let pulse = look_pulse(t);
+    // Pulsing (enraged / stunned) shared materials in use this frame.
+    let mut pulsing = [[false; 8]; 4];
+    let mut pulsing_flash = [[[false; FLASH_STEPS]; 8]; 4];
+    let mut swap = |e: Entity, want: &Handle<StandardMaterial>| {
+        if let Ok(mut m) = parts.get_mut(e)
+            && m.0.id() != want.id()
+        {
+            m.0 = want.clone();
+        }
+    };
+    for (e, look, marked, children) in &enemies {
         // Bob / stagger animation on the body pivot.
         let moving = Vec2::new(e.velocity.x, e.velocity.z).length() > 0.5;
         let bob = if e.kind.flying() {
@@ -1215,7 +1396,10 @@ fn enemy_visuals(
                 b.rotation = Quat::from_rotation_z(sway + stun);
             }
             if let Ok((mut htf, mut hvis)) = halos.get_mut(c) {
-                *hvis = if e.enraged { Visibility::Inherited } else { Visibility::Hidden };
+                let want = if e.enraged { Visibility::Inherited } else { Visibility::Hidden };
+                if *hvis != want {
+                    *hvis = want;
+                }
                 if e.enraged {
                     htf.rotation = Quat::from_euler(EulerRot::YXZ, t * 5.0 + e.phase, 0.45, (t * 8.0).sin() * 0.35);
                     let s = 0.64 + 0.14 * (t * 14.0).sin().abs();
@@ -1228,43 +1412,50 @@ fn enemy_visuals(
                 rtf.rotation = Quat::from_rotation_y(t * 1.6);
             }
         }
-        // Material tinting (only rewritten when the visual state changes).
-        let pulse = (t * 10.0).sin() * 0.5 + 0.5;
-        let flashing = e.hit_flash > 0.0 || e.stun_timer > 0.0 || e.enraged;
-        let key = (e.enraged as u32) | ((marked.is_some() as u32) << 1) | ((e.stun_timer > 0.0) as u32) << 2;
-        if flashing || key != look.dirty_key {
-            look.dirty_key = key;
-            let mut body = look.body_emissive;
-            if e.enraged {
-                // High-contrast electric violet-magenta static aura (pops against red Mars walls!).
-                body += LinearRgba::rgb(0.9, 0.08, 1.35) * (0.45 + 0.55 * pulse);
+        // Material tinting: swap to the shared state material (no per-demon materials).
+        let mats = ea.look(e.kind);
+        let state = (e.enraged as usize * LOOK_ENRAGED) | (marked.is_some() as usize * LOOK_MARKED) | ((e.stun_timer > 0.0) as usize * LOOK_STUNNED);
+        let body = if e.hit_flash > 0.0 {
+            let step = flash_step(e.hit_flash);
+            if state & (LOOK_ENRAGED | LOOK_STUNNED) != 0 {
+                pulsing_flash[e.kind.index()][state][step] = true;
             }
-            if marked.is_some() {
-                body += LinearRgba::rgb(0.0, 0.18, 0.3);
+            &mats.flash[state][step]
+        } else {
+            if state & (LOOK_ENRAGED | LOOK_STUNNED) != 0 {
+                pulsing[e.kind.index()][state] = true;
             }
-            if e.stun_timer > 0.0 {
-                body += LinearRgba::rgb(0.4, 1.2, 1.6) * pulse;
-            }
-            if e.hit_flash > 0.0 {
-                body += LinearRgba::rgb(4.2, 3.4, 2.6) * (e.hit_flash / HIT_FLASH_SECS);
-            }
-            if let Some(mut m) = materials.get_mut(&look.body) {
-                m.emissive = body;
-            }
-            let eye = if e.enraged { LinearRgba::rgb(16.0, 4.0, 20.0) } else { look.eye_emissive };
-            if let Some(mut m) = materials.get_mut(&look.eye) {
-                m.emissive = eye;
-            }
-        }
-        if let Ok(mut l) = auras.get_mut(look.aura) {
-            l.intensity = match e.kind {
+            &mats.body[state]
+        };
+        swap(look.body_part, body);
+        swap(look.eye_part, if e.enraged { &mats.eye_enraged } else { &mats.eye });
+        if let Ok((mut l, mut cull)) = auras.get_mut(look.aura) {
+            let intensity = match e.kind {
                 _ if e.enraged => 220_000.0 + 180_000.0 * pulse,
                 EnemyKind::JammerFiend => 140_000.0 + 90_000.0 * pulse,
                 EnemyKind::HellBaron => 200_000.0,
                 _ => 0.0,
             };
-            if e.enraged {
-                l.color = Color::srgb(1.0, 0.2, 0.95);
+            cull.set_intensity(intensity);
+            let violet = Color::srgb(1.0, 0.2, 0.95);
+            if e.enraged && l.color != violet {
+                l.color = violet;
+            }
+        }
+    }
+    // Re-tint each active pulsing material once per frame.
+    for kind in EnemyKind::ALL {
+        let mats = ea.look(kind);
+        for (state, used) in pulsing[kind.index()].iter().enumerate() {
+            if *used && let Some(mut m) = materials.get_mut(&mats.body[state]) {
+                m.emissive = body_state_emissive(mats.body_emissive, state, pulse);
+            }
+        }
+        for (state, steps) in pulsing_flash[kind.index()].iter().enumerate() {
+            for (step, used) in steps.iter().enumerate() {
+                if *used && let Some(mut m) = materials.get_mut(&mats.flash[state][step]) {
+                    m.emissive = body_flash_emissive(mats.body_emissive, state, pulse, step);
+                }
             }
         }
     }
@@ -1529,5 +1720,19 @@ mod tests {
         assert!((d - 2.0).abs() < 1e-5);
         let d = segment_point_distance(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0), Vec3::new(-3.0, 0.0, 0.0));
         assert!((d - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hit_flash_preserves_enraged_marked_and_stunned_tint() {
+        let base = LinearRgba::rgb(0.1, 0.0, 0.0);
+        let state = LOOK_ENRAGED | LOOK_MARKED | LOOK_STUNNED;
+        let pulse = 0.75;
+        let steady = body_state_emissive(base, state, pulse);
+        let last_flash = body_flash_emissive(base, state, pulse, FLASH_STEPS - 1);
+        let plain_last_flash = body_flash_emissive(base, 0, pulse, FLASH_STEPS - 1);
+        // Flash adds on top of the active state's emissive rather than replacing it.
+        assert!(last_flash.blue > steady.blue);
+        assert!(last_flash.blue > plain_last_flash.blue + 1.0);
+        assert!(last_flash.green > plain_last_flash.green + 0.5);
     }
 }

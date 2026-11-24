@@ -6,7 +6,7 @@ use bevy::prelude::*;
 
 use crate::apps::{HijackedHotspot, PhoneApps, HIJACK_STRENGTH, SPOOF_STRENGTH};
 
-use crate::enemies::{fiend_jammer_fields, Enemy};
+use crate::enemies::{fiend_jammer_fields_iter, Enemy};
 use crate::level::{DemonJammer, LevelGrid, SignalTower};
 use crate::physics::count_wall_occlusions;
 use crate::player::{Player, PLAYER_EYE_HEIGHT};
@@ -101,17 +101,18 @@ pub fn distance_strength(dist: f32) -> f32 {
 
 /// Bars removed by jammers at `pos` (sum of all fields, linear-ish falloff).
 pub fn jammer_suppression(pos: Vec3, jammers: &[JammerField]) -> f32 {
-    jammers
-        .iter()
-        .map(|j| {
-            let d = pos.distance(j.pos);
-            if d >= j.radius {
-                0.0
-            } else {
-                j.strength * (1.0 - d / j.radius).powf(0.6)
-            }
-        })
-        .sum()
+    jammers.iter().map(|j| field_suppression(pos, j.pos, j.radius, j.strength)).sum()
+}
+
+/// [`jammer_suppression`] with every radius multiplied by `radius_mult`
+/// (computed inline: no scaled copy of the field list).
+pub fn jammer_suppression_scaled(pos: Vec3, jammers: &[JammerField], radius_mult: f32) -> f32 {
+    jammers.iter().map(|j| field_suppression(pos, j.pos, j.radius * radius_mult, j.strength)).sum()
+}
+
+fn field_suppression(pos: Vec3, center: Vec3, radius: f32, strength: f32) -> f32 {
+    let d = pos.distance(center);
+    if d >= radius { 0.0 } else { strength * (1.0 - d / radius).powf(0.6) }
 }
 
 pub fn bars_from_strength(raw: f32) -> u8 {
@@ -147,8 +148,7 @@ pub fn compute_signal_at(
         raw *= wall_factor(wall_occlusions, modifiers);
     }
     if (modifiers.jammer_radius_mult - 1.0).abs() > f32::EPSILON {
-        let scaled: Vec<JammerField> = jammers.iter().map(|j| JammerField { radius: j.radius * modifiers.jammer_radius_mult, ..*j }).collect();
-        raw -= jammer_suppression(pos, &scaled);
+        raw -= jammer_suppression_scaled(pos, jammers, modifiers.jammer_radius_mult);
     } else {
         raw -= jammer_suppression(pos, jammers);
     }
@@ -220,10 +220,14 @@ pub fn relative_yaw(forward: Vec3, to_target: Vec3) -> f32 {
 
 /// Collect active jammer fields from the ECS.
 pub fn active_jammer_fields<'a>(jammers: impl Iterator<Item = (&'a DemonJammer, &'a GlobalTransform)>) -> Vec<JammerField> {
+    active_jammer_fields_iter(jammers).collect()
+}
+
+/// Allocation-free form of [`active_jammer_fields`] (extend a reused buffer).
+pub fn active_jammer_fields_iter<'a>(jammers: impl Iterator<Item = (&'a DemonJammer, &'a GlobalTransform)>) -> impl Iterator<Item = JammerField> {
     jammers
         .filter(|(j, _)| j.is_active())
         .map(|(j, t)| JammerField { pos: t.translation() + Vec3::Y * 2.0, radius: j.suppression_radius, strength: j.suppression_strength })
-        .collect()
 }
 
 pub struct SignalPlugin;
@@ -245,19 +249,21 @@ fn update_signal(
     jammers: Query<(&DemonJammer, &GlobalTransform)>,
     fiends: Query<(&Enemy, &GlobalTransform)>,
     hotspots: Query<(&HijackedHotspot, &Transform)>,
+    (mut fields, mut spots): (Local<Vec<JammerField>>, Local<Vec<HotspotField>>),
 ) {
     let (Some(grid), Ok(ptf), Ok(tower)) = (grid, player.single(), tower.single()) else {
         return;
     };
     let head = ptf.translation + Vec3::Y * PLAYER_EYE_HEIGHT;
-    let mut fields = active_jammer_fields(jammers.iter());
+    fields.clear();
+    fields.extend(active_jammer_fields_iter(jammers.iter()));
     // Jammer Fiends carry a mobile Dead Zone.
-    fields.extend(fiend_jammer_fields(fiends.iter()));
+    fields.extend(fiend_jammer_fields_iter(fiends.iter()));
     let walls = count_wall_occlusions(&grid, head, tower.beacon);
     let tower_pos = grid.tower_world() + Vec3::Y * 1.5;
     let base = compute_signal_at(head, tower_pos, &fields, walls, &modifiers);
-    let spots: Vec<HotspotField> =
-        hotspots.iter().map(|(h, tf)| HotspotField { pos: tf.translation, radius: h.radius, strength: HIJACK_STRENGTH }).collect();
+    spots.clear();
+    spots.extend(hotspots.iter().map(|(h, tf)| HotspotField { pos: tf.translation, radius: h.radius, strength: HIJACK_STRENGTH }));
     let spoofed = apps.is_some_and(|a| a.spoof_active());
     let boosted = boost_reading(base, hotspot_boost(head, &spots));
     let r = if spoofed { boost_reading(boosted, SPOOF_STRENGTH) } else { boosted };

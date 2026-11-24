@@ -11,6 +11,8 @@
 //! window's physical cursor position) because Bevy 0.20 deprecated `Interaction`
 //! in favour of picking, which this build does not enable.
 
+use std::fmt::Write as _;
+
 use bevy::prelude::*;
 use bevy::ui::UiGlobalTransform;
 use bevy::window::PrimaryWindow;
@@ -105,7 +107,7 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((UiKitPlugin, MetaUiPlugin))
+        app.add_plugins((UiKitPlugin, MetaUiPlugin, crate::perf::PerfOverlayPlugin))
             .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
             .add_systems(OnEnter(AppState::Playing), spawn_hud)
             .add_systems(OnEnter(AppState::Paused), spawn_pause_menu)
@@ -177,10 +179,16 @@ pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("SYSTEM", &[(&["CLICK"], "capture mouse"), (&["ESC", "P"], "pause"), (&["F9"], "debug: skip floor")]),
 ];
 
-fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
+fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>, msaa: Option<Res<crate::perf::RenderMsaa>>) {
     let tex = tex.as_deref();
+    let msaa = msaa.map(|m| m.0).unwrap_or(bevy::render::view::Msaa::Sample2);
     // Menu needs its own camera: the player camera only exists in a run.
-    commands.spawn((DespawnOnExit(AppState::MainMenu), Camera3d::default(), Camera { clear_color: ClearColorConfig::Custom(COLOR_BG), ..default() }));
+    commands.spawn((
+        DespawnOnExit(AppState::MainMenu),
+        Camera3d::default(),
+        Camera { clear_color: ClearColorConfig::Custom(COLOR_BG), ..default() },
+        msaa,
+    ));
     let root = punk_screen_root(&mut commands, AppState::MainMenu, tex, INK_BLACK, 1.0);
     screen_rails(&mut commands, root, tex, 12.0, false);
 
@@ -1645,6 +1653,9 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
     }
 }
 
+/// Cached `(chip tag, contract tags)` of the run loadout.
+type LoadoutTags = Option<(String, Option<String>)>;
+
 #[allow(clippy::too_many_arguments)]
 fn update_hud(
     signal: Res<SignalState>,
@@ -1657,87 +1668,149 @@ fn update_hud(
     gauge: Res<VelGauge>,
     players: Query<&Player>,
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
+    (mut buf, mut tags): (Local<String>, Local<LoadoutTags>),
 ) {
     let t = time.elapsed_secs();
     let Ok(p) = players.single() else { return };
-    let (chip_tag, contract_tags) = loadout_tag_parts(&loadout);
+    // Loadout tags only change with the loadout: format them once.
+    if loadout.is_changed() || tags.is_none() {
+        *tags = Some(loadout_tag_parts(&loadout));
+    }
+    let Some((chip_tag, contract_tags)) = tags.as_ref() else { return };
     let contract_color = loadout_contract_color(loadout.contract_count());
     let accent = weapon_accent(ws.current);
     let (cur, max) = ammo(p, ws.current);
     for (slot, mut txt, mut col) in &mut texts {
-        let (s, c): (String, Color) = match *slot {
-            HudText::Floor => (format!("FLOOR {}/{}", run.floor, FINAL_FLOOR), COLOR_TEXT),
-            HudText::Stats => (format!("KILLS {}  |  JAMMERS {}", run.kills, run.jammers_destroyed), COLOR_DIM),
-            HudText::LoadoutChip => {
-                let c = if loadout.chip == crate::meta::StarterChip::StockUac { COLOR_DIM } else { COLOR_CYAN.with_alpha(0.9) };
-                (chip_tag.clone(), c)
+        // Every label is written into one reused buffer; `Text` / `TextColor`
+        // are only touched (marked changed) when the value really differs.
+        let b = &mut *buf;
+        b.clear();
+        let c: Color = match *slot {
+            HudText::Floor => {
+                let _ = write!(b, "FLOOR {}/{}", run.floor, FINAL_FLOOR);
+                COLOR_TEXT
             }
-            HudText::LoadoutContracts => (contract_tags.clone().unwrap_or_default(), contract_color),
-            HudText::Status => match *ext {
-                ExtractionState::Uploading { .. } => ("DEMON RUSH - HOLD THE SIGNAL".into(), COLOR_SIGNAL_RED),
-                ExtractionState::Extracting { .. } | ExtractionState::Complete => ("ORBITAL EXTRACTION IN PROGRESS".into(), COLOR_CYAN),
-                _ if signal.near_tower => ("5-BAR SIGNAL - EXTRACTION TOWER IN RANGE".into(), COLOR_SIGNAL_GREEN),
-                _ if signal.in_dead_zone => ("NO SERVICE - DEAD ZONE".into(), COLOR_SIGNAL_RED),
-                _ => ("SEARCH FOR 5-BAR SIGNAL TOWER".into(), COLOR_SIGNAL_AMBER),
-            },
+            HudText::Stats => {
+                let _ = write!(b, "KILLS {}  |  JAMMERS {}", run.kills, run.jammers_destroyed);
+                COLOR_DIM
+            }
+            HudText::LoadoutChip => {
+                b.push_str(chip_tag);
+                if loadout.chip == crate::meta::StarterChip::StockUac { COLOR_DIM } else { COLOR_CYAN.with_alpha(0.9) }
+            }
+            HudText::LoadoutContracts => {
+                b.push_str(contract_tags.as_deref().unwrap_or_default());
+                contract_color
+            }
+            HudText::Status => {
+                let (s, c) = match *ext {
+                    ExtractionState::Uploading { .. } => ("DEMON RUSH - HOLD THE SIGNAL", COLOR_SIGNAL_RED),
+                    ExtractionState::Extracting { .. } | ExtractionState::Complete => ("ORBITAL EXTRACTION IN PROGRESS", COLOR_CYAN),
+                    _ if signal.near_tower => ("5-BAR SIGNAL - EXTRACTION TOWER IN RANGE", COLOR_SIGNAL_GREEN),
+                    _ if signal.in_dead_zone => ("NO SERVICE - DEAD ZONE", COLOR_SIGNAL_RED),
+                    _ => ("SEARCH FOR 5-BAR SIGNAL TOWER", COLOR_SIGNAL_AMBER),
+                };
+                b.push_str(s);
+                c
+            }
             HudText::Prompt => match *ext {
                 ExtractionState::Searching { hold } if signal.near_tower => {
                     let a = 0.6 + 0.4 * (t * 5.0).sin();
-                    let extra = if hold > 0.0 { format!("  ({:.0}%)", hold / UPLINK_HOLD_SECS * 100.0) } else { String::new() };
-                    (format!("PRESS [E] TO TRIGGER SOS UPLINK{extra}"), COLOR_SIGNAL_GREEN.with_alpha(a))
+                    b.push_str("PRESS [E] TO TRIGGER SOS UPLINK");
+                    if hold > 0.0 {
+                        let _ = write!(b, "  ({:.0}%)", hold / UPLINK_HOLD_SECS * 100.0);
+                    }
+                    COLOR_SIGNAL_GREEN.with_alpha(a)
                 }
-                _ => (String::new(), Color::NONE),
+                _ => Color::NONE,
             },
             HudText::Alert => match &feed.alert {
-                Some(a) => (a.text.clone(), a.color.with_alpha(if (t * 8.0).sin() > -0.3 { 1.0 } else { 0.35 })),
-                None => (String::new(), Color::NONE),
+                Some(a) => {
+                    b.push_str(&a.text);
+                    a.color.with_alpha(if (t * 8.0).sin() > -0.3 { 1.0 } else { 0.35 })
+                }
+                None => Color::NONE,
             },
-            HudText::VelValue => (speed_label(gauge.speed), gauge.value_color()),
-            HudText::VelChain => (bhop_chain_label(p.bhop_chain).unwrap_or_default(), INK_BLACK),
+            HudText::VelValue => {
+                b.push_str(&speed_label(gauge.speed));
+                gauge.value_color()
+            }
+            HudText::VelChain => {
+                if let Some(label) = bhop_chain_label(p.bhop_chain) {
+                    b.push_str(&label);
+                }
+                INK_BLACK
+            }
             HudText::UplinkLabel => match *ext {
                 ExtractionState::Uploading { progress, jammed: true, .. } => {
-                    (format!("UPLINK JAMMED! KILL THE JAMMER FIEND  {:.0}%", progress * 100.0), COLOR_SIGNAL_RED.with_alpha(if (t * 10.0).sin() > 0.0 { 1.0 } else { 0.4 }))
+                    let _ = write!(b, "UPLINK JAMMED! KILL THE JAMMER FIEND  {:.0}%", progress * 100.0);
+                    COLOR_SIGNAL_RED.with_alpha(if (t * 10.0).sin() > 0.0 { 1.0 } else { 0.4 })
                 }
                 ExtractionState::Uploading { progress, in_ring: false, .. } => {
-                    (format!("RETURN TO SIGNAL RING!  {:.0}%", progress * 100.0), COLOR_SIGNAL_AMBER)
+                    let _ = write!(b, "RETURN TO SIGNAL RING!  {:.0}%", progress * 100.0);
+                    COLOR_SIGNAL_AMBER
                 }
-                ExtractionState::Uploading { progress, .. } => (format!("UPLOADING SOS {:.0}%", progress * 100.0), COLOR_CYAN),
-                _ => (String::new(), COLOR_CYAN),
+                ExtractionState::Uploading { progress, .. } => {
+                    let _ = write!(b, "UPLOADING SOS {:.0}%", progress * 100.0);
+                    COLOR_CYAN
+                }
+                _ => COLOR_CYAN,
             },
             HudText::HpValue => {
-                let c = if hp_band(fraction(p.hp, p.max_hp)) == HpBand::Critical { hp_color(0.0, t) } else { COLOR_TEXT };
-                (format!("{}/{}", p.hp.ceil().max(0.0) as i32, p.max_hp as i32), c)
+                let _ = write!(b, "{}/{}", p.hp.ceil().max(0.0) as i32, p.max_hp as i32);
+                if hp_band(fraction(p.hp, p.max_hp)) == HpBand::Critical { hp_color(0.0, t) } else { COLOR_TEXT }
             }
-            HudText::ArmorValue => (format!("{}/{}", p.armor.ceil().max(0.0) as i32, p.max_armor as i32), COLOR_ARMOR),
+            HudText::ArmorValue => {
+                let _ = write!(b, "{}/{}", p.armor.ceil().max(0.0) as i32, p.max_armor as i32);
+                COLOR_ARMOR
+            }
             HudText::StaminaValue => {
                 if p.dash_ready() {
-                    ("READY".into(), COLOR_GOLD)
+                    b.push_str("READY");
+                    COLOR_GOLD
                 } else {
-                    (format!("{:.1}s", p.dash_cooldown), COLOR_CYAN)
+                    let _ = write!(b, "{:.1}s", p.dash_cooldown);
+                    COLOR_CYAN
                 }
             }
-            HudText::WeaponName => (weapon_title(ws.current).into(), accent),
-            HudText::AmmoCount => (cur.to_string(), if cur == 0 { COLOR_SIGNAL_RED } else { COLOR_TEXT }),
-            HudText::AmmoMax => (format!("/ {max}"), COLOR_DIM),
+            HudText::WeaponName => {
+                b.push_str(weapon_title(ws.current));
+                accent
+            }
+            HudText::AmmoCount => {
+                let _ = write!(b, "{cur}");
+                if cur == 0 { COLOR_SIGNAL_RED } else { COLOR_TEXT }
+            }
+            HudText::AmmoMax => {
+                let _ = write!(b, "/ {max}");
+                COLOR_DIM
+            }
             HudText::Slot(i) => {
                 let w = if i == 0 { Weapon::Shotgun } else { Weapon::Plasma };
                 let name = if i == 0 { "SHOTGUN" } else { "PLASMA" };
                 let (n, _) = ammo(p, w);
-                (format!("[{}] {name} {n}", i + 1), if ws.current == w { weapon_accent(w) } else { COLOR_DIM })
+                let _ = write!(b, "[{}] {name} {n}", i + 1);
+                if ws.current == w { weapon_accent(w) } else { COLOR_DIM }
             }
             HudText::Toast(i) => match feed.toasts.iter().rev().nth(i as usize) {
-                Some(toast) => (toast.text.clone(), toast.color.with_alpha((toast.timer / 0.6).min(1.0))),
-                None => (String::new(), Color::NONE),
+                Some(toast) => {
+                    b.push_str(&toast.text);
+                    toast.color.with_alpha((toast.timer / 0.6).min(1.0))
+                }
+                None => Color::NONE,
             },
             HudText::Hitmarker => {
                 let a = (feed.hitmarker / 0.18).clamp(0.0, 1.0);
-                ("X".into(), if feed.hit_kill { COLOR_SIGNAL_RED.with_alpha(a) } else { Color::srgba(1.0, 1.0, 1.0, a) })
+                b.push('X');
+                if feed.hit_kill { COLOR_SIGNAL_RED.with_alpha(a) } else { Color::srgba(1.0, 1.0, 1.0, a) }
             }
         };
-        if txt.0 != s {
-            txt.0 = s;
+        if txt.0 != *b {
+            txt.0.clone_from(b);
         }
-        col.0 = c;
+        if col.0 != c {
+            col.0 = c;
+        }
     }
 }
 
@@ -1756,10 +1829,25 @@ fn status_plate_border(ext: &ExtractionState) -> BorderColor {
     }
 }
 
-fn set_display(node: &mut Node, show: bool) {
+/// Change-guarded writes: `DerefMut` (and the UI relayout it triggers) only
+/// happens when the value really changes.
+fn set_display(node: &mut Mut<Node>, show: bool) {
     let want = if show { Display::Flex } else { Display::None };
     if node.display != want {
         node.display = want;
+    }
+}
+
+fn set_width_pct(node: &mut Mut<Node>, pct: f32) {
+    let want = Val::Percent(pct);
+    if node.width != want {
+        node.width = want;
+    }
+}
+
+fn set_bg(bg: &mut Mut<BackgroundColor>, c: Color) {
+    if bg.0 != c {
+        bg.0 = c;
     }
 }
 
@@ -1795,15 +1883,15 @@ fn update_hud_boxes(
             }
         };
         match *b {
-            HudBox::DamageFlash => bg.0 = Color::srgba(0.8, 0.0, 0.0, (0.45 - p.since_damage).max(0.0)),
+            HudBox::DamageFlash => set_bg(&mut bg, Color::srgba(0.8, 0.0, 0.0, (0.45 - p.since_damage).max(0.0))),
             HudBox::DeadZoneFrame => {
                 if signal.in_dead_zone {
                     let strength = if signal.bars == 0 { 1.0 } else { 0.6 };
                     set_border(BorderColor::all(Color::srgba(0.55, 0.03, 0.03, strength * (0.4 + 0.2 * (t * 3.0).sin()))));
-                    bg.0 = Color::srgba(0.4, 0.0, 0.0, 0.03 * strength);
+                    set_bg(&mut bg, Color::srgba(0.4, 0.0, 0.0, 0.03 * strength));
                 } else {
                     set_border(BorderColor::all(Color::NONE));
-                    bg.0 = Color::NONE;
+                    set_bg(&mut bg, Color::NONE);
                 }
             }
             HudBox::StatusPlate => set_border(status_plate_border(&ext)),
@@ -1811,63 +1899,64 @@ fn update_hud_boxes(
             HudBox::UplinkPanel => set_display(&mut node, matches!(*ext, ExtractionState::Uploading { .. })),
             HudBox::UplinkFill => {
                 if let ExtractionState::Uploading { progress, jammed, in_ring, .. } = *ext {
-                    node.width = Val::Percent(progress * 100.0);
-                    bg.0 = if jammed {
+                    set_width_pct(&mut node, progress * 100.0);
+                    let c = if jammed {
                         COLOR_SIGNAL_RED.with_alpha(if (t * 10.0).sin() > 0.0 { 1.0 } else { 0.4 })
                     } else if !in_ring {
                         COLOR_SIGNAL_AMBER
                     } else {
                         COLOR_CYAN
                     };
+                    set_bg(&mut bg, c);
                 }
             }
             HudBox::AlertPanel => set_display(&mut node, feed.alert.is_some()),
             HudBox::LoadoutDot => {
                 set_display(&mut node, loadout.contract_count() > 0);
-                bg.0 = loadout_contract_color(loadout.contract_count());
+                set_bg(&mut bg, loadout_contract_color(loadout.contract_count()));
             }
             HudBox::ToastChip(i) => {
                 let look = toast_look(i);
                 set_display(&mut node, look.is_some());
                 let (a, c) = look.unwrap_or((0.0, Color::NONE));
-                bg.0 = PANEL_BG.with_alpha(0.8 * a);
+                set_bg(&mut bg, PANEL_BG.with_alpha(0.8 * a));
                 set_border(plate_border(c.with_alpha(a), PANEL_EDGE.with_alpha(0.45 * a)));
             }
             HudBox::VelPlate => set_border(plate_border(tier_color, STEEL_BORDER.with_alpha(0.45))),
             HudBox::VelTrack => set_border(BorderColor { left: tier_color, right: tier_color.with_alpha(0.55), top: TRACK_BORDER, bottom: INK_BLACK }),
-            HudBox::VelValueBadge => bg.0 = gauge.badge_color(),
+            HudBox::VelValueBadge => set_bg(&mut bg, gauge.badge_color()),
             HudBox::VelChainTag => {
                 set_display(&mut node, bhop_chain_label(p.bhop_chain).is_some());
-                bg.0 = tier_color;
+                set_bg(&mut bg, tier_color);
             }
-            HudBox::VelSeg(i) => bg.0 = segment_color(i, vel_lit),
+            HudBox::VelSeg(i) => set_bg(&mut bg, segment_color(i, vel_lit)),
             HudBox::HpFill => {
                 let f = fraction(p.hp, p.max_hp);
-                node.width = Val::Percent(f * 100.0);
-                bg.0 = hp_color(f, t);
+                set_width_pct(&mut node, f * 100.0);
+                set_bg(&mut bg, hp_color(f, t));
             }
-            HudBox::ArmorFill => node.width = Val::Percent(fraction(p.armor, p.max_armor) * 100.0),
+            HudBox::ArmorFill => set_width_pct(&mut node, fraction(p.armor, p.max_armor) * 100.0),
             HudBox::StaminaFill => {
-                node.width = Val::Percent(stamina * 100.0);
-                bg.0 = if stamina >= 1.0 { COLOR_GOLD } else { COLOR_CYAN.with_alpha(0.75) };
+                set_width_pct(&mut node, stamina * 100.0);
+                set_bg(&mut bg, if stamina >= 1.0 { COLOR_GOLD } else { COLOR_CYAN.with_alpha(0.75) });
             }
             HudBox::ShellRow => set_display(&mut node, shotgun),
             HudBox::ShellPip(i) => {
                 let on = i < lit;
-                bg.0 = if on { COLOR_SHELL } else { COLOR_PIP_OFF };
+                set_bg(&mut bg, if on { COLOR_SHELL } else { COLOR_PIP_OFF });
                 set_border(BorderColor::all(if on { COLOR_BRASS } else { COLOR_PIP_OFF_BORDER }));
             }
             HudBox::PlasmaTrack => set_display(&mut node, !shotgun),
             HudBox::PlasmaFill => {
-                node.width = Val::Percent(fraction(cur as f32, max as f32) * 100.0);
-                bg.0 = COLOR_CYAN.with_alpha(0.8 + 0.2 * (t * 4.0).sin());
+                set_width_pct(&mut node, fraction(cur as f32, max as f32) * 100.0);
+                set_bg(&mut bg, COLOR_CYAN.with_alpha(0.8 + 0.2 * (t * 4.0).sin()));
             }
             HudBox::WeaponCard => set_border(plate_border(accent, PANEL_EDGE)),
             HudBox::SlotChip(i) => {
                 let active = (i == 0) == shotgun;
                 let w = if i == 0 { Weapon::Shotgun } else { Weapon::Plasma };
                 set_border(if active { plate_border(weapon_accent(w), weapon_accent(w).with_alpha(0.5)) } else { plate_border(PANEL_EDGE, PANEL_EDGE) });
-                bg.0 = if active { weapon_accent(w).with_alpha(0.18) } else { PANEL_BG };
+                set_bg(&mut bg, if active { weapon_accent(w).with_alpha(0.18) } else { PANEL_BG });
             }
             HudBox::OverclockPill => set_display(&mut node, overclock_active(signal.bars, mods.overclock_bonus)),
         }

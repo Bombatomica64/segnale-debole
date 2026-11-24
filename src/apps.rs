@@ -17,8 +17,8 @@ use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::{take_flag, BotControl};
 use crate::enemies::{damage_enemy, Enemy, EnemyAssets, EnemyKind, PingMarked, FIEND_FIELD_RADIUS};
 use crate::fx::{overlay_layer, spawn_beam, Fx, FxFade, FxMotion, spawn_burst, spawn_flash_light, spawn_lightning, spawn_shockwave, BurstColor, FxAssets, HudFeed};
-use crate::fx::additive_glow;
-use crate::level::{DemonJammer, LevelEntity, LevelGrid};
+use crate::fx::beam_glows;
+use crate::level::{CullableLight, DemonJammer, LevelEntity, LevelGrid};
 use crate::physics::sample_floor_height;
 use crate::player::{CursorCaptured, Player};
 use crate::signal::{bars_from_strength, SignalState};
@@ -113,7 +113,7 @@ pub struct DecoyHandset {
 
 /// Decoy parts animated by [`tick_decoys`].
 #[derive(Component, Debug, Clone)]
-pub struct DecoyScreen(pub Handle<StandardMaterial>);
+pub struct DecoyScreen;
 #[derive(Component, Debug, Clone, Copy)]
 pub struct DecoyRing;
 #[derive(Component, Debug, Clone, Copy)]
@@ -230,17 +230,15 @@ fn spawn_route_breadcrumbs(commands: &mut Commands, fx: &FxAssets, materials: &m
         p.y = sample_floor_height(grid, p.x, p.z).unwrap_or(p.y) + 0.06;
         // Short glowing post + flat pulsing floor disc.
         spawn_beam(commands, fx, materials, p, 0.45, 0.32, ROUTE_LIFE, cyan, false);
-        let mat = additive_glow(cyan, 0.75);
-        let emissive = mat.emissive;
-        let handle = materials.add(mat);
+        let fade = FxFade::new(fx.fade_palette(materials, cyan, 0.75));
         let scale = Vec3::new(0.55, 0.05, 0.55);
         commands.spawn((
             LevelEntity,
             RouteBreadcrumb { index: i },
             Fx::new(ROUTE_LIFE, FxMotion::Hold, scale),
-            FxFade { material: handle.clone(), alpha: 0.75, emissive },
+            MeshMaterial3d(fade.first()),
+            fade,
             Mesh3d(fx.ring.clone()),
-            MeshMaterial3d(handle),
             Transform::from_translation(p).with_scale(scale),
         ));
     }
@@ -256,15 +254,9 @@ fn animate_breadcrumbs(time: Res<Time>, mut q: Query<(&RouteBreadcrumb, &Fx, &mu
     }
 }
 
-fn spawn_decoy(commands: &mut Commands, fx: &FxAssets, materials: &mut Assets<StandardMaterial>, pos: Vec3) -> Entity {
-    let body = materials.add(StandardMaterial { base_color: Color::srgb(0.05, 0.06, 0.07), perceptual_roughness: 0.35, metallic: 0.6, ..default() });
-    let screen = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.7, 0.15),
-        emissive: LinearRgba::rgb(6.0, 3.6, 0.6),
-        unlit: true,
-        ..default()
-    });
-    let ring = materials.add(additive_glow(Color::srgb(1.0, 0.75, 0.2), 0.7));
+/// Missed Call decoy: shared pre-allocated materials (no per-decoy materials).
+fn spawn_decoy(commands: &mut Commands, fx: &FxAssets, pos: Vec3) -> Entity {
+    let (body, screen, ring) = (fx.decoy_body.clone(), fx.decoy_screen_amber.clone(), fx.decoy_ring.clone());
     commands
         .spawn((
             LevelEntity,
@@ -273,10 +265,11 @@ fn spawn_decoy(commands: &mut Commands, fx: &FxAssets, materials: &mut Assets<St
             Visibility::default(),
             children![
                 (Mesh3d(fx.cube.clone()), MeshMaterial3d(body), Transform::from_scale(Vec3::new(0.34, 0.06, 0.66))),
-                (DecoyScreen(screen.clone()), Mesh3d(fx.cube.clone()), MeshMaterial3d(screen), Transform::from_xyz(0.0, 0.035, 0.0).with_scale(Vec3::new(0.28, 0.02, 0.56))),
+                (DecoyScreen, Mesh3d(fx.cube.clone()), MeshMaterial3d(screen), Transform::from_xyz(0.0, 0.035, 0.0).with_scale(Vec3::new(0.28, 0.02, 0.56))),
                 (DecoyRing, Mesh3d(fx.ring.clone()), MeshMaterial3d(ring), Transform::from_xyz(0.0, -0.15, 0.0).with_scale(Vec3::new(0.6, 0.1, 0.6))),
                 (
                     DecoyLight,
+                    CullableLight::for_range(9.0),
                     PointLight { color: Color::srgb(1.0, 0.7, 0.2), intensity: 250_000.0, range: 9.0, shadow_maps_enabled: false, ..default() },
                     Transform::from_xyz(0.0, 0.5, 0.0),
                 ),
@@ -290,9 +283,9 @@ fn spawn_decoy(commands: &mut Commands, fx: &FxAssets, materials: &mut Assets<St
 pub fn tick_decoys(
     mut commands: Commands,
     time: Res<Time>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    fx: Res<FxAssets>,
     mut decoys: Query<(Entity, &mut DecoyHandset, &mut Transform, &Children)>,
-    screens: Query<&DecoyScreen>,
+    mut screens: Query<&mut MeshMaterial3d<StandardMaterial>, With<DecoyScreen>>,
     mut rings: Query<&mut Transform, (With<DecoyRing>, Without<DecoyHandset>)>,
     mut lights: Query<&mut PointLight, With<DecoyLight>>,
 ) {
@@ -309,10 +302,11 @@ pub fn tick_decoys(
         tf.rotation = Quat::from_rotation_y(buzz);
         let cyan_phase = (age * 6.0) as u32 % 2 == 1;
         for c in children.iter() {
-            if let Ok(s) = screens.get(c)
-                && let Some(mut m) = materials.get_mut(&s.0)
-            {
-                m.emissive = if cyan_phase { LinearRgba::rgb(0.6, 4.5, 6.0) } else { LinearRgba::rgb(6.0, 3.6, 0.6) };
+            if let Ok(mut m) = screens.get_mut(c) {
+                let want = if cyan_phase { &fx.decoy_screen_cyan } else { &fx.decoy_screen_amber };
+                if m.0.id() != want.id() {
+                    m.0 = want.clone();
+                }
             }
             if let Ok(mut r) = rings.get_mut(c) {
                 let k = (age * 1.8).fract();
@@ -375,7 +369,7 @@ fn phone_apps(
             for d in &decoys {
                 commands.entity(d).try_despawn();
             }
-            spawn_decoy(&mut commands, &fx, &mut materials, ptf.translation + Vec3::Y * 0.25);
+            spawn_decoy(&mut commands, &fx, ptf.translation + Vec3::Y * 0.25);
             apps.ping_cooldown = ping_cooldown(&mods);
             apps.cast_anim = 1.0;
             sfx.play(SfxEvent::Ping);
@@ -624,16 +618,14 @@ pub fn spawn_hijack_hotspot(commands: &mut Commands, fx: &FxAssets, materials: &
     let ground = pos.with_y(pos.y.max(0.0) + 0.07);
     let emerald = Color::srgb(0.2, 1.0, 0.7);
     spawn_beam(commands, fx, materials, ground, 7.0, 0.55, HIJACK_SECS, emerald, false);
-    let mat = additive_glow(Color::srgb(0.25, 1.0, 0.85), 0.7);
-    let emissive = mat.emissive;
-    let handle = materials.add(mat);
+    let fade = FxFade::new(fx.fade_palette(materials, HIJACK_RING_COLOR, 0.7));
     let scale = Vec3::new(HIJACK_RADIUS, 0.08, HIJACK_RADIUS);
     commands.spawn((
         LevelEntity,
         Fx::new(HIJACK_SECS, FxMotion::Hold, scale),
-        FxFade { material: handle.clone(), alpha: 0.7, emissive },
+        MeshMaterial3d(fade.first()),
+        fade,
         Mesh3d(fx.ring.clone()),
-        MeshMaterial3d(handle),
         Transform::from_translation(ground).with_scale(scale),
     ));
     feed.toast("JAMMER HIJACKED - 5-BAR HOTSPOT!", emerald);
@@ -650,11 +642,32 @@ pub fn tick_hijack_hotspots(mut commands: Commands, time: Res<Time>, mut q: Quer
     }
 }
 
+const HIJACK_RING_COLOR: Color = Color::srgb(0.25, 1.0, 0.85);
+
+/// Every glow the phone apps fade (Ping / Overload / dash shockwaves, beacon
+/// and route beams, route discs, hijack hotspots): palettes built at startup.
+fn prewarm_app_fades(fx: Res<FxAssets>, mut materials: ResMut<Assets<StandardMaterial>>) {
+    let mut glows = vec![
+        (Color::srgb(0.2, 0.95, 1.0), 0.85),
+        (Color::srgb(0.55, 1.0, 1.0), 0.42),
+        (Color::srgb(0.35, 0.9, 1.0), 0.95),
+        (Color::srgb(0.85, 1.0, 1.0), 0.72),
+        (Color::srgb(0.3, 0.9, 1.0), 0.9),
+        (Color::srgb(0.2, 1.0, 0.95), 0.75),
+        (HIJACK_RING_COLOR, 0.7),
+    ];
+    for beam in [Color::srgb(0.2, 1.0, 0.95), Color::srgb(0.2, 1.0, 0.8), Color::srgb(1.0, 0.1, 0.35), Color::srgb(0.2, 1.0, 0.7)] {
+        glows.extend(beam_glows(beam));
+    }
+    fx.prewarm_fades(&mut materials, &glows);
+}
+
 pub struct AppsPlugin;
 
 impl Plugin for AppsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PhoneApps>()
+            .add_systems(Startup, prewarm_app_fades)
             .add_systems(Update, reset_apps.run_if(resource_exists_and_changed::<LevelGrid>).in_set(crate::state::GameSet::World))
             .add_systems(
                 Update,

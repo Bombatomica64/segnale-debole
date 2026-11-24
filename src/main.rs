@@ -9,7 +9,8 @@ fn main() {
             primary_window: Some(Window {
                 title: "SEGNALE DEBOLE".into(),
                 resolution: (1280, 720).into(),
-                present_mode: PresentMode::AutoVsync,
+                // Uncapped by default; F4 toggles VSync live (see `perf`).
+                present_mode: PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()

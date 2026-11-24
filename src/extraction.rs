@@ -13,8 +13,8 @@ use rand::seq::IndexedRandom;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::{take_flag, BotControl};
 use crate::enemies::{spawn_enemy, spawn_pos_for, Enemy, EnemyAssets, EnemyKind, EnemyProjectile};
-use crate::fx::{additive_glow, spawn_beam, spawn_burst, spawn_flash_light, BurstColor, FxAssets, HudFeed};
-use crate::level::{Cell, LevelEntity, LevelGrid, TowerBeacon};
+use crate::fx::{additive_glow, beam_glows, spawn_beam, spawn_burst, spawn_flash_light, BurstColor, FxAssets, HudFeed};
+use crate::level::{Cell, CullableLight, LevelEntity, LevelGrid, TowerBeacon};
 use crate::physics::has_line_of_sight;
 use crate::player::{Player, PLAYER_EYE_HEIGHT};
 use crate::signal::{SignalState, TOWER_RING_RADIUS};
@@ -173,6 +173,27 @@ pub struct SignalRingFx {
     pub material: Handle<StandardMaterial>,
 }
 
+/// The one shared (startup-allocated) material of every Signal Ring,
+/// re-tinted once per frame by [`alarm_atmosphere`].
+#[derive(Resource, Clone)]
+pub struct SignalRingMaterial(pub Handle<StandardMaterial>);
+
+fn create_ring_material(mut commands: Commands, fx: Res<FxAssets>, mut materials: ResMut<Assets<StandardMaterial>>) {
+    commands.insert_resource(SignalRingMaterial(materials.add(additive_glow(Color::srgb(0.2, 1.0, 0.85), 0.7))));
+    // Every beam the SOS spawns: palettes built up front.
+    let mut glows = Vec::new();
+    for c in [SUPPLY_BEAM, FIEND_BEAM_GREEN, FIEND_BEAM_RED, EXTRACT_BEAM_OUTER, EXTRACT_BEAM_CORE] {
+        glows.extend(beam_glows(c));
+    }
+    fx.prewarm_fades(&mut materials, &glows);
+}
+
+const SUPPLY_BEAM: Color = Color::srgb(0.3, 1.0, 0.5);
+const FIEND_BEAM_GREEN: Color = Color::srgb(0.35, 1.0, 0.25);
+const FIEND_BEAM_RED: Color = Color::srgb(1.0, 0.12, 0.2);
+const EXTRACT_BEAM_OUTER: Color = Color::srgb(0.4, 1.0, 1.0);
+const EXTRACT_BEAM_CORE: Color = Color::srgb(0.9, 1.0, 1.0);
+
 #[derive(Component)]
 pub struct AlarmLight {
     pub phase: f32,
@@ -195,7 +216,7 @@ fn reset_extraction(
     mut rush: ResMut<RushSpawns>,
     mut clear: ResMut<ClearColor>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    ring_mat: Res<SignalRingMaterial>,
 ) {
     *state = ExtractionState::default();
     rush.0.clear();
@@ -204,7 +225,7 @@ fn reset_extraction(
     // Rings on the pedestal and on the atrium floor around it.
     for floor_y in [tower.y, 0.0] {
         let r = ring_radius_at(floor_y, tower.y);
-        let mat = materials.add(additive_glow(Color::srgb(0.2, 1.0, 0.85), 0.7));
+        let mat = ring_mat.0.clone();
         commands.spawn((
             LevelEntity,
             SignalRingFx { material: mat.clone() },
@@ -216,22 +237,23 @@ fn reset_extraction(
 }
 
 /// Drop a glowing supply pickup on the next ring-perimeter cell.
+#[allow(clippy::too_many_arguments)]
 fn drop_supply(
     commands: &mut Commands,
     grid: &LevelGrid,
+    cells: &[IVec2],
     pickups: Option<&PickupAssets>,
     fx: &FxAssets,
     materials: &mut Assets<StandardMaterial>,
     kind: PickupKind,
     idx: &mut usize,
 ) {
-    let cells = ring_supply_cells(grid);
     let Some(a) = pickups.filter(|_| !cells.is_empty()) else { return };
     let c = cells[*idx % cells.len()];
     *idx += 1;
     let pos = grid.cell_center(c);
     spawn_pickup(commands, a, kind, pos, true);
-    spawn_beam(commands, fx, materials, pos, 6.0, 0.35, 1.6, Color::srgb(0.3, 1.0, 0.5), false);
+    spawn_beam(commands, fx, materials, pos, 6.0, 0.35, 1.6, SUPPLY_BEAM, false);
 }
 
 fn rush_cells(grid: &LevelGrid) -> Vec<IVec2> {
@@ -260,14 +282,29 @@ fn update_extraction(
     mut players: Query<(&Transform, &mut Player)>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform)>,
     projectiles: Query<Entity, With<EnemyProjectile>>,
-    (mut bot, pickups, mut beacon_timer, mut supply_idx, mut second_wind): (Option<ResMut<BotControl>>, Option<Res<PickupAssets>>, Local<f32>, Local<usize>, Local<bool>),
+    (mut bot, pickups, mut beacon_timer, mut supply_idx, mut second_wind, mut supply_cells, mut fiends): (
+        Option<ResMut<BotControl>>,
+        Option<Res<PickupAssets>>,
+        Local<f32>,
+        Local<usize>,
+        Local<bool>,
+        Local<Option<Vec<IVec2>>>,
+        Local<Vec<Vec3>>,
+    ),
 ) {
+    // Ring supply cells are a pure function of the current LevelGrid: refresh
+    // before any early return so a grid replacement is never missed while no
+    // player is spawned.
+    if grid.is_changed() || supply_cells.is_none() {
+        *supply_cells = Some(ring_supply_cells(&grid));
+    }
     let dt = time.delta_secs();
     let Ok((ptf, mut player)) = players.single_mut() else { return };
     let pickups = pickups.as_deref();
     let tower = grid.tower_world();
     let ppos = ptf.translation;
     let mut rng = rand::rng();
+    let ring_cells = supply_cells.as_deref().unwrap_or(&[]);
 
     match &mut *state {
         ExtractionState::Searching { hold } => {
@@ -295,8 +332,8 @@ fn update_extraction(
                 *supply_idx = 0;
                 *second_wind = false;
                 *beacon_timer = 0.0;
-                drop_supply(&mut commands, &grid, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
-                drop_supply(&mut commands, &grid, pickups, &fx, &mut materials, if run.floor <= 1 { PickupKind::Armor } else { PickupKind::Shells }, &mut supply_idx);
+                drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
+                drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, if run.floor <= 1 { PickupKind::Armor } else { PickupKind::Shells }, &mut supply_idx);
                 for (mut e, _) in &mut enemies {
                     e.alerted = true;
                 }
@@ -309,6 +346,7 @@ fn update_extraction(
                         commands.spawn((
                             LevelEntity,
                             AlarmLight { phase: i as f32 * 1.3 },
+                            CullableLight::for_range(22.0),
                             PointLight { color: Color::srgb(1.0, 0.1, 0.05), intensity: 0.0, range: 22.0, shadow_maps_enabled: false, ..default() },
                             Transform::from_translation(p),
                         ));
@@ -319,11 +357,8 @@ fn update_extraction(
         ExtractionState::Uploading { in_ring, wave_timer, baron_spawned, progress, jammed, .. } => {
             let was_jammed = *jammed;
             let ring = signal.near_tower;
-            let fiends: Vec<Vec3> = enemies
-                .iter()
-                .filter(|(e, _)| e.kind == EnemyKind::JammerFiend && e.is_alive())
-                .map(|(_, g)| g.translation())
-                .collect();
+            fiends.clear();
+            fiends.extend(enemies.iter().filter(|(e, _)| e.kind == EnemyKind::JammerFiend && e.is_alive()).map(|(_, g)| g.translation()));
             let jam = fiend_jams_uplink(&fiends, tower);
             if jam && !was_jammed {
                 feed.alert("UPLINK JAMMED - KILL THE JAMMER FIEND!", Color::srgb(1.0, 0.2, 0.15), 2.5);
@@ -336,8 +371,8 @@ fn update_extraction(
                     *beacon_timer = FIEND_BEACON_SECS;
                     for f in fiends.iter().filter(|f| Vec2::new(f.x - tower.x, f.z - tower.z).length() <= TOWER_RING_RADIUS) {
                         let base = f.with_y(f.y.min(tower.y.max(0.0)));
-                        spawn_beam(&mut commands, &fx, &mut materials, base, 40.0, 0.6, FIEND_BEACON_SECS + 0.15, Color::srgb(0.35, 1.0, 0.25), true);
-                        spawn_beam(&mut commands, &fx, &mut materials, base, 40.0, 0.25, FIEND_BEACON_SECS + 0.15, Color::srgb(1.0, 0.12, 0.2), true);
+                        spawn_beam(&mut commands, &fx, &mut materials, base, 40.0, 0.6, FIEND_BEACON_SECS + 0.15, FIEND_BEAM_GREEN, true);
+                        spawn_beam(&mut commands, &fx, &mut materials, base, 40.0, 0.25, FIEND_BEACON_SECS + 0.15, FIEND_BEAM_RED, true);
                     }
                 }
             }
@@ -394,8 +429,8 @@ fn update_extraction(
             // Floor 1 second wind: medkit + armor on the ring edge for the final push.
             if run.floor <= 1 && *progress >= 0.75 && !*second_wind {
                 *second_wind = true;
-                drop_supply(&mut commands, &grid, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
-                drop_supply(&mut commands, &grid, pickups, &fx, &mut materials, PickupKind::Armor, &mut supply_idx);
+                drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
+                drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Armor, &mut supply_idx);
                 feed.toast("SUPPLY DROP ON THE RING", Color::srgb(0.3, 1.0, 0.5));
             }
             if want_baron && let Some(c) = pick_cell(&mut rng) {
@@ -405,14 +440,14 @@ fn update_extraction(
                 sfx.play(SfxEvent::BaronAlert);
                 feed.alert("WARNING: HELL BARON INBOUND!", Color::srgb(1.0, 0.55, 0.1), 3.5);
                 // Emergency medkit on the ring edge.
-                drop_supply(&mut commands, &grid, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
+                drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
             }
             if state.advance_upload(dt, ring, jam) {
                 // Orbital extraction: beam + vaporize.
                 sfx.play(SfxEvent::Extract);
                 feed.alert("ORBITAL EXTRACTION LOCKED", Color::srgb(0.3, 1.0, 1.0), 2.0);
-                spawn_beam(&mut commands, &fx, &mut materials, tower, 90.0, 2.8, EXTRACT_SECS + 0.6, Color::srgb(0.4, 1.0, 1.0), false);
-                spawn_beam(&mut commands, &fx, &mut materials, tower, 90.0, 1.0, EXTRACT_SECS + 0.6, Color::srgb(0.9, 1.0, 1.0), false);
+                spawn_beam(&mut commands, &fx, &mut materials, tower, 90.0, 2.8, EXTRACT_SECS + 0.6, EXTRACT_BEAM_OUTER, false);
+                spawn_beam(&mut commands, &fx, &mut materials, tower, 90.0, 1.0, EXTRACT_SECS + 0.6, EXTRACT_BEAM_CORE, false);
                 spawn_flash_light(&mut commands, tower + Vec3::Y * 3.0, Color::srgb(0.4, 1.0, 1.0), 40_000_000.0, 60.0, EXTRACT_SECS);
                 player.invuln_timer = player.invuln_timer.max(EXTRACT_SECS + 1.0);
                 for (mut e, _) in &mut enemies {
@@ -438,15 +473,16 @@ fn update_extraction(
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn alarm_atmosphere(
     time: Res<Time>,
     state: Res<ExtractionState>,
     mut clear: ResMut<ClearColor>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    ring_mat: Option<Res<SignalRingMaterial>>,
     rings: Query<(&SignalRingFx, &mut Transform)>,
     mut beacons: Query<&mut PointLight, (With<TowerBeacon>, Without<AlarmLight>)>,
-    mut alarms: Query<(&AlarmLight, &mut PointLight), Without<TowerBeacon>>,
+    mut alarms: Query<(&AlarmLight, &mut CullableLight), Without<TowerBeacon>>,
 ) {
     let t = time.elapsed_secs();
     let uploading = matches!(*state, ExtractionState::Uploading { .. });
@@ -461,22 +497,28 @@ fn alarm_atmosphere(
             l.color = Color::srgb(0.3, 1.0, 0.75);
         }
     }
-    for (a, mut l) in &mut alarms {
+    for (a, mut cull) in &mut alarms {
         let k = (0.5 + 0.5 * (t * 7.0 + a.phase).sin()).powi(2);
-        l.intensity = if uploading { 2_500_000.0 * k } else { 0.0 };
+        cull.set_intensity(if uploading { 2_500_000.0 * k } else { 0.0 });
     }
-    for (ring, mut tf) in rings {
+    let mut any_ring = false;
+    for (_, mut tf) in rings {
+        any_ring = true;
         let s = 1.0 + 0.03 * (t * 3.0).sin();
         tf.scale = Vec3::new(s, 1.0 + 2.0 * pulse, s);
-        if let Some(mut m) = materials.get_mut(&ring.material) {
-            let c = match *state {
-                _ if jammed => LinearRgba::rgb(4.0, 0.2, 0.2),
-                ExtractionState::Uploading { in_ring: false, .. } => LinearRgba::rgb(4.0, 2.4, 0.2),
-                ExtractionState::Uploading { .. } => LinearRgba::rgb(0.4, 5.0, 4.0),
-                _ => LinearRgba::rgb(0.3, 2.5, 2.0),
-            };
-            m.emissive = c * (0.6 + 0.6 * pulse);
-        }
+    }
+    // Every ring shares one material: tint it once.
+    if any_ring
+        && let Some(ring_mat) = ring_mat
+        && let Some(mut m) = materials.get_mut(&ring_mat.0)
+    {
+        let c = match *state {
+            _ if jammed => LinearRgba::rgb(4.0, 0.2, 0.2),
+            ExtractionState::Uploading { in_ring: false, .. } => LinearRgba::rgb(4.0, 2.4, 0.2),
+            ExtractionState::Uploading { .. } => LinearRgba::rgb(0.4, 5.0, 4.0),
+            _ => LinearRgba::rgb(0.3, 2.5, 2.0),
+        };
+        m.emissive = c * (0.6 + 0.6 * pulse);
     }
 }
 
@@ -485,6 +527,7 @@ pub struct ExtractionPlugin;
 impl Plugin for ExtractionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ExtractionState>()
+            .add_systems(Startup, create_ring_material)
             .init_resource::<RushSpawns>()
             .add_systems(Update, reset_extraction.run_if(resource_exists_and_changed::<LevelGrid>).in_set(GameSet::World))
             .add_systems(

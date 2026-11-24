@@ -7,6 +7,8 @@
 //! color-coded `[RMB] PING` / `[Q] 5G` app status tiles, bold SOS bar, and
 //! subtle in-screen Dead-Zone static snow.
 
+use std::fmt::Write as _;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
@@ -130,15 +132,13 @@ fn update_phone_screen(
     extraction: Res<ExtractionState>,
     mut screen: ResMut<PhoneScreenTexture>,
     mut images: ResMut<Assets<Image>>,
+    (mut frame, mut shown): (Local<Vec<u8>>, Local<Vec<u8>>),
 ) {
     screen.timer -= time.delta_secs();
     if screen.timer > 0.0 {
         return;
     }
     screen.timer = 1.0 / 24.0;
-    let Some(mut img) = images.get_mut(&screen.image) else {
-        return;
-    };
     let (sos_progress, sos_jammed, sos_in_ring, sos_extracting) = match *extraction {
         ExtractionState::Uploading { progress, jammed, in_ring, .. } => (Some(progress), jammed, in_ring, false),
         ExtractionState::Extracting { .. } | ExtractionState::Complete => (Some(1.0), false, true, true),
@@ -169,14 +169,53 @@ fn update_phone_screen(
         spoof_active: apps.spoof_active(),
         hijack_boost: signal.hotspot_boosted,
     };
+    // Render off-texture; only touch the image (which marks it for GPU
+    // re-upload) when the pixels actually differ from the last upload.
+    frame.resize((SCREEN_W * SCREEN_H * 4) as usize, 0);
+    render_phone_screen(&mut frame, &snap);
+    if *frame == *shown {
+        return;
+    }
+    let Some(mut img) = images.get_mut(&screen.image) else {
+        return;
+    };
     if let Some(data) = img.data.as_mut() {
-        render_phone_screen(data, &snap);
+        data.copy_from_slice(&frame);
+        shown.clone_from(&frame);
     }
 }
 
 // ---------------------------------------------------------------------------
 // Pixel framebuffer primitives
 // ---------------------------------------------------------------------------
+
+/// Tiny fixed-capacity string for OLED labels (no heap allocation).
+struct StackStr {
+    buf: [u8; 24],
+    len: usize,
+}
+
+impl StackStr {
+    fn new() -> Self {
+        StackStr { buf: [0; 24], len: 0 }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Write for StackStr {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
 
 struct ScreenBuf<'a> {
     data: &'a mut [u8],
@@ -382,7 +421,9 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         g.rect_outline(57 + i * 9, 6, 9, 9, [60, 40, 120]);
     }
     // Bold bar count + battery top-right.
-    g.text(90, 5, &format!("{}/5", s.bars), 2, bright);
+    let mut lbl = StackStr::new();
+    let _ = write!(lbl, "{}/5", s.bars);
+    g.text(90, 5, lbl.as_str(), 2, bright);
     g.rect_outline(134, 6, 18, 10, dim);
     g.rect(152, 8, 2, 6, dim);
     g.rect(136, 8, 14, 6, green);
@@ -403,8 +444,9 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         }
     }
     // Large 2x dBm number right beside the bars.
-    let dbm_str = format!("{}", s.dbm);
-    g.text(88, 34, &dbm_str, 2, accent);
+    let mut dbm_str = StackStr::new();
+    let _ = write!(dbm_str, "{}", s.dbm);
+    g.text(88, 34, dbm_str.as_str(), 2, accent);
     g.text(94, 54, "DBM", 2, dim);
 
     // ---- 3. Bold 2px Oscilloscope Waveform (y = 88..112) ----
@@ -474,7 +516,9 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
             g.text(64, 145, hint, 2, cyan);
         } else {
             let d = s.tower_distance.round().min(999.0) as i32;
-            g.text(64, 124, &format!("{d}M"), 2, accent);
+            let mut dist = StackStr::new();
+            let _ = write!(dist, "{d}M");
+            g.text(64, 124, dist.as_str(), 2, accent);
             let dir_lbl = if ang.abs() < 0.35 {
                 "AHEAD"
             } else if ang.abs() > 2.6 {
@@ -543,12 +587,9 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
             g.rect(7, 218, fill_w, 16, fill_c);
         }
         let pct = (p * 100.0).round() as i32;
-        let lbl = if s.sos_jammed {
-            format!("JAM! {pct}%")
-        } else {
-            format!("SOS {pct}%")
-        };
-        g.text(28, 219, &lbl, 2, bright);
+        let mut lbl = StackStr::new();
+        let _ = if s.sos_jammed { write!(lbl, "JAM! {pct}%") } else { write!(lbl, "SOS {pct}%") };
+        g.text(28, 219, lbl.as_str(), 2, bright);
     } else {
         let (msg, col) = if s.near_tower { ("PRESS [E]", green) } else { ("FIND 5-BAR", amber) };
         g.text(22, 219, msg, 2, col);
@@ -623,12 +664,13 @@ fn draw_app_tile(
     g.rect_thick_outline(x, y, w, h, border);
     g.text(x + 6, y + 5, title, 1, title_c);
     // Large 2x status so player reads READY / 1B / 3B / 2.3 at a single peripheral glance!
-    let status = match blocked {
-        None => "READY".to_string(),
-        Some(_) if bars < min_bars => format!("NO {min_bars}B"),
-        Some(_) => format!("{cd:.1}S"),
+    let mut status = StackStr::new();
+    let _ = match blocked {
+        None => write!(status, "READY"),
+        Some(_) if bars < min_bars => write!(status, "NO {min_bars}B"),
+        Some(_) => write!(status, "{cd:.1}S"),
     };
-    g.text(x + 6, y + 17, &status, 2, status_c);
+    g.text(x + 6, y + 17, status.as_str(), 2, status_c);
 }
 
 // ---------------------------------------------------------------------------

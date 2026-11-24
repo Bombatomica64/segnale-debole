@@ -10,6 +10,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
+use bevy::render::view::Msaa;
 use rand::Rng;
 
 use crate::apps::{spawn_hijack_hotspot, PhoneApps};
@@ -21,7 +22,8 @@ use crate::fx::{
     FxAssets, HudFeed, OVERLAY_LAYER,
 };
 use crate::hud::signal_color;
-use crate::level::{Cell, DemonJammer, JammerCore, LevelEntity, LevelGrid};
+use crate::level::{Cell, CullableLight, DemonJammer, JammerCore, LevelEntity, LevelGrid};
+use crate::mesh_batch::{MaterialBatches, ParentedBatches};
 use crate::meta::{HandsetSkin, RunLoadout, SkinSlot};
 use crate::phone_screen::PhoneScreenTexture;
 use crate::physics::raycast_grid;
@@ -128,6 +130,30 @@ pub fn jammer_ray_hit(base: Vec3, origin: Vec3, dir: Vec3) -> Option<f32> {
         .reduce(f32::min)
 }
 
+/// Lightweight hitscan view of a demon (no `Enemy` clone per shot).
+#[derive(Debug, Clone, Copy)]
+pub struct HitTargetInfo {
+    pub root: Vec3,
+    pub alive: bool,
+    /// Hit volumes `(height above root, radius)` (see [`Enemy::ray_hit`]).
+    pub spheres: &'static [(f32, f32)],
+}
+
+impl HitTargetInfo {
+    pub fn of(root: Vec3, e: &Enemy) -> Self {
+        HitTargetInfo { root, alive: e.is_alive(), spheres: e.stats.hit_spheres }
+    }
+
+    /// Same result as [`Enemy::ray_hit`].
+    pub fn ray_hit(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<f32> {
+        self.spheres
+            .iter()
+            .filter_map(|&(h, r)| ray_sphere(origin, dir, self.root + Vec3::Y * h, r))
+            .filter(|&t| t <= max_dist)
+            .reduce(f32::min)
+    }
+}
+
 /// Nearest hit among walls, demons and jammers (walls block shots).
 pub fn resolve_hitscan(
     grid: &LevelGrid,
@@ -137,14 +163,27 @@ pub fn resolve_hitscan(
     enemies: &[(Vec3, &Enemy)],
     jammers: &[Vec3],
 ) -> (f32, HitTarget) {
+    let targets: Vec<HitTargetInfo> = enemies.iter().map(|(root, e)| HitTargetInfo::of(*root, e)).collect();
+    resolve_hitscan_targets(grid, origin, dir, max_dist, &targets, jammers)
+}
+
+/// [`resolve_hitscan`] over pre-collected [`HitTargetInfo`]s.
+pub fn resolve_hitscan_targets(
+    grid: &LevelGrid,
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    enemies: &[HitTargetInfo],
+    jammers: &[Vec3],
+) -> (f32, HitTarget) {
     let dir = dir.normalize_or_zero();
     let mut best = match raycast_grid(grid, origin, dir, max_dist) {
         Some(h) => (h.distance, HitTarget::Wall),
         None => (max_dist, HitTarget::Nothing),
     };
-    for (i, (root, e)) in enemies.iter().enumerate() {
-        if e.is_alive()
-            && let Some(t) = e.ray_hit(*root, origin, dir, best.0)
+    for (i, e) in enemies.iter().enumerate() {
+        if e.alive
+            && let Some(t) = e.ray_hit(origin, dir, best.0)
             && t < best.0
         {
             best = (t, HitTarget::Enemy(i));
@@ -196,6 +235,19 @@ pub enum PickupKind {
     Armor,
     Shells,
     Plasma,
+}
+
+impl PickupKind {
+    pub const ALL: [PickupKind; 4] = [PickupKind::Health, PickupKind::Armor, PickupKind::Shells, PickupKind::Plasma];
+
+    pub fn index(self) -> usize {
+        match self {
+            PickupKind::Health => 0,
+            PickupKind::Armor => 1,
+            PickupKind::Shells => 2,
+            PickupKind::Plasma => 3,
+        }
+    }
 }
 
 impl PickupKind {
@@ -262,6 +314,9 @@ pub struct PickupAssets {
     pub brass: Handle<StandardMaterial>,
     pub plasma: Handle<StandardMaterial>,
     pub steel: Handle<StandardMaterial>,
+    /// Per-kind models baked at startup: one merged mesh per material
+    /// (indexed by [`PickupKind::index`]).
+    pub models: [Vec<(Handle<Mesh>, Handle<StandardMaterial>)>; 4],
 }
 
 #[derive(Component)]
@@ -270,10 +325,19 @@ struct PickupSpin;
 /// Mesh part of a pickup model: (mesh, material, offset, scale).
 type PickupPart = (Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3);
 
-pub fn spawn_pickup(commands: &mut Commands, a: &PickupAssets, kind: PickupKind, pos: Vec3, dropped: bool) {
-    let mut rng = rand::rng();
-    let base_y = pos.y + 0.55;
-    let (light, parts): (Color, Vec<PickupPart>) = match kind {
+/// Glow light color of a pickup.
+pub fn pickup_light(kind: PickupKind) -> Color {
+    match kind {
+        PickupKind::Health => Color::srgb(1.0, 0.2, 0.2),
+        PickupKind::Armor => Color::srgb(0.2, 1.0, 0.4),
+        PickupKind::Shells => Color::srgb(1.0, 0.6, 0.2),
+        PickupKind::Plasma => Color::srgb(0.2, 0.9, 1.0),
+    }
+}
+
+/// Light color and rigid parts of a pickup model.
+fn pickup_parts(a: &PickupAssets, kind: PickupKind) -> (Color, Vec<PickupPart>) {
+    match kind {
         PickupKind::Health => (
             Color::srgb(1.0, 0.2, 0.2),
             vec![
@@ -310,7 +374,15 @@ pub fn spawn_pickup(commands: &mut Commands, a: &PickupAssets, kind: PickupKind,
                 (a.cyl.clone(), a.steel.clone(), Vec3::new(0.0, -0.24, 0.0), Vec3::new(0.19, 0.07, 0.19)),
             ],
         ),
-    };
+    }
+}
+
+/// Spawn a pickup: root (bob) + light + spinning pivot carrying the
+/// pre-baked per-material meshes (no per-pickup assets).
+pub fn spawn_pickup(commands: &mut Commands, a: &PickupAssets, kind: PickupKind, pos: Vec3, dropped: bool) {
+    let mut rng = rand::rng();
+    let base_y = pos.y + 0.55;
+    let light = pickup_light(kind);
     let root = commands
         .spawn((
             LevelEntity,
@@ -321,18 +393,24 @@ pub fn spawn_pickup(commands: &mut Commands, a: &PickupAssets, kind: PickupKind,
         .id();
     commands.spawn((
         ChildOf(root),
+        CullableLight::for_range(4.0),
         PointLight { color: light, intensity: if dropped { 50_000.0 } else { 80_000.0 }, range: 4.0, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(0.0, 0.3, 0.0),
     ));
-    let spin = commands.spawn((ChildOf(root), PickupSpin, Transform::default(), Visibility::default())).id();
-    for (mesh, mat, t, s) in parts {
-        commands.spawn((ChildOf(spin), Mesh3d(mesh), MeshMaterial3d(mat), Transform::from_translation(t).with_scale(s)));
+    let models = &a.models[kind.index()];
+    let mut spin = commands.spawn((ChildOf(root), PickupSpin, Transform::default(), Visibility::default()));
+    if let Some((mesh, mat)) = models.first() {
+        spin.insert((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone())));
+    }
+    let spin = spin.id();
+    for (mesh, mat) in models.iter().skip(1) {
+        commands.spawn((ChildOf(spin), Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY));
     }
 }
 
 fn create_pickup_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
     let glow = |c: Color, e: LinearRgba| StandardMaterial { base_color: c, emissive: e, perceptual_roughness: 0.4, ..default() };
-    commands.insert_resource(PickupAssets {
+    let mut a = PickupAssets {
         cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
         cyl: meshes.add(Cylinder::new(1.0, 1.0)),
         white: materials.add(glow(Color::srgb(0.9, 0.9, 0.9), LinearRgba::rgb(0.6, 0.6, 0.6))),
@@ -342,7 +420,19 @@ fn create_pickup_assets(mut commands: Commands, mut materials: ResMut<Assets<Sta
         brass: materials.add(glow(Color::srgb(0.9, 0.7, 0.2), LinearRgba::rgb(1.2, 0.8, 0.1))),
         plasma: materials.add(glow(Color::srgb(0.3, 0.9, 1.0), LinearRgba::rgb(0.5, 5.0, 7.0))),
         steel: materials.add(StandardMaterial { base_color: Color::srgb(0.3, 0.32, 0.35), metallic: 0.8, perceptual_roughness: 0.35, ..default() }),
-    });
+        models: Default::default(),
+    };
+    let src_cube = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
+    let src_cyl = Mesh::from(Cylinder::new(1.0, 1.0));
+    for kind in PickupKind::ALL {
+        let mut batches = MaterialBatches::new();
+        for (mesh, mat, t, s) in pickup_parts(&a, kind).1 {
+            let src = if mesh.id() == a.cube.id() { &src_cube } else { &src_cyl };
+            batches.add(src, &mat, Transform::from_translation(t).with_scale(s));
+        }
+        a.models[kind.index()] = batches.finish(&mut meshes);
+    }
+    commands.insert_resource(a);
 }
 
 /// Floor loot: a pickup in the middle of a few bunker rooms.
@@ -450,6 +540,29 @@ fn vm_part(parent: Entity, mesh: &Handle<Mesh>, mat: &Handle<StandardMaterial>, 
     (ChildOf(parent), Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::from_translation(t).with_scale(s).with_rotation(r), overlay_layer())
 }
 
+/// Source primitives of the viewmodel batches (same shapes as the handles).
+struct VmSourceMeshes {
+    cube: Mesh,
+    cyl: Mesh,
+    cap: Mesh,
+    thin_ring: Mesh,
+    sphere: Mesh,
+    cone: Mesh,
+}
+
+impl VmSourceMeshes {
+    fn new() -> Self {
+        VmSourceMeshes {
+            cube: Mesh::from(Cuboid::new(1.0, 1.0, 1.0)),
+            cyl: Mesh::from(Cylinder::new(1.0, 1.0)),
+            cap: Mesh::from(Capsule3d::new(0.5, 1.0)),
+            thin_ring: Mesh::from(Torus::new(0.78, 1.0)),
+            sphere: Sphere::new(1.0).mesh().uv(16, 12),
+            cone: Mesh::from(Cone::new(1.0, 1.0)),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_viewmodels(
     mut commands: Commands,
@@ -458,8 +571,12 @@ fn spawn_viewmodels(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     loadout: Option<Res<RunLoadout>>,
+    render_msaa: Option<Res<crate::perf::RenderMsaa>>,
 ) {
     let Ok((cam, proj)) = cams.single() else { return };
+    let msaa = render_msaa.map(|m| m.0).unwrap_or(Msaa::Sample2);
+    // Adapter-validated MSAA on the world camera (the player module stays untouched).
+    commands.entity(cam).insert(msaa);
     let skin = loadout.map(|l| l.skin).unwrap_or_default();
     let palette = skin.palette();
     let fov = match proj {
@@ -468,12 +585,14 @@ fn spawn_viewmodels(
     };
     let cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let cyl = meshes.add(Cylinder::new(1.0, 1.0));
-    let cap = meshes.add(Capsule3d::new(0.5, 1.0));
     let ring = meshes.add(Torus::new(0.68, 1.0));
     let thin_ring = meshes.add(Torus::new(0.78, 1.0));
     let sphere = meshes.add(Sphere::new(1.0).mesh().uv(16, 12));
-    let cone = meshes.add(Cone::new(1.0, 1.0));
     let screen_quad = meshes.add(Rectangle::new(0.118, 0.177));
+    // Rigid untagged parts are baked per (pivot, material) into a few meshes;
+    // tagged / animated parts (skin slots, LEDs, coils, screen) stay separate.
+    let src = VmSourceMeshes::new();
+    let mut vb = ParentedBatches::new();
 
     let mat = |m: &mut Assets<StandardMaterial>, c: Color, rough: f32, metal: f32| {
         m.add(StandardMaterial { base_color: c, perceptual_roughness: rough, metallic: metal, ..default() })
@@ -529,6 +648,7 @@ fn spawn_viewmodels(
             OverlayCamera,
             Camera3d::default(),
             Camera { order: 1, clear_color: ClearColorConfig::None, ..default() },
+            msaa,
             Projection::Perspective(PerspectiveProjection { fov, near: 0.01, far: 400.0, ..default() }),
             RenderLayers::layer(OVERLAY_LAYER),
             Transform::default(),
@@ -566,70 +686,69 @@ fn spawn_viewmodels(
     // ---- Weapon 1: Mars Combat Pump Shotgun ----
     let sg = commands.spawn((ChildOf(wroot), GunModel(Weapon::Shotgun), Transform::default(), Visibility::default())).id();
     // Stepped sculpted receiver body + chamfered top dust cover + bottom trigger housing.
-    commands.spawn(vm_part(sg, &cube, &dark_steel, Vec3::new(0.0, 0.0, -0.01), Vec3::new(0.072, 0.088, 0.25), id));
-    commands.spawn(vm_part(sg, &cube, &brushed, Vec3::new(0.0, 0.044, -0.01), Vec3::new(0.056, 0.016, 0.235), id));
-    commands.spawn(vm_part(sg, &cube, &titanium, Vec3::new(0.0, -0.046, 0.01), Vec3::new(0.052, 0.018, 0.18), id));
+    vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, 0.0, -0.01), Vec3::new(0.072, 0.088, 0.25), id);
+    vb.part(sg, &src.cube, &brushed, Vec3::new(0.0, 0.044, -0.01), Vec3::new(0.056, 0.016, 0.235), id);
+    vb.part(sg, &src.cube, &titanium, Vec3::new(0.0, -0.046, 0.01), Vec3::new(0.052, 0.018, 0.18), id);
     // Side receiver detail: recessed ejection port on right showing chambered red/brass shell + rivets.
-    commands.spawn(vm_part(sg, &cube, &grip, Vec3::new(0.036, 0.014, -0.05), Vec3::new(0.006, 0.028, 0.092), id));
-    commands.spawn(vm_part(sg, &cyl, &shell_red, Vec3::new(0.034, 0.014, -0.06), Vec3::new(0.01, 0.048, 0.01), rx));
-    commands.spawn(vm_part(sg, &cyl, &brass, Vec3::new(0.034, 0.014, -0.032), Vec3::new(0.0105, 0.016, 0.0105), rx));
-    commands.spawn(vm_part(sg, &cube, &hazard, Vec3::new(-0.037, 0.008, -0.02), Vec3::new(0.004, 0.016, 0.11), id));
+    vb.part(sg, &src.cube, &grip, Vec3::new(0.036, 0.014, -0.05), Vec3::new(0.006, 0.028, 0.092), id);
+    vb.part(sg, &src.cyl, &shell_red, Vec3::new(0.034, 0.014, -0.06), Vec3::new(0.01, 0.048, 0.01), rx);
+    vb.part(sg, &src.cyl, &brass, Vec3::new(0.034, 0.014, -0.032), Vec3::new(0.0105, 0.016, 0.0105), rx);
+    vb.part(sg, &src.cube, &hazard, Vec3::new(-0.037, 0.008, -0.02), Vec3::new(0.004, 0.016, 0.11), id);
     for z in [-0.09f32, -0.01, 0.06] {
         for s in [-1.0f32, 1.0] {
-            commands.spawn(vm_part(sg, &cyl, &bolt_silver, Vec3::new(0.037 * s, -0.022, z), Vec3::new(0.005, 0.004, 0.005), rz));
+            vb.part(sg, &src.cyl, &bolt_silver, Vec3::new(0.037 * s, -0.022, z), Vec3::new(0.005, 0.004, 0.005), rz);
         }
     }
     // Top Picatinny rail blocks + rear green tritium ghost-ring sight + front red fiber-optic post.
     for k in 0..7 {
-        commands.spawn(vm_part(sg, &cube, &dark_steel, Vec3::new(0.0, 0.056, -0.105 + k as f32 * 0.026), Vec3::new(0.028, 0.01, 0.015), id));
+        vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, 0.056, -0.105 + k as f32 * 0.026), Vec3::new(0.028, 0.01, 0.015), id);
     }
-    commands.spawn(vm_part(sg, &thin_ring, &steel, Vec3::new(0.0, 0.072, 0.055), Vec3::new(0.014, 0.008, 0.014), rx));
+    vb.part(sg, &src.thin_ring, &steel, Vec3::new(0.0, 0.072, 0.055), Vec3::new(0.014, 0.008, 0.014), rx);
     for s in [-1.0f32, 1.0] {
-        commands.spawn(vm_part(sg, &sphere, &sight_green, Vec3::new(0.018 * s, 0.072, 0.058), Vec3::splat(0.0038), id));
+        vb.part(sg, &src.sphere, &sight_green, Vec3::new(0.018 * s, 0.072, 0.058), Vec3::splat(0.0038), id);
     }
     // Heavy upper barrel + ventilated perforated heat-shield shroud + ported muzzle choke.
-    commands.spawn(vm_part(sg, &cyl, &steel, Vec3::new(0.0, 0.030, -0.35), Vec3::new(0.020, 0.48, 0.020), rx));
-    commands.spawn(vm_part(sg, &cyl, &grip, Vec3::new(0.0, 0.030, -0.592), Vec3::new(0.015, 0.008, 0.015), rx)); // bore opening
-    commands.spawn(vm_part(sg, &cyl, &heat_metal, Vec3::new(0.0, 0.030, -0.565), Vec3::new(0.024, 0.052, 0.024), rx)); // muzzle brake
-    commands.spawn(vm_part(sg, &cube, &brushed, Vec3::new(0.0, 0.050, -0.34), Vec3::new(0.018, 0.008, 0.39), id)); // ventilated top rib
+    vb.part(sg, &src.cyl, &steel, Vec3::new(0.0, 0.030, -0.35), Vec3::new(0.020, 0.48, 0.020), rx);
+    vb.part(sg, &src.cyl, &grip, Vec3::new(0.0, 0.030, -0.592), Vec3::new(0.015, 0.008, 0.015), rx); // bore opening
+    vb.part(sg, &src.cyl, &heat_metal, Vec3::new(0.0, 0.030, -0.565), Vec3::new(0.024, 0.052, 0.024), rx); // muzzle brake
+    vb.part(sg, &src.cube, &brushed, Vec3::new(0.0, 0.050, -0.34), Vec3::new(0.018, 0.008, 0.39), id); // ventilated top rib
     for k in 0..8 {
-        commands.spawn(vm_part(
-            sg,
-            &thin_ring,
+        vb.part(
+            sg, &src.thin_ring,
             &brushed,
             Vec3::new(0.0, 0.030, -0.165 - k as f32 * 0.048),
             Vec3::new(0.026, 0.014, 0.026),
             rx,
-        ));
+        );
     }
     // Front sight ramp + glowing red tritium bead.
-    commands.spawn(vm_part(sg, &cube, &dark_steel, Vec3::new(0.0, 0.057, -0.555), Vec3::new(0.012, 0.018, 0.028), id));
-    commands.spawn(vm_part(sg, &sphere, &sight_red, Vec3::new(0.0, 0.071, -0.552), Vec3::splat(0.0048), id));
+    vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, 0.057, -0.555), Vec3::new(0.012, 0.018, 0.028), id);
+    vb.part(sg, &src.sphere, &sight_red, Vec3::new(0.0, 0.071, -0.552), Vec3::splat(0.0048), id);
     // Underbarrel magazine tube + barrel clamp + knurled front cap.
-    commands.spawn(vm_part(sg, &cyl, &dark_steel, Vec3::new(0.0, -0.012, -0.32), Vec3::new(0.016, 0.42, 0.016), rx));
-    commands.spawn(vm_part(sg, &cyl, &brushed, Vec3::new(0.0, -0.012, -0.535), Vec3::new(0.0185, 0.028, 0.0185), rx));
-    commands.spawn(vm_part(sg, &cube, &steel, Vec3::new(0.0, 0.008, -0.49), Vec3::new(0.032, 0.056, 0.024), id));
+    vb.part(sg, &src.cyl, &dark_steel, Vec3::new(0.0, -0.012, -0.32), Vec3::new(0.016, 0.42, 0.016), rx);
+    vb.part(sg, &src.cyl, &brushed, Vec3::new(0.0, -0.012, -0.535), Vec3::new(0.0185, 0.028, 0.0185), rx);
+    vb.part(sg, &src.cube, &steel, Vec3::new(0.0, 0.008, -0.49), Vec3::new(0.032, 0.056, 0.024), id);
     // Sculpted rear stock + grip + trigger guard + trigger.
-    commands.spawn(vm_part(sg, &cube, &wood, Vec3::new(0.0, -0.048, 0.20), Vec3::new(0.054, 0.078, 0.21), Quat::from_rotation_x(0.14)));
-    commands.spawn(vm_part(sg, &cube, &grip, Vec3::new(0.0, -0.062, 0.305), Vec3::new(0.056, 0.088, 0.02), Quat::from_rotation_x(0.14)));
-    commands.spawn(vm_part(sg, &cap, &grip, Vec3::new(0.0, -0.095, 0.075), Vec3::new(0.046, 0.07, 0.052), Quat::from_rotation_x(-0.38)));
-    commands.spawn(vm_part(sg, &cube, &dark_steel, Vec3::new(0.0, -0.076, -0.015), Vec3::new(0.014, 0.006, 0.075), id)); // trigger guard bottom
-    commands.spawn(vm_part(sg, &cube, &steel, Vec3::new(0.0, -0.060, 0.004), Vec3::new(0.006, 0.024, 0.01), Quat::from_rotation_x(0.35))); // trigger
+    vb.part(sg, &src.cube, &wood, Vec3::new(0.0, -0.048, 0.20), Vec3::new(0.054, 0.078, 0.21), Quat::from_rotation_x(0.14));
+    vb.part(sg, &src.cube, &grip, Vec3::new(0.0, -0.062, 0.305), Vec3::new(0.056, 0.088, 0.02), Quat::from_rotation_x(0.14));
+    vb.part(sg, &src.cap, &grip, Vec3::new(0.0, -0.095, 0.075), Vec3::new(0.046, 0.07, 0.052), Quat::from_rotation_x(-0.38));
+    vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, -0.076, -0.015), Vec3::new(0.014, 0.006, 0.075), id); // trigger guard bottom
+    vb.part(sg, &src.cube, &steel, Vec3::new(0.0, -0.060, 0.004), Vec3::new(0.006, 0.024, 0.01), Quat::from_rotation_x(0.35)); // trigger
     // Articulated gloved marine right hand + armored wrist cuff gripping shotgun.
-    commands.spawn(vm_part(sg, &cap, &glove, Vec3::new(0.012, -0.112, 0.082), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.35)));
-    commands.spawn(vm_part(sg, &cube, &glove_plate, Vec3::new(0.036, -0.096, 0.065), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.3)));
-    commands.spawn(vm_part(sg, &cap, &glove, Vec3::new(0.042, -0.17, 0.20), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2)));
-    commands.spawn(vm_part(sg, &cyl, &glove_plate, Vec3::new(0.048, -0.155, 0.165), Vec3::new(0.052, 0.036, 0.052), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2)));
+    vb.part(sg, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.082), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.35));
+    vb.part(sg, &src.cube, &glove_plate, Vec3::new(0.036, -0.096, 0.065), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.3));
+    vb.part(sg, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.20), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
+    vb.part(sg, &src.cyl, &glove_plate, Vec3::new(0.048, -0.155, 0.165), Vec3::new(0.052, 0.036, 0.052), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
 
     // Sliding pump forend (contoured wood/polymer ribs + dual steel action bars).
     let pump = commands.spawn((ChildOf(sg), PumpForend, Transform::from_xyz(0.0, -0.012, -0.30), Visibility::default())).id();
-    commands.spawn(vm_part(pump, &cyl, &wood, Vec3::ZERO, Vec3::new(0.032, 0.175, 0.030), rx));
-    commands.spawn(vm_part(pump, &cube, &wood, Vec3::new(0.0, -0.014, 0.0), Vec3::new(0.058, 0.034, 0.165), id));
+    vb.part(pump, &src.cyl, &wood, Vec3::ZERO, Vec3::new(0.032, 0.175, 0.030), rx);
+    vb.part(pump, &src.cube, &wood, Vec3::new(0.0, -0.014, 0.0), Vec3::new(0.058, 0.034, 0.165), id);
     for k in 0..6 {
-        commands.spawn(vm_part(pump, &cyl, &grip, Vec3::new(0.0, -0.002, -0.068 + k as f32 * 0.027), Vec3::new(0.0335, 0.011, 0.0335), rx));
+        vb.part(pump, &src.cyl, &grip, Vec3::new(0.0, -0.002, -0.068 + k as f32 * 0.027), Vec3::new(0.0335, 0.011, 0.0335), rx);
     }
     for s in [-1.0f32, 1.0] {
-        commands.spawn(vm_part(pump, &cube, &steel, Vec3::new(0.027 * s, 0.005, 0.13), Vec3::new(0.005, 0.008, 0.18), id));
+        vb.part(pump, &src.cube, &steel, Vec3::new(0.027 * s, 0.005, 0.13), Vec3::new(0.005, 0.008, 0.18), id);
     }
     // Layered volumetric shotgun muzzle star-burst (compact & punchy so targets stay visible).
     let star = commands
@@ -637,29 +756,29 @@ fn spawn_viewmodels(
         .id();
     let q = std::f32::consts::FRAC_PI_4;
     for (a, len, width) in [(0.0f32, 0.24f32, 0.018f32), (2.0 * q, 0.21, 0.016), (q, 0.14, 0.014), (3.0 * q, 0.13, 0.014)] {
-        commands.spawn(vm_part(star, &cube, &flash_fire, Vec3::ZERO, Vec3::new(len, width, 0.005), Quat::from_rotation_z(a)));
-        commands.spawn(vm_part(star, &cube, &flash_core, Vec3::new(0.0, 0.0, 0.003), Vec3::new(len * 0.52, width * 0.55, 0.005), Quat::from_rotation_z(a)));
+        vb.part(star, &src.cube, &flash_fire, Vec3::ZERO, Vec3::new(len, width, 0.005), Quat::from_rotation_z(a));
+        vb.part(star, &src.cube, &flash_core, Vec3::new(0.0, 0.0, 0.003), Vec3::new(len * 0.52, width * 0.55, 0.005), Quat::from_rotation_z(a));
     }
-    commands.spawn(vm_part(star, &cone, &flash_fire, Vec3::new(0.0, 0.0, -0.075), Vec3::new(0.025, 0.15, 0.025), Quat::from_rotation_x(-FRAC_PI_2)));
-    commands.spawn(vm_part(star, &sphere, &flash_core, Vec3::ZERO, Vec3::splat(0.034), id));
+    vb.part(star, &src.cone, &flash_fire, Vec3::new(0.0, 0.0, -0.075), Vec3::new(0.025, 0.15, 0.025), Quat::from_rotation_x(-FRAC_PI_2));
+    vb.part(star, &src.sphere, &flash_core, Vec3::ZERO, Vec3::splat(0.034), id);
 
     // ---- Weapon 2: UAC Plasma Repeater (elaborate twin-rail sci-fi rifle) ----
     let pl = commands.spawn((ChildOf(wroot), GunModel(Weapon::Plasma), Transform::default(), Visibility::Hidden)).id();
     // Layered dark titanium lower receiver + brushed upper shroud + rear stock.
-    commands.spawn(vm_part(pl, &cube, &titanium, Vec3::new(0.0, -0.008, -0.10), Vec3::new(0.088, 0.092, 0.34), id));
-    commands.spawn(vm_part(pl, &cube, &brushed, Vec3::new(0.0, 0.042, -0.14), Vec3::new(0.072, 0.034, 0.32), id));
-    commands.spawn(vm_part(pl, &cube, &dark_steel, Vec3::new(0.0, 0.062, -0.08), Vec3::new(0.046, 0.018, 0.20), id));
-    commands.spawn(vm_part(pl, &cube, &hazard, Vec3::new(0.0, 0.018, 0.04), Vec3::new(0.092, 0.014, 0.05), id));
-    commands.spawn(vm_part(pl, &cube, &dark_steel, Vec3::new(0.0, -0.02, 0.14), Vec3::new(0.068, 0.084, 0.16), id));
+    vb.part(pl, &src.cube, &titanium, Vec3::new(0.0, -0.008, -0.10), Vec3::new(0.088, 0.092, 0.34), id);
+    vb.part(pl, &src.cube, &brushed, Vec3::new(0.0, 0.042, -0.14), Vec3::new(0.072, 0.034, 0.32), id);
+    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.0, 0.062, -0.08), Vec3::new(0.046, 0.018, 0.20), id);
+    vb.part(pl, &src.cube, &hazard, Vec3::new(0.0, 0.018, 0.04), Vec3::new(0.092, 0.014, 0.05), id);
+    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.0, -0.02, 0.14), Vec3::new(0.068, 0.084, 0.16), id);
     // Rear holographic sight frame + glowing cyan reticle dot.
-    commands.spawn(vm_part(pl, &cube, &dark_steel, Vec3::new(-0.022, 0.086, -0.01), Vec3::new(0.007, 0.036, 0.034), id));
-    commands.spawn(vm_part(pl, &cube, &dark_steel, Vec3::new(0.022, 0.086, -0.01), Vec3::new(0.007, 0.036, 0.034), id));
-    commands.spawn(vm_part(pl, &cube, &dark_steel, Vec3::new(0.0, 0.102, -0.01), Vec3::new(0.052, 0.007, 0.034), id));
-    commands.spawn(vm_part(pl, &sphere, &coil, Vec3::new(0.0, 0.086, -0.012), Vec3::splat(0.0042), id));
+    vb.part(pl, &src.cube, &dark_steel, Vec3::new(-0.022, 0.086, -0.01), Vec3::new(0.007, 0.036, 0.034), id);
+    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.022, 0.086, -0.01), Vec3::new(0.007, 0.036, 0.034), id);
+    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.0, 0.102, -0.01), Vec3::new(0.052, 0.007, 0.034), id);
+    vb.part(pl, &src.sphere, &coil, Vec3::new(0.0, 0.086, -0.012), Vec3::splat(0.0042), id);
     // Twin parallel steel accelerator rails + central glowing plasma conduit + 5 pulsing coils.
-    commands.spawn(vm_part(pl, &cube, &steel, Vec3::new(0.0, 0.034, -0.42), Vec3::new(0.034, 0.016, 0.30), id));
-    commands.spawn(vm_part(pl, &cube, &steel, Vec3::new(0.0, -0.034, -0.42), Vec3::new(0.034, 0.016, 0.30), id));
-    commands.spawn(vm_part(pl, &cyl, &coil, Vec3::new(0.0, 0.0, -0.40), Vec3::new(0.016, 0.32, 0.016), rx));
+    vb.part(pl, &src.cube, &steel, Vec3::new(0.0, 0.034, -0.42), Vec3::new(0.034, 0.016, 0.30), id);
+    vb.part(pl, &src.cube, &steel, Vec3::new(0.0, -0.034, -0.42), Vec3::new(0.034, 0.016, 0.30), id);
+    vb.part(pl, &src.cyl, &coil, Vec3::new(0.0, 0.0, -0.40), Vec3::new(0.016, 0.32, 0.016), rx);
     for k in 0..5 {
         commands.spawn((
             PlasmaCoil(k),
@@ -669,33 +788,33 @@ fn spawn_viewmodels(
     // Flared triple-pronged plasma emitter crown around muzzle lens.
     for a in [0.0f32, TAU / 3.0, 2.0 * TAU / 3.0] {
         let off = Vec3::new(a.cos() * 0.034, a.sin() * 0.034, -0.575);
-        commands.spawn(vm_part(pl, &cube, &steel, off, Vec3::new(0.012, 0.012, 0.06), Quat::from_rotation_z(a)));
+        vb.part(pl, &src.cube, &steel, off, Vec3::new(0.012, 0.012, 0.06), Quat::from_rotation_z(a));
     }
-    commands.spawn(vm_part(pl, &sphere, &coil, Vec3::new(0.0, 0.0, -0.555), Vec3::splat(0.022), id));
+    vb.part(pl, &src.sphere, &coil, Vec3::new(0.0, 0.0, -0.555), Vec3::splat(0.022), id);
     // Side copper cooling radiator fins with glowing heat vents.
     for k in 0..5 {
         let z = -0.22 + k as f32 * 0.042;
-        commands.spawn(vm_part(pl, &cube, &copper, Vec3::new(0.047, 0.012, z), Vec3::new(0.012, 0.052, 0.014), id));
-        commands.spawn(vm_part(pl, &cube, &vent_amber, Vec3::new(0.045, 0.012, z + 0.021), Vec3::new(0.006, 0.036, 0.008), id));
+        vb.part(pl, &src.cube, &copper, Vec3::new(0.047, 0.012, z), Vec3::new(0.012, 0.052, 0.014), id);
+        vb.part(pl, &src.cube, &vent_amber, Vec3::new(0.045, 0.012, z + 0.021), Vec3::new(0.006, 0.036, 0.008), id);
     }
     // Side-mounted pressurized glowing cyan plasma cell canister + dual steel clamp rings + conduit.
-    commands.spawn(vm_part(pl, &cyl, &coil, Vec3::new(-0.062, -0.008, -0.07), Vec3::new(0.022, 0.18, 0.022), rx));
+    vb.part(pl, &src.cyl, &coil, Vec3::new(-0.062, -0.008, -0.07), Vec3::new(0.022, 0.18, 0.022), rx);
     for z in [-0.135f32, -0.005] {
-        commands.spawn(vm_part(pl, &cyl, &dark_steel, Vec3::new(-0.062, -0.008, z), Vec3::new(0.026, 0.022, 0.026), rx));
+        vb.part(pl, &src.cyl, &dark_steel, Vec3::new(-0.062, -0.008, z), Vec3::new(0.026, 0.022, 0.026), rx);
     }
-    commands.spawn(vm_part(pl, &cap, &brushed, Vec3::new(-0.052, -0.012, -0.20), Vec3::new(0.012, 0.06, 0.012), Quat::from_rotation_x(1.3) * Quat::from_rotation_z(-0.45)));
+    vb.part(pl, &src.cap, &brushed, Vec3::new(-0.052, -0.012, -0.20), Vec3::new(0.012, 0.06, 0.012), Quat::from_rotation_x(1.3) * Quat::from_rotation_z(-0.45));
     // Grip + gloved right hand.
-    commands.spawn(vm_part(pl, &cap, &grip, Vec3::new(0.0, -0.095, 0.035), Vec3::new(0.046, 0.072, 0.052), Quat::from_rotation_x(-0.32)));
-    commands.spawn(vm_part(pl, &cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3)));
-    commands.spawn(vm_part(pl, &cube, &glove_plate, Vec3::new(0.036, -0.096, 0.03), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.28)));
-    commands.spawn(vm_part(pl, &cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2)));
+    vb.part(pl, &src.cap, &grip, Vec3::new(0.0, -0.095, 0.035), Vec3::new(0.046, 0.072, 0.052), Quat::from_rotation_x(-0.32));
+    vb.part(pl, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
+    vb.part(pl, &src.cube, &glove_plate, Vec3::new(0.036, -0.096, 0.03), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.28));
+    vb.part(pl, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
     // Layered plasma muzzle flash (bright core + additive outer halo).
     let pl_flash = commands
         .spawn((ChildOf(pl), MuzzleFlash(Weapon::Plasma), Transform::from_xyz(0.0, 0.0, -0.60), Visibility::Hidden))
         .id();
-    commands.spawn(vm_part(pl_flash, &sphere, &flash_cyan, Vec3::ZERO, Vec3::splat(0.045), id));
-    commands.spawn(vm_part(pl_flash, &sphere, &flash_cyan_halo, Vec3::ZERO, Vec3::splat(0.095), id));
-    commands.spawn(vm_part(pl_flash, &thin_ring, &flash_cyan, Vec3::new(0.0, 0.0, -0.01), Vec3::new(0.075, 0.015, 0.075), rx));
+    vb.part(pl_flash, &src.sphere, &flash_cyan, Vec3::ZERO, Vec3::splat(0.045), id);
+    vb.part(pl_flash, &src.sphere, &flash_cyan_halo, Vec3::ZERO, Vec3::splat(0.095), id);
+    vb.part(pl_flash, &src.thin_ring, &flash_cyan, Vec3::new(0.0, 0.0, -0.01), Vec3::new(0.075, 0.015, 0.075), rx);
 
     // =========================================================================
     // LEFT HAND: ELABORATE TACTICAL SMARTPHONE WITH LIVE 160x240 OLED DISPLAY
@@ -711,7 +830,7 @@ fn spawn_viewmodels(
     for k in 0..6 {
         let y = -0.062 + k as f32 * 0.024;
         for s in [-1.0f32, 1.0] {
-            commands.spawn(vm_part(proot, &cube, &grip, Vec3::new(0.072 * s, y, 0.0), Vec3::new(0.005, 0.010, 0.016), id));
+            vb.part(proot, &src.cube, &grip, Vec3::new(0.072 * s, y, 0.0), Vec3::new(0.005, 0.010, 0.016), id);
         }
     }
     // 4 sculpted rugged corner armor bumpers with silver hex bolts.
@@ -723,22 +842,22 @@ fn spawn_viewmodels(
         ));
     }
     // Top bulkhead: speaker grille slot + front-facing lens + blinking status LED.
-    commands.spawn(vm_part(proot, &cube, &dark_steel, Vec3::new(0.0, 0.097, 0.0105), Vec3::new(0.036, 0.005, 0.003), id));
-    commands.spawn(vm_part(proot, &cyl, &brushed, Vec3::new(-0.032, 0.097, 0.0105), Vec3::new(0.0045, 0.003, 0.0045), rx));
+    vb.part(proot, &src.cube, &dark_steel, Vec3::new(0.0, 0.097, 0.0105), Vec3::new(0.036, 0.005, 0.003), id);
+    vb.part(proot, &src.cyl, &brushed, Vec3::new(-0.032, 0.097, 0.0105), Vec3::new(0.0045, 0.003, 0.0045), rx);
     commands.spawn((PhoneLed, vm_part(proot, &sphere, &led, Vec3::new(0.034, 0.097, 0.0115), Vec3::splat(0.0038), id)));
     // Bottom chin tactile home bar + lanyard loop.
-    commands.spawn(vm_part(proot, &cube, &brushed, Vec3::new(0.0, -0.098, 0.0105), Vec3::new(0.044, 0.006, 0.003), id));
+    vb.part(proot, &src.cube, &brushed, Vec3::new(0.0, -0.098, 0.0105), Vec3::new(0.044, 0.006, 0.003), id);
     // Side hardware controls: orange PTT button on left, volume rockers on right.
     commands.spawn((PhoneSkinPart(SkinSlot::Ptt), vm_part(proot, &cube, &phone_ptt, Vec3::new(-0.074, 0.036, 0.0), Vec3::new(0.006, 0.026, 0.010), id)));
-    commands.spawn(vm_part(proot, &cube, &steel, Vec3::new(0.074, 0.046, 0.0), Vec3::new(0.005, 0.018, 0.008), id));
-    commands.spawn(vm_part(proot, &cube, &steel, Vec3::new(0.074, 0.020, 0.0), Vec3::new(0.005, 0.018, 0.008), id));
+    vb.part(proot, &src.cube, &steel, Vec3::new(0.074, 0.046, 0.0), Vec3::new(0.005, 0.018, 0.008), id);
+    vb.part(proot, &src.cube, &steel, Vec3::new(0.074, 0.020, 0.0), Vec3::new(0.005, 0.018, 0.008), id);
     // Knurled antenna collar + telescoping tactical whip antenna + helical coil + glowing beacon bead.
-    commands.spawn(vm_part(proot, &cyl, &brushed, Vec3::new(0.048, 0.114, -0.001), Vec3::new(0.011, 0.018, 0.011), id));
-    commands.spawn(vm_part(proot, &cyl, &dark_steel, Vec3::new(0.048, 0.145, -0.001), Vec3::new(0.0048, 0.052, 0.0048), id));
+    vb.part(proot, &src.cyl, &brushed, Vec3::new(0.048, 0.114, -0.001), Vec3::new(0.011, 0.018, 0.011), id);
+    vb.part(proot, &src.cyl, &dark_steel, Vec3::new(0.048, 0.145, -0.001), Vec3::new(0.0048, 0.052, 0.0048), id);
     commands.spawn((PhoneSkinPart(SkinSlot::Coil), vm_part(proot, &thin_ring, &phone_coil, Vec3::new(0.048, 0.132, -0.001), Vec3::new(0.008, 0.006, 0.008), id)));
     commands.spawn((PhoneLed, vm_part(proot, &sphere, &led, Vec3::new(0.048, 0.174, -0.001), Vec3::splat(0.0062), id)));
     // Raised screen surround lip + LIVE 160x240 pixel-art OLED screen quad!
-    commands.spawn(vm_part(proot, &cube, &grip, Vec3::new(0.0, 0.0, 0.0096), Vec3::new(0.123, 0.182, 0.002), id));
+    vb.part(proot, &src.cube, &grip, Vec3::new(0.0, 0.0, 0.0096), Vec3::new(0.123, 0.182, 0.002), id);
     commands.spawn((
         PhoneScreen,
         ChildOf(proot),
@@ -748,19 +867,22 @@ fn spawn_viewmodels(
         overlay_layer(),
     ));
     // Articulated gloved marine left hand & armored cuff gripping bottom & sides (never blocking the screen!).
-    commands.spawn(vm_part(proot, &cap, &glove, Vec3::new(-0.012, -0.118, -0.022), Vec3::new(0.088, 0.058, 0.058), rz)); // palm base
-    commands.spawn(vm_part(proot, &cap, &glove, Vec3::new(-0.072, -0.042, -0.014), Vec3::new(0.026, 0.088, 0.032), Quat::from_rotation_z(-0.08))); // left hand heel
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.012, -0.118, -0.022), Vec3::new(0.088, 0.058, 0.058), rz); // palm base
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.072, -0.042, -0.014), Vec3::new(0.026, 0.088, 0.032), Quat::from_rotation_z(-0.08)); // left hand heel
     // 3 wrapped armored fingers gripping the right spine from behind.
     for k in 0..3 {
         let y = -0.058 + k as f32 * 0.030;
-        commands.spawn(vm_part(proot, &cap, &glove, Vec3::new(0.072, y, -0.004), Vec3::new(0.018, 0.022, 0.022), rz));
-        commands.spawn(vm_part(proot, &cube, &glove_plate, Vec3::new(0.076, y, 0.004), Vec3::new(0.012, 0.014, 0.012), id));
+        vb.part(proot, &src.cap, &glove, Vec3::new(0.072, y, -0.004), Vec3::new(0.018, 0.022, 0.022), rz);
+        vb.part(proot, &src.cube, &glove_plate, Vec3::new(0.076, y, 0.004), Vec3::new(0.012, 0.014, 0.012), id);
     }
     // Curled thumb gripping the lower-left armor bumper cleanly clear of the OLED screen!
-    commands.spawn(vm_part(proot, &cap, &glove, Vec3::new(-0.080, -0.098, 0.011), Vec3::new(0.018, 0.030, 0.018), Quat::from_rotation_z(-0.42)));
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.080, -0.098, 0.011), Vec3::new(0.018, 0.030, 0.018), Quat::from_rotation_z(-0.42));
     // Left armored forearm descending into bottom-left corner.
-    commands.spawn(vm_part(proot, &cap, &glove, Vec3::new(-0.045, -0.20, -0.065), Vec3::new(0.082, 0.11, 0.072), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22)));
-    commands.spawn(vm_part(proot, &cyl, &glove_plate, Vec3::new(-0.036, -0.165, -0.05), Vec3::new(0.048, 0.034, 0.048), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22)));
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.045, -0.20, -0.065), Vec3::new(0.082, 0.11, 0.072), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22));
+    vb.part(proot, &src.cyl, &glove_plate, Vec3::new(-0.036, -0.165, -0.05), Vec3::new(0.048, 0.034, 0.048), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22));
+    for (parent, mesh, mat) in vb.finish(&mut meshes) {
+        commands.spawn(vm_part(parent, &mesh, &mat, Vec3::ZERO, Vec3::ONE, Quat::IDENTITY));
+    }
 }
 
 fn sync_overlay_fov(main: Query<&Projection, (With<PlayerCamera>, Without<OverlayCamera>)>, mut overlay: Query<&mut Projection, With<OverlayCamera>>) {
@@ -899,6 +1021,16 @@ fn create_bolt_assets(mut commands: Commands, mut materials: ResMut<Assets<Stand
     });
 }
 
+/// Reused per-shot buffers of [`fire_weapons`].
+#[derive(Default)]
+struct FireScratch {
+    targets: Vec<HitTargetInfo>,
+    jammers: Vec<Vec3>,
+    enemy_dmg: Vec<f32>,
+    enemy_kb: Vec<Vec3>,
+    jam_dmg: Vec<f32>,
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn fire_weapons(
     mut commands: Commands,
@@ -916,6 +1048,7 @@ fn fire_weapons(
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
     mut bot: Option<ResMut<BotControl>>,
+    mut scratch: Local<FireScratch>,
 ) {
     let dt = time.delta_secs();
     let Ok((mut player, body)) = players.single_mut() else { return };
@@ -981,10 +1114,12 @@ fn fire_weapons(
     let fwd = rot * Vec3::NEG_Z;
     let muzzle = origin + rot * Vec3::new(0.2, -0.17, -0.85);
 
-    // Snapshot targets for ray tests.
-    let snapshot: Vec<(Vec3, Enemy, bool)> = enemies.iter().map(|(e, g, m)| (g.translation(), e.clone(), m.is_some())).collect();
-    let refs: Vec<(Vec3, &Enemy)> = snapshot.iter().map(|(p, e, _)| (*p, e)).collect();
-    let jam_list: Vec<Vec3> = jammers.iter().filter(|(j, _)| j.is_active()).map(|(_, g)| g.translation()).collect();
+    // Snapshot lightweight targets for ray tests (reused buffers).
+    let FireScratch { targets: refs, jammers: jam_list, enemy_dmg, enemy_kb, jam_dmg } = &mut *scratch;
+    refs.clear();
+    refs.extend(enemies.iter().map(|(e, g, _)| HitTargetInfo::of(g.translation(), e)));
+    jam_list.clear();
+    jam_list.extend(jammers.iter().filter(|(j, _)| j.is_active()).map(|(_, g)| g.translation()));
 
     match ws.current {
         Weapon::Shotgun => {
@@ -1003,16 +1138,19 @@ fn fire_weapons(
             let mut rng = rand::rng();
             let pellets = SHOTGUN_PELLETS + mods.extra_pellets;
             let spread = PELLET_SPREAD * mods.pellet_spread_mult;
-            let mut enemy_dmg = vec![0.0f32; refs.len()];
-            let mut enemy_kb = vec![Vec3::ZERO; refs.len()];
-            let mut jam_dmg = vec![0.0f32; jam_list.len()];
+            enemy_dmg.clear();
+            enemy_dmg.resize(refs.len(), 0.0);
+            enemy_kb.clear();
+            enemy_kb.resize(refs.len(), Vec3::ZERO);
+            jam_dmg.clear();
+            jam_dmg.resize(jam_list.len(), 0.0);
             let mut wall_sparks = 0;
             for i in 0..pellets {
                 let a = rng.random_range(0.0..TAU);
                 let r = spread * rng.random::<f32>().sqrt();
                 let local = Vec3::new(a.cos() * r, a.sin() * r, -1.0).normalize();
                 let dir = rot * local;
-                let (dist, target) = resolve_hitscan(&grid, origin, dir, HITSCAN_RANGE, &refs, &jam_list);
+                let (dist, target) = resolve_hitscan_targets(&grid, origin, dir, HITSCAN_RANGE, refs, jam_list);
                 let hit = origin + dir * dist;
                 let falloff = (1.0 - (dist - 18.0).max(0.0) / 40.0).clamp(0.4, 1.0);
                 if i % 2 == 0 {
@@ -1071,7 +1209,7 @@ fn fire_weapons(
             sfx.play(SfxEvent::Plasma);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(0.3, 0.9, 1.0), 250_000.0, 7.0, 0.05);
             // Converge the bolt onto whatever the crosshair points at.
-            let (dist, _) = resolve_hitscan(&grid, origin, fwd, HITSCAN_RANGE, &refs, &jam_list);
+            let (dist, _) = resolve_hitscan_targets(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list);
             let aim = origin + fwd * dist.max(2.0);
             let dir = (aim - muzzle).normalize_or_zero();
             commands.spawn((
@@ -1082,7 +1220,11 @@ fn fire_weapons(
                 Transform::from_translation(muzzle).with_rotation(Quat::from_rotation_arc(Vec3::Y, dir)),
                 children![
                     (Mesh3d(bolts.halo_mesh.clone()), MeshMaterial3d(bolts.halo_mat.clone()), Transform::default()),
-                    (PointLight { color: Color::srgb(0.3, 0.95, 1.0), intensity: 85_000.0, range: 6.0, shadow_maps_enabled: false, ..default() }, Transform::default()),
+                    (
+                        CullableLight::for_range(6.0),
+                        PointLight { color: Color::srgb(0.3, 0.95, 1.0), intensity: 85_000.0, range: 6.0, shadow_maps_enabled: false, ..default() },
+                        Transform::default(),
+                    ),
                 ],
             ));
         }
@@ -1159,7 +1301,7 @@ fn move_player_projectiles(
             HitTarget::Wall => {}
         }
         spawn_burst(&mut commands, &fx, hit - dir * 0.1, BurstColor::Cyan, 7, 4.8, 0.065);
-        spawn_shockwave(&mut commands, &fx, &mut materials, hit - dir * 0.12, 0.85, 0.18, Color::srgb(0.3, 0.95, 1.0), 0.7, false);
+        spawn_shockwave(&mut commands, &fx, &mut materials, hit - dir * 0.12, 0.85, 0.18, BOLT_IMPACT_GLOW.0, BOLT_IMPACT_GLOW.1, false);
         commands.entity(e).try_despawn();
     }
 }
@@ -1209,13 +1351,20 @@ fn jammer_deaths(
     }
 }
 
+/// Plasma bolt impact shockwave glow `(color, alpha)`.
+const BOLT_IMPACT_GLOW: (Color, f32) = (Color::srgb(0.3, 0.95, 1.0), 0.7);
+
+fn prewarm_weapon_fades(fx: Res<FxAssets>, mut materials: ResMut<Assets<StandardMaterial>>) {
+    fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW]);
+}
+
 pub struct WeaponsPlugin;
 
 impl Plugin for WeaponsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WeaponState>()
             .configure_sets(Update, CombatDamage.in_set(GameSet::Combat))
-            .add_systems(Startup, (create_pickup_assets, create_bolt_assets))
+            .add_systems(Startup, (create_pickup_assets, create_bolt_assets, prewarm_weapon_fades))
             .add_systems(Update, spawn_viewmodels)
             .add_systems(Update, (spawn_floor_pickups.run_if(resource_exists_and_changed::<LevelGrid>)).in_set(GameSet::World))
             .add_systems(

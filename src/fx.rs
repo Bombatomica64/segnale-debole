@@ -10,7 +10,9 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use rand::Rng;
 
-use crate::level::{LevelEntity, LevelGrid};
+use std::sync::{Arc, Mutex};
+
+use crate::level::{CullableLight, LevelEntity, LevelGrid};
 use crate::physics::sample_floor_height;
 use crate::state::GameSet;
 
@@ -56,12 +58,67 @@ impl Fx {
     }
 }
 
-/// Fades a per-entity material's alpha (and emissive) over the [`Fx`] life.
+/// Quantized fade steps of a shared additive-glow palette.
+pub const FADE_STEPS: usize = 12;
+/// Upper bound of distinct fade palettes (colors x alphas) ever allocated.
+pub const MAX_FADE_PALETTES: usize = 48;
+/// Simultaneous transient particles (sparks, gibs, debris, smoke, brass).
+pub const MAX_FX_PARTICLES: usize = 180;
+/// Simultaneous transient flash lights.
+pub const MAX_FX_LIGHTS: usize = 6;
+
+/// Shared materials of one additive glow at [`FADE_STEPS`] fade levels
+/// (step 0 = full alpha / emissive, last step = fully faded).
+pub type FadePalette = Arc<[Handle<StandardMaterial>; FADE_STEPS]>;
+
+/// Bounded cache of fade palettes keyed by quantized `(color, alpha)`.
+#[derive(Default)]
+pub struct FadeCache {
+    entries: Vec<([u8; 4], FadePalette)>,
+}
+
+impl FadeCache {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+fn fade_key(color: Color, alpha: f32) -> [u8; 4] {
+    let c = color.to_srgba();
+    [c.red, c.green, c.blue, alpha].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// Fade factor of palette step `s`.
+pub fn fade_factor(step: usize) -> f32 {
+    1.0 - step as f32 / (FADE_STEPS - 1) as f32
+}
+
+/// Palette step for normalized effect time `t` (nearest of the quantized levels).
+pub fn fade_step(t: f32) -> usize {
+    ((t.clamp(0.0, 1.0) * (FADE_STEPS - 1) as f32) + 0.5) as usize
+}
+
+/// Fades an effect over its [`Fx`] life by swapping between the shared,
+/// pre-allocated materials of its palette (no per-effect material).
 #[derive(Component, Debug, Clone)]
 pub struct FxFade {
-    pub material: Handle<StandardMaterial>,
-    pub alpha: f32,
-    pub emissive: LinearRgba,
+    pub palette: FadePalette,
+    pub step: usize,
+}
+
+impl FxFade {
+    pub fn new(palette: FadePalette) -> Self {
+        FxFade { palette, step: 0 }
+    }
+
+    /// Material for the first (unfaded) frame.
+    pub fn first(&self) -> Handle<StandardMaterial> {
+        self.palette[0].clone()
+    }
 }
 
 /// Point light whose intensity decays to zero over the [`Fx`] life.
@@ -94,6 +151,13 @@ pub struct FxAssets {
     pub beam: Handle<Mesh>,
     pub ring: Handle<Mesh>,
     pub shell_cyl: Handle<Mesh>,
+    /// Missed Call decoy handset (shared by every decoy).
+    pub decoy_body: Handle<StandardMaterial>,
+    pub decoy_screen_amber: Handle<StandardMaterial>,
+    pub decoy_screen_cyan: Handle<StandardMaterial>,
+    pub decoy_ring: Handle<StandardMaterial>,
+    /// Shared fade palettes (see [`FxAssets::fade_palette`]).
+    pub fades: Arc<Mutex<FadeCache>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +181,39 @@ impl FxAssets {
             BurstColor::Gore => self.gore.clone(),
             BurstColor::Gold => self.gold.clone(),
             BurstColor::Smoke => self.smoke.clone(),
+        }
+    }
+
+    /// Shared fade palette of an additive glow: built once per distinct
+    /// `(color, alpha)` (bounded by [`MAX_FADE_PALETTES`]; beyond that the
+    /// closest existing palette is reused), then only cloned.
+    pub fn fade_palette(&self, materials: &mut Assets<StandardMaterial>, color: Color, alpha: f32) -> FadePalette {
+        let key = fade_key(color, alpha);
+        let mut cache = self.fades.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = cache.entries.iter().find(|(k, _)| *k == key) {
+            return p.clone();
+        }
+        if cache.entries.len() >= MAX_FADE_PALETTES {
+            let dist = |k: &[u8; 4]| k.iter().zip(key).map(|(a, b)| (*a as i32 - b as i32).pow(2)).sum::<i32>();
+            let (_, p) = cache.entries.iter().min_by_key(|(k, _)| dist(k)).expect("non-empty cache");
+            return p.clone();
+        }
+        let base = additive_glow(color, alpha);
+        let palette: FadePalette = Arc::new(std::array::from_fn(|step| {
+            let k = fade_factor(step);
+            let mut m = base.clone();
+            m.base_color.set_alpha(alpha * k);
+            m.emissive = base.emissive * k;
+            materials.add(m)
+        }));
+        cache.entries.push((key, palette.clone()));
+        palette
+    }
+
+    /// Pre-build palettes at startup so gameplay never allocates materials.
+    pub fn prewarm_fades(&self, materials: &mut Assets<StandardMaterial>, glows: &[(Color, f32)]) {
+        for &(c, a) in glows {
+            self.fade_palette(materials, c, a);
         }
     }
 
@@ -181,7 +278,30 @@ fn create_fx_assets(mut commands: Commands, mut materials: ResMut<Assets<Standar
         beam: meshes.add(Cylinder::new(1.0, 1.0)),
         ring: meshes.add(Torus::new(0.94, 1.0)),
         shell_cyl: meshes.add(Cylinder::new(0.014, 0.055)),
+        decoy_body: materials.add(StandardMaterial { base_color: Color::srgb(0.05, 0.06, 0.07), perceptual_roughness: 0.35, metallic: 0.6, ..default() }),
+        decoy_screen_amber: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.7, 0.15),
+            emissive: LinearRgba::rgb(6.0, 3.6, 0.6),
+            unlit: true,
+            ..default()
+        }),
+        decoy_screen_cyan: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.7, 0.15),
+            emissive: LinearRgba::rgb(0.6, 4.5, 6.0),
+            unlit: true,
+            ..default()
+        }),
+        decoy_ring: materials.add(additive_glow(Color::srgb(1.0, 0.75, 0.2), 0.7)),
+        fades: Arc::new(Mutex::new(FadeCache::default())),
     });
+}
+
+/// Beam layers `(radius multiplier, alpha)` of [`spawn_beam`].
+pub const BEAM_LAYERS: [(f32, f32); 2] = [(0.45, 0.72), (1.0, 0.32)];
+
+/// Fade palettes for beams of `color` (both layers).
+pub fn beam_glows(color: Color) -> [(Color, f32); 2] {
+    BEAM_LAYERS.map(|(_, a)| (color, a))
 }
 
 /// Burst of varied ballistic shards/gibs + short core flash + point light.
@@ -296,6 +416,7 @@ pub fn spawn_flash_light(commands: &mut Commands, pos: Vec3, color: Color, inten
         LevelEntity,
         Fx::new(life, FxMotion::Hold, Vec3::ONE),
         FxLight { intensity },
+        CullableLight::for_range(range),
         PointLight { color, intensity, range, shadow_maps_enabled: false, ..default() },
         Transform::from_translation(pos),
     ));
@@ -363,9 +484,7 @@ pub fn spawn_shockwave(
     alpha: f32,
     ring: bool,
 ) {
-    let mat = additive_glow(color, alpha);
-    let emissive = mat.emissive;
-    let handle = materials.add(mat);
+    let fade = FxFade::new(fx.fade_palette(materials, color, alpha));
     let (mesh, from, to) = if ring {
         (fx.ring.clone(), Vec3::new(0.3, 0.8, 0.3), Vec3::new(radius, radius * 0.1 + 0.8, radius))
     } else {
@@ -374,9 +493,9 @@ pub fn spawn_shockwave(
     commands.spawn((
         LevelEntity,
         Fx::new(life, FxMotion::Grow { from, to }, Vec3::ONE),
-        FxFade { material: handle.clone(), alpha, emissive },
+        MeshMaterial3d(fade.first()),
+        fade,
         Mesh3d(mesh),
-        MeshMaterial3d(handle),
         Transform::from_translation(pos).with_scale(from),
     ));
 }
@@ -395,17 +514,15 @@ pub fn spawn_beam(
     color: Color,
     xray: bool,
 ) {
-    for (r_mul, a_mul) in [(0.45, 0.72), (1.0, 0.32)] {
-        let mat = additive_glow(color, a_mul);
-        let emissive = mat.emissive;
-        let handle = materials.add(mat);
+    for (r_mul, a_mul) in BEAM_LAYERS {
+        let fade = FxFade::new(fx.fade_palette(materials, color, a_mul));
         let scale = Vec3::new(radius * r_mul, height, radius * r_mul);
         let mut e = commands.spawn((
             LevelEntity,
             Fx::new(life, FxMotion::Thin, scale),
-            FxFade { material: handle.clone(), alpha: a_mul, emissive },
+            MeshMaterial3d(fade.first()),
+            fade,
             Mesh3d(fx.beam.clone()),
-            MeshMaterial3d(handle),
             Transform::from_translation(base + Vec3::Y * height * 0.5).with_scale(scale),
         ));
         if xray {
@@ -494,17 +611,33 @@ fn animate_fx(
     mut commands: Commands,
     time: Res<Time>,
     grid: Option<Res<LevelGrid>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut q: Query<(Entity, &mut Fx, &mut Transform, Option<&FxFade>, Option<&FxLight>, Option<&mut PointLight>)>,
+    mut q: Query<(
+        Entity,
+        &mut Fx,
+        &mut Transform,
+        Option<(&mut FxFade, &mut MeshMaterial3d<StandardMaterial>)>,
+        Option<&FxLight>,
+        Option<&mut CullableLight>,
+        Option<&mut PointLight>,
+    )>,
+    (mut particles, mut lights): (Local<Vec<(f32, Entity)>>, Local<Vec<(f32, Entity)>>),
 ) {
     let dt = time.delta_secs();
-    for (e, mut fx, mut tf, fade, flight, light) in &mut q {
+    particles.clear();
+    lights.clear();
+    for (e, mut fx, mut tf, fade, flight, cull_light, light) in &mut q {
         fx.age += dt;
         if fx.age >= fx.life {
             commands.entity(e).try_despawn();
             continue;
         }
         let t = fx.t();
+        if matches!(fx.motion, FxMotion::Particle { .. } | FxMotion::Debris { .. } | FxMotion::Smoke { .. }) {
+            particles.push((t, e));
+        }
+        if flight.is_some() {
+            lights.push((t, e));
+        }
         match &mut fx.motion {
             FxMotion::Particle { vel, gravity } => {
                 vel.y -= *gravity * dt;
@@ -557,16 +690,36 @@ fn animate_fx(
             }
             FxMotion::Hold => {}
         }
-        if let Some(f) = fade
-            && let Some(mut m) = materials.get_mut(&f.material)
-        {
-            let k = 1.0 - t;
-            m.base_color.set_alpha(f.alpha * k);
-            m.emissive = f.emissive * k;
+        if let Some((mut f, mut mat)) = fade {
+            let step = fade_step(t);
+            if step != f.step {
+                f.step = step;
+                mat.0 = f.palette[step].clone();
+            }
         }
-        if let (Some(fl), Some(mut l)) = (flight, light) {
-            l.intensity = fl.intensity * (1.0 - t);
+        if let Some(fl) = flight {
+            let intensity = fl.intensity * (1.0 - t);
+            if let Some(mut cull) = cull_light {
+                cull.set_intensity(intensity);
+            } else if let Some(mut l) = light {
+                l.intensity = intensity;
+            }
         }
+    }
+    // Bounded transient FX: recycle the oldest beyond the caps.
+    recycle_oldest(&mut commands, &mut particles, MAX_FX_PARTICLES);
+    recycle_oldest(&mut commands, &mut lights, MAX_FX_LIGHTS);
+}
+
+/// Despawn the entries closest to the end of their life beyond `cap`.
+fn recycle_oldest(commands: &mut Commands, live: &mut [(f32, Entity)], cap: usize) {
+    if live.len() <= cap {
+        return;
+    }
+    let excess = live.len() - cap;
+    live.select_nth_unstable_by(excess - 1, |a, b| b.0.total_cmp(&a.0));
+    for &(_, e) in &live[..excess] {
+        commands.entity(e).try_despawn();
     }
 }
 

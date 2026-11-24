@@ -602,14 +602,16 @@ fn meta_card_clicks(
     }
 }
 
-fn set_text(txt: &mut Text, s: &str) {
+/// Change-guarded text write (no `DerefMut`, hence no relayout, when equal).
+fn set_text(txt: &mut Mut<Text>, s: &str) {
     if txt.0 != s {
-        txt.0 = s.to_string();
+        txt.0.clear();
+        txt.0.push_str(s);
     }
 }
 
 /// Restyle every tagged card / label / pill from the live profile.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn refresh_meta_ui(
     store: Res<ProfileStore>,
     fb: Res<MetaFeedback>,
@@ -624,9 +626,13 @@ fn refresh_meta_ui(
         Or<(With<MetaStatus>, With<MetaName>, With<MetaLabel>)>,
     >,
     tags: Query<(), With<MetaStatusTag>>,
+    fresh: Query<(), Or<(Added<MetaStatus>, Added<MetaLabel>)>>,
 ) {
     let p = &store.profile;
     let pulse = 0.5 + 0.5 * (time.elapsed_secs() * 3.5).sin();
+    // Label strings only depend on the profile / feedback: rebuild them only
+    // when those change or new labels appear (colors still pulse per frame).
+    let retext = store.is_changed() || fb.is_changed() || !fresh.is_empty();
     let selected = p.normalized_catalog().len();
     let (counter, full) = catalog_counter_text(selected);
     let counter_color = if full { ACID_GREEN } else { HAZARD_YELLOW };
@@ -665,7 +671,9 @@ fn refresh_meta_ui(
     }
     for (mut txt, mut col, status, name, label, parent) in &mut texts {
         let c = if let Some(s) = status {
-            set_text(&mut txt, &status_text(p, s.0));
+            if retext {
+                set_text(&mut txt, &status_text(p, s.0));
+            }
             // Inside a stamped tag the text takes the tag's own text color.
             let l = look(s.0);
             if parent.is_some_and(|p| tags.contains(p.parent())) { l.tag.1 } else { l.status_color }
@@ -674,15 +682,21 @@ fn refresh_meta_ui(
         } else {
             match label {
                 Some(MetaLabel::Feedback) => {
-                    set_text(&mut txt, &fb.text);
+                    if retext {
+                        set_text(&mut txt, &fb.text);
+                    }
                     fb.color
                 }
                 Some(MetaLabel::CatalogCounter) => {
-                    set_text(&mut txt, &counter);
+                    if retext {
+                        set_text(&mut txt, &counter);
+                    }
                     INK_BLACK
                 }
                 Some(MetaLabel::RiskBadge) => {
-                    set_text(&mut txt, &risk_badge_text(risk));
+                    if retext {
+                        set_text(&mut txt, &risk_badge_text(risk));
+                    }
                     INK_BLACK
                 }
                 None => continue,
@@ -731,8 +745,13 @@ pub fn unlock_panel_look(summary: Option<&RunUnlockSummary>, pulse: f32) -> (Col
 
 /// Full-screen grunge root + the screen's own camera (entered from menus or
 /// end screens, where no player camera exists).
-fn meta_root(commands: &mut Commands, state: AppState, tex: Option<&UiKitTextures>) -> Entity {
-    commands.spawn((DespawnOnExit(state), Camera3d::default(), Camera { clear_color: ClearColorConfig::Custom(COLOR_BG), ..default() }));
+fn meta_root(commands: &mut Commands, state: AppState, tex: Option<&UiKitTextures>, msaa: bevy::render::view::Msaa) -> Entity {
+    commands.spawn((
+        DespawnOnExit(state),
+        Camera3d::default(),
+        Camera { clear_color: ClearColorConfig::Custom(COLOR_BG), ..default() },
+        msaa,
+    ));
     punk_screen_root(commands, state, tex, INK_BLACK, 1.0)
 }
 
@@ -843,10 +862,17 @@ fn footer(commands: &mut Commands, phone: Entity, buttons: [(&str, MenuAction, B
 // LOADOUT screen
 // ---------------------------------------------------------------------------
 
-fn spawn_loadout_screen(mut commands: Commands, store: Res<ProfileStore>, fb: Res<MetaFeedback>, tex: Option<Res<UiKitTextures>>) {
+fn spawn_loadout_screen(
+    mut commands: Commands,
+    store: Res<ProfileStore>,
+    fb: Res<MetaFeedback>,
+    tex: Option<Res<UiKitTextures>>,
+    msaa: Option<Res<crate::perf::RenderMsaa>>,
+) {
     let tex = tex.as_deref();
+    let msaa = msaa.map(|m| m.0).unwrap_or(bevy::render::view::Msaa::Sample2);
     let p = &store.profile;
-    let root = meta_root(&mut commands, AppState::Loadout, tex);
+    let root = meta_root(&mut commands, AppState::Loadout, tex, msaa);
     let phone = terminal_chassis(&mut commands, root, tex, PHONE_WIDTH, false);
 
     // Header: title | live feedback | jam-demo toggle.
@@ -960,11 +986,18 @@ fn spawn_loadout_screen(mut commands: Commands, store: Res<ProfileStore>, fb: Re
 // CONTRACTS & FEATS screen
 // ---------------------------------------------------------------------------
 
-fn spawn_contracts_screen(mut commands: Commands, store: Res<ProfileStore>, fb: Res<MetaFeedback>, tex: Option<Res<UiKitTextures>>) {
+fn spawn_contracts_screen(
+    mut commands: Commands,
+    store: Res<ProfileStore>,
+    fb: Res<MetaFeedback>,
+    tex: Option<Res<UiKitTextures>>,
+    msaa: Option<Res<crate::perf::RenderMsaa>>,
+) {
     let tex = tex.as_deref();
+    let msaa = msaa.map(|m| m.0).unwrap_or(bevy::render::view::Msaa::Sample2);
     let p = &store.profile;
     let risk = p.active_contracts.len();
-    let root = meta_root(&mut commands, AppState::ContractsFeats, tex);
+    let root = meta_root(&mut commands, AppState::ContractsFeats, tex, msaa);
     let phone = terminal_chassis(&mut commands, root, tex, PHONE_WIDTH, risk > 0);
 
     let header = screen_header(&mut commands, phone, "UAC-PHONE // CARRIER CONTRACTS & FEATS", &fb);

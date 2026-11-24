@@ -6,7 +6,7 @@ use bevy::math::Affine2;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use crate::level::{CELL_SIZE, PILLAR_RADIUS, TOWER_MAST_RADIUS};
+use crate::level::CELL_SIZE;
 
 pub const TEX_SIZE: u32 = 64;
 
@@ -31,19 +31,8 @@ pub struct GameAssets {
     pub tex_jammer: Handle<Image>,
     pub tex_tower: Handle<Image>,
     // Meshes
-    /// Unit-height cell block (scale Y to the needed height).
-    pub slab_mesh: Handle<Mesh>,
-    pub ceiling_mesh: Handle<Mesh>,
-    /// Unit-height cylinder of radius `PILLAR_RADIUS` (scale Y).
-    pub pillar_mesh: Handle<Mesh>,
-    pub lamp_mesh: Handle<Mesh>,
-    pub tower_mast_mesh: Handle<Mesh>,
-    pub tower_panel_mesh: Handle<Mesh>,
-    pub tower_arm_mesh: Handle<Mesh>,
     pub beacon_mesh: Handle<Mesh>,
-    pub jammer_stalk_mesh: Handle<Mesh>,
     pub jammer_core_mesh: Handle<Mesh>,
-    pub antenna_mesh: Handle<Mesh>,
     /// Small reusable shapes for Milestone 2 (projectiles, gibs, pickups).
     pub sphere_small: Handle<Mesh>,
     pub cube_small: Handle<Mesh>,
@@ -400,17 +389,8 @@ pub fn create_game_assets(
         tex_wall,
         tex_jammer,
         tex_tower,
-        slab_mesh: meshes.add(Cuboid::new(CELL_SIZE, 1.0, CELL_SIZE)),
-        ceiling_mesh: meshes.add(Cuboid::new(CELL_SIZE, 0.3, CELL_SIZE)),
-        pillar_mesh: meshes.add(Cylinder::new(PILLAR_RADIUS, 1.0)),
-        lamp_mesh: meshes.add(Cuboid::new(0.9, 0.12, 0.4)),
-        tower_mast_mesh: meshes.add(Cylinder::new(TOWER_MAST_RADIUS * 0.8, 1.0)),
-        tower_panel_mesh: meshes.add(Cuboid::new(1.0, 2.4, 0.12)),
-        tower_arm_mesh: meshes.add(Cuboid::new(4.0, 0.2, 0.2)),
         beacon_mesh: meshes.add(Sphere::new(0.55)),
-        jammer_stalk_mesh: meshes.add(Cylinder::new(0.35, 2.4)),
         jammer_core_mesh: meshes.add(Sphere::new(0.6)),
-        antenna_mesh: meshes.add(Cylinder::new(0.05, 1.6)),
         sphere_small: meshes.add(Sphere::new(0.2)),
         cube_small: meshes.add(Cuboid::new(0.3, 0.3, 0.3)),
     };
