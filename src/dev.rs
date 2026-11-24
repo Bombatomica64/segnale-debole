@@ -4,7 +4,10 @@
 //!   teleport near the Signal Tower and capture `tower.png`, then a jammer
 //!   (`jammer.png`), the SOS uplink HUD (`uplink.png`), a staged firefight with
 //!   all four demons and the dual-wield viewmodels (`combat.png`), and finally
-//!   the App Store upgrade screen (`upgrades.png`), then exit. Used for headless
+//!   the App Store upgrade screen (`upgrades.png`), then jumps to the Floor 5
+//!   boss arena for `boss.png` (shielded Carrier Daemon + 2 Shield Pylons, a
+//!   Phase Stalker and a Relay Sniper, Signal-Mortar in hand, boss plate +
+//!   held uplink + alert banner all live) and exits. Used for headless
 //!   visual checks (xvfb). The player is invulnerable during the tour.
 //! - `SEGNALE_BOT_TEST=<dir>`: autonomous playtest bot (see `playtest_bot.rs`):
 //!   plays menu -> Floor 1 -> SOS -> App Store -> Floor 2 through virtual input,
@@ -24,10 +27,12 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 use crate::apps::PhoneApps;
+use crate::boss::{spawn_pylon, BossPhase, BossState, PHASE1_THRESHOLD};
+use crate::fx::HudFeed;
 use crate::meta::{
     start_run_with_loadout, CarrierContract, FeatId, HandsetSkin, LifetimeStats, PlayerProfile, ProfileStore, RunLoadout, StarterChip,
 };
-use crate::enemies::{spawn_enemy, EnemyAssets, EnemyKind};
+use crate::enemies::{spawn_enemy, Enemy, EnemyAssets, EnemyKind};
 use crate::extraction::ExtractionState;
 use crate::level::{yaw_facing, LevelGrid};
 use crate::physics::sample_floor_height;
@@ -100,8 +105,10 @@ fn screenshot_tour(
     grid: Option<Res<LevelGrid>>,
     mut player: Query<(&mut Player, &mut Transform)>,
     (mut ext, mut ws, mut run, mut next): (ResMut<ExtractionState>, ResMut<WeaponState>, ResMut<RunStats>, ResMut<NextState<AppState>>),
-    (ea, mut apps): (Res<EnemyAssets>, ResMut<PhoneApps>),
+    (ea, mut apps, mut feed): (Res<EnemyAssets>, ResMut<PhoneApps>, ResMut<HudFeed>),
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut bosses: Query<(Entity, &mut Enemy, &mut BossState)>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     let Some(dir) = cfg.shots.clone() else { return };
     let Some(grid) = grid else { return };
@@ -173,6 +180,7 @@ fn screenshot_tour(
                 jammed: false,
                 wave_timer: 0.5,
                 baron_spawned: false,
+                boss_hold: false,
             };
             cfg.stage = 6;
         }
@@ -227,12 +235,81 @@ fn screenshot_tour(
             complete_floor(&mut run, &mut next);
             cfg.stage = 12;
         }
+        // ---- Floor 5 boss arena (entered from `screenshot_store`) ----
+        (20, t) if t > 2.5 && grid.floor == FINAL_FLOOR => {
+            // Stand on the Signal Ring's west lane looking north across the
+            // atrium: the boss dead ahead, the sniper perched on the pedestal.
+            let floor = grid.floor;
+            let start = boss_arena_point(&grid, 0.0, 0.0);
+            for (kind, dist, lat) in [(EnemyKind::CarrierDaemon, 11.5, 0.6), (EnemyKind::PhaseStalker, 6.0, -1.3), (EnemyKind::RelaySniper, 9.5, 3.0)] {
+                let pos = boss_arena_point(&grid, dist, lat) + Vec3::Y * 0.05;
+                // The boss stays un-alerted so no barrage crosses the frame.
+                let e = spawn_enemy(&mut commands, &ea, &mut materials, kind, pos, floor, kind != EnemyKind::CarrierDaemon);
+                let to = start - pos;
+                commands.entity(e).insert(Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_facing(Vec2::new(to.x, to.z)))));
+            }
+            commands.insert_resource(DevFreezeAi);
+            place(grid.world_to_cell(start), boss_arena_point(&grid, 14.0, 1.0).with_y(3.2));
+            if let Ok((mut p, _)) = player.single_mut() {
+                p.ammo_rockets = p.max_rockets;
+            }
+            ws.current = Weapon::Rocket;
+            ws.previous = Weapon::Rocket;
+            ws.swap_timer = 0.0;
+            *ext = ExtractionState::Uploading {
+                progress: crate::extraction::BOSS_HOLD_PROGRESS,
+                duration: 44.0,
+                in_ring: true,
+                jammed: false,
+                wave_timer: 999.0,
+                baron_spawned: true,
+                boss_hold: true,
+            };
+            cfg.stage = 21;
+        }
+        (21, t) if t > 3.0 => {
+            // Raise the first Signal Shield with both pylons flanking the boss.
+            if let Ok((be, mut e, mut st)) = bosses.single_mut() {
+                e.hp = e.max_hp * PHASE1_THRESHOLD;
+                st.phase = BossPhase::Shielded1;
+                st.raise_grace = 0.5;
+                for (dist, lat) in [(5.0, -4.4), (9.8, 5.2)] {
+                    spawn_pylon(&mut commands, &ea, boss_arena_point(&grid, dist, lat), be, grid.floor);
+                }
+                feed.alert("SIGNAL SHIELD UP - DESTROY THE 2 PYLONS!", Color::srgb(0.55, 0.65, 1.0), 6.0);
+            }
+            cfg.stage = 22;
+        }
+        (22, t) if t > 5.0 => {
+            shot(&mut commands, "boss.png");
+            cfg.stage = 23;
+        }
+        (23, t) if t > 6.5 => {
+            exit.write(AppExit::Success);
+            cfg.stage = 24;
+        }
         _ => {}
     }
 }
 
-/// Capture the App Store screen, then exit.
-fn screenshot_store(mut commands: Commands, time: Res<Time>, cfg: Res<DevConfig>, mut t: Local<f32>, mut exit: MessageWriter<AppExit>) {
+/// `boss.png` staging: a ground point `dist` metres north and `lat` metres
+/// east of the camera cell (west lane of the Signal Ring, beside the pedestal).
+fn boss_arena_point(grid: &LevelGrid, dist: f32, lat: f32) -> Vec3 {
+    let mut p = grid.cell_center(grid.tower + IVec2::new(-2, 1)) + Vec3::NEG_Z * dist + Vec3::X * lat;
+    p.y = sample_floor_height(grid, p.x, p.z).unwrap_or(0.0);
+    p
+}
+
+/// Capture the App Store screen, then jump to the Floor 5 boss arena
+/// (`screenshot_tour` stages 20+ take `boss.png` and exit).
+fn screenshot_store(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<DevConfig>,
+    mut t: Local<f32>,
+    mut run: ResMut<RunStats>,
+    mut next: ResMut<NextState<AppState>>,
+) {
     let Some(dir) = cfg.shots.clone() else { return };
     let before = *t;
     *t += time.delta_secs();
@@ -241,8 +318,11 @@ fn screenshot_store(mut commands: Commands, time: Res<Time>, cfg: Res<DevConfig>
         info!("dev: screenshot -> {path}");
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     }
-    if *t > 3.0 {
-        exit.write(AppExit::Success);
+    if *t > 3.0 && cfg.stage < 20 {
+        run.floor = FINAL_FLOOR;
+        cfg.stage = 20;
+        cfg.timer = 0.0;
+        next.set(AppState::Playing);
     }
 }
 

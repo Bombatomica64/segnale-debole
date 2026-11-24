@@ -350,7 +350,11 @@ fn phone_apps(
     (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
     (players, decoys): (Query<&Transform, With<Player>>, Query<Entity, With<DecoyHandset>>),
     mut enemies: Query<(Entity, &mut Enemy, &GlobalTransform, Option<&mut PingMarked>)>,
-    (mut jammers, mut barrels): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut ExplosiveBarrel, &GlobalTransform)>),
+    (mut jammers, mut barrels, mut pylons): (
+        Query<(&mut DemonJammer, &GlobalTransform)>,
+        Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
+        Query<(&mut crate::boss::BossPylon, &GlobalTransform)>,
+    ),
     mut bot: Option<ResMut<BotControl>>,
 ) {
     apps.tick(time.delta_secs());
@@ -488,6 +492,15 @@ fn phone_apps(
                     if j.is_active() && (g.translation() + Vec3::Y * 2.0).distance(center) <= radius + 0.8 {
                         damage_jammer(&mut j, dmg);
                         spawn_lightning(&mut commands, &fx, center, g.translation() + Vec3::Y * 2.7);
+                        jhit += 1;
+                    }
+                }
+                // Carrier Daemon Shield Pylons short out in the EMP.
+                for (mut p, g) in &mut pylons {
+                    let c = g.translation() + Vec3::Y * 1.6;
+                    if p.is_alive() && c.distance(center) <= radius + 0.9 {
+                        crate::boss::damage_pylon(&mut p, dmg);
+                        spawn_lightning(&mut commands, &fx, center, c);
                         jhit += 1;
                     }
                 }

@@ -5,6 +5,10 @@
 //! drops in at 50%, progress runs at 100% inside the ring, 20% outside and 0%
 //! while a Jammer Fiend stands in the ring. At 100% an orbital beam vaporizes
 //! every demon and the floor is completed.
+//!
+//! Boss floors (Floor 5, Endless 10 / 15 / 20...) replace the Hell Baron with
+//! THE CARRIER DAEMON ([`crate::boss`]), which lands the moment the uplink
+//! starts: the upload holds at [`BOSS_HOLD_PROGRESS`] until it dies.
 
 use bevy::prelude::*;
 use rand::Rng;
@@ -12,6 +16,7 @@ use rand::seq::IndexedRandom;
 
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::{take_flag, BotControl};
+use crate::boss::{carrier_spawn_cell, BOSS_ARRIVAL_TEXT, BOSS_HOLD_TEXT};
 use crate::enemies::{spawn_enemy, spawn_pos_for, Enemy, EnemyAssets, EnemyKind, EnemyProjectile};
 use crate::fx::{additive_glow, beam_glows, spawn_beam, spawn_burst, spawn_flash_light, BurstColor, FxAssets, HudFeed};
 use crate::level::{Cell, CullableLight, LevelEntity, LevelGrid, TowerBeacon};
@@ -51,6 +56,8 @@ pub enum ExtractionState {
         jammed: bool,
         wave_timer: f32,
         baron_spawned: bool,
+        /// Boss floor: upload parked at 99% while the Carrier Daemon lives.
+        boss_hold: bool,
     },
     Extracting {
         timer: f32,
@@ -73,20 +80,37 @@ pub fn upload_duration(floor: u32) -> f32 {
 /// Living-demon ceiling of the Demon Rush (keeps deep Endless floors at 90-120 FPS).
 pub const MAX_RUSH_CAP: usize = 26;
 
-/// Endless Boss Rematch floors (10, 15, 20, ...): an extra Overdrive Hell
-/// Baron wave crashes the SOS. Floor 5 keeps its standard single Baron.
+/// Endless Boss Rematch floors (10, 15, 20, ...): the Carrier Daemon returns.
 pub fn is_endless_rematch(floor: u32) -> bool {
     floor > FINAL_FLOOR && is_boss_floor(floor)
 }
 
-/// Hell Barons in an Endless Boss Rematch wave (2 on Floor 10, 3 from Floor 20).
-pub fn rematch_baron_count(floor: u32) -> usize {
-    if floor >= 4 * FINAL_FLOOR { 3 } else { 2 }
+/// Upload progress the SOS holds at while a Carrier Daemon lives.
+pub const BOSS_HOLD_PROGRESS: f32 = 0.99;
+
+/// Demon Rush cap while the Carrier Daemon is alive: lighter so the boss
+/// fight stays readable (and high-FPS).
+pub fn boss_rush_cap(floor: u32) -> usize {
+    rush_cap(floor) * 2 / 3
 }
 
-/// The rematch alert text.
-pub fn rematch_alert(floor: u32) -> String {
-    format!("ENDLESS BOSS REMATCH - FLOOR {floor}!")
+/// Demons in one Demon Rush wave (one fewer while the boss is alive).
+pub fn rush_wave_size(floor: u32, boss_alive: bool) -> usize {
+    let n = 2 + floor as usize / 2;
+    if boss_alive { n.saturating_sub(1).max(1) } else { n }
+}
+
+/// Demon Rush roster pick from a uniform `roll` (Floor 1 is unchanged:
+/// Imps and Cacodemons only). Phase Stalkers join from Floor 2, Relay
+/// Snipers occasionally from Floor 3.
+pub fn rush_kind(floor: u32, roll: f32) -> EnemyKind {
+    if roll < 0.62 {
+        if floor >= 2 && roll < 0.2 { EnemyKind::PhaseStalker } else { EnemyKind::Imp }
+    } else if floor >= 3 && roll >= 0.92 {
+        EnemyKind::RelaySniper
+    } else {
+        EnemyKind::Cacodemon
+    }
 }
 
 /// Upload speed multiplier.
@@ -178,6 +202,7 @@ impl ExtractionState {
             jammed: false,
             wave_timer: 2.5,
             baron_spawned: false,
+            boss_hold: false,
         }
     }
 
@@ -191,10 +216,26 @@ impl ExtractionState {
 
     /// Advance the uplink. Returns true on the frame it completes (now `Extracting`).
     pub fn advance_upload(&mut self, dt: f32, ring: bool, jam: bool) -> bool {
-        if let ExtractionState::Uploading { progress, duration, in_ring, jammed, .. } = self {
+        self.advance_upload_gated(dt, ring, jam, false)
+    }
+
+    /// [`Self::advance_upload`] on a boss floor: while `boss_alive` the upload
+    /// stops at [`BOSS_HOLD_PROGRESS`]; the frame the boss dies while held,
+    /// extraction locks immediately.
+    pub fn advance_upload_gated(&mut self, dt: f32, ring: bool, jam: bool, boss_alive: bool) -> bool {
+        if let ExtractionState::Uploading { progress, duration, in_ring, jammed, boss_hold, .. } = self {
             *in_ring = ring;
             *jammed = jam;
             *progress = (*progress + dt / *duration * upload_rate(ring, jam)).min(1.0);
+            if boss_alive {
+                *progress = progress.min(BOSS_HOLD_PROGRESS);
+                *boss_hold = *progress >= BOSS_HOLD_PROGRESS;
+            } else {
+                if *boss_hold && !jam {
+                    *progress = 1.0;
+                }
+                *boss_hold = false;
+            }
             if *progress >= 1.0 {
                 *self = ExtractionState::Extracting { timer: EXTRACT_SECS };
                 return true;
@@ -319,7 +360,7 @@ fn update_extraction(
     mut players: Query<(&Transform, &mut Player)>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform)>,
     projectiles: Query<Entity, With<EnemyProjectile>>,
-    (mut bot, pickups, mut beacon_timer, mut supply_idx, mut second_wind, mut supply_cells, mut fiends, mut rematch_spawned): (
+    (mut bot, pickups, mut beacon_timer, mut supply_idx, mut second_wind, mut supply_cells, mut fiends): (
         Option<ResMut<BotControl>>,
         Option<Res<PickupAssets>>,
         Local<f32>,
@@ -327,7 +368,6 @@ fn update_extraction(
         Local<bool>,
         Local<Option<Vec<IVec2>>>,
         Local<Vec<Vec3>>,
-        Local<bool>,
     ),
 ) {
     // Ring supply cells are a pure function of the current LevelGrid: refresh
@@ -353,6 +393,22 @@ fn update_extraction(
             if pressed || *hold >= UPLINK_HOLD_SECS {
                 *state = ExtractionState::start_upload_scaled(run.floor, mods.upload_duration_mult);
                 rush.0 = rush_cells(&grid);
+                // Boss floor: THE CARRIER DAEMON lands in the Signal Atrium
+                // right away (it replaces the mid-upload Hell Baron).
+                if is_boss_floor(run.floor) {
+                    if let ExtractionState::Uploading { baron_spawned, .. } = &mut *state {
+                        *baron_spawned = true;
+                    }
+                    if let Some(c) = carrier_spawn_cell(&grid, ppos) {
+                        let pos = spawn_pos_for(EnemyKind::CarrierDaemon, &grid, c);
+                        spawn_enemy(&mut commands, &ea, &mut materials, EnemyKind::CarrierDaemon, pos, run.floor, true);
+                        spawn_burst(&mut commands, &fx, pos + Vec3::Y * 2.2, BurstColor::Gold, 40, 10.0, 0.3);
+                        spawn_burst(&mut commands, &fx, pos + Vec3::Y * 1.2, BurstColor::Gore, 28, 8.0, 0.24);
+                        spawn_flash_light(&mut commands, pos + Vec3::Y * 3.0, Color::srgb(1.0, 0.45, 0.25), 8_000_000.0, 36.0, 0.9);
+                        sfx.play(SfxEvent::BaronAlert);
+                        feed.alert(BOSS_ARRIVAL_TEXT, Color::srgb(1.0, 0.45, 0.2), 4.0);
+                    }
+                }
                 // Priority Jamming: a Jammer Fiend crashes the uplink immediately.
                 if mods.priority_jamming {
                     let far: Vec<IVec2> = rush.0.iter().copied().filter(|c| grid.cell_center(*c).distance(ppos) > 11.0).collect();
@@ -365,11 +421,12 @@ fn update_extraction(
                     }
                 }
                 sfx.play(SfxEvent::UplinkStart);
-                feed.alert("SOS UPLINK ONLINE - HOLD THE SIGNAL RING", Color::srgb(0.3, 1.0, 0.85), 3.0);
+                if !is_boss_floor(run.floor) {
+                    feed.alert("SOS UPLINK ONLINE - HOLD THE SIGNAL RING", Color::srgb(0.3, 1.0, 0.85), 3.0);
+                }
                 // Tactical supply drops on the ring perimeter: kiting the tower pays.
                 *supply_idx = 0;
                 *second_wind = false;
-                *rematch_spawned = false;
                 *beacon_timer = 0.0;
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, if run.floor <= 1 { PickupKind::Armor } else { PickupKind::Shells }, &mut supply_idx);
@@ -393,8 +450,10 @@ fn update_extraction(
                 }
             }
         }
-        ExtractionState::Uploading { in_ring, wave_timer, baron_spawned, progress, jammed, .. } => {
+        ExtractionState::Uploading { in_ring, wave_timer, baron_spawned, progress, jammed, boss_hold, .. } => {
             let was_jammed = *jammed;
+            let was_held = *boss_hold;
+            let boss_alive = enemies.iter().any(|(e, _)| e.kind == EnemyKind::CarrierDaemon && e.is_alive());
             let ring = signal.near_tower;
             fiends.clear();
             fiends.extend(enemies.iter().filter(|(e, _)| e.kind == EnemyKind::JammerFiend && e.is_alive()).map(|(_, g)| g.translation()));
@@ -416,8 +475,8 @@ fn update_extraction(
                 }
             }
             // Firewall Daemon: only while the SOS actually advances (in ring, not
-            // jammed) - no farming armor off a deliberately spared Jammer Fiend.
-            if firewall_regen_active(ring, jam) && mods.armor_regen_while_uploading > 0.0 {
+            // jammed, and not stalled at 99% waiting on a spared boss).
+            if firewall_regen_active(ring, jam) && !*boss_hold && mods.armor_regen_while_uploading > 0.0 {
                 player.armor = (player.armor + mods.armor_regen_while_uploading * dt).min(player.max_armor);
             }
             let _ = in_ring;
@@ -445,18 +504,17 @@ fn update_extraction(
                 }
                 rush.0.choose(rng).copied()
             };
-            if spawn_wave && alive < rush_cap(floor) {
+            let cap = if boss_alive { boss_rush_cap(floor) } else { rush_cap(floor) };
+            if spawn_wave && alive < cap {
                 let living_fiends = fiends.len();
                 let (fiend_cap, fiend_chance) = rush_fiend_odds(mods.priority_jamming);
-                let n = (2 + floor as usize / 2).min(rush_cap(floor) - alive);
+                let n = rush_wave_size(floor, boss_alive).min(cap - alive);
                 for i in 0..n {
                     let roll: f32 = rng.random();
                     let kind = if i == 0 && living_fiends < fiend_cap && roll < fiend_chance {
                         EnemyKind::JammerFiend
-                    } else if roll < 0.62 {
-                        EnemyKind::Imp
                     } else {
-                        EnemyKind::Cacodemon
+                        rush_kind(floor, roll)
                     };
                     if let Some(c) = pick_cell(&mut rng) {
                         let pos = spawn_pos_for(kind, &grid, c);
@@ -481,21 +539,14 @@ fn update_extraction(
                 // Emergency medkit on the ring edge.
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
             }
-            // Endless Boss Rematch: an Overdrive Hell Baron wave at 30%.
-            if is_endless_rematch(floor) && *progress >= 0.3 && !*rematch_spawned {
-                *rematch_spawned = true;
-                for _ in 0..rematch_baron_count(floor) {
-                    if let Some(c) = pick_cell(&mut rng) {
-                        let pos = spawn_pos_for(EnemyKind::HellBaron, &grid, c);
-                        spawn_enemy(&mut commands, &ea, &mut materials, EnemyKind::HellBaron, pos, floor, true);
-                        spawn_burst(&mut commands, &fx, pos + Vec3::Y * 1.5, BurstColor::Gold, 24, 6.0, 0.2);
-                    }
-                }
-                sfx.play(SfxEvent::BaronAlert);
-                feed.alert(rematch_alert(floor), Color::srgb(1.0, 0.25, 0.85), 4.0);
-                drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Armor, &mut supply_idx);
+            let advanced = state.advance_upload_gated(dt, ring, jam, boss_alive);
+            if let ExtractionState::Uploading { boss_hold: true, .. } = *state
+                && !was_held
+            {
+                feed.alert(BOSS_HOLD_TEXT, Color::srgb(1.0, 0.35, 0.2), 3.0);
+                sfx.play(SfxEvent::Denied);
             }
-            if state.advance_upload(dt, ring, jam) {
+            if advanced {
                 // Orbital extraction: beam + vaporize.
                 sfx.play(SfxEvent::Extract);
                 feed.alert("ORBITAL EXTRACTION LOCKED", Color::srgb(0.3, 1.0, 1.0), 2.0);
@@ -684,7 +735,54 @@ mod tests {
         assert_eq!(upload_duration(5), 44.0);
         assert_eq!(upload_duration(40), upload_duration(10));
         assert!(!is_endless_rematch(5) && !is_endless_rematch(9) && is_endless_rematch(10) && is_endless_rematch(15));
-        assert_eq!(rematch_alert(10), "ENDLESS BOSS REMATCH - FLOOR 10!");
+    }
+
+    #[test]
+    fn boss_holds_upload_at_99_until_killed_then_locks_immediately() {
+        let mut s = ExtractionState::start_upload(5);
+        // The boss alive: upload parks at 99% (never Extracting).
+        for _ in 0..200 {
+            assert!(!s.advance_upload_gated(1.0, true, false, true));
+        }
+        assert_eq!(s.progress(), Some(BOSS_HOLD_PROGRESS));
+        assert!(matches!(s, ExtractionState::Uploading { boss_hold: true, .. }));
+        // Jammed while held: still held; even if the boss dies while jammed,
+        // the Jammer Fiend must still be cleared before extraction locks.
+        assert!(!s.advance_upload_gated(1.0, true, true, true));
+        assert!(!s.advance_upload_gated(0.0, false, true, false));
+        assert!(matches!(s, ExtractionState::Uploading { jammed: true, .. }));
+        // Unjammed boss death while held: extraction locks on that very frame (even outside ring).
+        let mut s = ExtractionState::start_upload(5);
+        for _ in 0..200 {
+            assert!(!s.advance_upload_gated(1.0, true, false, true));
+        }
+        assert!(s.advance_upload_gated(0.0, false, false, false));
+        assert_eq!(s, ExtractionState::Extracting { timer: EXTRACT_SECS });
+        // Boss killed early (before 99%): the upload simply finishes normally.
+        let mut s = ExtractionState::start_upload(5);
+        assert!(!s.advance_upload_gated(10.0, true, false, true));
+        assert!(!s.advance_upload_gated(1.0, true, false, false));
+        assert!(matches!(s, ExtractionState::Uploading { boss_hold: false, .. }));
+        assert!(s.progress().unwrap() < 0.99);
+        assert!(s.advance_upload_gated(100.0, true, false, false));
+    }
+
+    #[test]
+    fn rush_is_lighter_during_the_boss_and_rosters_scale_by_floor() {
+        for floor in [5u32, 10, 15] {
+            assert!(boss_rush_cap(floor) < rush_cap(floor));
+            assert!(rush_wave_size(floor, true) < rush_wave_size(floor, false));
+            assert!(rush_wave_size(floor, true) >= 1);
+        }
+        // Floor 1: Imps / Cacodemons only, exactly as before.
+        for k in 0..100 {
+            let roll = k as f32 / 100.0;
+            let kind = rush_kind(1, roll);
+            assert_eq!(kind, if roll < 0.62 { EnemyKind::Imp } else { EnemyKind::Cacodemon });
+            assert_ne!(rush_kind(2, roll), EnemyKind::RelaySniper, "snipers join SOS waves from Floor 3");
+        }
+        assert_eq!(rush_kind(2, 0.1), EnemyKind::PhaseStalker);
+        assert_eq!(rush_kind(3, 0.95), EnemyKind::RelaySniper);
     }
 
     #[test]

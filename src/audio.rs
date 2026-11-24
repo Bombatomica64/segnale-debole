@@ -45,10 +45,16 @@ pub enum SfxEvent {
     RocketExplode,
     /// Signal Jump Pad launch: pneumatic burst + rising synth sweep.
     JumpPad,
+    /// Phase Stalker blink shimmer: glitchy static with a warped pitch.
+    PhaseBlink,
+    /// Relay Sniper lock-on: sharp rising laser whine.
+    SniperLock,
+    /// Carrier Daemon Signal Shield surge / shatter: resonant crystalline chord.
+    BossShield,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 22] = [
+    pub const ALL: [SfxEvent; 25] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -71,6 +77,9 @@ impl SfxEvent {
         SfxEvent::RocketFire,
         SfxEvent::RocketExplode,
         SfxEvent::JumpPad,
+        SfxEvent::PhaseBlink,
+        SfxEvent::SniperLock,
+        SfxEvent::BossShield,
     ];
 
     /// Playback volume (0..1).
@@ -280,6 +289,32 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
                 puff + (saw(p) * 0.35 + fifth) * env(t, 0.06, 1.1)
             })
         }
+        SfxEvent::PhaseBlink => {
+            let mut hold = 0.0f32;
+            render(0.38, move |ts, t, n| {
+                // Pitch warps down then snaps up; sample-and-hold static bursts.
+                let warp = 900.0 * (1.0 - t * 1.6).abs() + 160.0;
+                let p = o.step(warp + 120.0 * (ts * 55.0).sin());
+                if ((ts * 2400.0) as u32).is_multiple_of(7) {
+                    hold = n.next();
+                }
+                let glitch = if ((ts * 30.0) as u32).is_multiple_of(2) { square(p) * 0.35 } else { tri(o2.step(warp * 1.5)) * 0.3 };
+                (glitch + hold * 0.4) * env(t, 0.04, 1.4)
+            })
+        }
+        SfxEvent::SniperLock => render(0.7, |ts, t, _| {
+            // Rising whine + a lock-confirm double beep at the end.
+            let p = o.step(600.0 + 2600.0 * t * t);
+            let beep = if ts > 0.56 && ((ts * 40.0) as u32).is_multiple_of(2) { square(o2.step(3200.0)) * 0.25 } else { 0.0 };
+            ((p * TAU).sin() * 0.45 + saw(p) * 0.12) * env(t, 0.6, 0.6) + beep
+        }),
+        SfxEvent::BossShield => render(1.1, |ts, t, n| {
+            // Crystalline chord (stacked fifths) with shimmer + a glassy noise crack.
+            let base = 220.0 * (1.0 + 0.04 * (ts * 9.0).sin());
+            let chord = (o.step(base) * TAU).sin() * 0.4 + (o2.step(base * 1.5) * TAU).sin() * 0.3 + tri(base * 4.0 * ts) * 0.15;
+            let crack = if ts < 0.12 { lp.run(n.next(), 0.7) * (1.0 - ts / 0.12) * 0.9 } else { 0.0 };
+            chord * env(t, 0.05, 1.3) + crack
+        }),
     }
 }
 
@@ -460,7 +495,7 @@ mod tests {
 
     #[test]
     fn rocket_sfx_are_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 22);
+        assert_eq!(SfxEvent::ALL.len(), 25);
         let fire = synthesize_wav(SfxEvent::RocketFire);
         let boom = synthesize_wav(SfxEvent::RocketExplode);
         assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
@@ -470,6 +505,22 @@ mod tests {
         // The explosion is the long, heavy one.
         assert!(boom.len() > fire.len());
         assert!(boom.len() > synthesize_wav(SfxEvent::Shotgun).len());
+    }
+
+    #[test]
+    fn milestone13_sfx_are_valid_distinct_and_deterministic() {
+        assert_eq!(SfxEvent::ALL.len(), 25);
+        let news = [SfxEvent::PhaseBlink, SfxEvent::SniperLock, SfxEvent::BossShield];
+        for sfx in news {
+            assert!(SfxEvent::ALL.contains(&sfx));
+            let w = synthesize_wav(sfx);
+            assert_eq!(w, synthesize_wav(sfx), "{sfx:?} deterministic");
+            assert_eq!(&w[0..4], b"RIFF");
+            assert!(w.len() > 44 + 1000);
+            for other in SfxEvent::ALL.into_iter().filter(|o| *o != sfx) {
+                assert_ne!(w, synthesize_wav(other), "{sfx:?} vs {other:?}");
+            }
+        }
     }
 
     #[test]

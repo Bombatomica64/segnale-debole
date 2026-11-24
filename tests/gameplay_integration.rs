@@ -24,9 +24,12 @@ use segnale_debole::bot_input::BotControl;
 use segnale_debole::playtest_bot::{PlaytestBot, PlaytestBotPlugin, BOT_TIMEOUT_SECS};
 use segnale_debole::{build_headless_test_app, HeadlessGamePlugin};
 use segnale_debole::enemies::{
-    garrison_size, spawn_enemy, spawn_enemy_projectile, spawn_pos_for, Enemy, EnemyAssets, EnemyKind, PingMarked, ENRAGE_SPEED_MULT,
+    garrison_size, spawn_enemy, spawn_enemy_projectile, spawn_pos_for, Enemy, EnemyAssets, EnemyKind, EnemyProjectile, PingMarked,
+    ENRAGE_SPEED_MULT,
 };
-use segnale_debole::extraction::{rush_cap, upload_duration, ExtractionState};
+use segnale_debole::boss::{BossHud, BossPhase, BossPylon, BossState, BOSS_ARRIVAL_TEXT, BOSS_DEATH_TEXT, BOSS_SHIELD_STUN};
+use segnale_debole::enemies::{damage_enemy, pick_phase_blink_target, SniperLaser, SNIPER_LOCK_SECS};
+use segnale_debole::extraction::{rush_cap, upload_duration, ExtractionState, BOSS_HOLD_PROGRESS};
 use segnale_debole::fx::{BurstColor, FxAssets, HudFeed};
 use segnale_debole::hud::{HudCrosshair, HudPlugin, ENDLESS_CTA};
 use segnale_debole::meta_ui::{
@@ -215,6 +218,51 @@ fn trigger_uplink(app: &mut App) {
     bot(app).interact = true;
     step(app, 2);
     assert!(matches!(extraction(app), ExtractionState::Uploading { .. }), "E inside the ring starts the uplink: {:?}", extraction(app));
+}
+
+/// The living Carrier Daemon, if any.
+fn carrier(app: &mut App) -> Option<Entity> {
+    let mut q = app.world_mut().query::<(Entity, &Enemy)>();
+    q.iter(app.world()).find(|(_, e)| e.kind == EnemyKind::CarrierDaemon && e.is_alive()).map(|(e, _)| e)
+}
+
+fn boss_phase(app: &App, boss: Entity) -> BossPhase {
+    app.world().get::<BossState>(boss).unwrap().phase
+}
+
+fn living_pylons(app: &mut App) -> Vec<Entity> {
+    let mut q = app.world_mut().query::<(Entity, &BossPylon)>();
+    q.iter(app.world()).filter(|(_, p)| p.is_alive()).map(|(e, _)| e).collect()
+}
+
+fn upload_progress(app: &App) -> f32 {
+    extraction(app).progress().unwrap_or(-1.0)
+}
+
+/// Boss floor gate: THE CARRIER DAEMON landed with the uplink and parks it at
+/// 99%; killing it locks extraction on the spot.
+fn boss_floor_gate(app: &mut App) {
+    let floor = grid(app).floor;
+    let boss = carrier(app).unwrap_or_else(|| panic!("floor {floor}: the Carrier Daemon lands when the SOS starts"));
+    assert_eq!(enemy(app, boss).unwrap().max_hp, segnale_debole::enemies::carrier_daemon_hp(floor));
+    if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
+        *progress = 0.985;
+    }
+    for _ in 0..FPS {
+        godmode(app);
+        cull_kind(app, EnemyKind::JammerFiend, None);
+        step(app, 1);
+    }
+    assert_eq!(app_state(app), AppState::Playing, "floor {floor}: no extraction while the boss lives");
+    assert!(matches!(extraction(app), ExtractionState::Uploading { boss_hold: true, .. }), "floor {floor}: {:?}", extraction(app));
+    assert_eq!(upload_progress(app), BOSS_HOLD_PROGRESS);
+    assert!(app.world().resource::<BossHud>().active, "boss plate up");
+    kill(app, boss);
+    step(app, 1);
+    assert!(matches!(extraction(app), ExtractionState::Extracting { .. }), "floor {floor}: boss death locks extraction at once: {:?}", extraction(app));
+    step(app, 2);
+    assert!(!app.world().resource::<BossHud>().active, "boss plate gone");
+    assert_eq!(count::<BossPylon>(app), 0);
 }
 
 /// A standing cell with line of sight to a jammer core.
@@ -606,6 +654,11 @@ fn multi_seed_five_floor_victory_soak() {
             // Fast-forward the uplink to 90%: waves + Hell Baron still spawn.
             if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
                 *progress = 0.9;
+            }
+            if is_boss_floor(g.floor) {
+                boss_floor_gate(&mut app);
+            } else {
+                assert!(carrier(&mut app).is_none(), "seed {seed} floor {}: no boss off boss floors", g.floor);
             }
             let mut guard = 0;
             while app_state(&app) == AppState::Playing {
@@ -1220,6 +1273,9 @@ fn fast_clear_floor(app: &mut App) {
     trigger_uplink(app);
     if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
         *progress = 0.9;
+    }
+    if is_boss_floor(grid(app).floor) {
+        boss_floor_gate(app);
     }
     let mut guard = 0;
     while app_state(app) == AppState::Playing {
@@ -2962,6 +3018,20 @@ fn endless_overdrive_continues_past_victory_and_records_once() {
     // Floors 1-5 exactly as before: Floor 5 ends in Victory.
     for floor in 1..=FINAL_FLOOR {
         assert_eq!(grid(&app).floor, floor);
+        if floor == FINAL_FLOOR {
+            // Boss plate + 99% hold status on the HUD.
+            godmode(&mut app);
+            trigger_uplink(&mut app);
+            if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
+                *progress = 0.995;
+            }
+            step(&mut app, 3);
+            let texts = ui_texts(&mut app);
+            assert!(texts.iter().any(|t| t == "THE CARRIER DAEMON"), "boss plate header");
+            assert!(texts.iter().any(|t| t == "PHASE I"), "boss phase tag");
+            assert!(texts.iter().any(|t| t == "DEFEAT THE CARRIER DAEMON TO LOCK EXTRACTION"), "hold status: {texts:?}");
+            assert!(texts.iter().any(|t| t.starts_with("UPLINK HELD 99%")));
+        }
         fast_clear_floor(&mut app);
         if floor < FINAL_FLOOR {
             assert_eq!(app_state(&app), AppState::UpgradeSelect);
@@ -3031,38 +3101,332 @@ fn endless_overdrive_continues_past_victory_and_records_once() {
     assert!(ui_texts(&mut app).iter().any(|t| t.starts_with("ENDLESS FL 8")), "Game Over shows the endless floor");
 }
 
-#[test]
-fn endless_boss_rematch_floor_spawns_an_overdrive_baron_wave() {
-    let mut app = build_headless_test_app();
-    begin_run(&mut app, 77);
-    // Jump the run into Endless Floor 10 and rebuild through Paused -> Playing.
+/// Jump the run to `floor` (endless past 5) and rebuild through Paused -> Playing.
+fn jump_to_floor(app: &mut App, floor: u32) {
     {
         let mut run = app.world_mut().resource_mut::<RunStats>();
-        run.endless = true;
-        run.floor = 10;
+        run.endless = floor > FINAL_FLOOR;
+        run.floor = floor;
     }
     app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Paused);
-    step(&mut app, 2);
+    step(app, 2);
     app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Playing);
-    step(&mut app, 3);
+    step(app, 3);
+    assert_eq!(grid(app).floor, floor);
+}
+
+fn boss_hud(app: &App) -> BossHud {
+    app.world().resource::<BossHud>().clone()
+}
+
+#[test]
+fn endless_floor10_boss_rematch_is_the_carrier_daemon() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 77);
+    jump_to_floor(&mut app, 10);
     let g = grid(&app);
-    assert_eq!(g.floor, 10);
     assert!(g.validate() && is_boss_floor(10));
     assert_eq!(count::<DemonJammer>(&mut app), jammer_count_for_floor(10));
     godmode(&mut app);
     despawn_all_enemies(&mut app);
     trigger_uplink(&mut app);
-    if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
-        *progress = 0.32;
-    }
     step(&mut app, 2);
     let alert = app.world().resource::<HudFeed>().alert.clone().map(|a| a.text).unwrap_or_default();
-    assert_eq!(alert, "ENDLESS BOSS REMATCH - FLOOR 10!");
+    assert_eq!(alert, BOSS_ARRIVAL_TEXT);
+    let boss = carrier(&mut app).expect("Carrier Daemon on Endless Floor 10");
+    assert_eq!(enemy(&app, boss).unwrap().max_hp, 2200.0);
+    let atrium = g.rooms[0];
+    assert!(atrium.contains(g.world_to_cell(app.world().get::<Transform>(boss).unwrap().translation)), "lands in the Signal Atrium");
+    // Past 50%: no Hell Baron / rematch Baron wave on a boss floor.
+    if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
+        *progress = 0.6;
+    }
+    step(&mut app, 3);
     let barons = {
         let mut q = app.world_mut().query::<&Enemy>();
         q.iter(app.world()).filter(|e| e.kind == EnemyKind::HellBaron && e.is_alive()).count()
     };
-    assert!(barons >= 2, "rematch wave: {barons} barons");
+    assert_eq!(barons, 0, "the Carrier Daemon replaces the Hell Barons");
+    let h = boss_hud(&app);
+    assert!(h.active && h.phase == BossPhase::Phase1 && h.tag() == "PHASE I");
+    // Holds at 99%, then completes Floor 10 once the boss falls.
+    boss_floor_gate(&mut app);
+    let mut guard = 0;
+    while app_state(&app) == AppState::Playing {
+        godmode(&mut app);
+        step(&mut app, 1);
+        guard += 1;
+        assert!(guard < 5 * FPS);
+    }
+    assert_eq!(app_state(&app), AppState::UpgradeSelect, "Floor 10 completes into the next draft");
     assert!(EnemyKind::HellBaron.stats(35).fire_cooldown >= 1.0);
     assert!(rush_cap(30) <= 26);
+}
+
+/// Floor 5: the full Carrier Daemon fight through production systems - both
+/// Signal Shields, pylons destroyed by real weapon fire (shotgun + rocket) and
+/// raw damage, stuns, escort, Overdrive, death, then orbital extraction.
+#[test]
+fn carrier_daemon_two_shield_phases_lock_extraction_until_killed() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 2026);
+    jump_to_floor(&mut app, FINAL_FLOOR);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    trigger_uplink(&mut app);
+    step(&mut app, 2);
+    let boss = carrier(&mut app).expect("Carrier Daemon spawned on Floor 5");
+    let max = enemy(&app, boss).unwrap().max_hp;
+    assert_eq!(max, 1200.0);
+    assert_eq!(boss_phase(&app, boss), BossPhase::Phase1);
+    let mods = PlayerModifiers::default();
+    let hit = |app: &mut App, amount: f32| -> f32 {
+        let mut e = app.world_mut().get_mut::<Enemy>(boss).unwrap();
+        damage_enemy(&mut e, amount, false, &mods)
+    };
+    let calm = |app: &mut App| {
+        godmode(app);
+        cull_kind(app, EnemyKind::JammerFiend, None);
+        if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
+            *progress = progress.max(0.5);
+        }
+    };
+
+    // Phase I -> clamp at 65% -> Shielded I with two tethered pylons.
+    hit(&mut app, 5000.0);
+    assert_eq!(enemy(&app, boss).unwrap().hp, max * 0.65, "threshold clamps HP");
+    calm(&mut app);
+    step(&mut app, 3);
+    assert_eq!(boss_phase(&app, boss), BossPhase::Shielded1);
+    let pylons = living_pylons(&mut app);
+    assert_eq!(pylons.len(), 2, "two Shield Pylons");
+    assert_eq!(boss_hud(&app).tag(), "SHIELDED // 2 PYLONS");
+    assert!(enemy(&app, boss).unwrap().shielded);
+    assert_eq!(hit(&mut app, 400.0), 0.0, "full shield immunity while pylons stand");
+    assert_eq!(enemy(&app, boss).unwrap().hp, max * 0.65);
+    let (pa, pb) = (app.world().get::<Transform>(pylons[0]).unwrap().translation, app.world().get::<Transform>(pylons[1]).unwrap().translation);
+    let t = grid(&app).tower_world();
+    assert!((pa - t).with_y(0.0).normalize().dot((pb - t).with_y(0.0).normalize()) < 0.0, "pylons on opposite sides");
+
+    // Pylon #1: shotgun fire (HitTarget::Pylon). Freeze the boss for a clean line.
+    app.world_mut().get_mut::<Enemy>(boss).unwrap().stun_timer = 1.0e3;
+    let g = grid(&app);
+    let pc = g.world_to_cell(pa);
+    let stand = [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y]
+        .into_iter()
+        .flat_map(|o| [pc + o * 2, pc + o])
+        .find(|c| matches!(g.cell(*c), Cell::Floor { .. } | Cell::AtriumFloor) && has_line_of_sight(&g, g.cell_center(*c) + Vec3::Y * PLAYER_EYE_HEIGHT, pa + Vec3::Y * 1.5))
+        .expect("vantage on pylon");
+    teleport(&mut app, g.cell_center(stand), pa + Vec3::Y * 1.5);
+    step(&mut app, 2);
+    bot(&mut app).switch_weapon = Some(Weapon::Shotgun);
+    let target = pylons[0];
+    let frames = fire_until(
+        &mut app,
+        12 * FPS,
+        |a| {
+            calm(a);
+            with_player(a, |p| p.ammo_shells = p.max_shells);
+            aim_at(a, pa + Vec3::Y * 1.5);
+        },
+        |a| a.world().get_entity(target).is_err(),
+    );
+    assert!(frames < 12 * FPS, "shotgun destroys a Shield Pylon");
+    assert_eq!(living_pylons(&mut app).len(), 1);
+    step(&mut app, 2);
+    assert_eq!(boss_phase(&app, boss), BossPhase::Shielded1, "one pylon still shields the boss");
+    assert_eq!(boss_hud(&app).tag(), "SHIELDED // 1 PYLON");
+
+    // Pylon #2 down -> shatter: stun, Phase II, escort, supply drop.
+    app.world_mut().get_mut::<Enemy>(boss).unwrap().stun_timer = 0.0;
+    let pickups0 = count::<segnale_debole::weapons::Pickup>(&mut app);
+    app.world_mut().get_mut::<BossPylon>(pylons[1]).unwrap().hp = 0.0;
+    calm(&mut app);
+    step(&mut app, 2);
+    assert_eq!(boss_phase(&app, boss), BossPhase::Phase2);
+    let e = enemy(&app, boss).unwrap();
+    assert!(!e.shielded && e.stun_timer > BOSS_SHIELD_STUN - 0.1, "shatter stuns: {}", e.stun_timer);
+    assert!(count::<segnale_debole::weapons::Pickup>(&mut app) > pickups0, "supply drop on the ring");
+    let kinds: Vec<EnemyKind> = {
+        let mut q = app.world_mut().query::<&Enemy>();
+        q.iter(app.world()).filter(|e| e.is_alive()).map(|e| e.kind).collect()
+    };
+    assert!(kinds.contains(&EnemyKind::PhaseStalker) && kinds.contains(&EnemyKind::Imp), "Phase II escort: {kinds:?}");
+    assert_eq!(boss_hud(&app).tag(), "PHASE II");
+
+    // Phase II -> 30% -> Shielded II (fresh pylons at the atrium corners).
+    hit(&mut app, 5000.0);
+    assert!((enemy(&app, boss).unwrap().hp - max * 0.3).abs() < 1e-3);
+    calm(&mut app);
+    step(&mut app, 3);
+    assert_eq!(boss_phase(&app, boss), BossPhase::Shielded2);
+    let pylons = living_pylons(&mut app);
+    assert_eq!(pylons.len(), 2);
+    // Pylon #3: a direct Signal-Mortar rocket.
+    app.world_mut().get_mut::<Enemy>(boss).unwrap().stun_timer = 1.0e3;
+    let p3 = app.world().get::<Transform>(pylons[0]).unwrap().translation;
+    let pc = g.world_to_cell(p3);
+    let stand = [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y]
+        .into_iter()
+        .flat_map(|o| [pc + o * 2, pc + o * 3])
+        .find(|c| matches!(g.cell(*c), Cell::Floor { .. } | Cell::AtriumFloor) && has_line_of_sight(&g, g.cell_center(*c) + Vec3::Y * PLAYER_EYE_HEIGHT, p3 + Vec3::Y * 1.5))
+        .expect("vantage on pylon 3");
+    teleport(&mut app, g.cell_center(stand), p3 + Vec3::Y * 1.5);
+    step(&mut app, 2);
+    bot(&mut app).switch_weapon = Some(Weapon::Rocket);
+    let target = pylons[0];
+    let frames = fire_until(
+        &mut app,
+        12 * FPS,
+        |a| {
+            calm(a);
+            with_player(a, |p| p.ammo_rockets = p.max_rockets);
+            aim_at(a, p3 + Vec3::Y * 1.5);
+        },
+        |a| a.world().get_entity(target).is_err(),
+    );
+    assert!(frames < 12 * FPS, "rockets destroy a Shield Pylon");
+    app.world_mut().get_mut::<Enemy>(boss).unwrap().stun_timer = 0.0;
+    app.world_mut().get_mut::<BossPylon>(pylons[1]).unwrap().hp = 0.0;
+    calm(&mut app);
+    step(&mut app, 2);
+    assert_eq!(boss_phase(&app, boss), BossPhase::Overdrive);
+    assert!(enemy(&app, boss).unwrap().stun_timer > 1.0);
+    assert_eq!(boss_hud(&app).tag(), "OVERDRIVE");
+    assert_eq!(count::<BossPylon>(&mut app), 0);
+
+    // Overdrive fires crossfire once the stun wears off.
+    teleport(&mut app, g.cell_center(ring_cell(&g)), g.tower_world());
+    let proj0 = count::<EnemyProjectile>(&mut app);
+    let mut max_proj = proj0;
+    // 1.8 s shatter stun, then the Overdrive cadence (telegraph -> crossfire).
+    for _ in 0..(7 * FPS) {
+        calm(&mut app);
+        step(&mut app, 1);
+        max_proj = max_proj.max(count::<EnemyProjectile>(&mut app));
+    }
+    assert!(max_proj >= proj0 + 5, "Overdrive barrages: {proj0} -> {max_proj}");
+
+    // Upload holds at 99% while the boss lives; its death locks extraction.
+    if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
+        *progress = 0.99;
+    }
+    calm(&mut app);
+    step(&mut app, 30);
+    assert!(matches!(extraction(&app), ExtractionState::Uploading { boss_hold: true, .. }));
+    let kills0 = run_stats(&app).kills;
+    assert!(hit(&mut app, 5000.0) > 0.0, "Overdrive has no HP floor");
+    step(&mut app, 1);
+    assert!(matches!(extraction(&app), ExtractionState::Extracting { .. }), "{:?}", extraction(&app));
+    let feed = app.world().resource::<HudFeed>().clone();
+    assert!(feed.toasts.iter().any(|t| t.text == BOSS_DEATH_TEXT));
+    assert!(run_stats(&app).kills > kills0);
+    step(&mut app, 3 * FPS);
+    assert_eq!(app_state(&app), AppState::Victory, "Floor 5 completes into Victory");
+}
+
+#[test]
+fn phase_stalker_blinks_through_a_dead_zone_onto_a_walkable_flank() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 41);
+    jump_to_floor(&mut app, 2);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    let g = grid(&app);
+    let mut blinked = false;
+    'outer: for &j in &g.jammers {
+        for o in [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y] {
+            let dz = j + o;
+            if !matches!(g.cell(dz), Cell::Floor { .. }) {
+                continue;
+            }
+            let Some(me) = straight_cell(&g, dz, 2) else { continue };
+            let spos = spawn_pos_for(EnemyKind::PhaseStalker, &g, dz);
+            let ppos = g.cell_center(me);
+            if pick_phase_blink_target(&g, spos, ppos, 1.0).is_none() {
+                continue;
+            }
+            despawn_all_enemies(&mut app);
+            teleport(&mut app, ppos, spos + Vec3::Y * 1.2);
+            let st = spawn_demon(&mut app, EnemyKind::PhaseStalker, spos);
+            step(&mut app, 1);
+            {
+                let mut e = app.world_mut().get_mut::<Enemy>(st).unwrap();
+                e.alerted = true;
+                e.blink_cooldown = 0.0;
+                e.attack_timer = 5.0;
+            }
+            let mut telegraphed = false;
+            let mut last = spos;
+            for _ in 0..(2 * FPS) {
+                godmode(&mut app);
+                step(&mut app, 1);
+                let Some(e) = enemy(&app, st) else { break };
+                let now = app.world().get::<Transform>(st).unwrap().translation;
+                if e.blink_timer > 0.0 {
+                    telegraphed = true;
+                    assert!(e.enraged, "blinks only while Dead-Zone enraged");
+                }
+                let jump = Vec2::new(now.x - last.x, now.z - last.z).length();
+                if jump > 4.0 {
+                    assert!(telegraphed, "0.35 s shimmer telegraph precedes the blink");
+                    assert!((4.9..=8.1).contains(&jump), "blink distance {jump}");
+                    let c = g.world_to_cell(now);
+                    assert!(g.in_bounds(c) && matches!(g.cell(c), Cell::Floor { .. } | Cell::AtriumFloor | Cell::Ramp { .. }), "lands on {c}: {:?}", g.cell(c));
+                    blinked = true;
+                    break 'outer;
+                }
+                last = now;
+            }
+        }
+    }
+    assert!(blinked, "a Phase Stalker blinked out of a Dead Zone");
+}
+
+#[test]
+fn relay_sniper_locks_on_with_a_laser_then_fires_a_rail_bolt() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 99);
+    godmode(&mut app);
+    let c = open_arena(&mut app);
+    let floor = run_stats(&app).floor;
+    let sniper = spawn_demon(&mut app, EnemyKind::RelaySniper, c + Vec3::new(0.0, 0.05, -22.0));
+    step(&mut app, 1);
+    {
+        let mut e = app.world_mut().get_mut::<Enemy>(sniper).unwrap();
+        e.alerted = true;
+        e.attack_timer = 0.0;
+    }
+    let laser_visible = |app: &mut App| {
+        let mut q = app.world_mut().query_filtered::<&Visibility, With<SniperLaser>>();
+        q.iter(app.world()).any(|v| *v != Visibility::Hidden)
+    };
+    let rail_bolts = |app: &mut App| {
+        let mut q = app.world_mut().query::<&EnemyProjectile>();
+        q.iter(app.world()).filter(|p| p.vel.length() > 40.0).map(|p| p.damage).collect::<Vec<f32>>()
+    };
+    let mut lock_frame = None;
+    let mut fired_frame = None;
+    for f in 0..(3 * FPS) {
+        godmode(&mut app);
+        teleport(&mut app, c, c + Vec3::new(0.0, 1.0, -22.0));
+        step(&mut app, 1);
+        let e = enemy(&app, sniper).unwrap();
+        if lock_frame.is_none() && e.sniper_lock_timer > 0.0 {
+            lock_frame = Some(f);
+            assert!(laser_visible(&mut app), "laser sight shows during the lock-on");
+            assert!(rail_bolts(&mut app).is_empty(), "no shot during the telegraph");
+        }
+        let bolts = rail_bolts(&mut app);
+        if !bolts.is_empty() {
+            fired_frame = Some(f);
+            assert!((bolts[0] - (18.0 + floor as f32)).abs() < 1e-3, "rail damage {}", bolts[0]);
+            break;
+        }
+    }
+    let (lock, fired) = (lock_frame.expect("sniper locked on"), fired_frame.expect("rail bolt fired"));
+    let telegraph = (fired - lock) as f32 / FPS as f32;
+    assert!((telegraph - SNIPER_LOCK_SECS).abs() < 0.1, "lock-on telegraph {telegraph:.2}s");
+    step(&mut app, 1);
+    assert!(!laser_visible(&mut app), "laser drops after the shot");
 }

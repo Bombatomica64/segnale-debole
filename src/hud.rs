@@ -19,6 +19,7 @@ use bevy::window::PrimaryWindow;
 
 use crate::assets_gen::FloorTheme;
 use crate::audio::{SfxEvent, SfxQueue};
+use crate::boss::BossHud;
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
 use crate::fx::HudFeed;
 use crate::meta::{live_settings, record_game_over, record_victory, start_run_with_loadout, CrosshairColor, CrosshairStyle, ProfileStore, RunLoadout};
@@ -1091,6 +1092,39 @@ fn slot_ammo_color(n: u32, active: bool) -> Color {
 }
 const VITALS_WIDTH: f32 = 312.0;
 const UPLINK_WIDTH: f32 = 440.0;
+/// Width of the Carrier Daemon health bar.
+const BOSS_BAR_WIDTH: f32 = 460.0;
+/// Boss health-bar tick marks at the phase thresholds.
+pub const BOSS_PHASE_TICKS: [f32; 2] = [crate::boss::PHASE2_THRESHOLD, crate::boss::PHASE1_THRESHOLD];
+
+/// Boss health fill color: crimson -> molten gold as it drops, glowing
+/// cyan-violet while the Signal Shield is up.
+pub fn boss_bar_color(hud: &BossHud, t: f32) -> Color {
+    if hud.phase.shielded() {
+        Color::srgb(0.45 + 0.1 * (t * 6.0).sin(), 0.55, 1.0)
+    } else if hud.phase == crate::boss::BossPhase::Overdrive {
+        Color::srgb(1.0, 0.55 + 0.2 * (t * 10.0).sin().abs(), 0.08)
+    } else {
+        PUNK_RED.mix(&HAZARD_YELLOW, (1.0 - hud.hp_frac).clamp(0.0, 1.0) * 0.8)
+    }
+}
+
+/// Boss phase tag color.
+pub fn boss_tag_color(hud: &BossHud) -> Color {
+    match hud.phase {
+        p if p.shielded() => Color::srgb(0.55, 0.65, 1.0),
+        crate::boss::BossPhase::Overdrive => HAZARD_YELLOW,
+        _ => PUNK_RED,
+    }
+}
+
+/// Top status line while uploading (boss floors hold at 99%).
+pub fn uplink_status_text(ext: &ExtractionState) -> &'static str {
+    match ext {
+        ExtractionState::Uploading { boss_hold: true, .. } => crate::boss::BOSS_HOLD_TEXT,
+        _ => "DEMON RUSH - HOLD THE SIGNAL",
+    }
+}
 /// Height of the danger tape rails that clamp the status plate during a rush.
 const RUSH_RAIL_HEIGHT: f32 = 6.0;
 
@@ -1334,6 +1368,10 @@ pub fn sector_label(floor: u32) -> String {
 /// Every HUD text element, updated by one query.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 enum HudText {
+    /// Boss plate header (`THE CARRIER DAEMON`).
+    BossName,
+    /// Boss plate phase tag (`PHASE I`, `SHIELDED // 2 PYLONS`...).
+    BossPhase,
     Floor,
     /// Sector theme subtitle (`SECTOR 01 // RUST BUNKER`).
     Sector,
@@ -1377,6 +1415,12 @@ enum HudBox {
     RushRail,
     UplinkPanel,
     UplinkFill,
+    /// Carrier Daemon boss plate (only while a living boss is present).
+    BossPlate,
+    /// Boss health fill (crimson / molten gold, cyan-violet while shielded).
+    BossFill,
+    /// Boss health track: its end caps follow the phase tag color.
+    BossTrack,
     AlertPanel,
     ToastChip(u8),
     /// Square bullet between the chip label and the contract tags.
@@ -1685,6 +1729,69 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
     spawn_ruler(&mut commands, gauge);
     let rail = hazard_strip(&mut commands, rush, tex, RUSH_RAIL_HEIGHT, Tape::Danger);
     commands.entity(rail).insert((HudBox::RushRail, Node { display: Display::None, width: Val::Percent(100.0), height: Val::Px(RUSH_RAIL_HEIGHT), ..default() }));
+    // Boss plate: docked under the status / uplink plate, above the alert.
+    let boss = commands
+        .spawn((
+            ChildOf(top),
+            HudBox::BossPlate,
+            hud_plate(Node { display: Display::None, flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() }, PUNK_RED),
+        ))
+        .id();
+    commands.spawn((
+        ChildOf(boss),
+        Node { width: Val::Px(BOSS_BAR_WIDTH), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
+        children![
+            (HudText::BossName, text(crate::enemies::EnemyKind::CarrierDaemon.name(), 18.0, HAZARD_YELLOW)),
+            (HudText::BossPhase, text("PHASE I", 14.0, PUNK_RED)),
+        ],
+    ));
+    let bgauge = commands
+        .spawn((ChildOf(boss), Node { width: Val::Px(BOSS_BAR_WIDTH), flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }))
+        .id();
+    let btrack = commands.spawn((ChildOf(bgauge), HudBox::BossTrack, bar_track(Val::Percent(100.0), 14.0, PUNK_RED, Display::Flex))).id();
+    commands.spawn((ChildOf(btrack), HudBox::BossFill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(PUNK_RED)));
+    // Segment cuts + heavy phase-threshold ticks at 30% / 65%.
+    for n in 1..20 {
+        let pct = n as f32 * 5.0;
+        let major = BOSS_PHASE_TICKS.iter().any(|t| (t * 100.0 - pct).abs() < 0.1);
+        commands.spawn((
+            ChildOf(btrack),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(pct),
+                top: Val::Px(0.0),
+                width: Val::Px(if major { 3.0 } else { 1.0 }),
+                height: Val::Percent(100.0),
+                margin: UiRect::left(Val::Px(-1.0)),
+                ..default()
+            },
+            BackgroundColor(if major { BONE_TEXT.with_alpha(0.9) } else { INK_BLACK.with_alpha(0.7) }),
+        ));
+    }
+    // Ruler under the track: the phase thresholds stay readable on the empty
+    // (dark) part of the bar, where the in-track cuts vanish.
+    let bruler = commands.spawn((ChildOf(bgauge), Node { width: Val::Percent(100.0), height: Val::Px(RULER_HEIGHT), ..default() })).id();
+    for n in 0..=20u8 {
+        let pct = n as f32 * 5.0;
+        let major = BOSS_PHASE_TICKS.iter().any(|t| (t * 100.0 - pct).abs() < 0.1);
+        if !major && n % 2 == 1 {
+            continue;
+        }
+        commands.spawn((
+            ChildOf(bruler),
+            Node {
+                position_type: PositionType::Absolute,
+                left: if n == 20 { Val::Auto } else { Val::Percent(pct) },
+                right: if n == 20 { Val::Px(0.0) } else { Val::Auto },
+                top: Val::Px(0.0),
+                width: Val::Px(if major { 3.0 } else { 1.0 }),
+                height: Val::Px(if major { RULER_HEIGHT } else { RULER_HEIGHT - 2.0 }),
+                margin: UiRect::left(Val::Px(if major { -1.0 } else { 0.0 })),
+                ..default()
+            },
+            BackgroundColor(if major { HAZARD_YELLOW } else { ASH_DIM.with_alpha(0.6) }),
+        ));
+    }
     commands.spawn((
         ChildOf(top),
         HudBox::AlertPanel,
@@ -1940,6 +2047,7 @@ fn update_hud(
     ext: Res<ExtractionState>,
     loadout: Res<RunLoadout>,
     gauge: Res<VelGauge>,
+    boss: Option<Res<BossHud>>,
     players: Query<&Player>,
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
     (mut buf, mut tags): (Local<String>, Local<LoadoutTags>),
@@ -1960,6 +2068,15 @@ fn update_hud(
         let b = &mut *buf;
         b.clear();
         let c: Color = match *slot {
+            HudText::BossName => {
+                b.push_str(crate::enemies::EnemyKind::CarrierDaemon.name());
+                HAZARD_YELLOW
+            }
+            HudText::BossPhase => {
+                let h = boss.as_deref().cloned().unwrap_or_default();
+                b.push_str(&h.tag());
+                boss_tag_color(&h)
+            }
             HudText::Floor => {
                 if run.endless {
                     let _ = write!(b, "ENDLESS FL {}", run.floor);
@@ -1987,7 +2104,7 @@ fn update_hud(
             }
             HudText::Status => {
                 let (s, c) = match *ext {
-                    ExtractionState::Uploading { .. } => ("DEMON RUSH - HOLD THE SIGNAL", COLOR_SIGNAL_RED),
+                    ExtractionState::Uploading { .. } => (uplink_status_text(&ext), COLOR_SIGNAL_RED),
                     ExtractionState::Extracting { .. } | ExtractionState::Complete => ("ORBITAL EXTRACTION IN PROGRESS", COLOR_CYAN),
                     _ if signal.near_tower => ("5-BAR SIGNAL - EXTRACTION TOWER IN RANGE", COLOR_SIGNAL_GREEN),
                     _ if signal.in_dead_zone => ("NO SERVICE - DEAD ZONE", COLOR_SIGNAL_RED),
@@ -2025,6 +2142,10 @@ fn update_hud(
                 INK_BLACK
             }
             HudText::UplinkLabel => match *ext {
+                ExtractionState::Uploading { progress, boss_hold: true, .. } => {
+                    let _ = write!(b, "UPLINK HELD {:.0}% - KILL THE CARRIER DAEMON", progress * 100.0);
+                    COLOR_SIGNAL_AMBER.with_alpha(if (t * 6.0).sin() > 0.0 { 1.0 } else { 0.55 })
+                }
                 ExtractionState::Uploading { progress, jammed: true, .. } => {
                     let _ = write!(b, "UPLINK JAMMED! KILL THE JAMMER FIEND  {:.0}%", progress * 100.0);
                     COLOR_SIGNAL_RED.with_alpha(if (t * 10.0).sin() > 0.0 { 1.0 } else { 0.4 })
@@ -2152,6 +2273,7 @@ fn update_hud_boxes(
     mods: Res<PlayerModifiers>,
     loadout: Res<RunLoadout>,
     gauge: Res<VelGauge>,
+    boss: Option<Res<BossHud>>,
     players: Query<&Player>,
     mut boxes: Query<(&HudBox, &mut Node, &mut BackgroundColor, Option<&mut BorderColor>)>,
 ) {
@@ -2204,6 +2326,26 @@ fn update_hud_boxes(
                 }
             }
             HudBox::AlertPanel => set_display(&mut node, feed.alert.is_some()),
+            HudBox::BossPlate => {
+                let h = boss.as_deref().cloned().unwrap_or_default();
+                set_display(&mut node, h.active);
+                if h.active {
+                    let c = boss_tag_color(&h);
+                    set_border(plate_border(c, STEEL_BORDER.with_alpha(0.45)));
+                }
+            }
+            HudBox::BossTrack => {
+                if let Some(h) = boss.as_deref().filter(|h| h.active) {
+                    let c = boss_tag_color(h);
+                    set_border(BorderColor { left: c, right: c.with_alpha(0.55), top: TRACK_BORDER, bottom: INK_BLACK });
+                }
+            }
+            HudBox::BossFill => {
+                if let Some(h) = boss.as_deref().filter(|h| h.active) {
+                    set_width_pct(&mut node, h.hp_frac * 100.0);
+                    set_bg(&mut bg, boss_bar_color(h, t));
+                }
+            }
             HudBox::LoadoutDot => {
                 set_display(&mut node, loadout.contract_count() > 0);
                 set_bg(&mut bg, loadout_contract_color(loadout.contract_count()));
@@ -2658,6 +2800,24 @@ mod tests {
     }
 
     #[test]
+    fn boss_plate_formatting_ticks_and_colors() {
+        use crate::boss::BossPhase;
+        assert_eq!(BOSS_PHASE_TICKS, [0.30, 0.65]);
+        let p1 = BossHud { active: true, phase: BossPhase::Phase1, hp_frac: 1.0, pylons: 0 };
+        let sh = BossHud { active: true, phase: BossPhase::Shielded1, hp_frac: 0.65, pylons: 2 };
+        assert_eq!(p1.tag(), "PHASE I");
+        assert_eq!(sh.tag(), "SHIELDED // 2 PYLONS");
+        assert_eq!(boss_bar_color(&p1, 0.0), PUNK_RED);
+        let shield = boss_bar_color(&sh, 0.0).to_srgba();
+        assert!(shield.blue > shield.red && shield.blue > 0.9, "shielded bar glows cyan-violet");
+        let low = boss_bar_color(&BossHud { hp_frac: 0.35, phase: BossPhase::Phase2, ..p1.clone() }, 0.0).to_srgba();
+        assert!(low.green > PUNK_RED.to_srgba().green, "shifts toward molten gold");
+        let held = ExtractionState::Uploading { progress: 0.99, duration: 44.0, in_ring: true, jammed: false, wave_timer: 1.0, baron_spawned: true, boss_hold: true };
+        assert_eq!(uplink_status_text(&held), "DEFEAT THE CARRIER DAEMON TO LOCK EXTRACTION");
+        assert_eq!(uplink_status_text(&ExtractionState::start_upload(1)), "DEMON RUSH - HOLD THE SIGNAL");
+    }
+
+    #[test]
     fn slot_labels_hero_font_and_rush_frame() {
         assert_eq!([slot_label(0), slot_label(1), slot_label(2)], ["SLOT 01", "SLOT 02", "SLOT 03"]);
         // The hero switch is set larger than the secondary switches of its row.
@@ -2672,6 +2832,7 @@ mod tests {
             jammed: false,
             wave_timer: 0.5,
             baron_spawned: false,
+            boss_hold: false,
         });
         assert_eq!((calm.left, rush.left), (ARC_CYAN, PUNK_RED));
         assert_ne!(calm.top, rush.top);

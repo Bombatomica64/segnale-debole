@@ -17,6 +17,7 @@ use rand::Rng;
 use crate::apps::{spawn_hijack_hotspot, PhoneApps};
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::BotControl;
+use crate::boss::{damage_pylon, pylon_ray_hit, BossPylon, PYLON_SPHERES};
 use crate::enemies::{damage_enemy, ray_sphere, Enemy, EnemyKind, PingMarked};
 use crate::fx::{
     additive_glow, overlay_layer, spawn_burst, spawn_ejected_shell, spawn_flash_light, spawn_particles, spawn_shockwave, spawn_tracer, BurstColor,
@@ -202,6 +203,8 @@ pub enum HitTarget {
     Enemy(usize),
     Jammer(usize),
     Barrel(usize),
+    /// Carrier Daemon Shield Pylon (index into the pylon list).
+    Pylon(usize),
 }
 
 /// Jammer hit volumes relative to its base.
@@ -328,6 +331,30 @@ pub fn resolve_hitscan_full(
     best
 }
 
+/// [`resolve_hitscan_full`] plus Carrier Daemon Shield Pylons (bases in `pylons`).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_hitscan_all(
+    grid: &LevelGrid,
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    enemies: &[HitTargetInfo],
+    jammers: &[Vec3],
+    barrels: &[Vec3],
+    pylons: &[Vec3],
+) -> (f32, HitTarget) {
+    let mut best = resolve_hitscan_full(grid, origin, dir, max_dist, enemies, jammers, barrels);
+    let d = dir.normalize_or_zero();
+    for (i, base) in pylons.iter().enumerate() {
+        if let Some(t) = pylon_ray_hit(*base, origin, d)
+            && t < best.0
+        {
+            best = (t, HitTarget::Pylon(i));
+        }
+    }
+    best
+}
+
 /// [`resolve_hitscan`] over pre-collected [`HitTargetInfo`]s.
 pub fn resolve_hitscan_targets(
     grid: &LevelGrid,
@@ -376,6 +403,9 @@ pub fn knockback_scale(kind: EnemyKind) -> f32 {
         EnemyKind::Cacodemon => 0.7,
         EnemyKind::JammerFiend => 0.45,
         EnemyKind::HellBaron => 0.15,
+        EnemyKind::PhaseStalker => 0.9,
+        EnemyKind::RelaySniper => 0.6,
+        EnemyKind::CarrierDaemon => 0.05,
     }
 }
 
@@ -1488,6 +1518,8 @@ struct FireScratch {
     enemy_kb: Vec<Vec3>,
     jam_dmg: Vec<f32>,
     bar_dmg: Vec<f32>,
+    pylons: Vec<Vec3>,
+    pyl_dmg: Vec<f32>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1505,7 +1537,11 @@ fn fire_weapons(
     cams: Query<&Transform, With<PlayerCamera>>,
     mut players: Query<(&mut Player, &Transform), Without<PlayerCamera>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
-    (mut jammers, mut barrels): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut ExplosiveBarrel, &GlobalTransform)>),
+    (mut jammers, mut barrels, mut pylons): (
+        Query<(&mut DemonJammer, &GlobalTransform)>,
+        Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
+        Query<(&mut BossPylon, &GlobalTransform)>,
+    ),
     mut bot: Option<ResMut<BotControl>>,
     mut scratch: Local<FireScratch>,
 ) {
@@ -1582,13 +1618,15 @@ fn fire_weapons(
     let dmult = doppler_damage_mult(speed, &mods);
 
     // Snapshot lightweight targets for ray tests (reused buffers).
-    let FireScratch { targets: refs, jammers: jam_list, barrels: bar_list, enemy_dmg, enemy_kb, jam_dmg, bar_dmg } = &mut *scratch;
+    let FireScratch { targets: refs, jammers: jam_list, barrels: bar_list, enemy_dmg, enemy_kb, jam_dmg, bar_dmg, pylons: pyl_list, pyl_dmg } = &mut *scratch;
     refs.clear();
     refs.extend(enemies.iter().map(|(e, g, _)| HitTargetInfo::of(g.translation(), e)));
     jam_list.clear();
     jam_list.extend(jammers.iter().filter(|(j, _)| j.is_active()).map(|(_, g)| g.translation()));
     bar_list.clear();
     bar_list.extend(barrels.iter().filter(|(b, _)| b.is_intact()).map(|(_, g)| g.translation()));
+    pyl_list.clear();
+    pyl_list.extend(pylons.iter().filter(|(p, _)| p.is_alive()).map(|(_, g)| g.translation()));
 
     match ws.current {
         Weapon::Shotgun => {
@@ -1615,13 +1653,15 @@ fn fire_weapons(
             jam_dmg.resize(jam_list.len(), 0.0);
             bar_dmg.clear();
             bar_dmg.resize(bar_list.len(), 0.0);
+            pyl_dmg.clear();
+            pyl_dmg.resize(pyl_list.len(), 0.0);
             let mut wall_sparks = 0;
             for i in 0..pellets {
                 let a = rng.random_range(0.0..TAU);
                 let r = spread * rng.random::<f32>().sqrt();
                 let local = Vec3::new(a.cos() * r, a.sin() * r, -1.0).normalize();
                 let dir = rot * local;
-                let (dist, target) = resolve_hitscan_full(&grid, origin, dir, HITSCAN_RANGE, refs, jam_list, bar_list);
+                let (dist, target) = resolve_hitscan_all(&grid, origin, dir, HITSCAN_RANGE, refs, jam_list, bar_list, pyl_list);
                 let hit = origin + dir * dist;
                 let falloff = (1.0 - (dist - 18.0).max(0.0) / 40.0).clamp(0.4, 1.0);
                 if i % 2 == 0 {
@@ -1640,6 +1680,10 @@ fn fire_weapons(
                     HitTarget::Barrel(k) => {
                         bar_dmg[k] += PELLET_DAMAGE * falloff * dmult;
                         spawn_particles(&mut commands, &fx, hit, BurstColor::Spark, 3, 5.0, 0.06);
+                    }
+                    HitTarget::Pylon(k) => {
+                        pyl_dmg[k] += PELLET_DAMAGE * falloff * dmult;
+                        spawn_particles(&mut commands, &fx, hit, BurstColor::Cyan, 4, 5.5, 0.07);
                     }
                     HitTarget::Wall => {
                         spawn_particles(&mut commands, &fx, hit - dir * 0.05, BurstColor::Spark, 3, 3.8, 0.055);
@@ -1682,6 +1726,17 @@ fn fire_weapons(
                 }
                 k += 1;
             }
+            let mut k = 0;
+            for (mut p, _) in &mut pylons {
+                if !p.is_alive() {
+                    continue;
+                }
+                if pyl_dmg[k] > 0.0 {
+                    damage_pylon(&mut p, pyl_dmg[k]);
+                    any_hit = true;
+                }
+                k += 1;
+            }
             if any_hit {
                 feed.hit(false);
                 sfx.play(SfxEvent::Hit);
@@ -1694,7 +1749,7 @@ fn fire_weapons(
             sfx.play(SfxEvent::Plasma);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(0.3, 0.9, 1.0), 250_000.0, 7.0, 0.05);
             // Converge the bolt onto whatever the crosshair points at.
-            let (dist, _) = resolve_hitscan_full(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list);
+            let (dist, _) = resolve_hitscan_all(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list, pyl_list);
             let aim = origin + fwd * dist.max(2.0);
             let dir = (aim - muzzle).normalize_or_zero();
             commands.spawn((
@@ -1720,7 +1775,7 @@ fn fire_weapons(
             sfx.play(SfxEvent::RocketFire);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(1.0, 0.55, 0.15), 600_000.0, 10.0, 0.09);
             spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 3, 1.4, 0.08);
-            let (dist, _) = resolve_hitscan_full(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list);
+            let (dist, _) = resolve_hitscan_all(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list, pyl_list);
             let (start, dir) = rocket_launch(&grid, origin, fwd, muzzle, dist);
             spawn_rocket(&mut commands, &rockets, start, dir, player.velocity, dmult);
         }
@@ -1742,6 +1797,7 @@ fn move_player_projectiles(
     mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
     mut barrels: Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
     mut players: Query<(&mut Player, &Transform)>,
+    mut pylons: Query<(&mut BossPylon, &GlobalTransform)>,
 ) {
     let dt = time.delta_secs().min(1.0 / 20.0);
     for (e, mut b, mut tf) in &mut bolts {
@@ -1778,6 +1834,14 @@ fn move_player_projectiles(
                 best = (t, HitTarget::Barrel(i));
             }
         }
+        for (i, (p, g)) in pylons.iter().enumerate() {
+            if p.is_alive()
+                && let Some(t) = pylon_ray_hit(g.translation(), from, dir)
+                && t < best.0
+            {
+                best = (t, HitTarget::Pylon(i));
+            }
+        }
         let hit = from + dir * best.0;
         if b.kind == ProjectileKind::Rocket {
             if best.1 == HitTarget::Nothing && b.life > 0.0 {
@@ -1806,6 +1870,7 @@ fn move_player_projectiles(
                 &mut enemies,
                 &mut jammers,
                 &mut barrels,
+                &mut pylons,
                 &mut players,
             );
             if any_hit {
@@ -1846,6 +1911,13 @@ fn move_player_projectiles(
                     damage_barrel(&mut b, damage, false);
                 }
             }
+            HitTarget::Pylon(i) => {
+                if let Some((mut p, _)) = pylons.iter_mut().nth(i) {
+                    damage_pylon(&mut p, damage);
+                    feed.hit(false);
+                    sfx.play(SfxEvent::Hit);
+                }
+            }
             HitTarget::Wall => {}
         }
         spawn_burst(&mut commands, &fx, hit - dir * 0.1, BurstColor::Cyan, 7, 4.8, 0.065);
@@ -1872,6 +1944,7 @@ fn detonate_rocket(
     enemies: &mut Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     jammers: &mut Query<(&mut DemonJammer, &GlobalTransform)>,
     barrels: &mut Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
+    pylons: &mut Query<(&mut BossPylon, &GlobalTransform)>,
     players: &mut Query<(&mut Player, &Transform)>,
 ) -> bool {
     let radius = rocket_splash_radius(mods);
@@ -1930,6 +2003,22 @@ fn detonate_rocket(
         };
         if dmg > 0.0 {
             damage_jammer(&mut j, dmg);
+            any_hit = true;
+        }
+    }
+    for (i, (mut p, g)) in pylons.iter_mut().enumerate() {
+        if !p.is_alive() {
+            continue;
+        }
+        let dmg = if direct == HitTarget::Pylon(i) {
+            ROCKET_DIRECT_DAMAGE * damage_mult
+        } else {
+            let base = g.translation();
+            let d = splash_distance(blast, base, &PYLON_SPHERES);
+            if d > radius || !has_line_of_sight(grid, blast, base + Vec3::Y * 1.5) { 0.0 } else { rocket_splash_damage(d, radius, damage_mult) }
+        };
+        if dmg > 0.0 {
+            damage_pylon(&mut p, dmg);
             any_hit = true;
         }
     }
@@ -2008,7 +2097,7 @@ fn barrel_detonations(
     (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
     mut barrels: Query<(Entity, &mut ExplosiveBarrel, &GlobalTransform, &mut Transform), Without<Player>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
-    mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
+    (mut jammers, mut pylons): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut BossPylon, &GlobalTransform)>),
     mut players: Query<(&mut Player, &Transform), Without<ExplosiveBarrel>>,
     mut blasts: Local<Vec<(Entity, Vec3)>>,
 ) {
@@ -2062,6 +2151,14 @@ fn barrel_detonations(
             let d = splash_distance(blast, base, &JAMMER_SPHERES);
             if d <= BARREL_BLAST_RADIUS && has_line_of_sight(&grid, blast, base + Vec3::Y * 1.3) {
                 damage_jammer(&mut j, barrel_blast_damage(d));
+                any_hit = true;
+            }
+        }
+        for (mut p, g) in &mut pylons {
+            let base = g.translation();
+            let d = splash_distance(blast, base, &PYLON_SPHERES);
+            if p.is_alive() && d <= BARREL_BLAST_RADIUS && has_line_of_sight(&grid, blast, base + Vec3::Y * 1.5) {
+                damage_pylon(&mut p, barrel_blast_damage(d));
                 any_hit = true;
             }
         }
