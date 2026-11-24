@@ -4,20 +4,46 @@ version = "0.3.0"
 edition = "2024"
 
 [dependencies]
+# Minimal Bevy 0.20 feature set: omit unused asset/FX crates (bevy_gltf,
+# bevy_animation, morph, bevy_gizmos, bevy_anti_alias/smaa_luts, hdr,
+# bevy_post_process, bevy_mikktspace, bevy_curve, bevy_gilrs) since all
+# meshes, textures, animations and audio are procedural. `tonemapping_luts`
+# (+ `zstd_rust` for its embedded LUT) stays on so TonyMcMapface renders
+# identically across all platforms.
 bevy = { version = "0.20.1", default-features = false, features = [
     "default_app",
-    "3d_bevy_render",
-    "ui_bevy_render",
     "std",
     "bevy_winit",
     "default_font",
-    "multi_threaded",
-    "custom_cursor",
-    "png",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_image",
+    "bevy_mesh",
+    "bevy_shader",
+    "bevy_material",
+    "bevy_text",
+    "bevy_window",
+    "bevy_light",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_ui",
+    "bevy_ui_render",
+    "tonemapping_luts",
+    "zstd_rust",
 ] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Native-only Bevy features: multithreaded task pools, OS cursors, and PNG
+# screenshot encoding (for dev/bot tours; never needed on wasm32).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "0.20.1", default-features = false, features = [
+    "multi_threaded",
+    "custom_cursor",
+    "png",
+] }
 
 # Linux windowing backends (native only; never compiled into the web build).
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -52,10 +78,13 @@ codegen-units = 1
 strip = "symbols"
 
 # Web / itch.io build: size-tuned release (`trunk build --release --features
-# audio --cargo-profile wasm-release`). Fat LTO + `opt-level = "s"` shrink the
-# post-wasm-opt module from ~45 MB to ~30 MB (~13 -> ~9.6 MB gzipped); native
-# release stays speed-tuned.
+# audio --cargo-profile wasm-release`). Fat LTO + `opt-level = "s"` +
+# `panic = "abort"` keep the wasm module compact while native release stays
+# speed-tuned. Keep `strip = "none"` so `wasm-bindgen` can read the
+# `target_features` custom section before `wasm-opt -Oz` strips the output.
 [profile.wasm-release]
 inherits = "release"
 opt-level = "s"
 lto = "fat"
+panic = "abort"
+strip = "none"
