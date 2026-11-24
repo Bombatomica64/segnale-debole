@@ -4759,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "segnale_debole"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy",
  "getrandom 0.3.4",
