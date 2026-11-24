@@ -347,7 +347,7 @@ fn phone_apps(
     fx: Res<FxAssets>,
     ea: Res<EnemyAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
+    (mut sfx, mut feed, mut decals): (ResMut<SfxQueue>, ResMut<HudFeed>, ResMut<crate::decals::DecalQueue>),
     (players, decoys): (Query<&Transform, With<Player>>, Query<Entity, With<DecoyHandset>>),
     mut enemies: Query<(Entity, &mut Enemy, &GlobalTransform, Option<&mut PingMarked>)>,
     (mut jammers, mut barrels, mut pylons): (
@@ -465,6 +465,8 @@ fn phone_apps(
                 spawn_shockwave(&mut commands, &fx, &mut materials, ptf.translation + Vec3::Y * 0.18, radius, 0.58, cyan, 0.95, true);
                 spawn_shockwave(&mut commands, &fx, &mut materials, ptf.translation + Vec3::Y * 1.1, radius * 0.78, 0.44, Color::srgb(0.85, 1.0, 1.0), 0.72, true);
                 // (No beam column on the player: the camera would sit inside it -> full-screen cyan wash.)
+                // Glassy plasma burn scorched into the floor around the player.
+                decals.push(crate::decals::DecalRequest::floor(crate::decals::DecalKind::PlasmaBurn, ptf.translation, (radius * 0.55).min(5.5)));
                 spawn_burst(&mut commands, &fx, center, BurstColor::Cyan, 18, 9.5, 0.08);
                 spawn_flash_light(&mut commands, center, cyan, 2_800_000.0, radius * 1.4, 0.26);
                 let mut hit_pos: Vec<Vec3> = Vec::new();
@@ -480,6 +482,7 @@ fn phone_apps(
                         let away = Vec3::new(c.x - center.x, 0.0, c.z - center.z).normalize_or_zero();
                         let kind = en.kind;
                         en.knockback += away * 14.0 * knockback_scale(kind);
+                        en.stagger(away);
                         en.stun_timer = EMP_STUN;
                         hit_pos.push(c);
                         spawn_lightning(&mut commands, &fx, center, c);
@@ -598,6 +601,7 @@ fn dash_shockwave(
             let away = Vec3::new(ec.x - c.x, 0.0, ec.z - c.z).normalize_or_zero();
             let kind = e.kind;
             e.knockback += away * 10.0 * knockback_scale(kind);
+            e.stagger(away);
             hits += 1;
         }
     }

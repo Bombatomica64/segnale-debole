@@ -12,7 +12,8 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 
 use crate::audio::{SfxEvent, SfxQueue};
-use crate::fx::{spawn_burst, spawn_flash_light, BurstColor, FxAssets, HudFeed};
+use crate::decals::{DecalKind, DecalQueue, DecalRequest};
+use crate::fx::{spawn_burst, spawn_death_gibs, spawn_flash_light, BurstColor, FxAssets, GibMat, HudFeed};
 use crate::apps::spawn_hijack_hotspot;
 use crate::level::{Cell, CullableLight, DemonJammer, LevelEntity, LevelGrid, RampDir, SignalTower, CEILING_HEIGHT};
 use crate::mesh_batch::{MaterialBatches, MeshBatch};
@@ -272,6 +273,16 @@ pub struct Enemy {
     pub sniper_lock_timer: f32,
     /// Relay Sniper: world point the laser sight is locked on.
     pub sniper_aim: Vec3,
+    /// Attack pose envelope (1 on a shot / strike, decays to 0; purely visual).
+    pub attack_anim: f32,
+    /// The current attack pose is a forward melee / blink lunge (else a ranged recoil).
+    pub attack_lunge: bool,
+    /// Horizontal unit direction of the last directional hit (world XZ).
+    pub stagger_dir: Vec2,
+    /// Remaining hit-stagger (seconds; see [`stagger_secs`]).
+    pub stagger_timer: f32,
+    /// Walk-cycle phase (radians), advanced proportionally to ground speed.
+    pub stride_phase: f32,
 }
 
 impl Enemy {
@@ -306,7 +317,30 @@ impl Enemy {
             blink_side: if rng.random::<bool>() { 1.0 } else { -1.0 },
             sniper_lock_timer: 0.0,
             sniper_aim: Vec3::ZERO,
+            attack_anim: 0.0,
+            attack_lunge: false,
+            stagger_dir: Vec2::ZERO,
+            stagger_timer: 0.0,
+            stride_phase: rng.random_range(0.0..TAU),
         }
+    }
+
+    /// Record a directional hit (`dir` = travel direction of the hit / push,
+    /// world space) for the visual hit-stagger. Ignores vertical-only hits.
+    pub fn stagger(&mut self, dir: Vec3) {
+        if !self.is_alive() {
+            return;
+        }
+        if let Some(d) = Vec2::new(dir.x, dir.z).try_normalize() {
+            self.stagger_dir = d;
+            self.stagger_timer = stagger_secs(self.kind);
+        }
+    }
+
+    /// Trigger the visual attack pose (ranged recoil, or forward `lunge`).
+    pub fn trigger_attack_anim(&mut self, lunge: bool) {
+        self.attack_anim = 1.0;
+        self.attack_lunge = lunge;
     }
 
     pub fn is_alive(&self) -> bool {
@@ -477,6 +511,158 @@ pub fn fiend_jammer_fields_iter<'a>(enemies: impl Iterator<Item = (&'a Enemy, &'
     enemies
         .filter(|(e, _)| e.kind == EnemyKind::JammerFiend && e.is_alive())
         .map(|(_, t)| JammerField { pos: t.translation() + Vec3::Y * 1.6, radius: FIEND_FIELD_RADIUS, strength: FIEND_FIELD_STRENGTH })
+}
+
+// ---------------------------------------------------------------------------
+// Procedural combat animation (pure pose math; applied to the `EnemyBody`
+// visual pivot only - the root `Transform` and hit spheres never move).
+// ---------------------------------------------------------------------------
+
+/// Base hit-stagger duration (light demons).
+pub const STAGGER_SECS: f32 = 0.18;
+/// Attack pose duration (seconds for `attack_anim` to decay 1 -> 0).
+pub const ATTACK_ANIM_SECS: f32 = 0.32;
+/// Largest body pivot tilt any pose combination may produce (radians).
+pub const MAX_BODY_TILT: f32 = 0.6;
+
+/// How strongly a demon reacts to hits (1 = light; heavies stagger less).
+pub fn stagger_weight(kind: EnemyKind) -> f32 {
+    match kind {
+        EnemyKind::HellBaron => 0.45,
+        EnemyKind::CarrierDaemon => 0.25,
+        EnemyKind::Cacodemon => 0.8,
+        _ => 1.0,
+    }
+}
+
+/// Hit-stagger duration of a demon kind (shorter for heavies).
+pub fn stagger_secs(kind: EnemyKind) -> f32 {
+    STAGGER_SECS * (0.6 + 0.4 * stagger_weight(kind))
+}
+
+/// Fast-in / slow-out envelope over `u` in `0..1` (peaks 1 at `attack`).
+pub fn snap_envelope(u: f32, attack: f32) -> f32 {
+    let u = if u.is_finite() { u.clamp(0.0, 1.0) } else { 1.0 };
+    if u < attack {
+        let k = u / attack;
+        k * (2.0 - k)
+    } else {
+        let k = 1.0 - (u - attack) / (1.0 - attack);
+        k * k * (3.0 - 2.0 * k)
+    }
+}
+
+/// Visual body pivot pose: local offset + tilt (pitch about X, roll about Z,
+/// in the demon's local frame; `-Z` is forward).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BodyPose {
+    pub offset: Vec3,
+    pub pitch: f32,
+    pub roll: f32,
+}
+
+impl BodyPose {
+    pub fn is_finite(&self) -> bool {
+        self.offset.is_finite() && self.pitch.is_finite() && self.roll.is_finite()
+    }
+
+    pub fn rotation(&self) -> Quat {
+        Quat::from_rotation_x(self.pitch) * Quat::from_rotation_z(self.roll)
+    }
+
+    fn add(self, o: BodyPose) -> BodyPose {
+        BodyPose { offset: self.offset + o.offset, pitch: self.pitch + o.pitch, roll: self.roll + o.roll }
+    }
+
+    /// Clamp to the bounded tilt / offset range.
+    pub fn bounded(self) -> BodyPose {
+        let f = |v: f32| if v.is_finite() { v.clamp(-MAX_BODY_TILT, MAX_BODY_TILT) } else { 0.0 };
+        let o = if self.offset.is_finite() { self.offset.clamp(Vec3::splat(-0.4), Vec3::splat(0.4)) } else { Vec3::ZERO };
+        BodyPose { offset: o, pitch: f(self.pitch), roll: f(self.roll) }
+    }
+}
+
+/// Grounded walker stride: speed-proportional bob, hip sway and forward lean.
+/// `local_vel` is the horizontal velocity in the demon's local frame.
+pub fn stride_pose(local_vel: Vec2, max_speed: f32, stride_phase: f32) -> BodyPose {
+    let speed = local_vel.length();
+    let k = if max_speed > 0.01 && speed.is_finite() { (speed / max_speed).clamp(0.0, 1.3) } else { 0.0 };
+    let s = stride_phase.sin();
+    let idle = 1.0 - k.min(1.0);
+    // Forward component (local -Z) leans the torso into the run.
+    let fwd = if speed > 1e-3 { (-local_vel.y / speed).clamp(-1.0, 1.0) } else { 0.0 };
+    BodyPose {
+        offset: Vec3::new(s * 0.035 * k, s.abs() * 0.085 * k + (stride_phase * 0.25).sin() * 0.015 * idle, 0.0),
+        pitch: -0.09 * k * fwd,
+        roll: s * 0.065 * k,
+    }
+}
+
+/// Cacodemon hover: smooth bob plus gentle bank / tilt into its horizontal velocity.
+pub fn hover_pose(local_vel: Vec2, max_speed: f32, phase: f32) -> BodyPose {
+    let m = max_speed.max(0.01);
+    let v = if local_vel.is_finite() { local_vel / m } else { Vec2::ZERO };
+    BodyPose {
+        offset: Vec3::Y * ((phase * 2.0).sin() * 0.08),
+        // Sideways drift (local +X) banks the top toward it (-roll); forward (-Z) dips the nose.
+        pitch: (v.y * 0.16).clamp(-0.2, 0.2),
+        roll: (-v.x * 0.28).clamp(-0.3, 0.3),
+    }
+}
+
+/// Attack windup / recoil pose of `attack_anim` (1 -> 0): a ranged shot snaps
+/// the torso back, a melee / blink lunge pitches it forward.
+pub fn attack_pose(kind: EnemyKind, attack_anim: f32, lunge: bool) -> BodyPose {
+    if attack_anim <= 0.0 || !attack_anim.is_finite() {
+        return BodyPose::default();
+    }
+    let e = snap_envelope(1.0 - attack_anim.min(1.0), 0.18);
+    let w = 0.5 + 0.5 * stagger_weight(kind);
+    if lunge {
+        BodyPose { offset: Vec3::new(0.0, -0.03 * e, -0.16 * e * w), pitch: -0.3 * e * w, roll: 0.0 }
+    } else {
+        BodyPose { offset: Vec3::new(0.0, 0.0, 0.07 * e * w), pitch: 0.2 * e * w, roll: 0.0 }
+    }
+}
+
+/// Directional hit-stagger: tips the body top along the hit direction
+/// (`local_dir` = hit travel direction in the demon's local XZ frame).
+pub fn stagger_pose(kind: EnemyKind, local_dir: Vec2, timer: f32) -> BodyPose {
+    let total = stagger_secs(kind);
+    if timer <= 0.0 || !timer.is_finite() || !local_dir.is_finite() {
+        return BodyPose::default();
+    }
+    let e = snap_envelope(1.0 - (timer / total).min(1.0), 0.22);
+    let a = 0.32 * stagger_weight(kind) * e;
+    let d = local_dir.normalize_or_zero();
+    // Rx(+) tips +Y toward +Z; Rz(+) tips +Y toward -X.
+    BodyPose { offset: Vec3::new(d.x, 0.0, d.y) * 0.05 * stagger_weight(kind) * e, pitch: a * d.y, roll: -a * d.x }
+}
+
+/// Full body pivot pose of a demon facing `root_rot`, before the stun
+/// tremor / blink jitter overlays.
+pub fn body_pose(e: &Enemy, root_rot: Quat) -> BodyPose {
+    let inv = root_rot.inverse();
+    let lv = inv * Vec3::new(e.velocity.x, 0.0, e.velocity.z);
+    let local_vel = Vec2::new(lv.x, lv.z);
+    let base = if e.kind.flying() { hover_pose(local_vel, e.move_speed(), e.phase) } else { stride_pose(local_vel, e.move_speed(), e.stride_phase) };
+    let ld = inv * Vec3::new(e.stagger_dir.x, 0.0, e.stagger_dir.y);
+    base.add(attack_pose(e.kind, e.attack_anim, e.attack_lunge))
+        .add(stagger_pose(e.kind, Vec2::new(ld.x, ld.z), e.stagger_timer))
+        .bounded()
+}
+
+/// Advance the purely visual animation clocks of one demon.
+pub fn tick_enemy_anim(e: &mut Enemy, dt: f32) {
+    let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+    e.attack_anim = (e.attack_anim - dt / ATTACK_ANIM_SECS).max(0.0);
+    e.stagger_timer = (e.stagger_timer - dt).max(0.0);
+    if !e.kind.flying() {
+        // ~1 stride (two footfalls) per 1.6 m travelled, scaled by size.
+        let speed = Vec2::new(e.velocity.x, e.velocity.z).length();
+        let stride_len = 0.8 + e.stats.radius * 0.8;
+        e.stride_phase = (e.stride_phase + speed / stride_len * PI * dt) % TAU;
+    }
 }
 
 /// Pinged by the phone's Ping Scan: glows, shows through walls, takes Packet Sniffer bonus.
@@ -2122,8 +2308,9 @@ fn enemy_ai(
                         tf.translation = dest;
                         e.velocity = Vec3::ZERO;
                         spawn_burst(&mut commands, &fx, dest + Vec3::Y * 1.2, BurstColor::Gore, 10, 5.0, 0.12);
-                        // Arrives ready to fire its twin bolts.
+                        // Arrives ready to fire its twin bolts, lunging out of the blink.
                         e.attack_timer = e.attack_timer.min(0.25);
+                        e.trigger_attack_anim(true);
                     }
                     e.blink_side = -e.blink_side;
                 }
@@ -2236,6 +2423,7 @@ fn enemy_ai(
         let melee_reach = e.stats.radius + PLAYER_RADIUS + 0.9;
         if dist < melee_reach && (to_p.y).abs() < 2.5 && e.melee_timer <= 0.0 {
             e.melee_timer = if e.kind == EnemyKind::HellBaron { 1.4 } else { 1.0 };
+            e.trigger_attack_anim(true);
             let hurt = player.invuln_timer <= 0.0;
             player.apply_damage(e.stats.melee_damage * if e.enraged { 1.3 } else { 1.0 } * incoming);
             if hurt {
@@ -2265,6 +2453,7 @@ fn enemy_ai(
                             let start = eye + dir * (e.stats.radius + 0.4);
                             spawn_enemy_projectile(&mut commands, &fx, start, dir * e.stats.proj_speed, e.stats.proj_damage, e.stats.proj_radius, BurstColor::Spark);
                             spawn_burst(&mut commands, &fx, start, BurstColor::Spark, 6, 4.0, 0.08);
+                            e.trigger_attack_anim(false);
                             sfx.play(SfxEvent::EnemyFire);
                         }
                     }
@@ -2308,6 +2497,7 @@ fn enemy_ai(
                     if caco_purple { BurstColor::Gore } else { color },
                 );
             }
+            e.trigger_attack_anim(false);
             sfx.play(SfxEvent::EnemyFire);
         }
     }
@@ -2376,6 +2566,9 @@ pub fn spawn_enemy_projectile(commands: &mut Commands, fx: &FxAssets, pos: Vec3,
     ));
 }
 
+/// Enemy bolts at least this big (Hell Baron / boss hellfire) scorch walls.
+pub const HEAVY_BOLT_RADIUS: f32 = 0.38;
+
 /// Shortest distance between segment `a..b` and point `p`.
 pub fn segment_point_distance(a: Vec3, b: Vec3, p: Vec3) -> f32 {
     let ab = b - a;
@@ -2392,7 +2585,7 @@ fn move_enemy_projectiles(
     mut sfx: ResMut<SfxQueue>,
     mut players: Query<(&Transform, &mut Player)>,
     mut q: Query<(Entity, &mut EnemyProjectile, &mut Transform), Without<Player>>,
-    (signal, mods): (Res<SignalState>, Res<PlayerModifiers>),
+    (signal, mods, mut decals): (Res<SignalState>, Res<PlayerModifiers>, ResMut<DecalQueue>),
 ) {
     let incoming = incoming_damage_scale(signal.in_dead_zone, &mods);
     let Ok((ptf, mut player)) = players.single_mut() else { return };
@@ -2420,6 +2613,10 @@ fn move_enemy_projectiles(
         }
         if let Some(hit) = wall_hit {
             spawn_burst(&mut commands, &fx, hit.point + hit.normal * 0.1, p.color, 6, 4.0, 0.12);
+            // Heavy hellfire (Hell Baron / Carrier Daemon) chars the wall it hits.
+            if p.radius >= HEAVY_BOLT_RADIUS && p.color == BurstColor::Fire {
+                decals.push(DecalRequest::surface(DecalKind::Scorch, hit.point, hit.normal, p.radius * 3.2));
+            }
             commands.entity(e).try_despawn();
             continue;
         }
@@ -2454,11 +2651,11 @@ fn enemy_visuals(
     time: Res<Time>,
     ea: Res<EnemyAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    enemies: Query<(&Enemy, &EnemyLook, Option<&PingMarked>, &Children, Option<&EnemyRig>, Option<&crate::boss::BossState>)>,
-    mut bodies: Query<&mut Transform, (With<EnemyBody>, Without<EnrageHalo>, Without<FiendFieldRing>)>,
-    mut rigs: Query<(&mut Transform, &mut RigPivot), (Without<EnemyBody>, Without<EnrageHalo>, Without<FiendFieldRing>)>,
-    mut halos: Query<(&mut Transform, &mut Visibility), (With<EnrageHalo>, Without<EnemyBody>, Without<FiendFieldRing>)>,
-    mut fiend_rings: Query<&mut Transform, (With<FiendFieldRing>, Without<EnemyBody>, Without<EnrageHalo>)>,
+    mut enemies: Query<(&mut Enemy, &Transform, &EnemyLook, Option<&PingMarked>, &Children, Option<&EnemyRig>, Option<&crate::boss::BossState>)>,
+    mut bodies: Query<&mut Transform, (With<EnemyBody>, Without<EnrageHalo>, Without<FiendFieldRing>, Without<Enemy>)>,
+    mut rigs: Query<(&mut Transform, &mut RigPivot), (Without<EnemyBody>, Without<EnrageHalo>, Without<FiendFieldRing>, Without<Enemy>)>,
+    mut halos: Query<(&mut Transform, &mut Visibility), (With<EnrageHalo>, Without<EnemyBody>, Without<FiendFieldRing>, Without<Enemy>)>,
+    mut fiend_rings: Query<&mut Transform, (With<FiendFieldRing>, Without<EnemyBody>, Without<EnrageHalo>, Without<Enemy>)>,
     mut auras: Query<(&mut PointLight, &mut CullableLight), With<EnemyAura>>,
     mut parts: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
@@ -2475,7 +2672,11 @@ fn enemy_visuals(
             m.0 = want.clone();
         }
     };
-    for (e, look, marked, children, rig, boss) in &enemies {
+    for (mut e, root_tf, look, marked, children, rig, boss) in &mut enemies {
+        if e.is_alive() {
+            tick_enemy_anim(&mut e, dt);
+        }
+        let e = &*e;
         if let Some(rig) = rig {
             for pe in rig.pivots.iter().flatten() {
                 if let Ok((mut tf, mut rp)) = rigs.get_mut(*pe) {
@@ -2483,29 +2684,24 @@ fn enemy_visuals(
                 }
             }
         }
-        // Bob / stagger animation on the body pivot.
-        let moving = Vec2::new(e.velocity.x, e.velocity.z).length() > 0.5;
-        let bob = if e.kind.flying() {
-            (e.phase * 2.0).sin() * 0.08
-        } else if moving {
-            (e.phase * 9.0).sin().abs() * 0.08
-        } else {
-            (e.phase * 2.0).sin() * 0.02
-        };
+        // Stride / hover + attack recoil + directional hit-stagger on the
+        // visual body pivot (never the root: hit spheres stay put).
+        let pose = body_pose(e, root_tf.rotation);
         for c in children.iter() {
             if let Ok(mut b) = bodies.get_mut(c) {
-                b.translation.y = bob;
-                let sway = if moving && !e.kind.flying() { (e.phase * 9.0).sin() * 0.06 } else { 0.0 };
                 let stun = if e.stun_timer > 0.0 { (t * 40.0).sin() * 0.08 } else { 0.0 };
-                b.rotation = Quat::from_rotation_z(sway + stun);
+                let mut offset = pose.offset;
+                let mut scale = Vec3::ONE;
                 // Phase Stalker shimmer: glitchy jitter + stretch while charging a blink.
                 if e.blink_timer > 0.0 {
                     let k = 1.0 - e.blink_timer / PHASE_BLINK_TELEGRAPH;
-                    b.translation.x = (t * 70.0).sin() * 0.12 * (0.4 + k);
-                    b.scale = Vec3::new(1.0 - 0.25 * k, 1.0 + 0.2 * k, 1.0 - 0.25 * k);
-                } else if b.scale != Vec3::ONE || b.translation.x != 0.0 {
-                    b.scale = Vec3::ONE;
-                    b.translation.x = 0.0;
+                    offset.x += (t * 70.0).sin() * 0.12 * (0.4 + k);
+                    scale = Vec3::new(1.0 - 0.25 * k, 1.0 + 0.2 * k, 1.0 - 0.25 * k);
+                }
+                b.translation = offset;
+                b.rotation = pose.rotation() * Quat::from_rotation_z(stun);
+                if b.scale != scale {
+                    b.scale = scale;
                 }
             }
             if let Ok((mut htf, mut hvis)) = halos.get_mut(c) {
@@ -2576,6 +2772,11 @@ fn enemy_visuals(
     }
 }
 
+/// Rig recoil kick strength (0..1) right after firing: snaps in, eases out.
+pub fn rig_recoil(e: &Enemy) -> f32 {
+    if e.attack_lunge || e.attack_anim <= 0.0 { 0.0 } else { snap_envelope(1.0 - e.attack_anim.min(1.0), 0.08) }
+}
+
 /// Per-frame pose of one articulated sub-pivot.
 fn animate_rig(tf: &mut Transform, rp: &mut RigPivot, e: &Enemy, boss: Option<&crate::boss::BossState>, t: f32, dt: f32) {
     let rest = rp.rest;
@@ -2596,7 +2797,11 @@ fn animate_rig(tf: &mut Transform, rp: &mut RigPivot, e: &Enemy, boss: Option<&c
             } else {
                 Quat::from_euler(EulerRot::YXZ, (t * 0.6 + e.phase).sin() * 0.65, 0.05 * (t * 0.9 + e.phase).sin(), 0.0)
             };
-            tf.rotation = tf.rotation.slerp(rest.rotation * target, ease(if locking { 18.0 } else { 4.0 }));
+            // Snappy rail-fire recoil kick (pitch up + shove back) right after the shot.
+            let kick = rig_recoil(e);
+            let rate = if kick > 0.0 { 30.0 } else if locking { 18.0 } else { 4.0 };
+            tf.rotation = tf.rotation.slerp(rest.rotation * target * Quat::from_rotation_x(0.35 * kick), ease(rate));
+            tf.translation = rest.translation + Vec3::Z * (0.08 * kick);
         }
         RigKind::BossHalo => {
             // Broadcast halo spins about its axis; faster in Overdrive and while telegraphing.
@@ -2620,8 +2825,12 @@ fn animate_rig(tf: &mut Transform, rp: &mut RigPivot, e: &Enemy, boss: Option<&c
             let charging = boss.is_some_and(|st| st.telegraph > 0.0);
             let breathe = (t * 1.7 + e.phase).sin();
             let (offset, pitch) = if charging { (Vec3::new(0.0, 0.04, 0.2), 0.12) } else { (Vec3::Y * (0.03 * breathe), 0.035 * breathe) };
-            tf.translation = tf.translation.lerp(rest.translation + offset, ease(if charging { 14.0 } else { 6.0 }));
-            tf.rotation = tf.rotation.slerp(rest.rotation * Quat::from_rotation_x(pitch), ease(8.0));
+            // Hard barrel kick right after a barrage fires (decays with `attack_anim`).
+            let kick = rig_recoil(e);
+            let (offset, pitch) = (offset + Vec3::new(0.0, 0.03, 0.32) * kick, pitch + 0.28 * kick);
+            let rate = if kick > 0.0 { 32.0 } else if charging { 14.0 } else { 6.0 };
+            tf.translation = tf.translation.lerp(rest.translation + offset, ease(rate));
+            tf.rotation = tf.rotation.slerp(rest.rotation * Quat::from_rotation_x(pitch), ease(if kick > 0.0 { 32.0 } else { 8.0 }));
         }
         RigKind::PylonRing => {}
     }
@@ -2641,6 +2850,7 @@ fn enemy_deaths(
     mut players: Query<&mut Player>,
     enemies: Query<(Entity, &Enemy, &Transform, Option<&PingMarked>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut decals: ResMut<DecalQueue>,
 ) {
     let mut rng = rand::rng();
     for (entity, e, tf, marked) in &enemies {
@@ -2660,6 +2870,13 @@ fn enemy_deaths(
         };
         spawn_burst(&mut commands, &fx, center, a, n, 7.0, 0.22);
         spawn_burst(&mut commands, &fx, center, b, n / 2, 5.0, 0.16);
+        // Chunky sculpted gibs + archetype splatter / scorch on the floor beneath.
+        let (gibs, count) = death_gibs(e.kind);
+        spawn_death_gibs(&mut commands, &fx, center, gibs, count, 0.07 + e.stats.radius * 0.06, 6.5);
+        let feet = tf.translation.with_y(tf.translation.y - if e.kind.flying() { 2.0 } else { 0.0 });
+        for &(kind, size) in death_decals(e.kind, e.vaporized).iter().flatten() {
+            decals.push(DecalRequest::floor(kind, feet, size * (0.9 + e.stats.radius)));
+        }
         run.kills += 1;
         sfx.play(SfxEvent::EnemyDeath);
         if e.kind == EnemyKind::CarrierDaemon {
@@ -2747,6 +2964,36 @@ fn enemy_deaths(
             let off = Vec3::new((i as f32 * 2.1).cos(), 0.0, (i as f32 * 2.1).sin()) * if i == 0 { 0.0 } else { spread };
             spawn_pickup(&mut commands, &pickups, k, ground + off, true);
         }
+    }
+}
+
+/// Death gib palette and count of a demon kind.
+pub fn death_gibs(kind: EnemyKind) -> (&'static [GibMat], u32) {
+    use GibMat::*;
+    match kind {
+        EnemyKind::Imp => (&[Flesh, Bone, Flesh], 6),
+        EnemyKind::Cacodemon => (&[Flesh, Flesh, Bone], 7),
+        EnemyKind::JammerFiend => (&[FiendGreen, DarkMetal, FiendGreen, Bone], 7),
+        EnemyKind::HellBaron => (&[Flesh, MoltenGold, Bone, Flesh], 10),
+        EnemyKind::PhaseStalker => (&[VioletObsidian, VioletObsidian, Flesh], 7),
+        EnemyKind::RelaySniper => (&[DarkMetal, DarkMetal, Bone], 7),
+        EnemyKind::CarrierDaemon => (&[MoltenGold, DarkMetal, Flesh, VioletObsidian], 16),
+    }
+}
+
+/// Floor decals `(kind, size factor)` left by a demon's death (vaporized
+/// demons only leave a scorch).
+pub fn death_decals(kind: EnemyKind, vaporized: bool) -> [Option<(DecalKind, f32)>; 2] {
+    if vaporized {
+        return [Some((DecalKind::Scorch, 1.0)), None];
+    }
+    match kind {
+        EnemyKind::Imp | EnemyKind::Cacodemon => [Some((DecalKind::BloodCrimson, 1.0)), None],
+        EnemyKind::JammerFiend => [Some((DecalKind::IchorGreen, 1.1)), None],
+        EnemyKind::PhaseStalker => [Some((DecalKind::IchorViolet, 1.0)), None],
+        EnemyKind::RelaySniper => [Some((DecalKind::Scorch, 0.8)), None],
+        EnemyKind::HellBaron => [Some((DecalKind::Scorch, 1.3)), Some((DecalKind::BloodCrimson, 1.0))],
+        EnemyKind::CarrierDaemon => [Some((DecalKind::Scorch, 1.6)), Some((DecalKind::BloodCrimson, 1.1))],
     }
 }
 
@@ -3230,5 +3477,143 @@ mod tests {
             let (ehi, elo) = (e.red.max(e.green).max(e.blue), e.red.min(e.green).min(e.blue));
             assert!((0.8..=8.0).contains(&ehi) && elo < ehi * 0.12, "channel-pure emissive, got {e:?}");
         }
+    }
+
+    // --- Milestone 17: procedural combat animation -------------------------
+
+    fn pose_ok(p: BodyPose) {
+        assert!(p.is_finite(), "{p:?}");
+        assert!(p.pitch.abs() <= MAX_BODY_TILT + 1e-5 && p.roll.abs() <= MAX_BODY_TILT + 1e-5, "{p:?}");
+        assert!(p.offset.abs().max_element() <= 0.4 + 1e-5, "{p:?}");
+    }
+
+    #[test]
+    fn pose_helpers_are_finite_and_bounded_for_every_kind() {
+        let dirs = [Vec2::X, Vec2::NEG_Y, Vec2::new(0.6, 0.8), Vec2::ZERO, Vec2::new(f32::NAN, 1.0)];
+        for kind in EnemyKind::ALL {
+            let mut e = Enemy::new(kind, 5);
+            for speed in [0.0f32, 1.0, 6.0, 40.0, f32::INFINITY] {
+                for phase in [0.0f32, 1.3, 7.7, 1e4] {
+                    pose_ok(stride_pose(Vec2::new(0.3, -1.0) * speed, e.move_speed(), phase).bounded());
+                    pose_ok(hover_pose(Vec2::new(1.0, 0.5) * speed, e.move_speed(), phase).bounded());
+                }
+            }
+            for a in [-1.0f32, 0.0, 0.01, 0.5, 0.9, 1.0, 2.0, f32::NAN] {
+                pose_ok(attack_pose(kind, a, true).bounded());
+                pose_ok(attack_pose(kind, a, false).bounded());
+            }
+            for d in dirs {
+                for t in [0.0f32, 0.01, 0.09, 0.18, 1.0, f32::NAN] {
+                    pose_ok(stagger_pose(kind, d, t).bounded());
+                }
+            }
+            // Everything at once, with nonsense velocities.
+            e.velocity = Vec3::new(1e6, -3.0, f32::NAN);
+            e.attack_anim = 1.0;
+            e.stagger(Vec3::new(1.0, 5.0, -1.0));
+            pose_ok(body_pose(&e, Quat::from_rotation_y(1.1)));
+            e.velocity = Vec3::new(4.0, 0.0, -3.0);
+            for _ in 0..40 {
+                tick_enemy_anim(&mut e, 1.0 / 60.0);
+                pose_ok(body_pose(&e, Quat::from_rotation_y(0.4)));
+            }
+            assert_eq!(e.attack_anim, 0.0);
+            assert_eq!(e.stagger_timer, 0.0);
+            assert!(e.stride_phase.is_finite() && (0.0..TAU).contains(&e.stride_phase));
+        }
+    }
+
+    #[test]
+    fn stagger_tips_body_along_the_hit_and_heavies_stagger_less() {
+        // Hit travelling local +Z (shot from the front): the top tips back (+pitch).
+        let peak = |kind: EnemyKind, dir: Vec2| {
+            let total = stagger_secs(kind);
+            (0..=40).map(|i| stagger_pose(kind, dir, total * (1.0 - i as f32 / 40.0))).fold(BodyPose::default(), |m, p| {
+                BodyPose { offset: m.offset, pitch: if p.pitch.abs() > m.pitch.abs() { p.pitch } else { m.pitch }, roll: if p.roll.abs() > m.roll.abs() { p.roll } else { m.roll } }
+            })
+        };
+        let back = peak(EnemyKind::Imp, Vec2::Y);
+        assert!(back.pitch > 0.2 && back.roll.abs() < 1e-6, "{back:?}");
+        // Hit travelling local +X: the top tips toward +X (negative roll about Z).
+        let side = peak(EnemyKind::Imp, Vec2::X);
+        assert!(side.roll < -0.2 && side.pitch.abs() < 1e-6, "{side:?}");
+        let imp = peak(EnemyKind::Imp, Vec2::Y).pitch;
+        let baron = peak(EnemyKind::HellBaron, Vec2::Y).pitch;
+        let boss = peak(EnemyKind::CarrierDaemon, Vec2::Y).pitch;
+        assert!(baron < imp * 0.6 && boss < baron, "imp {imp} baron {baron} boss {boss}");
+        assert!(stagger_secs(EnemyKind::HellBaron) < stagger_secs(EnemyKind::Imp));
+        assert!(stagger_secs(EnemyKind::CarrierDaemon) < stagger_secs(EnemyKind::HellBaron));
+        assert!((stagger_secs(EnemyKind::Imp) - STAGGER_SECS).abs() < 1e-6);
+        // Fast in, slow out: peak well before the midpoint.
+        let total = stagger_secs(EnemyKind::Imp);
+        let at = |u: f32| stagger_pose(EnemyKind::Imp, Vec2::Y, total * (1.0 - u)).pitch;
+        assert!(at(0.2) > at(0.6) && at(0.6) > at(0.95) && at(0.05) > 0.0);
+        // The world-space hit is rotated into the demon's local frame.
+        let mut e = Enemy::new(EnemyKind::Imp, 1);
+        e.stagger(Vec3::X * 3.0);
+        assert_eq!(e.stagger_dir, Vec2::X);
+        e.stagger_timer = total * 0.8;
+        let p = body_pose(&e, Quat::from_rotation_y(FRAC_PI_2));
+        // Facing rotated 90 deg about Y: world +X is local +Z -> pitch back.
+        assert!(p.pitch > 0.1 && p.roll.abs() < 0.08, "{p:?}");
+    }
+
+    #[test]
+    fn stagger_ignores_vertical_hits_and_corpses() {
+        let mut e = Enemy::new(EnemyKind::Imp, 1);
+        e.stagger(Vec3::Y);
+        assert_eq!(e.stagger_timer, 0.0);
+        e.hp = 0.0;
+        e.stagger(Vec3::X);
+        assert_eq!(e.stagger_timer, 0.0);
+    }
+
+    #[test]
+    fn stride_leans_into_the_run_and_hover_banks_into_velocity() {
+        let idle = stride_pose(Vec2::ZERO, 6.0, 1.0);
+        assert!(idle.pitch == 0.0 && idle.roll == 0.0 && idle.offset.y.abs() < 0.02);
+        let run = stride_pose(Vec2::new(0.0, -6.0), 6.0, FRAC_PI_2);
+        assert!(run.pitch < -0.05, "forward lean {run:?}");
+        assert!(run.offset.y > 0.06 && run.roll > 0.03, "stride bob / hip sway {run:?}");
+        // Bob scales with speed.
+        assert!(stride_pose(Vec2::new(0.0, -3.0), 6.0, FRAC_PI_2).offset.y < run.offset.y);
+        let right = hover_pose(Vec2::new(5.0, 0.0), 5.0, 0.0);
+        assert!(right.roll < -0.1, "banks into +X drift {right:?}");
+        let fwd = hover_pose(Vec2::new(0.0, -5.0), 5.0, 0.0);
+        assert!(fwd.pitch < -0.1, "dips into forward flight {fwd:?}");
+    }
+
+    #[test]
+    fn attack_pose_recoils_back_or_lunges_forward_and_rigs_kick() {
+        let shot = attack_pose(EnemyKind::Imp, 0.85, false);
+        assert!(shot.pitch > 0.1 && shot.offset.z > 0.03, "{shot:?}");
+        let lunge = attack_pose(EnemyKind::Imp, 0.85, true);
+        assert!(lunge.pitch < -0.1 && lunge.offset.z < -0.05, "{lunge:?}");
+        assert_eq!(attack_pose(EnemyKind::Imp, 0.0, false), BodyPose::default());
+        let mut e = Enemy::new(EnemyKind::RelaySniper, 3);
+        assert_eq!(rig_recoil(&e), 0.0);
+        e.trigger_attack_anim(false);
+        tick_enemy_anim(&mut e, 0.02);
+        let k0 = rig_recoil(&e);
+        assert!(k0 > 0.5, "snappy kick right after firing: {k0}");
+        for _ in 0..30 {
+            tick_enemy_anim(&mut e, 1.0 / 60.0);
+        }
+        assert_eq!(rig_recoil(&e), 0.0);
+        e.trigger_attack_anim(true);
+        assert_eq!(rig_recoil(&e), 0.0, "lunges never kick the cannon / dish rigs");
+    }
+
+    #[test]
+    fn death_gibs_and_decals_cover_every_archetype() {
+        for kind in EnemyKind::ALL {
+            let (mats, n) = death_gibs(kind);
+            assert!(!mats.is_empty() && (4..=16).contains(&n));
+            assert!(death_decals(kind, false)[0].is_some());
+            assert_eq!(death_decals(kind, true)[0].unwrap().0, crate::decals::DecalKind::Scorch);
+        }
+        assert_eq!(death_decals(EnemyKind::JammerFiend, false)[0].unwrap().0, crate::decals::DecalKind::IchorGreen);
+        assert_eq!(death_decals(EnemyKind::PhaseStalker, false)[0].unwrap().0, crate::decals::DecalKind::IchorViolet);
+        assert!(death_decals(EnemyKind::HellBaron, false)[1].is_some() && death_decals(EnemyKind::CarrierDaemon, false)[1].is_some());
     }
 }

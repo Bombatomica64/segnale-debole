@@ -663,6 +663,7 @@ pub fn carrier_daemon_system(
                         let other = if attack == BossAttack::EmpVolley { BossAttack::HellfireBarrage } else { BossAttack::EmpVolley };
                         fire_boss_attack(&mut commands, &fx, &e, st.phase, other, core + Vec3::Y * 0.6, chest);
                     }
+                    e.trigger_attack_anim(false);
                     sfx.play(SfxEvent::EnemyFire);
                     st.next_attack = if st.next_attack == BossAttack::HellfireBarrage { BossAttack::EmpVolley } else { BossAttack::HellfireBarrage };
                 }

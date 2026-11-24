@@ -5,6 +5,7 @@ pub mod architecture;
 pub mod assets_gen;
 pub mod audio;
 pub mod boss;
+pub mod decals;
 pub mod bot_input;
 pub mod dev;
 pub mod enemies;
@@ -64,7 +65,8 @@ impl Plugin for CoreGameplayPlugin {
                 meta::MetaPlugin,
                 perf::PerfPlugin,
             ))
-            .add_plugins(boss::BossPlugin);
+            .add_plugins(boss::BossPlugin)
+            .add_plugins(decals::DecalsPlugin);
     }
 }
 

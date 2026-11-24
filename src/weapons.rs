@@ -19,11 +19,12 @@ use crate::apps::{spawn_hijack_hotspot, PhoneApps};
 use crate::assets_gen::{engraved_gold_texture, gunmetal_plate_texture, hazard_stripe_texture, obsidian_tech_texture, wood_grain_texture};
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::BotControl;
+use crate::decals::{DecalKind, DecalQueue, DecalRequest};
 use crate::boss::{damage_pylon, pylon_ray_hit, BossPylon, PYLON_SPHERES};
 use crate::enemies::{damage_enemy, ray_sphere, Enemy, EnemyKind, PingMarked};
 use crate::fx::{
-    additive_glow, overlay_layer, spawn_burst, spawn_ejected_shell, spawn_flash_light, spawn_particles, spawn_shockwave, spawn_tracer, BurstColor,
-    FxAssets, HudFeed, OVERLAY_LAYER,
+    additive_glow, overlay_layer, spawn_burst, spawn_ejected_shell, spawn_flash_light, spawn_mortar_casing, spawn_particles, spawn_plasma_vent,
+    spawn_shockwave, spawn_tracer, BurstColor, FxAssets, HudFeed, OVERLAY_LAYER,
 };
 use crate::hud::signal_color;
 use crate::level::{Cell, CullableLight, DemonJammer, ExplosiveBarrel, JammerCore, LevelEntity, LevelGrid};
@@ -34,7 +35,7 @@ use crate::physics::{has_line_of_sight, raycast_grid};
 use crate::sculpt;
 use crate::player::{live_eye_pose, smooth_factor, CursorCaptured, Player, PlayerCamera, AIR_SPEED_HARD_CAP};
 use crate::signal::{overclock_factor, SignalState};
-use crate::state::{GameSet, PlayerModifiers, RunStats};
+use crate::state::{AppState, GameSet, PlayerModifiers, RunStats};
 
 pub const SHOTGUN_COOLDOWN: f32 = 0.65;
 pub const PLASMA_COOLDOWN: f32 = 0.14;
@@ -175,6 +176,10 @@ pub struct WeaponState {
     pub muzzle_roll: f32,
     /// Dev/screenshot hook: fire once regardless of input.
     pub force_fire: bool,
+    /// Remaining `F` inspect flourish (purely visual; 0 = off).
+    pub inspect_timer: f32,
+    /// Cant direction of the current swap (+1 toward `next()`, -1 toward `prev()`).
+    pub swap_dir: f32,
 }
 
 impl WeaponState {
@@ -187,6 +192,8 @@ impl WeaponState {
         if w == self.current {
             return false;
         }
+        self.swap_dir = if w == self.current.next() { 1.0 } else { -1.0 };
+        self.inspect_timer = 0.0;
         // Mid-swap re-targets keep lowering whatever is actually on screen
         // without popping back to the raised pose.
         self.previous = self.displayed();
@@ -941,6 +948,10 @@ const ROCKET_GLOW: LinearRgba = LinearRgba::rgb(2.0, 0.62, 0.03);
 pub const MUZZLE_DEPTH: f32 = 0.85;
 /// Shotgun right-side ejection port, local to the gun model.
 pub const SHOTGUN_PORT_LOCAL: Vec3 = Vec3::new(0.036, 0.014, -0.045);
+/// Plasma Repeater cooling vent (viewmodel local, relative to `WEAPON_REST`).
+pub const PLASMA_VENT_LOCAL: Vec3 = Vec3::new(0.0, 0.09, -0.12);
+/// Signal-Mortar breech ejection port (viewmodel local, relative to `WEAPON_REST`).
+pub const MORTAR_PORT_LOCAL: Vec3 = Vec3::new(0.05, 0.07, -0.03);
 
 /// Barrel tip of each gun viewmodel, local to its [`GunModel`] (where its flash sits).
 pub fn viewmodel_muzzle_local(w: Weapon) -> Vec3 {
@@ -1738,6 +1749,101 @@ fn sync_overlay_fov(main: Query<&Projection, (With<PlayerCamera>, Without<Overla
     }
 }
 
+/// Duration of the `F` weapon inspect flourish.
+pub const INSPECT_SECS: f32 = 1.1;
+/// Deepest landing dip of the viewmodel (meters, downward).
+pub const LANDING_DIP_MAX: f32 = 0.045;
+/// Landing dip spring stiffness (1/s^2) and damping ratio.
+const DIP_STIFFNESS: f32 = 240.0;
+const DIP_DAMPING_RATIO: f32 = 0.55;
+
+/// Spring-damped viewmodel landing dip + touchdown tracking.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct ViewmodelFeel {
+    /// Vertical dip offset (<= 0 while dipping).
+    pub dip: f32,
+    pub dip_vel: f32,
+    pub was_grounded: bool,
+    /// Most negative vertical speed of the current airtime.
+    pub air_vy: f32,
+}
+
+impl ViewmodelFeel {
+    /// Track grounded transitions and integrate the dip spring for one frame.
+    pub fn update(&mut self, grounded: bool, vy: f32, dt: f32) {
+        if !grounded {
+            self.air_vy = self.air_vy.min(vy);
+        } else if !self.was_grounded {
+            self.dip_vel -= landing_dip_impulse(-self.air_vy);
+            self.air_vy = 0.0;
+        }
+        if grounded {
+            self.air_vy = 0.0;
+        }
+        self.was_grounded = grounded;
+        (self.dip, self.dip_vel) = dip_spring_step(self.dip, self.dip_vel, dt);
+    }
+}
+
+/// Downward velocity kick of the viewmodel for a touchdown at `impact_speed`
+/// (m/s, positive down): nothing for tiny steps, capped for huge falls.
+pub fn landing_dip_impulse(impact_speed: f32) -> f32 {
+    if !impact_speed.is_finite() || impact_speed <= 2.0 { 0.0 } else { ((impact_speed - 2.0) * 0.05).min(0.65) }
+}
+
+/// One semi-implicit, sub-stepped step of the underdamped dip spring
+/// (target 0); the offset is clamped to `[-LANDING_DIP_MAX, LANDING_DIP_MAX * 0.4]`.
+pub fn dip_spring_step(x: f32, v: f32, dt: f32) -> (f32, f32) {
+    let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+    let (mut x, mut v) = (if x.is_finite() { x } else { 0.0 }, if v.is_finite() { v } else { 0.0 });
+    let c = 2.0 * DIP_STIFFNESS.sqrt() * DIP_DAMPING_RATIO;
+    let n = ((dt / (1.0 / 240.0)).ceil() as usize).max(1);
+    let h = dt / n as f32;
+    for _ in 0..n {
+        v += (-DIP_STIFFNESS * x - c * v) * h;
+        x += v * h;
+        let lo = -LANDING_DIP_MAX;
+        let hi = LANDING_DIP_MAX * 0.4;
+        if x < lo || x > hi {
+            x = x.clamp(lo, hi);
+            v = 0.0;
+        }
+    }
+    (x, v)
+}
+
+/// Extra roll (cant) of the viewmodel during a swap: swings toward the
+/// direction of travel through the deck, peaking mid-swap.
+pub fn swap_cant(swap_timer: f32, dir: f32) -> f32 {
+    if swap_timer <= 0.0 || !swap_timer.is_finite() {
+        return 0.0;
+    }
+    let u = (1.0 - swap_timer / SWAP_SECS).clamp(0.0, 1.0);
+    (u * PI).sin() * 0.34 * dir.clamp(-1.0, 1.0)
+}
+
+/// Inspect flourish pose `(offset, rotation)` for the remaining `timer`:
+/// eases in, tilts and turns the gun to show its side, then eases back.
+pub fn inspect_pose(timer: f32) -> (Vec3, Quat) {
+    if timer <= 0.0 || !timer.is_finite() {
+        return (Vec3::ZERO, Quat::IDENTITY);
+    }
+    let u = (1.0 - timer / INSPECT_SECS).clamp(0.0, 1.0);
+    let smooth = |k: f32| {
+        let k = k.clamp(0.0, 1.0);
+        k * k * (3.0 - 2.0 * k)
+    };
+    let env = smooth(u / 0.25) * smooth((1.0 - u) / 0.25);
+    let yaw = env * (0.95 + 0.12 * (u * TAU).sin());
+    let roll = env * (0.42 + 0.1 * (u * PI * 3.0).sin());
+    let pitch = env * 0.16;
+    (Vec3::new(-0.075, 0.035, 0.025) * env, Quat::from_rotation_y(yaw) * Quat::from_rotation_z(roll) * Quat::from_rotation_x(pitch))
+}
+
+fn cancel_inspect(mut ws: ResMut<WeaponState>) {
+    ws.inspect_timer = 0.0;
+}
+
 /// Damping rate (1/s) of the viewmodel walk-bob amplitude.
 const VIEWMODEL_BOB_RATE: f32 = 8.0;
 
@@ -1755,6 +1861,7 @@ pub fn damp_bob_amp(current: f32, target: f32, dt: f32) -> f32 {
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn animate_viewmodels(
     mut bob_amp: Local<f32>,
+    mut feel: ResMut<ViewmodelFeel>,
     time: Res<Time>,
     ws: Res<WeaponState>,
     apps: Res<PhoneApps>,
@@ -1780,6 +1887,7 @@ fn animate_viewmodels(
     let t = time.elapsed_secs();
     let speed = Vec2::new(p.velocity.x, p.velocity.z).length();
     *bob_amp = damp_bob_amp(*bob_amp, viewmodel_bob_target(p.grounded, speed), time.delta_secs());
+    feel.update(p.grounded, p.velocity.y, time.delta_secs());
     let amp = *bob_amp;
     let bob = Vec3::new((p.bob_phase * 0.5).cos() * 0.011 * amp, -(p.bob_phase.sin().abs()) * 0.013 * amp, 0.0)
         + Vec3::new(0.0, (t * 1.6).sin() * 0.0025, 0.0);
@@ -1799,12 +1907,17 @@ fn animate_viewmodels(
             }
             _ => (kick * 0.095, kick * 0.022, kick * 0.36, 0.0),
         };
-        tf.translation = WEAPON_REST + bob + Vec3::new(0.0, -0.3 * swap + lift, back);
-        tf.rotation = Quat::from_rotation_x(pitch - swap * 0.6) * Quat::from_rotation_z(-swap * 0.3 - roll);
+        let (insp_off, insp_rot) = inspect_pose(ws.inspect_timer);
+        let cant = swap_cant(ws.swap_timer, ws.swap_dir);
+        tf.translation = WEAPON_REST + bob + Vec3::new(0.0, -0.3 * swap + lift + feel.dip, back) + insp_off;
+        tf.rotation = Quat::from_rotation_x(pitch - swap * 0.6 + feel.dip * 1.6)
+            * Quat::from_rotation_z(-swap * 0.3 - roll - cant)
+            * Quat::from_rotation_y(cant * 0.35)
+            * insp_rot;
     }
     let cast = apps.cast_anim.clamp(0.0, 1.0);
     if let Ok(mut tf) = set.p1().single_mut() {
-        tf.translation = PHONE_REST + bob * 0.55 + Vec3::new(0.045 * cast, 0.055 * cast, 0.03 * cast);
+        tf.translation = PHONE_REST + bob * 0.55 + Vec3::new(0.045 * cast, 0.055 * cast + feel.dip * 0.7, 0.03 * cast);
         tf.rotation = Quat::from_rotation_y(0.24 + 0.10 * cast) * Quat::from_rotation_x(0.11 + 0.18 * cast) * Quat::from_rotation_z(-0.04);
     }
     if let Ok(mut tf) = set.p2().single_mut() {
@@ -2012,7 +2125,7 @@ fn fire_weapons(
     signal: Res<SignalState>,
     mut ws: ResMut<WeaponState>,
     (fx, bolts, rockets): (Res<FxAssets>, Res<BoltAssets>, Res<RocketAssets>),
-    (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
+    (mut sfx, mut feed, mut decals): (ResMut<SfxQueue>, ResMut<HudFeed>, ResMut<DecalQueue>),
     cams: Query<&Transform, With<PlayerCamera>>,
     mut players: Query<(&mut Player, &Transform), Without<PlayerCamera>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
@@ -2034,6 +2147,7 @@ fn fire_weapons(
     ws.swap_timer = (ws.swap_timer - dt).max(0.0);
     ws.recoil = (ws.recoil - dt * 5.0).max(0.0);
     ws.muzzle = (ws.muzzle - dt).max(0.0);
+    ws.inspect_timer = (ws.inspect_timer - dt).max(0.0);
     if ws.pump > 0.0 {
         ws.pump = (ws.pump - dt / 0.35).max(0.0);
     }
@@ -2072,6 +2186,12 @@ fn fire_weapons(
 
     let bot_fire = bot.as_ref().is_some_and(|b| b.fire);
     let trigger = (captured.0 && mouse.pressed(MouseButton::Left)) || ws.force_fire || bot_fire;
+    // `F` inspect flourish (purely visual): pulling the trigger cancels it at once.
+    if trigger {
+        ws.inspect_timer = 0.0;
+    } else if keys.just_pressed(KeyCode::KeyF) && ws.swap_timer <= 0.0 {
+        ws.inspect_timer = INSPECT_SECS;
+    }
     if !trigger || ws.cooldown > 0.0 || ws.swap_timer > SWAP_SECS * 0.4 {
         return;
     }
@@ -2123,6 +2243,7 @@ fn fire_weapons(
             // Exactly at the viewmodel's right-side ejection port.
             let breach = origin + rot * (WEAPON_REST + SHOTGUN_PORT_LOCAL);
             spawn_ejected_shell(&mut commands, &fx, breach, right_dir, up_dir, fwd);
+            let mut wall_decals = 0;
             spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 2, 1.2, 0.06);
             let mut rng = rand::rng();
             let pellets = SHOTGUN_PELLETS + mods.extra_pellets;
@@ -2169,6 +2290,13 @@ fn fire_weapons(
                     }
                     HitTarget::Wall => {
                         spawn_particles(&mut commands, &fx, hit - dir * 0.05, BurstColor::Spark, 3, 3.8, 0.055);
+                        // Up to two small pellet scorch marks per blast so blood & craters linger longer.
+                        if wall_decals < 2
+                            && let Some(h) = raycast_grid(&grid, origin, dir, dist + 0.1)
+                        {
+                            decals.push(DecalRequest::surface(DecalKind::Scorch, h.point, h.normal, 0.2));
+                            wall_decals += 1;
+                        }
                         if wall_sparks % 3 == 0 {
                             spawn_particles(&mut commands, &fx, hit - dir * 0.06, BurstColor::Smoke, 1, 0.8, 0.09);
                         }
@@ -2179,11 +2307,19 @@ fn fire_weapons(
             }
             let _ = wall_sparks;
             let mut any_hit = false;
-            for (idx, (mut e, _, marked)) in enemies.iter_mut().enumerate() {
+            for (idx, (mut e, g, marked)) in enemies.iter_mut().enumerate() {
                 if enemy_dmg[idx] > 0.0 {
                     let kb = enemy_kb[idx] * knockback_scale(e.kind);
                     damage_enemy(&mut e, enemy_dmg[idx], marked.is_some(), &mods);
                     e.knockback += Vec3::new(kb.x, 0.0, kb.z) * 3.0;
+                    e.stagger(enemy_kb[idx]);
+                    // Heavy close-range blast: a subtle splatter on the floor beneath.
+                    let root = g.translation();
+                    if enemy_dmg[idx] >= PELLET_DAMAGE * 5.0 && root.distance(origin) < 7.0 {
+                        let kind = crate::enemies::death_decals(e.kind, false)[0].map_or(DecalKind::BloodCrimson, |d| d.0);
+                        let feet = root - Vec3::Y * if e.kind.flying() { 2.0 } else { 0.0 };
+                        decals.push(DecalRequest::floor(kind, feet + Vec3::new(fwd.x, 0.0, fwd.z) * 0.6, 0.7));
+                    }
                     any_hit = true;
                 }
             }
@@ -2229,6 +2365,8 @@ fn fire_weapons(
             ws.recoil = 0.35;
             ws.muzzle = 0.04;
             sfx.play(SfxEvent::Plasma);
+            // Hot cyan vent sparks from the cooling port on top of the receiver.
+            spawn_plasma_vent(&mut commands, &fx, origin + rot * (WEAPON_REST + PLASMA_VENT_LOCAL), rot * Vec3::Y, rot * Vec3::X);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(0.3, 0.9, 1.0), 250_000.0, 7.0, 0.05);
             // Converge the bolt onto whatever the crosshair points at.
             let (dist, _) = resolve_hitscan_all(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list, pyl_list);
@@ -2257,6 +2395,7 @@ fn fire_weapons(
             sfx.play(SfxEvent::RocketFire);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(1.0, 0.55, 0.15), 600_000.0, 10.0, 0.09);
             spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 3, 1.4, 0.08);
+            spawn_mortar_casing(&mut commands, &fx, origin + rot * (WEAPON_REST + MORTAR_PORT_LOCAL), rot * Vec3::X, rot * Vec3::Y, fwd);
             let (dist, _) = resolve_hitscan_all(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list, pyl_list);
             let (start, dir) = rocket_launch(&grid, origin, fwd, muzzle, dist);
             spawn_rocket(&mut commands, &rockets, start, dir, player.velocity, dmult);
@@ -2280,6 +2419,7 @@ fn move_player_projectiles(
     mut barrels: Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
     mut players: Query<(&mut Player, &Transform)>,
     mut pylons: Query<(&mut BossPylon, &GlobalTransform)>,
+    mut decals: ResMut<DecalQueue>,
 ) {
     let dt = time.delta_secs().min(1.0 / 20.0);
     for (e, mut b, mut tf) in &mut bolts {
@@ -2289,8 +2429,10 @@ fn move_player_projectiles(
         let len = step.length();
         let dir = step / len.max(1e-6);
         let mut best = (len, HitTarget::Nothing);
+        let mut wall_normal = None;
         if let Some(h) = raycast_grid(&grid, from, dir, len) {
             best = (h.distance, HitTarget::Wall);
+            wall_normal = Some(h.normal);
         }
         for (i, (en, g, _)) in enemies.iter().enumerate() {
             if en.is_alive()
@@ -2354,6 +2496,8 @@ fn move_player_projectiles(
                 &mut barrels,
                 &mut pylons,
                 &mut players,
+                &mut decals,
+                wall_normal.filter(|_| best.1 == HitTarget::Wall),
             );
             if any_hit {
                 feed.hit(false);
@@ -2377,6 +2521,7 @@ fn move_player_projectiles(
                     let kb = dir * 1.5 * knockback_scale(en.kind);
                     damage_enemy(&mut en, damage, marked.is_some(), &mods);
                     en.knockback += Vec3::new(kb.x, 0.0, kb.z);
+                    en.stagger(dir);
                     feed.hit(false);
                     sfx.play(SfxEvent::Hit);
                 }
@@ -2400,7 +2545,11 @@ fn move_player_projectiles(
                     sfx.play(SfxEvent::Hit);
                 }
             }
-            HitTarget::Wall => {}
+            HitTarget::Wall => {
+                if let Some(n) = wall_normal {
+                    decals.push(DecalRequest::surface(DecalKind::PlasmaBurn, hit, n, 0.42));
+                }
+            }
         }
         spawn_burst(&mut commands, &fx, hit - dir * 0.1, BurstColor::Cyan, 7, 4.8, 0.065);
         spawn_shockwave(&mut commands, &fx, &mut materials, hit - dir * 0.12, 0.85, 0.18, BOLT_IMPACT_GLOW.0, BOLT_IMPACT_GLOW.1, false);
@@ -2428,8 +2577,15 @@ fn detonate_rocket(
     barrels: &mut Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
     pylons: &mut Query<(&mut BossPylon, &GlobalTransform)>,
     players: &mut Query<(&mut Player, &Transform)>,
+    decals: &mut DecalQueue,
+    wall_normal: Option<Vec3>,
 ) -> bool {
     let radius = rocket_splash_radius(mods);
+    // Charred scorch on the impact wall and / or the floor under the blast.
+    if let Some(n) = wall_normal.filter(|n| n.y <= 0.7) {
+        decals.push(DecalRequest::surface(DecalKind::Scorch, blast + dir * 0.08, n, 1.5));
+    }
+    decals.push(DecalRequest::floor(DecalKind::Scorch, blast, 2.2));
     for (i, (mut b, g)) in barrels.iter_mut().enumerate() {
         if !b.is_intact() {
             continue;
@@ -2466,6 +2622,7 @@ fn detonate_rocket(
         let kb = 14.0 * falloff * knockback_scale(en.kind);
         damage_enemy(&mut en, dmg, marked.is_some(), mods);
         en.knockback += Vec3::new(away.x * kb, kb * 0.15, away.y * kb);
+        en.stagger(Vec3::new(away.x, 0.0, away.y));
         any_hit = true;
     }
     for (i, (mut j, g)) in jammers.iter_mut().enumerate() {
@@ -2576,7 +2733,7 @@ fn barrel_detonations(
     mods: Res<PlayerModifiers>,
     fx: Res<FxAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
+    (mut sfx, mut feed, mut decals): (ResMut<SfxQueue>, ResMut<HudFeed>, ResMut<DecalQueue>),
     mut barrels: Query<(Entity, &mut ExplosiveBarrel, &GlobalTransform, &mut Transform), Without<Player>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     (mut jammers, mut pylons): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut BossPylon, &GlobalTransform)>),
@@ -2623,6 +2780,7 @@ fn barrel_detonations(
             let kb = 16.0 * falloff * knockback_scale(en.kind);
             damage_enemy(&mut en, barrel_blast_damage(d), marked.is_some(), &mods);
             en.knockback += Vec3::new(away.x * kb, kb * 0.2, away.y * kb);
+            en.stagger(Vec3::new(away.x, 0.0, away.y));
             any_hit = true;
         }
         for (mut j, g) in &mut jammers {
@@ -2658,6 +2816,7 @@ fn barrel_detonations(
         {
             apply_rocket_jump(&mut p, &jump);
         }
+        decals.push(DecalRequest::floor(DecalKind::Scorch, blast - Vec3::Y * BARREL_CENTER_Y, 2.8));
         spawn_flash_light(&mut commands, blast, Color::srgb(1.0, 0.42, 0.12), 3_200_000.0, 18.0, 0.32);
         spawn_shockwave(&mut commands, &fx, &mut materials, blast, BARREL_BLAST_RADIUS * 0.9, 0.36, BARREL_BLAST_GLOW.0, BARREL_BLAST_GLOW.1, true);
         spawn_shockwave(&mut commands, &fx, &mut materials, blast, BARREL_BLAST_RADIUS * 0.45, 0.22, ROCKET_CORE_GLOW.0, ROCKET_CORE_GLOW.1, false);
@@ -2685,15 +2844,21 @@ fn prewarm_weapon_fades(fx: Res<FxAssets>, mut materials: ResMut<Assets<Standard
     fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW, ROCKET_BLAST_GLOW, ROCKET_CORE_GLOW, BARREL_BLAST_GLOW]);
 }
 
+fn reset_viewmodel_feel(mut feel: ResMut<ViewmodelFeel>) {
+    *feel = ViewmodelFeel { was_grounded: true, ..default() };
+}
+
 pub struct WeaponsPlugin;
 
 impl Plugin for WeaponsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WeaponState>()
+            .init_resource::<ViewmodelFeel>()
+            .add_systems(OnExit(AppState::Playing), cancel_inspect)
             .configure_sets(Update, CombatDamage.in_set(GameSet::Combat))
             .add_systems(Startup, (create_pickup_assets, create_bolt_assets, create_rocket_assets, prewarm_weapon_fades))
             .add_systems(Update, spawn_viewmodels)
-            .add_systems(Update, (spawn_floor_pickups.run_if(resource_exists_and_changed::<LevelGrid>)).in_set(GameSet::World))
+            .add_systems(Update, (spawn_floor_pickups, reset_viewmodel_feel).run_if(resource_exists_and_changed::<LevelGrid>).in_set(GameSet::World))
             .add_systems(
                 Update,
                 (fire_weapons, move_player_projectiles).chain().in_set(CombatDamage).run_if(resource_exists::<LevelGrid>),
@@ -3173,5 +3338,62 @@ mod tests {
         let rj = compute_rocket_jump(feet, Vec3::new(0.0, 0.0, 0.0), ROCKET_SPLASH_RADIUS, &m).unwrap();
         let f = splash_falloff(0.9, ROCKET_SPLASH_RADIUS);
         assert!((rj.self_damage - ROCKET_SPLASH_DAMAGE * f * ROCKET_SELF_DAMAGE_FRAC).abs() < 1e-4);
+    }
+
+
+    #[test]
+    fn landing_dip_is_spring_damped_and_capped() {
+        assert_eq!(landing_dip_impulse(1.0), 0.0, "tiny steps do not dip");
+        assert_eq!(landing_dip_impulse(f32::NAN), 0.0);
+        assert!(landing_dip_impulse(12.0) > landing_dip_impulse(6.0));
+        assert_eq!(landing_dip_impulse(500.0), landing_dip_impulse(1000.0), "capped");
+        for impact in [6.0f32, 8.0, 20.0, 80.0, 1e6] {
+            let mut f = ViewmodelFeel { was_grounded: false, ..default() };
+            f.update(false, -impact, 1.0 / 60.0);
+            let mut lowest: f32 = 0.0;
+            for i in 0..120 {
+                f.update(true, 0.0, 1.0 / 60.0);
+                assert!(f.dip.is_finite() && f.dip >= -LANDING_DIP_MAX - 1e-6 && f.dip <= LANDING_DIP_MAX * 0.4 + 1e-6, "{f:?}");
+                lowest = lowest.min(f.dip);
+                if i == 119 {
+                    assert!(f.dip.abs() < 2e-3, "settles back: {f:?}");
+                }
+            }
+            assert!(lowest < -0.004, "impact {impact} dipped only {lowest}");
+        }
+        // A bhop chain (one grounded frame per hop) stays bounded.
+        let mut f = ViewmodelFeel::default();
+        for hop in 0..60 {
+            f.update(hop % 20 == 0, if hop % 20 == 0 { 0.0 } else { -9.0 }, 1.0 / 60.0);
+            assert!(f.dip >= -LANDING_DIP_MAX - 1e-6);
+        }
+        assert_eq!(dip_spring_step(f32::NAN, f32::INFINITY, 1.0 / 60.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn inspect_and_swap_cant_poses_are_bounded_and_rest_at_the_ends() {
+        assert_eq!(inspect_pose(0.0), (Vec3::ZERO, Quat::IDENTITY));
+        let (o, r) = inspect_pose(INSPECT_SECS);
+        assert!(o.length() < 1e-4 && r.angle_between(Quat::IDENTITY) < 1e-3, "starts from rest");
+        let (o, r) = inspect_pose(INSPECT_SECS * 0.5);
+        assert!(r.angle_between(Quat::IDENTITY) > 0.8 && o.length() < 0.12, "showcases mid-way");
+        for i in 0..=50 {
+            let (o, r) = inspect_pose(INSPECT_SECS * i as f32 / 50.0);
+            assert!(o.is_finite() && r.is_finite() && r.angle_between(Quat::IDENTITY) < 1.6);
+        }
+        assert_eq!(swap_cant(0.0, 1.0), 0.0);
+        assert!(swap_cant(SWAP_SECS * 0.5, 1.0) > 0.3 && swap_cant(SWAP_SECS * 0.5, -1.0) < -0.3);
+        assert!(swap_cant(SWAP_SECS, 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn swapping_cancels_inspect_and_sets_cant_direction() {
+        let mut ws = WeaponState { inspect_timer: INSPECT_SECS, ..default() };
+        assert!(ws.switch_to(Weapon::Plasma));
+        assert_eq!(ws.inspect_timer, 0.0);
+        assert_eq!(ws.swap_dir, 1.0);
+        ws.swap_timer = 0.0;
+        assert!(ws.switch_to(Weapon::Shotgun));
+        assert_eq!(ws.swap_dir, -1.0);
     }
 }

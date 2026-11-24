@@ -151,6 +151,15 @@ pub struct FxAssets {
     pub beam: Handle<Mesh>,
     pub ring: Handle<Mesh>,
     pub shell_cyl: Handle<Mesh>,
+    /// Chunky faceted brass Signal-Mortar sleeve (sculpted, shared).
+    pub mortar_sleeve: Handle<Mesh>,
+    /// Sculpted faceted death gibs (unit-ish scale; see [`spawn_death_gibs`]).
+    pub gib_chunk: Handle<Mesh>,
+    pub gib_horn: Handle<Mesh>,
+    pub gib_plate: Handle<Mesh>,
+    pub gib_shard: Handle<Mesh>,
+    /// Shared gib materials (indexed by [`GibMat`]).
+    pub gib_mats: [Handle<StandardMaterial>; GIB_MAT_COUNT],
     /// Missed Call decoy handset (shared by every decoy).
     pub decoy_body: Handle<StandardMaterial>,
     pub decoy_screen_amber: Handle<StandardMaterial>,
@@ -158,6 +167,41 @@ pub struct FxAssets {
     pub decoy_ring: Handle<StandardMaterial>,
     /// Shared fade palettes (see [`FxAssets::fade_palette`]).
     pub fades: Arc<Mutex<FadeCache>>,
+}
+
+/// Shared death-gib material slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GibMat {
+    Flesh,
+    Bone,
+    DarkMetal,
+    FiendGreen,
+    VioletObsidian,
+    MoltenGold,
+}
+
+pub const GIB_MAT_COUNT: usize = 6;
+
+impl GibMat {
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Sculpted gib mesh builders `(chunk, horn, plate, shard)`: every one is a
+/// `TriangleList` with `{POSITION, NORMAL, UV_0}` and `Indices::U32`.
+pub fn gib_meshes() -> [Mesh; 4] {
+    [
+        crate::sculpt::ridged_sphere(Vec3::new(1.0, 0.78, 0.9), 4, 6, 0.14, 3.0, true),
+        crate::sculpt::curved_horn(0.32, 0.04, 1.7, 0.55, 0.2, 4, 5),
+        crate::sculpt::wedge_plate(1.4, 0.32, 1.0, 0.7, 0.8, 0.12),
+        crate::sculpt::tapered_prism(4, 0.42, 0.05, 1.6, true),
+    ]
+}
+
+/// Faceted brass mortar sleeve (shared by every ejected Signal-Mortar casing).
+pub fn mortar_sleeve_mesh() -> Mesh {
+    crate::sculpt::tapered_prism(8, 0.034, 0.03, 0.115, true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +290,7 @@ pub fn additive_glow(color: Color, alpha: f32) -> StandardMaterial {
 }
 
 fn create_fx_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
+    let [gib_chunk, gib_horn, gib_plate, gib_shard] = gib_meshes();
     commands.insert_resource(FxAssets {
         spark: materials.add(glow(Color::srgb(1.0, 0.9, 0.5), LinearRgba::rgb(10.0, 6.5, 2.0))),
         fire: materials.add(glow(Color::srgb(1.0, 0.48, 0.12), LinearRgba::rgb(12.0, 3.6, 0.4))),
@@ -278,6 +323,42 @@ fn create_fx_assets(mut commands: Commands, mut materials: ResMut<Assets<Standar
         beam: meshes.add(Cylinder::new(1.0, 1.0)),
         ring: meshes.add(Torus::new(0.94, 1.0)),
         shell_cyl: meshes.add(Cylinder::new(0.014, 0.055)),
+        mortar_sleeve: meshes.add(mortar_sleeve_mesh()),
+        gib_chunk: meshes.add(gib_chunk),
+        gib_horn: meshes.add(gib_horn),
+        gib_plate: meshes.add(gib_plate),
+        gib_shard: meshes.add(gib_shard),
+        gib_mats: [
+            // Flesh / gore: wet dark crimson.
+            materials.add(StandardMaterial { base_color: Color::srgb(0.38, 0.03, 0.03), perceptual_roughness: 0.28, reflectance: 0.6, ..default() }),
+            // Bone.
+            materials.add(StandardMaterial { base_color: Color::srgb(0.82, 0.76, 0.62), perceptual_roughness: 0.6, ..default() }),
+            // Dark metal.
+            materials.add(StandardMaterial { base_color: Color::srgb(0.12, 0.13, 0.15), metallic: 0.85, perceptual_roughness: 0.38, ..default() }),
+            // Fiend green (faint toxic glow).
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(0.22, 0.55, 0.1),
+                emissive: LinearRgba::rgb(0.12, 0.6, 0.05),
+                perceptual_roughness: 0.4,
+                ..default()
+            }),
+            // Violet obsidian.
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(0.18, 0.05, 0.26),
+                emissive: LinearRgba::rgb(0.35, 0.04, 0.5),
+                metallic: 0.4,
+                perceptual_roughness: 0.22,
+                ..default()
+            }),
+            // Molten gold.
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(0.95, 0.66, 0.18),
+                emissive: LinearRgba::rgb(1.4, 0.55, 0.06),
+                metallic: 0.9,
+                perceptual_roughness: 0.3,
+                ..default()
+            }),
+        ],
         decoy_body: materials.add(StandardMaterial { base_color: Color::srgb(0.05, 0.06, 0.07), perceptual_roughness: 0.35, metallic: 0.6, ..default() }),
         decoy_screen_amber: materials.add(StandardMaterial {
             base_color: Color::srgb(1.0, 0.7, 0.15),
@@ -409,6 +490,128 @@ pub fn spawn_ejected_shell(commands: &mut Commands, fx: &FxAssets, pos: Vec3, ri
         MeshMaterial3d(fx.shell_brass.clone()),
         Transform::from_xyz(0.0, -0.022, 0.0).with_scale(Vec3::new(1.08, 0.36, 1.08)),
     ));
+}
+
+/// Chunky spinning brass Signal-Mortar sleeve kicked out of the breech on fire.
+pub fn spawn_mortar_casing(commands: &mut Commands, fx: &FxAssets, pos: Vec3, right: Vec3, up: Vec3, fwd: Vec3) {
+    let mut rng = rand::rng();
+    let vel = right * rng.random_range(1.8..2.6) + up * rng.random_range(2.2..3.0) - fwd * rng.random_range(0.6..1.2);
+    let spin = Vec3::new(rng.random_range(-9.0..9.0), rng.random_range(-6.0..6.0), rng.random_range(-14.0..-7.0));
+    commands.spawn((
+        LevelEntity,
+        Fx::new(1.6, FxMotion::Debris { vel, spin, gravity: 15.0, bounce: 0.32 }, Vec3::ONE),
+        Mesh3d(fx.mortar_sleeve.clone()),
+        MeshMaterial3d(fx.shell_brass.clone()),
+        Transform::from_translation(pos).with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+    ));
+}
+
+/// Subtle hot cyan vent sparks puffed from the Plasma Repeater's cooling port.
+pub fn spawn_plasma_vent(commands: &mut Commands, fx: &FxAssets, pos: Vec3, up: Vec3, right: Vec3) {
+    let mut rng = rand::rng();
+    for _ in 0..2 {
+        let vel = up * rng.random_range(0.9..1.6) + right * rng.random_range(-0.4..0.6);
+        let s = rng.random_range(0.006..0.011);
+        let scale = Vec3::new(s * 0.5, s * 1.8, s * 0.5);
+        commands.spawn((
+            LevelEntity,
+            Fx::new(rng.random_range(0.12..0.22), FxMotion::Particle { vel, gravity: -1.5 }, scale),
+            Mesh3d(fx.cube.clone()),
+            MeshMaterial3d(fx.cyan.clone()),
+            Transform::from_translation(pos).with_scale(scale),
+        ));
+    }
+}
+
+/// Burst of chunky sculpted spinning gibs (archetype-flavored by `mats`, cycled
+/// per piece). Every gib is a bouncing [`FxMotion::Debris`] particle, so the
+/// [`MAX_FX_PARTICLES`] cap bounds them like every other transient particle.
+pub fn spawn_death_gibs(commands: &mut Commands, fx: &FxAssets, center: Vec3, mats: &[GibMat], count: u32, size: f32, speed: f32) {
+    if mats.is_empty() {
+        return;
+    }
+    let mut rng = rand::rng();
+    let meshes = [&fx.gib_chunk, &fx.gib_horn, &fx.gib_plate, &fx.gib_shard];
+    for i in 0..count as usize {
+        let dir = Vec3::new(rng.random_range(-1.0..1.0), rng.random_range(0.1..1.0), rng.random_range(-1.0..1.0)).normalize_or(Vec3::Y);
+        let vel = dir * speed * rng.random_range(0.45..1.0) + Vec3::Y * speed * rng.random_range(0.25..0.5);
+        let spin = Vec3::new(rng.random_range(-12.0..12.0), rng.random_range(-9.0..9.0), rng.random_range(-12.0..12.0));
+        let s = size * rng.random_range(0.7..1.3);
+        let scale = Vec3::splat(s);
+        let offset = Vec3::new(rng.random_range(-0.3..0.3), rng.random_range(-0.3..0.3), rng.random_range(-0.3..0.3)) * size * 3.0;
+        commands.spawn((
+            LevelEntity,
+            Fx::new(rng.random_range(1.4..2.2), FxMotion::Debris { vel, spin, gravity: 19.0, bounce: 0.3 }, scale),
+            Mesh3d(meshes[i % meshes.len()].clone()),
+            MeshMaterial3d(fx.gib_mats[mats[i % mats.len()].index()].clone()),
+            Transform::from_translation(center + offset)
+                .with_scale(scale)
+                .with_rotation(Quat::from_euler(EulerRot::XYZ, rng.random::<f32>() * 6.0, rng.random::<f32>() * 6.0, rng.random::<f32>() * 6.0)),
+        ));
+    }
+}
+
+/// Contact radius of bouncing debris above the floor.
+pub const DEBRIS_RADIUS: f32 = 0.03;
+/// Highest floor rise debris rolls up onto (ramps); taller ledges block it like walls.
+pub const DEBRIS_STEP: f32 = 0.25;
+
+/// One integration step of tumbling debris against the real floor heights
+/// `floor_at(x, z)` (`None` = solid wall): gravity, per-axis ledge / wall
+/// rebounds, floor bounce with velocity + spin damping, and smooth rolling
+/// friction while resting. Returns `(pos, vel, spin)`.
+#[allow(clippy::too_many_arguments)]
+pub fn debris_step(pos: Vec3, vel: Vec3, spin: Vec3, gravity: f32, bounce: f32, dt: f32, floor_at: impl Fn(f32, f32) -> Option<f32>) -> (Vec3, Vec3, Vec3) {
+    if !dt.is_finite() || dt <= 0.0 {
+        return (pos, vel, spin);
+    }
+    let mut vel = vel;
+    let mut spin = spin;
+    vel.y -= gravity * dt;
+    let here = floor_at(pos.x, pos.z);
+    // Blocked moving into a wall, or into a ledge rising above the debris.
+    let blocked = |x: f32, z: f32| here.is_some() && floor_at(x, z).is_none_or(|h| h + DEBRIS_RADIUS > pos.y + DEBRIS_STEP);
+    let mut p = pos;
+    let nx = p.x + vel.x * dt;
+    if blocked(nx, p.z) {
+        vel.x = -vel.x * bounce;
+        spin *= 0.7;
+    } else {
+        p.x = nx;
+    }
+    let nz = p.z + vel.z * dt;
+    if blocked(p.x, nz) {
+        vel.z = -vel.z * bounce;
+        spin *= 0.7;
+    } else {
+        p.z = nz;
+    }
+    p.y += vel.y * dt;
+    let floor_y = floor_at(p.x, p.z).or(here).unwrap_or(0.0) + DEBRIS_RADIUS;
+    if p.y <= floor_y {
+        p.y = floor_y;
+        if vel.y < -0.5 {
+            vel.y = -vel.y * bounce;
+            vel.x *= 0.65;
+            vel.z *= 0.65;
+            spin *= 0.6;
+        } else {
+            // Resting / rolling: smooth exponential friction down to a stop.
+            vel.y = 0.0;
+            let f = (-8.0 * dt).exp();
+            vel.x *= f;
+            vel.z *= f;
+            spin *= (-6.0 * dt).exp();
+            if vel.x.abs() + vel.z.abs() < 0.02 {
+                vel.x = 0.0;
+                vel.z = 0.0;
+            }
+            if spin.length_squared() < 0.01 {
+                spin = Vec3::ZERO;
+            }
+        }
+    }
+    (p, vel, spin)
 }
 
 pub fn spawn_flash_light(commands: &mut Commands, pos: Vec3, color: Color, intensity: f32, range: f32, life: f32) {
@@ -646,25 +849,13 @@ fn animate_fx(
                 tf.rotate_x(dt * 8.0);
             }
             FxMotion::Debris { vel, spin, gravity, bounce } => {
-                vel.y -= *gravity * dt;
-                tf.translation += *vel * dt;
-                let floor_y = grid
-                    .as_deref()
-                    .and_then(|g| sample_floor_height(g, tf.translation.x, tf.translation.z))
-                    .unwrap_or(0.0)
-                    + 0.03;
-                if tf.translation.y < floor_y {
-                    tf.translation.y = floor_y;
-                    if vel.y < -0.5 {
-                        vel.y = -vel.y * *bounce;
-                        vel.x *= 0.65;
-                        vel.z *= 0.65;
-                        *spin *= 0.6;
-                    } else {
-                        *vel = Vec3::ZERO;
-                        *spin = Vec3::ZERO;
-                    }
-                }
+                let (p, v, s) = match grid.as_deref() {
+                    Some(g) => debris_step(tf.translation, *vel, *spin, *gravity, *bounce, dt, |x, z| sample_floor_height(g, x, z)),
+                    None => debris_step(tf.translation, *vel, *spin, *gravity, *bounce, dt, |_, _| Some(0.0)),
+                };
+                tf.translation = p;
+                *vel = v;
+                *spin = s;
                 tf.rotate_x(spin.x * dt);
                 tf.rotate_y(spin.y * dt);
                 tf.rotate_z(spin.z * dt);
@@ -743,5 +934,56 @@ mod tests {
         f.tick(TOAST_SECONDS);
         assert!(f.toasts.is_empty());
         assert!(f.alert.is_none());
+    }
+
+
+    fn run_debris(start: Vec3, vel: Vec3, floor_at: impl Fn(f32, f32) -> Option<f32>) -> (Vec3, Vec3, Vec3) {
+        let (mut p, mut v, mut s) = (start, vel, Vec3::new(9.0, -6.0, 12.0));
+        for _ in 0..240 {
+            (p, v, s) = debris_step(p, v, s, 18.0, 0.4, 1.0 / 60.0, &floor_at);
+            assert!(p.is_finite() && v.is_finite() && s.is_finite());
+        }
+        (p, v, s)
+    }
+
+    #[test]
+    fn debris_bounces_on_real_floor_heights_and_settles() {
+        let ground = run_debris(Vec3::new(0.0, 1.5, 0.0), Vec3::new(1.0, 2.0, 0.5), |_, _| Some(0.0));
+        assert!((ground.0.y - DEBRIS_RADIUS).abs() < 1e-4, "ground rest {:?}", ground.0);
+        assert_eq!(ground.1, Vec3::ZERO, "settled");
+        assert_eq!(ground.2, Vec3::ZERO, "spin damped out");
+        let cat = crate::level::CATWALK_HEIGHT;
+        let catwalk = run_debris(Vec3::new(0.0, cat + 1.5, 0.0), Vec3::new(1.0, 2.0, 0.5), |_, _| Some(cat));
+        assert!((catwalk.0.y - (cat + DEBRIS_RADIUS)).abs() < 1e-4, "catwalk rest {:?}", catwalk.0);
+        // First contact bounces (velocity reversed, damped).
+        let (_, v, s) = debris_step(Vec3::new(0.0, cat + 0.05, 0.0), Vec3::new(2.0, -6.0, 0.0), Vec3::splat(10.0), 18.0, 0.4, 1.0 / 60.0, |_, _| Some(cat));
+        assert!(v.y > 2.0 && v.y < 6.0 && v.x < 2.0 && s.x < 10.0, "bounce {v:?} {s:?}");
+    }
+
+    #[test]
+    fn debris_rebounds_off_ledges_and_walls_instead_of_snapping_up() {
+        // Ground at x < 1, a 2.4 m catwalk ledge beyond: rolling debris bounces back.
+        let cat = crate::level::CATWALK_HEIGHT;
+        let floor = |x: f32, _z: f32| if x < 1.0 { Some(0.0) } else { Some(cat) };
+        let (p, _, _) = run_debris(Vec3::new(0.5, 0.2, 0.0), Vec3::new(4.0, 0.0, 0.0), floor);
+        assert!(p.x < 1.0 && p.y < 0.1, "stayed below the ledge {p:?}");
+        // Falling from above lands on the catwalk.
+        let (p, _, _) = run_debris(Vec3::new(1.5, cat + 1.0, 0.0), Vec3::new(0.5, 0.0, 0.0), floor);
+        assert!((p.y - (cat + DEBRIS_RADIUS)).abs() < 1e-4, "{p:?}");
+        // Walls (None) block horizontally.
+        let wall = |_x: f32, z: f32| if z < 1.0 { Some(0.0) } else { None };
+        let (p, _, _) = run_debris(Vec3::new(0.0, 0.5, 0.5), Vec3::new(0.0, 0.0, 5.0), wall);
+        assert!(p.z < 1.0, "{p:?}");
+    }
+
+    #[test]
+    fn gib_and_casing_meshes_are_rt_convertible() {
+        use bevy::mesh::Indices;
+        for m in gib_meshes().iter().chain([mortar_sleeve_mesh()].iter()) {
+            assert!(crate::raytracing::rt_mesh_convertible(m));
+            assert!(matches!(m.indices(), Some(Indices::U32(i)) if !i.is_empty() && i.len().is_multiple_of(3)));
+            assert!(m.contains_attribute(Mesh::ATTRIBUTE_UV_0));
+            assert!(crate::raytracing::triangle_count(m) < 2_000);
+        }
     }
 }

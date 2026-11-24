@@ -3564,3 +3564,248 @@ fn architecture_batches_are_static_rt_ready_and_hazards_flow() {
         step(&mut app, 3);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 17: combat juice (enemy animation, decals, gibs, weapon feel)
+// ---------------------------------------------------------------------------
+
+/// Small walled arena: ground floor, a 3x2 catwalk block (`^`, 2.4 m) and a
+/// hazard pit (`~`). Garrison cleared, player at the west end.
+fn juice_arena(app: &mut App) -> LevelGrid {
+    let rows = [
+        "############",
+        "#..........#",
+        "#...^^^....#",
+        "#...^^^..~~#",
+        "#..........#",
+        "#..........#",
+        "############",
+    ];
+    app.world_mut().insert_resource(LevelGrid::from_ascii(&rows));
+    step(app, 2);
+    despawn_all_enemies(app);
+    let g = grid(app);
+    let feet = g.cell_center(IVec2::new(1, 5));
+    teleport(app, feet, feet + Vec3::new(10.0, PLAYER_EYE_HEIGHT, 0.0));
+    step(app, 5);
+    g
+}
+
+fn body_pivot(app: &mut App, root: Entity) -> Transform {
+    let kids: Vec<Entity> = app.world().get::<Children>(root).unwrap().iter().collect();
+    let body = kids.into_iter().find(|k| app.world().get::<segnale_debole::enemies::EnemyBody>(*k).is_some()).expect("body pivot");
+    *app.world().get::<Transform>(body).unwrap()
+}
+
+#[test]
+fn enemy_hit_stagger_and_attack_pose_move_only_the_body_pivot() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 21);
+    godmode(&mut app);
+    let g = juice_arena(&mut app);
+    app.world_mut().insert_resource(segnale_debole::dev::DevFreezeAi);
+    let imp = spawn_demon(&mut app, EnemyKind::Imp, spawn_pos_for(EnemyKind::Imp, &g, IVec2::new(8, 1)));
+    let baron = spawn_demon(&mut app, EnemyKind::HellBaron, spawn_pos_for(EnemyKind::HellBaron, &g, IVec2::new(8, 4)));
+    step(&mut app, 3);
+    let roots: Vec<Transform> = [imp, baron].iter().map(|e| *app.world().get::<Transform>(*e).unwrap()).collect();
+    let probe = |app: &App, e: Entity, root: Vec3| {
+        let en = app.world().get::<Enemy>(e).unwrap();
+        let origin = root + Vec3::new(-6.0, en.stats.hit_spheres[0].0, 0.0);
+        en.ray_hit(root, origin, Vec3::X, 50.0)
+    };
+    let hits0 = [probe(&app, imp, roots[0].translation), probe(&app, baron, roots[1].translation)];
+
+    // A shot travelling +X staggers both; the root (and hit spheres) never move.
+    for e in [imp, baron] {
+        app.world_mut().get_mut::<Enemy>(e).unwrap().stagger(Vec3::new(3.0, 0.4, 0.0));
+    }
+    step(&mut app, 3);
+    let tip = |tf: &Transform| (tf.rotation * Vec3::Y).x;
+    let (imp_tip, baron_tip) = (tip(&body_pivot(&mut app, imp)), tip(&body_pivot(&mut app, baron)));
+    assert!(imp_tip > 0.08, "imp body tips away from the hit: {imp_tip}");
+    assert!(baron_tip > 0.01 && baron_tip < imp_tip * 0.6, "heavy baron staggers less: {baron_tip} vs {imp_tip}");
+    for (i, e) in [imp, baron].into_iter().enumerate() {
+        assert_eq!(*app.world().get::<Transform>(e).unwrap(), roots[i], "root transform untouched by animation");
+        assert_eq!(probe(&app, e, roots[i].translation), hits0[i], "hit spheres unaffected");
+    }
+    step(&mut app, FPS / 2);
+    assert!(tip(&body_pivot(&mut app, imp)).abs() < 0.02, "stagger recovers");
+
+    // Ranged recoil pitches the torso back (+Z), a melee lunge forward (-Z).
+    app.world_mut().get_mut::<Enemy>(imp).unwrap().trigger_attack_anim(false);
+    step(&mut app, 3);
+    let back = (body_pivot(&mut app, imp).rotation * Vec3::Y).z;
+    app.world_mut().get_mut::<Enemy>(imp).unwrap().trigger_attack_anim(true);
+    step(&mut app, 3);
+    let fwd = (body_pivot(&mut app, imp).rotation * Vec3::Y).z;
+    assert!(back > 0.05 && fwd < -0.05, "recoil {back} / lunge {fwd}");
+    assert_eq!(*app.world().get::<Transform>(imp).unwrap(), roots[0]);
+}
+
+#[test]
+fn decal_pool_is_fifo_bounded_level_scoped_and_allocation_free() {
+    use segnale_debole::decals::{Decal, DecalKind, DecalPool, DecalQueue, DecalRequest, MAX_DECALS};
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 5);
+    godmode(&mut app);
+    let g = juice_arena(&mut app);
+    step(&mut app, 2);
+    let (mats0, meshes0, images0) = (material_count(&app), mesh_count(&app), app.world().resource::<Assets<Image>>().len());
+    assert_eq!(count::<Decal>(&mut app), 0);
+
+    let ground = g.cell_center(IVec2::new(2, 1));
+    // Two bursts (a single frame's queue is itself bounded by MAX_DECALS).
+    for range in [0..MAX_DECALS, MAX_DECALS..MAX_DECALS + 34] {
+        let mut q = app.world_mut().resource_mut::<DecalQueue>();
+        for i in range {
+            let kind = DecalKind::ALL[i % 5];
+            q.push(DecalRequest::floor(kind, ground + Vec3::new((i % 7) as f32 * 0.3, 0.5, (i % 5) as f32 * 0.3), 1.0));
+        }
+        step(&mut app, 1);
+    }
+    step(&mut app, 1);
+    assert_eq!(count::<Decal>(&mut app), MAX_DECALS, "ring buffer caps live decals");
+    let pool = app.world().resource::<DecalPool>();
+    assert_eq!(pool.ring.len(), MAX_DECALS);
+    assert_eq!(pool.spawned, (MAX_DECALS + 34) as u64);
+    let newest = *pool.ring.back().unwrap();
+    let oldest_live = *pool.ring.front().unwrap();
+    assert!(app.world().get_entity(newest).is_ok() && app.world().get_entity(oldest_live).is_ok());
+    // Every decal sits flush (anti-z-fight lift) on the ground floor.
+    let mut q = app.world_mut().query_filtered::<&Transform, With<Decal>>();
+    for tf in q.iter(app.world()) {
+        assert!((0.017..0.03).contains(&tf.translation.y), "decal at {:?}", tf.translation);
+    }
+
+    // Catwalk decal snaps to 2.4 m; pit / wall requests are skipped.
+    let spawned = app.world().resource::<DecalPool>().spawned;
+    {
+        let mut q = app.world_mut().resource_mut::<DecalQueue>();
+        q.push(DecalRequest::floor(DecalKind::Scorch, g.cell_center(IVec2::new(5, 2)) + Vec3::Y, 1.5));
+        q.push(DecalRequest::floor(DecalKind::Scorch, g.cell_center(IVec2::new(9, 3)), 1.5));
+        q.push(DecalRequest::floor(DecalKind::Scorch, g.cell_center(IVec2::new(0, 0)), 1.5));
+    }
+    step(&mut app, 2);
+    let pool = app.world().resource::<DecalPool>();
+    assert_eq!(pool.spawned, spawned + 1, "pit and wall requests were skipped");
+    let cat = *app.world().get::<Transform>(*pool.ring.back().unwrap()).unwrap();
+    assert!((cat.translation.y - 2.4).abs() < 0.03 && cat.translation.y > 2.4, "catwalk decal at {:?}", cat.translation);
+
+    // A death leaves its archetype splatter.
+    let fiend = spawn_demon(&mut app, EnemyKind::JammerFiend, spawn_pos_for(EnemyKind::JammerFiend, &g, IVec2::new(2, 4)));
+    step(&mut app, 2);
+    kill(&mut app, fiend);
+    step(&mut app, 3);
+    let mut q = app.world_mut().query::<&Decal>();
+    assert!(q.iter(app.world()).any(|d| d.0 == DecalKind::IchorGreen), "Jammer Fiend ichor decal");
+    assert_eq!(count::<Decal>(&mut app), MAX_DECALS);
+
+    assert_eq!(material_count(&app), mats0, "decals + gibs allocated no StandardMaterials");
+    assert_eq!(mesh_count(&app), meshes0, "decals + gibs allocated no meshes");
+    assert_eq!(app.world().resource::<Assets<Image>>().len(), images0, "decal textures are startup-only");
+
+    // Floor transition: every decal is a LevelEntity and the pool forgets them.
+    fast_clear_floor(&mut app);
+    assert_eq!(app_state(&app), AppState::UpgradeSelect);
+    bot(&mut app).pick_upgrade = Some(0);
+    step(&mut app, 3);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(grid(&app).floor, 2);
+    assert_eq!(count::<Decal>(&mut app), 0, "floor transition cleared decals");
+    assert!(app.world().resource::<DecalPool>().ring.is_empty());
+}
+
+#[test]
+fn debris_bounces_on_real_floor_height_catwalk_vs_ground() {
+    use segnale_debole::fx::{Fx, FxMotion};
+    use segnale_debole::level::LevelEntity;
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 9);
+    godmode(&mut app);
+    let g = juice_arena(&mut app);
+    let drop = |app: &mut App, at: Vec3| {
+        app.world_mut()
+            .spawn((
+                LevelEntity,
+                Fx::new(5.0, FxMotion::Debris { vel: Vec3::new(0.2, 3.0, -0.1), spin: Vec3::new(8.0, 3.0, -6.0), gravity: 18.0, bounce: 0.45 }, Vec3::ONE),
+                Transform::from_translation(at + Vec3::Y * 1.8),
+            ))
+            .id()
+    };
+    let cat = drop(&mut app, g.cell_center(IVec2::new(5, 2)));
+    let ground = drop(&mut app, g.cell_center(IVec2::new(2, 1)));
+    let mut min_cat = f32::MAX;
+    for _ in 0..(2 * FPS) {
+        step(&mut app, 1);
+        min_cat = min_cat.min(app.world().get::<Transform>(cat).unwrap().translation.y);
+    }
+    let y = |app: &App, e: Entity| app.world().get::<Transform>(e).unwrap().translation.y;
+    assert!((y(&app, cat) - 2.43).abs() < 0.02, "catwalk debris rests at {}", y(&app, cat));
+    assert!(min_cat > 2.4, "never sank through the catwalk ({min_cat})");
+    assert!((y(&app, ground) - 0.03).abs() < 0.02, "ground debris rests at {}", y(&app, ground));
+    let Fx { motion: FxMotion::Debris { vel, spin, .. }, .. } = app.world().get::<Fx>(cat).unwrap().clone() else { panic!() };
+    assert_eq!((vel, spin), (Vec3::ZERO, Vec3::ZERO), "bounces damped to rest");
+}
+
+#[test]
+fn weapon_inspect_cancels_on_fire_swap_and_pause_and_landing_dips_viewmodel() {
+    use segnale_debole::weapons::{ViewmodelFeel, INSPECT_SECS, LANDING_DIP_MAX};
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 13);
+    godmode(&mut app);
+    let _ = juice_arena(&mut app);
+    let ws = |app: &App| app.world().resource::<WeaponState>().clone();
+    step(&mut app, FPS);
+    assert_eq!(ws(&app).inspect_timer, 0.0);
+
+    tap(&mut app, KeyCode::KeyF);
+    let t = ws(&app).inspect_timer;
+    assert!(t > INSPECT_SECS * 0.9 && t <= INSPECT_SECS, "inspect started: {t}");
+    let cd = ws(&app).cooldown;
+    step(&mut app, 10);
+    assert!(ws(&app).inspect_timer < t, "inspect plays out");
+    assert!(ws(&app).cooldown <= cd, "inspect never touches fire cooldowns");
+    // Firing cancels it immediately.
+    bot(&mut app).fire = true;
+    step(&mut app, 1);
+    bot(&mut app).fire = false;
+    assert_eq!(ws(&app).inspect_timer, 0.0, "fire cancels inspect");
+    step(&mut app, FPS);
+    // Swapping cancels it.
+    tap(&mut app, KeyCode::KeyF);
+    assert!(ws(&app).inspect_timer > 0.0);
+    tap(&mut app, KeyCode::Digit2);
+    assert_eq!(ws(&app).inspect_timer, 0.0, "swap cancels inspect");
+    step(&mut app, FPS);
+    // Pausing cancels it.
+    tap(&mut app, KeyCode::KeyF);
+    assert!(ws(&app).inspect_timer > 0.0);
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Paused);
+    step(&mut app, 2);
+    assert_eq!(ws(&app).inspect_timer, 0.0, "pause cancels inspect");
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Playing);
+    step(&mut app, 2);
+    // Expires on its own.
+    tap(&mut app, KeyCode::KeyF);
+    step(&mut app, (INSPECT_SECS * FPS as f32) as usize + 2);
+    assert_eq!(ws(&app).inspect_timer, 0.0);
+
+    // Landing dip: drop the player from 4 m; the viewmodel dips (bounded) and recovers.
+    let feet = player_feet(&mut app);
+    {
+        let mut q = app.world_mut().query::<(&mut Player, &mut Transform)>();
+        let (mut p, mut tf) = q.single_mut(app.world_mut()).unwrap();
+        tf.translation = feet + Vec3::Y * 4.0;
+        p.velocity = Vec3::ZERO;
+        p.grounded = false;
+    }
+    let mut lowest: f32 = 0.0;
+    for _ in 0..(2 * FPS) {
+        step(&mut app, 1);
+        let f = *app.world().resource::<ViewmodelFeel>();
+        assert!(f.dip >= -LANDING_DIP_MAX - 1e-6 && f.dip.is_finite());
+        lowest = lowest.min(f.dip);
+    }
+    assert!(lowest < -0.005, "landing dipped the viewmodel ({lowest})");
+    assert!(app.world().resource::<ViewmodelFeel>().dip.abs() < 2e-3, "dip springs back");
+}
