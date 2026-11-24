@@ -41,10 +41,12 @@ pub enum SfxEvent {
     RocketFire,
     /// Rocket detonation: deep sub-bass boom + low-passed debris crackle.
     RocketExplode,
+    /// Signal Jump Pad launch: pneumatic burst + rising synth sweep.
+    JumpPad,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 21] = [
+    pub const ALL: [SfxEvent; 22] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -66,6 +68,7 @@ impl SfxEvent {
         SfxEvent::UpgradeSelect,
         SfxEvent::RocketFire,
         SfxEvent::RocketExplode,
+        SfxEvent::JumpPad,
     ];
 
     /// Playback volume (0..1).
@@ -263,6 +266,18 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
                 boom * 0.95 + body + crackle
             })
         }
+        SfxEvent::JumpPad => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(0.42, move |ts, t, n| {
+                // Pneumatic burst: band-passed noise puff in the first 80ms.
+                let x = n.next();
+                let puff = if ts < 0.08 { (lp.run(x, 0.5) - lp2.run(x, 0.05)) * 1.6 * env(ts / 0.08, 0.05, 1.5) } else { 0.0 };
+                // Energetic rising synth sweep (saw + square fifth).
+                let p = o.step(180.0 + 1300.0 * t * t.sqrt());
+                let fifth = square(o2.step((180.0 + 1300.0 * t * t.sqrt()) * 1.5)) * 0.15;
+                puff + (saw(p) * 0.35 + fifth) * env(t, 0.06, 1.1)
+            })
+        }
     }
 }
 
@@ -408,7 +423,7 @@ mod tests {
 
     #[test]
     fn rocket_sfx_are_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 21);
+        assert_eq!(SfxEvent::ALL.len(), 22);
         let fire = synthesize_wav(SfxEvent::RocketFire);
         let boom = synthesize_wav(SfxEvent::RocketExplode);
         assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
@@ -418,5 +433,15 @@ mod tests {
         // The explosion is the long, heavy one.
         assert!(boom.len() > fire.len());
         assert!(boom.len() > synthesize_wav(SfxEvent::Shotgun).len());
+    }
+
+    #[test]
+    fn jump_pad_sfx_is_distinct_and_deterministic() {
+        let pad = synthesize_wav(SfxEvent::JumpPad);
+        assert_eq!(pad, synthesize_wav(SfxEvent::JumpPad));
+        assert!(SfxEvent::ALL.contains(&SfxEvent::JumpPad));
+        for other in [SfxEvent::Jump, SfxEvent::Bhop, SfxEvent::Dash, SfxEvent::RocketFire] {
+            assert_ne!(pad, synthesize_wav(other), "{other:?}");
+        }
     }
 }

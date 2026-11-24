@@ -17,6 +17,7 @@ use bevy::prelude::*;
 use bevy::ui::UiGlobalTransform;
 use bevy::window::PrimaryWindow;
 
+use crate::assets_gen::FloorTheme;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
 use crate::fx::HudFeed;
@@ -1218,10 +1219,17 @@ fn ammo(p: &Player, w: Weapon) -> (u32, u32) {
     }
 }
 
+/// Floor plate subtitle naming the floor's sector theme.
+pub fn sector_label(floor: u32) -> String {
+    format!("SECTOR {:02} // {}", floor, FloorTheme::for_floor(floor).name())
+}
+
 /// Every HUD text element, updated by one query.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 enum HudText {
     Floor,
+    /// Sector theme subtitle (`SECTOR 01 // RUST BUNKER`).
+    Sector,
     Stats,
     /// Starter chip label of the run loadout.
     LoadoutChip,
@@ -1502,6 +1510,7 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
         ),
         children![
             (HudText::Floor, text("FLOOR 1/5", 20.0, COLOR_TEXT)),
+            (HudText::Sector, text(sector_label(1), 11.0, HAZARD_YELLOW)),
             (HudText::Stats, text("KILLS 0  |  JAMMERS 0", 14.0, COLOR_DIM)),
             (
                 Node { column_gap: Val::Px(7.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(1.0)), ..default() },
@@ -1842,6 +1851,10 @@ fn update_hud(
                 let _ = write!(b, "FLOOR {}/{}", run.floor, FINAL_FLOOR);
                 COLOR_TEXT
             }
+            HudText::Sector => {
+                let _ = write!(b, "SECTOR {:02} // {}", run.floor, FloorTheme::for_floor(run.floor).name());
+                HAZARD_YELLOW
+            }
             HudText::Stats => {
                 let _ = write!(b, "KILLS {}  |  JAMMERS {}", run.kills, run.jammers_destroyed);
                 COLOR_DIM
@@ -2161,6 +2174,16 @@ fn debug_skip_floor(keys: Res<ButtonInput<KeyCode>>, mut run: ResMut<RunStats>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_plate_names_the_sector_theme() {
+        assert_eq!(sector_label(1), "SECTOR 01 // RUST BUNKER");
+        assert_eq!(sector_label(2), "SECTOR 02 // TOXIC COOLANT");
+        assert_eq!(sector_label(3), "SECTOR 03 // CRYO RELAY");
+        assert_eq!(sector_label(4), "SECTOR 04 // MAGMA FOUNDRY");
+        assert_eq!(sector_label(5), "SECTOR 05 // OBSIDIAN CORE");
+        assert_eq!(sector_label(6), "SECTOR 06 // RUST BUNKER");
+    }
 
     #[test]
     fn signal_colors_by_band() {

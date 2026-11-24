@@ -25,7 +25,18 @@ pub const UPLINK_HOLD_RADIUS: f32 = 4.5;
 pub const UPLINK_HOLD_SECS: f32 = 1.5;
 pub const OUTSIDE_RING_RATE: f32 = 0.2;
 pub const EXTRACT_SECS: f32 = 1.6;
+/// Floor 1 (Rust Bunker) sky; every floor uses its theme's sky (see [`sky_for_floor`]).
 pub const SKY_COLOR: Color = Color::srgb(0.32, 0.04, 0.03);
+
+/// Baseline sky (camera clear color) of a floor's sector theme.
+pub fn sky_for_floor(floor: u32) -> Color {
+    crate::assets_gen::FloorTheme::for_floor(floor).sky_color()
+}
+
+/// Sky during the SOS upload: pulses from the theme sky toward crimson alarm.
+pub fn alarm_sky(base: Color, uploading: bool, pulse: f32) -> Color {
+    if uploading { base.mix(&Color::srgb(0.6, 0.02, 0.02), pulse * 0.7) } else { base }
+}
 
 #[derive(Resource, Debug, Clone, PartialEq)]
 pub enum ExtractionState {
@@ -106,14 +117,20 @@ pub fn rush_fiend_odds(priority_jamming: bool) -> (usize, f32) {
 /// Seconds between X-ray beacons on a jamming Jammer Fiend.
 pub const FIEND_BEACON_SECS: f32 = 1.1;
 
-/// Walkable atrium cells just inside the Signal Ring perimeter (supply drops),
+/// Walkable atrium cells (and pedestal ramps) just inside the Signal Ring perimeter (supply drops),
 /// spread around the tower: ordered so consecutive picks sit far apart.
 pub fn ring_supply_cells(grid: &LevelGrid) -> Vec<IVec2> {
     let tower = grid.tower_world();
     let r = ring_radius_at(0.0, tower.y);
     let mut cells: Vec<(IVec2, f32)> = (0..grid.depth)
         .flat_map(|z| (0..grid.width).map(move |x| IVec2::new(x, z)))
-        .filter(|&c| c != grid.tower && matches!(grid.cell(c), Cell::AtriumFloor | Cell::Floor { height: 0.0 }))
+        // Twin pedestal ramps count too (their slope midpoint is in the ring);
+        // keep supply drops off jump pads so players aren't launched away from loot.
+        .filter(|&c| {
+            c != grid.tower
+                && !grid.jump_pads.iter().any(|p| p.cell == c)
+                && matches!(grid.cell(c), Cell::AtriumFloor | Cell::Floor { height: 0.0 } | Cell::Ramp { .. })
+        })
         .filter_map(|c| {
             let p = grid.cell_center(c);
             let d = Vec2::new(p.x - tower.x, p.z - tower.z);
@@ -220,7 +237,7 @@ fn reset_extraction(
 ) {
     *state = ExtractionState::default();
     rush.0.clear();
-    clear.0 = SKY_COLOR;
+    clear.0 = sky_for_floor(grid.floor);
     let tower = grid.tower_world();
     // Rings on the pedestal and on the atrium floor around it.
     for floor_y in [tower.y, 0.0] {
@@ -477,6 +494,7 @@ fn update_extraction(
 fn alarm_atmosphere(
     time: Res<Time>,
     state: Res<ExtractionState>,
+    grid: Option<Res<LevelGrid>>,
     mut clear: ResMut<ClearColor>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     ring_mat: Option<Res<SignalRingMaterial>>,
@@ -488,7 +506,10 @@ fn alarm_atmosphere(
     let uploading = matches!(*state, ExtractionState::Uploading { .. });
     let jammed = matches!(*state, ExtractionState::Uploading { jammed: true, .. });
     let pulse = 0.5 + 0.5 * (t * 6.0).sin();
-    clear.0 = if uploading { SKY_COLOR.mix(&Color::srgb(0.6, 0.02, 0.02), pulse * 0.7) } else { SKY_COLOR };
+    let sky = alarm_sky(grid.map_or(SKY_COLOR, |g| sky_for_floor(g.floor)), uploading, pulse);
+    if clear.0 != sky {
+        clear.0 = sky;
+    }
     for mut l in &mut beacons {
         if uploading {
             l.color = if (t * 2.0) as i32 % 2 == 0 { Color::srgb(1.0, 0.1, 0.05) } else { Color::srgb(1.0, 0.6, 0.1) };
@@ -646,5 +667,20 @@ mod tests {
             let (a, b) = (g.cell_center(cells[0]) - t, g.cell_center(cells[1]) - t);
             assert!(a.with_y(0.0).normalize().dot(b.with_y(0.0).normalize()) < 0.2);
         }
+    }
+
+    #[test]
+    fn sky_follows_floor_theme_and_alarm_pulses_from_it() {
+        assert_eq!(sky_for_floor(1), SKY_COLOR);
+        for floor in 1..=5 {
+            let base = sky_for_floor(floor);
+            assert_eq!(alarm_sky(base, false, 1.0), base);
+            let pulsed = alarm_sky(base, true, 1.0).to_srgba();
+            let b = base.to_srgba();
+            assert!(pulsed.red > b.red, "floor {floor} pulses toward crimson");
+            assert_eq!(alarm_sky(base, true, 0.0), base);
+        }
+        assert_ne!(sky_for_floor(2), sky_for_floor(3));
+        assert_eq!(sky_for_floor(7), sky_for_floor(2));
     }
 }

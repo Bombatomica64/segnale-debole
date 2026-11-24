@@ -23,7 +23,7 @@ use crate::fx::{
     FxAssets, HudFeed, OVERLAY_LAYER,
 };
 use crate::hud::signal_color;
-use crate::level::{Cell, CullableLight, DemonJammer, JammerCore, LevelEntity, LevelGrid};
+use crate::level::{Cell, CullableLight, DemonJammer, ExplosiveBarrel, JammerCore, LevelEntity, LevelGrid};
 use crate::mesh_batch::{MaterialBatches, ParentedBatches};
 use crate::meta::{HandsetSkin, RunLoadout, SkinSlot};
 use crate::phone_screen::PhoneScreenTexture;
@@ -61,6 +61,21 @@ pub const ROCKET_LIFE: f32 = 3.0;
 pub const ROCKET_TRAIL_SECS: f32 = 0.04;
 /// Aim distance under which a rocket starts on the eye ray (never behind geometry).
 pub const ROCKET_CLOSE_AIM: f32 = 2.0;
+
+// --- Explosive server-rack barrels ---------------------------------------------
+/// Soft hit cylinder of a barrel (non-blocking for movement).
+pub const BARREL_RADIUS: f32 = 0.55;
+pub const BARREL_HEIGHT: f32 = 1.25;
+/// Height of a barrel's blast / LoS center above its base.
+pub const BARREL_CENTER_Y: f32 = 0.6;
+pub const BARREL_BLAST_RADIUS: f32 = 6.0;
+pub const BARREL_DAMAGE: f32 = 120.0;
+/// Staggered fuse of a barrel set off by another barrel's blast.
+pub const BARREL_CHAIN_FUSE: f32 = 0.12;
+/// Forgiving share of a barrel blast the player takes.
+pub const BARREL_SELF_DAMAGE_FRAC: f32 = 0.15;
+/// Barrel blast jumps launch a bit harder than rocket jumps.
+pub const BARREL_JUMP_MULT: f32 = 1.15;
 
 // --- Doppler Overdrive ---------------------------------------------------------
 /// Horizontal speed (m/s) above which Doppler Overdrive kicks in.
@@ -186,6 +201,7 @@ pub enum HitTarget {
     Wall,
     Enemy(usize),
     Jammer(usize),
+    Barrel(usize),
 }
 
 /// Jammer hit volumes relative to its base.
@@ -196,6 +212,62 @@ pub fn jammer_ray_hit(base: Vec3, origin: Vec3, dir: Vec3) -> Option<f32> {
         .iter()
         .filter_map(|&(h, r)| ray_sphere(origin, dir, base + Vec3::Y * h, r))
         .reduce(f32::min)
+}
+
+/// Distance along `dir` to a barrel's hit cylinder standing on `base`.
+pub fn barrel_ray_hit(base: Vec3, origin: Vec3, dir: Vec3) -> Option<f32> {
+    let dir = dir.normalize_or_zero();
+    let o = origin - base;
+    let r2 = BARREL_RADIUS * BARREL_RADIUS;
+    let mut best = f32::INFINITY;
+    // Curved side.
+    let a = dir.x * dir.x + dir.z * dir.z;
+    if a > 1e-8 {
+        let b = o.x * dir.x + o.z * dir.z;
+        let c = o.x * o.x + o.z * o.z - r2;
+        let disc = b * b - a * c;
+        if disc >= 0.0 {
+            let sq = disc.sqrt();
+            for t in [(-b - sq) / a, (-b + sq) / a] {
+                let y = o.y + dir.y * t;
+                if t >= 0.0 && (0.0..=BARREL_HEIGHT).contains(&y) {
+                    best = best.min(t);
+                }
+            }
+        }
+    }
+    // Caps.
+    if dir.y.abs() > 1e-6 {
+        for cap in [0.0, BARREL_HEIGHT] {
+            let t = (cap - o.y) / dir.y;
+            let p = o + dir * t;
+            if t >= 0.0 && p.x * p.x + p.z * p.z <= r2 {
+                best = best.min(t);
+            }
+        }
+    }
+    best.is_finite().then_some(best)
+}
+
+/// Damage a barrel. Lethal damage arms its fuse: instant for weapons, a
+/// short staggered [`BARREL_CHAIN_FUSE`] for another barrel's blast. Returns
+/// true if this armed it.
+pub fn damage_barrel(b: &mut ExplosiveBarrel, amount: f32, chain: bool) -> bool {
+    if !b.is_intact() || amount <= 0.0 {
+        return false;
+    }
+    b.hp -= amount;
+    b.hit_flash = 0.15;
+    if b.hp <= 0.0 {
+        b.fuse = Some(if chain { BARREL_CHAIN_FUSE } else { 0.0 });
+        return true;
+    }
+    false
+}
+
+/// Barrel blast damage on a target whose nearest hit surface is `dist` away.
+pub fn barrel_blast_damage(dist: f32) -> f32 {
+    BARREL_DAMAGE * splash_falloff(dist, BARREL_BLAST_RADIUS)
 }
 
 /// Lightweight hitscan view of a demon (no `Enemy` clone per shot).
@@ -233,6 +305,27 @@ pub fn resolve_hitscan(
 ) -> (f32, HitTarget) {
     let targets: Vec<HitTargetInfo> = enemies.iter().map(|(root, e)| HitTargetInfo::of(*root, e)).collect();
     resolve_hitscan_targets(grid, origin, dir, max_dist, &targets, jammers)
+}
+
+/// [`resolve_hitscan_targets`] plus explosive barrels (bases in `barrels`).
+pub fn resolve_hitscan_full(
+    grid: &LevelGrid,
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    enemies: &[HitTargetInfo],
+    jammers: &[Vec3],
+    barrels: &[Vec3],
+) -> (f32, HitTarget) {
+    let mut best = resolve_hitscan_targets(grid, origin, dir, max_dist, enemies, jammers);
+    for (i, base) in barrels.iter().enumerate() {
+        if let Some(t) = barrel_ray_hit(*base, origin, dir)
+            && t < best.0
+        {
+            best = (t, HitTarget::Barrel(i));
+        }
+    }
+    best
 }
 
 /// [`resolve_hitscan`] over pre-collected [`HitTargetInfo`]s.
@@ -352,6 +445,20 @@ pub struct RocketJump {
 /// Quake rocket jump: self-damage and launch impulse for a blast at `blast`
 /// on a player whose feet are at `player_pos` (`None` = out of range).
 pub fn compute_rocket_jump(player_pos: Vec3, blast: Vec3, splash_radius: f32, mods: &PlayerModifiers) -> Option<RocketJump> {
+    let self_damage = ROCKET_SPLASH_DAMAGE * ROCKET_SELF_DAMAGE_FRAC * mods.rocket_self_damage_mult;
+    compute_blast_jump(player_pos, blast, splash_radius, self_damage, mods.rocket_jump_mult)
+}
+
+/// Quake blast boost from an exploding barrel: forgiving ~15% self-damage
+/// and a strong launch impulse (`None` = out of range).
+pub fn compute_barrel_jump(player_pos: Vec3, blast: Vec3, mods: &PlayerModifiers) -> Option<RocketJump> {
+    let self_damage = BARREL_DAMAGE * BARREL_SELF_DAMAGE_FRAC * mods.rocket_self_damage_mult;
+    compute_blast_jump(player_pos, blast, BARREL_BLAST_RADIUS, self_damage, mods.rocket_jump_mult * BARREL_JUMP_MULT)
+}
+
+/// Shared blast-jump math: linear falloff of `self_damage_at_center` and of
+/// the [`ROCKET_JUMP_UP`] / [`ROCKET_JUMP_PUSH`] impulse scaled by `jump_mult`.
+pub fn compute_blast_jump(player_pos: Vec3, blast: Vec3, splash_radius: f32, self_damage_at_center: f32, jump_mult: f32) -> Option<RocketJump> {
     let center = player_pos + Vec3::Y * 0.9;
     let d = center - blast;
     let dist = d.length();
@@ -363,9 +470,9 @@ pub fn compute_rocket_jump(player_pos: Vec3, blast: Vec3, splash_radius: f32, mo
     // vector so steep foot shots launch predominantly upward while wall/rear
     // blasts deliver full sideways/forward kick.
     let horiz = if dist > 1e-4 { Vec2::new(d.x, d.z) / dist } else { Vec2::ZERO };
-    let k = falloff * mods.rocket_jump_mult;
+    let k = falloff * jump_mult;
     let impulse = Vec3::new(horiz.x * ROCKET_JUMP_PUSH * k, ROCKET_JUMP_UP * k, horiz.y * ROCKET_JUMP_PUSH * k);
-    let self_damage = ROCKET_SPLASH_DAMAGE * falloff * ROCKET_SELF_DAMAGE_FRAC * mods.rocket_self_damage_mult;
+    let self_damage = self_damage_at_center * falloff;
     Some(RocketJump { self_damage, impulse, falloff })
 }
 
@@ -1376,9 +1483,11 @@ pub fn spawn_rocket(commands: &mut Commands, assets: &RocketAssets, start: Vec3,
 struct FireScratch {
     targets: Vec<HitTargetInfo>,
     jammers: Vec<Vec3>,
+    barrels: Vec<Vec3>,
     enemy_dmg: Vec<f32>,
     enemy_kb: Vec<Vec3>,
     jam_dmg: Vec<f32>,
+    bar_dmg: Vec<f32>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1396,7 +1505,7 @@ fn fire_weapons(
     cams: Query<&Transform, With<PlayerCamera>>,
     mut players: Query<(&mut Player, &Transform), Without<PlayerCamera>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
-    mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
+    (mut jammers, mut barrels): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut ExplosiveBarrel, &GlobalTransform)>),
     mut bot: Option<ResMut<BotControl>>,
     mut scratch: Local<FireScratch>,
 ) {
@@ -1473,11 +1582,13 @@ fn fire_weapons(
     let dmult = doppler_damage_mult(speed, &mods);
 
     // Snapshot lightweight targets for ray tests (reused buffers).
-    let FireScratch { targets: refs, jammers: jam_list, enemy_dmg, enemy_kb, jam_dmg } = &mut *scratch;
+    let FireScratch { targets: refs, jammers: jam_list, barrels: bar_list, enemy_dmg, enemy_kb, jam_dmg, bar_dmg } = &mut *scratch;
     refs.clear();
     refs.extend(enemies.iter().map(|(e, g, _)| HitTargetInfo::of(g.translation(), e)));
     jam_list.clear();
     jam_list.extend(jammers.iter().filter(|(j, _)| j.is_active()).map(|(_, g)| g.translation()));
+    bar_list.clear();
+    bar_list.extend(barrels.iter().filter(|(b, _)| b.is_intact()).map(|(_, g)| g.translation()));
 
     match ws.current {
         Weapon::Shotgun => {
@@ -1502,13 +1613,15 @@ fn fire_weapons(
             enemy_kb.resize(refs.len(), Vec3::ZERO);
             jam_dmg.clear();
             jam_dmg.resize(jam_list.len(), 0.0);
+            bar_dmg.clear();
+            bar_dmg.resize(bar_list.len(), 0.0);
             let mut wall_sparks = 0;
             for i in 0..pellets {
                 let a = rng.random_range(0.0..TAU);
                 let r = spread * rng.random::<f32>().sqrt();
                 let local = Vec3::new(a.cos() * r, a.sin() * r, -1.0).normalize();
                 let dir = rot * local;
-                let (dist, target) = resolve_hitscan_targets(&grid, origin, dir, HITSCAN_RANGE, refs, jam_list);
+                let (dist, target) = resolve_hitscan_full(&grid, origin, dir, HITSCAN_RANGE, refs, jam_list, bar_list);
                 let hit = origin + dir * dist;
                 let falloff = (1.0 - (dist - 18.0).max(0.0) / 40.0).clamp(0.4, 1.0);
                 if i % 2 == 0 {
@@ -1523,6 +1636,10 @@ fn fire_weapons(
                     HitTarget::Jammer(k) => {
                         jam_dmg[k] += PELLET_DAMAGE * falloff * dmult;
                         spawn_particles(&mut commands, &fx, hit, BurstColor::Spark, 4, 5.5, 0.07);
+                    }
+                    HitTarget::Barrel(k) => {
+                        bar_dmg[k] += PELLET_DAMAGE * falloff * dmult;
+                        spawn_particles(&mut commands, &fx, hit, BurstColor::Spark, 3, 5.0, 0.06);
                     }
                     HitTarget::Wall => {
                         spawn_particles(&mut commands, &fx, hit - dir * 0.05, BurstColor::Spark, 3, 3.8, 0.055);
@@ -1555,6 +1672,16 @@ fn fire_weapons(
                 }
                 j += 1;
             }
+            let mut k = 0;
+            for (mut b, _) in &mut barrels {
+                if !b.is_intact() {
+                    continue;
+                }
+                if bar_dmg[k] > 0.0 {
+                    damage_barrel(&mut b, bar_dmg[k], false);
+                }
+                k += 1;
+            }
             if any_hit {
                 feed.hit(false);
                 sfx.play(SfxEvent::Hit);
@@ -1567,7 +1694,7 @@ fn fire_weapons(
             sfx.play(SfxEvent::Plasma);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(0.3, 0.9, 1.0), 250_000.0, 7.0, 0.05);
             // Converge the bolt onto whatever the crosshair points at.
-            let (dist, _) = resolve_hitscan_targets(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list);
+            let (dist, _) = resolve_hitscan_full(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list);
             let aim = origin + fwd * dist.max(2.0);
             let dir = (aim - muzzle).normalize_or_zero();
             commands.spawn((
@@ -1593,7 +1720,7 @@ fn fire_weapons(
             sfx.play(SfxEvent::RocketFire);
             spawn_flash_light(&mut commands, muzzle, Color::srgb(1.0, 0.55, 0.15), 600_000.0, 10.0, 0.09);
             spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 3, 1.4, 0.08);
-            let (dist, _) = resolve_hitscan_targets(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list);
+            let (dist, _) = resolve_hitscan_full(&grid, origin, fwd, HITSCAN_RANGE, refs, jam_list, bar_list);
             let (start, dir) = rocket_launch(&grid, origin, fwd, muzzle, dist);
             spawn_rocket(&mut commands, &rockets, start, dir, player.velocity, dmult);
         }
@@ -1613,6 +1740,7 @@ fn move_player_projectiles(
     mut bolts: Query<(Entity, &mut PlayerProjectile, &mut Transform), Without<Player>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
+    mut barrels: Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
     mut players: Query<(&mut Player, &Transform)>,
 ) {
     let dt = time.delta_secs().min(1.0 / 20.0);
@@ -1642,6 +1770,14 @@ fn move_player_projectiles(
                 best = (t, HitTarget::Jammer(i));
             }
         }
+        for (i, (b, g)) in barrels.iter().enumerate() {
+            if b.is_intact()
+                && let Some(t) = barrel_ray_hit(g.translation(), from, dir)
+                && t < best.0
+            {
+                best = (t, HitTarget::Barrel(i));
+            }
+        }
         let hit = from + dir * best.0;
         if b.kind == ProjectileKind::Rocket {
             if best.1 == HitTarget::Nothing && b.life > 0.0 {
@@ -1669,6 +1805,7 @@ fn move_player_projectiles(
                 &mods,
                 &mut enemies,
                 &mut jammers,
+                &mut barrels,
                 &mut players,
             );
             if any_hit {
@@ -1704,6 +1841,11 @@ fn move_player_projectiles(
                     sfx.play(SfxEvent::Hit);
                 }
             }
+            HitTarget::Barrel(i) => {
+                if let Some((mut b, _)) = barrels.iter_mut().nth(i) {
+                    damage_barrel(&mut b, damage, false);
+                }
+            }
             HitTarget::Wall => {}
         }
         spawn_burst(&mut commands, &fx, hit - dir * 0.1, BurstColor::Cyan, 7, 4.8, 0.065);
@@ -1729,9 +1871,23 @@ fn detonate_rocket(
     mods: &PlayerModifiers,
     enemies: &mut Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     jammers: &mut Query<(&mut DemonJammer, &GlobalTransform)>,
+    barrels: &mut Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
     players: &mut Query<(&mut Player, &Transform)>,
 ) -> bool {
     let radius = rocket_splash_radius(mods);
+    for (i, (mut b, g)) in barrels.iter_mut().enumerate() {
+        if !b.is_intact() {
+            continue;
+        }
+        let dmg = if direct == HitTarget::Barrel(i) {
+            ROCKET_DIRECT_DAMAGE * damage_mult
+        } else {
+            let c = g.translation() + Vec3::Y * BARREL_CENTER_Y;
+            let d = (c.distance(blast) - BARREL_RADIUS).max(0.0);
+            if d > radius || !has_line_of_sight(grid, blast, c) { 0.0 } else { rocket_splash_damage(d, radius, damage_mult) }
+        };
+        damage_barrel(&mut b, dmg, false);
+    }
     let mut any_hit = false;
     for (i, (mut en, g, marked)) in enemies.iter_mut().enumerate() {
         if !en.is_alive() {
@@ -1838,6 +1994,107 @@ fn jammer_deaths(
     }
 }
 
+/// Tick barrel fuses and detonate the armed ones: LoS-respecting linear
+/// falloff blast on demons, jammers and the player (forgiving blast jump),
+/// staggered chain fuses on nearby barrels, and the explosion VFX.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn barrel_detonations(
+    mut commands: Commands,
+    time: Res<Time>,
+    grid: Res<LevelGrid>,
+    mods: Res<PlayerModifiers>,
+    fx: Res<FxAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
+    mut barrels: Query<(Entity, &mut ExplosiveBarrel, &GlobalTransform, &mut Transform), Without<Player>>,
+    mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
+    mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
+    mut players: Query<(&mut Player, &Transform), Without<ExplosiveBarrel>>,
+    mut blasts: Local<Vec<(Entity, Vec3)>>,
+) {
+    let dt = time.delta_secs();
+    blasts.clear();
+    for (e, mut b, g, mut tf) in &mut barrels {
+        if b.exploded {
+            continue;
+        }
+        if b.hit_flash > 0.0 {
+            b.hit_flash = (b.hit_flash - dt).max(0.0);
+            let s = 1.0 + b.hit_flash * 0.8;
+            tf.scale = Vec3::new(s, 1.0 + b.hit_flash * 0.3, s);
+        } else if tf.scale != Vec3::ONE {
+            tf.scale = Vec3::ONE;
+        }
+        if let Some(f) = b.fuse {
+            let f = f - dt;
+            if f <= 0.0 {
+                b.exploded = true;
+                blasts.push((e, g.translation() + Vec3::Y * BARREL_CENTER_Y));
+            } else {
+                b.fuse = Some(f);
+            }
+        }
+    }
+    let mut any_hit = false;
+    for &(e, blast) in blasts.iter() {
+        commands.entity(e).try_despawn();
+        for (mut en, g, marked) in &mut enemies {
+            if !en.is_alive() {
+                continue;
+            }
+            let root = g.translation();
+            let d = splash_distance(blast, root, en.stats.hit_spheres);
+            if d > BARREL_BLAST_RADIUS || !has_line_of_sight(&grid, blast, en.center(root)) {
+                continue;
+            }
+            let falloff = splash_falloff(d, BARREL_BLAST_RADIUS);
+            let away = Vec2::new(root.x - blast.x, root.z - blast.z).normalize_or(Vec2::X);
+            let kb = 16.0 * falloff * knockback_scale(en.kind);
+            damage_enemy(&mut en, barrel_blast_damage(d), marked.is_some(), &mods);
+            en.knockback += Vec3::new(away.x * kb, kb * 0.2, away.y * kb);
+            any_hit = true;
+        }
+        for (mut j, g) in &mut jammers {
+            if !j.is_active() {
+                continue;
+            }
+            let base = g.translation();
+            let d = splash_distance(blast, base, &JAMMER_SPHERES);
+            if d <= BARREL_BLAST_RADIUS && has_line_of_sight(&grid, blast, base + Vec3::Y * 1.3) {
+                damage_jammer(&mut j, barrel_blast_damage(d));
+                any_hit = true;
+            }
+        }
+        for (_, mut b, g, _) in &mut barrels {
+            let c = g.translation() + Vec3::Y * BARREL_CENTER_Y;
+            let d = (c.distance(blast) - BARREL_RADIUS).max(0.0);
+            if b.is_intact() && d <= BARREL_BLAST_RADIUS && has_line_of_sight(&grid, blast, c) {
+                damage_barrel(&mut b, barrel_blast_damage(d), true);
+            }
+        }
+        if let Ok((mut p, ptf)) = players.single_mut()
+            && !p.is_dead()
+            && has_line_of_sight(&grid, blast, ptf.translation + Vec3::Y * 0.9)
+            && let Some(jump) = compute_barrel_jump(ptf.translation, blast, &mods)
+        {
+            apply_rocket_jump(&mut p, &jump);
+        }
+        spawn_flash_light(&mut commands, blast, Color::srgb(1.0, 0.42, 0.12), 3_200_000.0, 18.0, 0.32);
+        spawn_shockwave(&mut commands, &fx, &mut materials, blast, BARREL_BLAST_RADIUS * 0.9, 0.36, BARREL_BLAST_GLOW.0, BARREL_BLAST_GLOW.1, true);
+        spawn_shockwave(&mut commands, &fx, &mut materials, blast, BARREL_BLAST_RADIUS * 0.45, 0.22, ROCKET_CORE_GLOW.0, ROCKET_CORE_GLOW.1, false);
+        spawn_burst(&mut commands, &fx, blast, BurstColor::Fire, 18, 10.0, 0.18);
+        spawn_particles(&mut commands, &fx, blast, BurstColor::Spark, 10, 12.0, 0.06);
+        spawn_particles(&mut commands, &fx, blast + Vec3::Y * 0.4, BurstColor::Smoke, 6, 2.6, 0.32);
+        sfx.play(SfxEvent::RocketExplode);
+    }
+    if any_hit {
+        feed.hit(false);
+    }
+}
+
+/// Barrel explosion shockwave ring glow `(color, alpha)`.
+const BARREL_BLAST_GLOW: (Color, f32) = (Color::srgb(1.0, 0.32, 0.08), 0.8);
+
 /// Plasma bolt impact shockwave glow `(color, alpha)`.
 const BOLT_IMPACT_GLOW: (Color, f32) = (Color::srgb(0.3, 0.95, 1.0), 0.7);
 /// Rocket explosion shockwave ring glow `(color, alpha)`.
@@ -1846,7 +2103,7 @@ const ROCKET_BLAST_GLOW: (Color, f32) = (Color::srgb(1.0, 0.55, 0.12), 0.75);
 const ROCKET_CORE_GLOW: (Color, f32) = (Color::srgb(1.0, 0.78, 0.35), 0.8);
 
 fn prewarm_weapon_fades(fx: Res<FxAssets>, mut materials: ResMut<Assets<StandardMaterial>>) {
-    fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW, ROCKET_BLAST_GLOW, ROCKET_CORE_GLOW]);
+    fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW, ROCKET_BLAST_GLOW, ROCKET_CORE_GLOW, BARREL_BLAST_GLOW]);
 }
 
 pub struct WeaponsPlugin;
@@ -1861,6 +2118,10 @@ impl Plugin for WeaponsPlugin {
             .add_systems(
                 Update,
                 (fire_weapons, move_player_projectiles).chain().in_set(CombatDamage).run_if(resource_exists::<LevelGrid>),
+            )
+            .add_systems(
+                Update,
+                barrel_detonations.in_set(GameSet::Combat).after(CombatDamage).before(jammer_deaths).run_if(resource_exists::<LevelGrid>),
             )
             .add_systems(Update, (jammer_deaths, update_pickups).in_set(GameSet::Combat).after(CombatDamage))
             .add_systems(Update, (sync_overlay_fov, animate_viewmodels).in_set(GameSet::Ui));
@@ -2190,5 +2451,75 @@ mod tests {
         for (_, c) in plan {
             assert!(matches!(g.cell(c), Cell::Floor { .. }));
         }
+    }
+
+    #[test]
+    fn barrel_hit_cylinder_ray_tests() {
+        let base = Vec3::new(10.0, 0.0, 10.0);
+        // Side hit from the front at mid height.
+        let t = barrel_ray_hit(base, Vec3::new(10.0, 0.6, 20.0), Vec3::NEG_Z).unwrap();
+        assert!((t - (10.0 - BARREL_RADIUS)).abs() < 1e-4, "{t}");
+        // Over the top and beside: miss.
+        assert!(barrel_ray_hit(base, Vec3::new(10.0, 1.5, 20.0), Vec3::NEG_Z).is_none());
+        assert!(barrel_ray_hit(base, Vec3::new(10.7, 0.6, 20.0), Vec3::NEG_Z).is_none());
+        // Behind the ray origin: miss.
+        assert!(barrel_ray_hit(base, Vec3::new(10.0, 0.6, 5.0), Vec3::NEG_Z).is_none());
+        // Straight down onto the lid.
+        let t = barrel_ray_hit(base, base + Vec3::Y * 5.0, Vec3::NEG_Y).unwrap();
+        assert!((t - (5.0 - BARREL_HEIGHT)).abs() < 1e-4, "{t}");
+    }
+
+    #[test]
+    fn hitscan_reaches_barrels_but_walls_and_nearer_targets_block() {
+        let g = corridor();
+        let origin = Vec3::new(6.0, 0.6, 6.0);
+        let barrel = Vec3::new(18.0, 0.0, 6.0);
+        let (d, t) = resolve_hitscan_full(&g, origin, Vec3::X, HITSCAN_RANGE, &[], &[], &[barrel]);
+        assert_eq!(t, HitTarget::Barrel(0));
+        assert!((d - (12.0 - BARREL_RADIUS)).abs() < 1e-3);
+        // A jammer in front wins.
+        let (_, t) = resolve_hitscan_full(&g, origin, Vec3::X, HITSCAN_RANGE, &[], &[Vec3::new(12.0, 0.0, 6.0)], &[barrel]);
+        assert_eq!(t, HitTarget::Jammer(0));
+        // Behind the wall at x=20..24 on row z=1 (cell (5,2)).
+        let (_, t) = resolve_hitscan_full(&g, Vec3::new(6.0, 0.6, 10.0), Vec3::X, HITSCAN_RANGE, &[], &[], &[Vec3::new(30.0, 0.0, 10.0)]);
+        assert_eq!(t, HitTarget::Wall);
+    }
+
+    #[test]
+    fn barrel_damage_arms_instant_or_staggered_fuse() {
+        let mut b = ExplosiveBarrel::default();
+        // One shotgun blast (8 pellets) / two plasma bolts / one rocket / EMP.
+        assert!(PELLET_DAMAGE * SHOTGUN_PELLETS as f32 >= b.hp);
+        assert!(PLASMA_DAMAGE < b.hp && 2.0 * PLASMA_DAMAGE >= b.hp);
+        assert!(crate::apps::EMP_DAMAGE >= b.hp, "EMP (rockets hit harder still)");
+        assert!(!damage_barrel(&mut b, PLASMA_DAMAGE, false));
+        assert!(b.is_intact() && b.hit_flash > 0.0);
+        assert!(damage_barrel(&mut b, PLASMA_DAMAGE, false));
+        assert_eq!(b.fuse, Some(0.0));
+        assert!(!damage_barrel(&mut b, 50.0, false), "already armed");
+        let mut c = ExplosiveBarrel::default();
+        assert!(damage_barrel(&mut c, BARREL_DAMAGE, true));
+        assert_eq!(c.fuse, Some(BARREL_CHAIN_FUSE));
+        assert!(!damage_barrel(&mut ExplosiveBarrel { exploded: true, ..default() }, 100.0, false));
+    }
+
+    #[test]
+    fn barrel_blast_falloff_and_forgiving_player_boost() {
+        assert_eq!(barrel_blast_damage(0.0), BARREL_DAMAGE);
+        assert!((barrel_blast_damage(BARREL_BLAST_RADIUS * 0.5) - BARREL_DAMAGE * 0.5).abs() < 1e-3);
+        assert_eq!(barrel_blast_damage(BARREL_BLAST_RADIUS + 0.1), 0.0);
+        let m = PlayerModifiers::default();
+        let feet = Vec3::ZERO;
+        let j = compute_barrel_jump(feet, Vec3::new(1.0, 0.6, 0.0), &m).unwrap();
+        assert!(j.self_damage > 0.0 && j.self_damage <= BARREL_DAMAGE * BARREL_SELF_DAMAGE_FRAC);
+        assert!(j.impulse.y > 8.0 && j.impulse.x < -5.0, "up and away: {:?}", j.impulse);
+        // Barrel jumps launch harder than an equal rocket jump.
+        let r = compute_rocket_jump(feet, Vec3::new(1.0, 0.6, 0.0), BARREL_BLAST_RADIUS, &m).unwrap();
+        assert!(j.impulse.y > r.impulse.y);
+        assert!(compute_barrel_jump(feet, Vec3::new(8.0, 0.6, 0.0), &m).is_none());
+        // The rocket-jump refactor is unchanged.
+        let rj = compute_rocket_jump(feet, Vec3::new(0.0, 0.0, 0.0), ROCKET_SPLASH_RADIUS, &m).unwrap();
+        let f = splash_falloff(0.9, ROCKET_SPLASH_RADIUS);
+        assert!((rj.self_damage - ROCKET_SPLASH_DAMAGE * f * ROCKET_SELF_DAMAGE_FRAC).abs() < 1e-4);
     }
 }

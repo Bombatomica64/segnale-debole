@@ -13,7 +13,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use crate::assets_gen::GameAssets;
+use crate::assets_gen::{FloorTheme, GameAssets, ThemeMaterials};
 use crate::mesh_batch::{MaterialBatches, MeshBatch};
 use crate::state::{AppState, GameSet, RunStats};
 
@@ -33,6 +33,17 @@ pub const STEP_HEIGHT: f32 = 0.5;
 pub const PILLAR_RADIUS: f32 = 0.45;
 pub const TOWER_MAST_RADIUS: f32 = 0.7;
 pub const ATRIUM_SIZE: i32 = 7;
+/// Vertical launch speed of an atrium jump pad (onto the tower pedestal).
+pub const JUMP_PAD_ATRIUM_UP: f32 = 13.5;
+/// Barrels placed on floor `f`: `BARREL_BASE_COUNT + min(f, 4)` (5..=8).
+pub const BARREL_BASE_COUNT: usize = 4;
+
+/// A signal-gated jump pad: cell + launch velocity (m/s).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JumpPadSpec {
+    pub cell: IVec2,
+    pub launch_vel: Vec3,
+}
 
 /// Ascent direction of a ramp (low edge -> high edge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +182,10 @@ pub struct LevelGrid {
     pub pillars: Vec<Vec2>,
     pub pillar_radii: Vec<f32>,
     pub rooms: Vec<Room>,
+    /// Signal-gated jump pads (non-blocking: never affect walking / BFS).
+    pub jump_pads: Vec<JumpPadSpec>,
+    /// Volatile server-coolant barrels (non-blocking shootable props).
+    pub barrels: Vec<IVec2>,
     pub floor: u32,
     pub seed: u64,
     /// Run seed this grid was built for (used to detect a fresh run).
@@ -194,6 +209,8 @@ impl LevelGrid {
             pillars: Vec::new(),
             pillar_radii: Vec::new(),
             rooms: Vec::new(),
+            jump_pads: Vec::new(),
+            barrels: Vec::new(),
             floor: 1,
             seed: 0,
             run_seed: 0,
@@ -417,7 +434,9 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
     }
 
     // 2. Braid: knock out some separating walls to create loops (less dead ends).
-    let loop_chance = 0.10 + 0.01 * floor as f64;
+    // High-speed flow: generous loops so bhop routes circle back instead of
+    // dead-ending.
+    let loop_chance = 0.16 + 0.015 * floor as f64;
     for z in 1..n - 1 {
         for x in 1..n - 1 {
             let c = IVec2::new(x, z);
@@ -455,15 +474,24 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
             g.set(tower + IVec2::new(x, z), Cell::Floor { height: CATWALK_HEIGHT });
         }
     }
+    // Twin ramps (opposite or perpendicular) on the pedestal's mid-edges, so
+    // kiting during the SOS upload flows up/down from several angles. Mid-edge
+    // cells never hold an atrium pillar (those sit on the diagonals).
     let ramp_dir = RampDir::ALL[rng.random_range(0..4)];
-    // Ramp sits outside the pedestal and rises toward it.
-    let ramp_cell = tower - ramp_dir.offset() * 2;
-    g.set(ramp_cell, Cell::Ramp { low_height: 0.0, high_height: CATWALK_HEIGHT, dir: ramp_dir });
+    let second_dir = {
+        let o = ramp_dir.offset();
+        let choices = [-o, o.perp(), -o.perp()];
+        RampDir::from_offset(choices[rng.random_range(0..3)]).expect("unit offset")
+    };
+    for dir in [ramp_dir, second_dir] {
+        // Ramp sits outside the pedestal and rises toward it.
+        g.set(tower - dir.offset() * 2, Cell::Ramp { low_height: 0.0, high_height: CATWALK_HEIGHT, dir });
+    }
     g.pillars.push(tower_world_xz(tower));
     g.pillar_radii.push(TOWER_MAST_RADIUS);
     for (dx, dz) in [(1, 1), (5, 1), (1, 5), (5, 5)] {
         let c = amin + IVec2::new(dx, dz);
-        if c != ramp_cell {
+        if matches!(g.cell(c), Cell::AtriumFloor) {
             g.pillars.push(tower_world_xz(c));
             g.pillar_radii.push(PILLAR_RADIUS);
         }
@@ -589,7 +617,116 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
         }
     }
 
+    // 8. Signal jump pads, 9. explosive barrels (non-blocking props).
+    place_jump_pads(&mut g, &mut rng);
+    place_barrels(&mut g, &mut rng);
+
     Some(g)
+}
+
+/// Cells a prop must never occupy: spawn airlock area, tower, jammers, room
+/// centers (pickups), ramps and pits.
+fn prop_cell_free(g: &LevelGrid, c: IVec2) -> bool {
+    let standable = matches!(g.cell(c), Cell::Floor { height } if height == 0.0) || matches!(g.cell(c), Cell::AtriumFloor);
+    standable
+        && (c - g.spawn).abs().element_sum() >= 4
+        && c != g.tower
+        && !g.jammers.contains(&c)
+        && !g.rooms.iter().skip(1).any(|r| r.center() == c)
+        && !g.jump_pads.iter().any(|p| p.cell == c)
+}
+
+fn place_jump_pads(g: &mut LevelGrid, rng: &mut StdRng) {
+    let tower = g.tower;
+    // Atrium: a free pedestal mid-edge (not a ramp), launching up and onto
+    // the pedestal toward the mast.
+    let mut atrium_slots: Vec<IVec2> =
+        RampDir::ALL.map(RampDir::offset).into_iter().filter(|&o| matches!(g.cell(tower + o * 2), Cell::AtriumFloor)).collect();
+    atrium_slots.shuffle(rng);
+    let atrium_pad = |o: IVec2| JumpPadSpec { cell: tower + o * 2, launch_vel: Vec3::new(-o.x as f32 * 5.0, JUMP_PAD_ATRIUM_UP, -o.y as f32 * 5.0) };
+    if let Some(&o) = atrium_slots.first() {
+        g.jump_pads.push(atrium_pad(o));
+    }
+
+    // Rooms: catwalk launchers and across-the-room launchers.
+    let want_rooms = (1 + g.floor as usize / 2).min(3);
+    let mut rooms: Vec<Room> = g.rooms.iter().skip(1).copied().collect();
+    rooms.shuffle(rng);
+    let mut placed = 0;
+    for room in rooms {
+        if placed >= want_rooms {
+            break;
+        }
+        let m = room.min;
+        let spec = match room.feature {
+            RoomFeature::Catwalk => {
+                // In front of the raised plates, launching north onto them.
+                let c = m + IVec2::new(2, 3);
+                (matches!(g.cell(c + IVec2::NEG_Y), Cell::Floor { height } if height > 0.1))
+                    .then_some(JumpPadSpec { cell: c, launch_vel: Vec3::new(0.0, 11.0, -5.0) })
+            }
+            RoomFeature::None | RoomFeature::Pillars => {
+                // West edge of the middle row, launching east across the room.
+                let c = m + IVec2::new(0, room.size.y / 2);
+                let path_clear = (1..room.size.x).all(|k| matches!(g.cell(c + IVec2::X * k), Cell::Floor { height } if height == 0.0));
+                path_clear.then_some(JumpPadSpec { cell: c, launch_vel: Vec3::new(9.0, 10.0, 0.0) })
+            }
+            RoomFeature::LavaPit => None,
+        };
+        if let Some(spec) = spec
+            && prop_cell_free(g, spec.cell)
+        {
+            g.jump_pads.push(spec);
+            placed += 1;
+        }
+    }
+    // Always at least two pads: fall back to a second atrium launcher.
+    if g.jump_pads.len() < 2
+        && let Some(&o) = atrium_slots.get(1)
+    {
+        g.jump_pads.push(atrium_pad(o));
+    }
+}
+
+/// Straight 1-cell corridor or dead end (props there would read as blockers).
+fn is_chokepoint(g: &LevelGrid, c: IVec2) -> bool {
+    let open = |o: IVec2| !g.cell(c + o).is_wall();
+    let n = RampDir::ALL.map(RampDir::offset).into_iter().filter(|&o| open(o)).count();
+    n <= 1 || (n == 2 && ((open(IVec2::X) && open(IVec2::NEG_X)) || (open(IVec2::Y) && open(IVec2::NEG_Y))))
+}
+
+fn place_barrels(g: &mut LevelGrid, rng: &mut StdRng) {
+    let want = BARREL_BASE_COUNT + (g.floor.max(1) as usize).min(4);
+    let mut candidates: Vec<IVec2> = Vec::new();
+    // Room corners.
+    for room in g.rooms.iter().skip(1) {
+        let s = room.size - IVec2::ONE;
+        candidates.extend([IVec2::ZERO, IVec2::new(s.x, 0), IVec2::new(0, s.y), s].map(|o| room.min + o));
+    }
+    // Atrium perimeter.
+    let amin = g.rooms[0].min;
+    for k in 0..ATRIUM_SIZE {
+        for o in [IVec2::new(k, 0), IVec2::new(k, ATRIUM_SIZE - 1), IVec2::new(0, k), IVec2::new(ATRIUM_SIZE - 1, k)] {
+            candidates.push(amin + o);
+        }
+    }
+    candidates.sort_by_key(|c| (c.y, c.x));
+    candidates.dedup();
+    candidates.shuffle(rng);
+    let near_blocked = |g: &LevelGrid, c: IVec2| {
+        RampDir::ALL.map(RampDir::offset).into_iter().any(|o| {
+            let n = c + o;
+            matches!(g.cell(n), Cell::Ramp { .. } | Cell::HazardPit) || g.jump_pads.iter().any(|p| p.cell == n)
+        })
+    };
+    for c in candidates {
+        if g.barrels.len() >= want {
+            break;
+        }
+        if prop_cell_free(g, c) && !g.barrels.contains(&c) && !is_chokepoint(g, c) && !near_blocked(g, c) {
+            g.barrels.push(c);
+        }
+    }
 }
 
 fn apply_room_feature(g: &mut LevelGrid, room: &Room, rng: &mut StdRng) {
@@ -670,6 +807,70 @@ impl DemonJammer {
     pub fn is_active(&self) -> bool {
         self.hp > 0.0
     }
+}
+
+/// Signal-gated jump pad (powered at >= 2 bars at its position).
+#[derive(Component, Debug, Clone)]
+pub struct JumpPad {
+    /// World position of the pad (center, floor height).
+    pub pos: Vec3,
+    pub launch_vel: Vec3,
+    /// Seconds until the pad can launch again.
+    pub cooldown: f32,
+    pub powered: bool,
+    /// Power state evaluated at least once (no power-up burst on spawn).
+    pub primed: bool,
+}
+
+/// Emissive ring + core of a jump pad (material swapped with power).
+#[derive(Component)]
+pub struct JumpPadGlow {
+    pub phase: f32,
+}
+
+/// Point light of a jump pad (color swapped with power).
+#[derive(Component)]
+pub struct JumpPadLight;
+
+pub const PAD_POWERED_LIGHT: Color = Color::srgb(0.2, 1.0, 0.7);
+pub const PAD_DORMANT_LIGHT: Color = Color::srgb(0.9, 0.22, 0.08);
+
+/// Volatile server-coolant barrel (shootable, chain-detonating).
+#[derive(Component, Debug, Clone, PartialEq)]
+pub struct ExplosiveBarrel {
+    pub hp: f32,
+    pub max_hp: f32,
+    /// Seconds until detonation once lethal damage landed.
+    pub fuse: Option<f32>,
+    pub exploded: bool,
+    pub hit_flash: f32,
+}
+
+pub const BARREL_HP: f32 = 28.0;
+
+impl Default for ExplosiveBarrel {
+    fn default() -> Self {
+        ExplosiveBarrel { hp: BARREL_HP, max_hp: BARREL_HP, fuse: None, exploded: false, hit_flash: 0.0 }
+    }
+}
+
+impl ExplosiveBarrel {
+    /// Still on the map and not yet counting down.
+    pub fn is_intact(&self) -> bool {
+        !self.exploded && self.fuse.is_none()
+    }
+}
+
+/// World position (base, floor height) of the barrel on cell `c`: nudged
+/// toward adjacent walls so drums sit against them.
+pub fn barrel_world(g: &LevelGrid, c: IVec2) -> Vec3 {
+    let mut p = g.cell_center(c);
+    for o in RampDir::ALL.map(RampDir::offset) {
+        if g.cell(c + o).is_wall() {
+            p += Vec3::new(o.x as f32, 0.0, o.y as f32) * 1.1;
+        }
+    }
+    p
 }
 
 /// Pulsing visual part of a jammer (scaled by `animate_props`).
@@ -885,11 +1086,13 @@ impl LevelSourceMeshes {
 #[derive(Component)]
 pub struct LevelBatch;
 
-fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, meshes: &mut Assets<Mesh>) {
-    // Atmosphere: crimson Martian moonlight + ambient. (Fog lives on the camera.)
+fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, assets: &GameAssets, meshes: &mut Assets<Mesh>) {
+    let theme = FloorTheme::for_floor(g.floor).spec();
+    let a = assets.theme_for_floor(g.floor);
+    // Atmosphere: sector-themed moonlight + ambient. (Fog lives on the camera.)
     commands.spawn((
         LevelEntity,
-        DirectionalLight { color: Color::srgb(1.0, 0.35, 0.25), illuminance: 1800.0, shadow_maps_enabled: false, ..default() },
+        DirectionalLight { color: theme.sun_color, illuminance: theme.sun_illuminance, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(0.0, 50.0, 0.0).looking_at(Vec3::new(30.0, 0.0, 45.0), Vec3::Y),
     ));
 
@@ -963,7 +1166,7 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
                             LevelEntity,
                             CullableLight::for_range(9.0),
                             PointLight {
-                                color: Color::srgb(1.0, 0.3, 0.05),
+                                color: theme.hazard_light_color,
                                 intensity: 250_000.0,
                                 range: 9.0,
                                 shadow_maps_enabled: false,
@@ -1019,7 +1222,7 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
             LevelEntity,
             CullableLight::for_range(16.0),
             PointLight {
-                color: if warm { Color::srgb(1.0, 0.62, 0.35) } else { Color::srgb(0.9, 0.25, 0.2) },
+                color: if warm { theme.lamp_warm } else { theme.lamp_accent },
                 intensity: 420_000.0,
                 range: 16.0,
                 shadow_maps_enabled: false,
@@ -1030,16 +1233,57 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, 
         batches.add(&src.lamp, &a.lamp, Transform::from_translation(pos + Vec3::Y * 0.45));
     }
 
-    spawn_signal_tower(commands, g, a, &src, &mut batches);
+    spawn_signal_tower(commands, g, assets, a, &src, &mut batches);
     for (mesh, mat) in batches.finish(meshes) {
         commands.spawn((LevelEntity, LevelBatch, Mesh3d(mesh), MeshMaterial3d(mat), Transform::IDENTITY));
     }
     for &j in &g.jammers {
-        spawn_jammer(commands, g, a, &src, meshes, j);
+        spawn_jammer(commands, g, assets, &src, meshes, j);
+    }
+    for pad in &g.jump_pads {
+        spawn_jump_pad(commands, g, assets, pad);
+    }
+    for &c in &g.barrels {
+        spawn_barrel(commands, assets, barrel_world(g, c));
     }
 }
 
-fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, src: &LevelSourceMeshes, batches: &mut MaterialBatches) {
+fn spawn_jump_pad(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, spec: &JumpPadSpec) {
+    let pos = g.cell_center(spec.cell);
+    let phase = (spec.cell.x * 5 + spec.cell.y * 11) as f32 * 0.41;
+    commands
+        .spawn((
+            LevelEntity,
+            JumpPad { pos, launch_vel: spec.launch_vel, cooldown: 0.0, powered: false, primed: false },
+            Transform::from_translation(pos),
+            Visibility::default(),
+        ))
+        .with_children(|p| {
+            for (mesh, mat) in &a.pad_base_model {
+                p.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY));
+            }
+            p.spawn((JumpPadGlow { phase }, Mesh3d(a.pad_glow_mesh.clone()), MeshMaterial3d(a.pad_dormant.clone()), Transform::IDENTITY));
+            p.spawn((
+                JumpPadLight,
+                CullableLight::for_range(7.0),
+                PointLight { color: PAD_DORMANT_LIGHT, intensity: 90_000.0, range: 7.0, shadow_maps_enabled: false, ..default() },
+                Transform::from_xyz(0.0, 0.9, 0.0),
+            ));
+        });
+}
+
+/// Spawn a barrel from the pre-baked drum model (shared meshes + materials).
+pub fn spawn_barrel(commands: &mut Commands, a: &GameAssets, pos: Vec3) {
+    commands
+        .spawn((LevelEntity, ExplosiveBarrel::default(), Transform::from_translation(pos), Visibility::default()))
+        .with_children(|b| {
+            for (mesh, mat) in &a.barrel_model {
+                b.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY));
+            }
+        });
+}
+
+fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, assets: &GameAssets, a: &ThemeMaterials, src: &LevelSourceMeshes, batches: &mut MaterialBatches) {
     let base = g.tower_world();
     let mast_h = 14.0;
     let beacon = base + Vec3::Y * (mast_h + 0.6);
@@ -1054,7 +1298,7 @@ fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, sr
             let y = 2.5 + level as f32 * 4.0;
             batches.add(
                 &src.tower_panel,
-                &a.tower_panel,
+                &assets.tower_panel,
                 at(Transform::from_translation(Quat::from_rotation_y(ang) * Vec3::new(0.0, y, -0.85)).with_rotation(Quat::from_rotation_y(ang))),
             );
         }
@@ -1077,8 +1321,8 @@ fn spawn_signal_tower(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, sr
         .with_children(|t| {
             t.spawn((
                 TowerBeacon,
-                Mesh3d(a.beacon_mesh.clone()),
-                MeshMaterial3d(a.beacon.clone()),
+                Mesh3d(assets.beacon_mesh.clone()),
+                MeshMaterial3d(assets.beacon.clone()),
                 Transform::from_xyz(0.0, mast_h + 0.6, 0.0),
                 PointLight {
                     color: Color::srgb(0.3, 1.0, 0.75),
@@ -1149,10 +1393,15 @@ fn spawn_jammer(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, src: &Le
 
 fn animate_props(
     time: Res<Time>,
-    mut cores: Query<(&JammerCore, &mut Transform)>,
+    mut cores: Query<(&JammerCore, &mut Transform), Without<JumpPadGlow>>,
     mut beacons: Query<&mut PointLight, With<TowerBeacon>>,
+    mut pads: Query<(&JumpPadGlow, &mut Transform), Without<JammerCore>>,
 ) {
     let t = time.elapsed_secs();
+    for (glow, mut tf) in &mut pads {
+        let s = 1.0 + 0.07 * (t * 4.0 + glow.phase).sin();
+        tf.scale = Vec3::new(s, 1.0, s);
+    }
     for (core, mut tf) in &mut cores {
         let s = 1.0 + 0.18 * (t * 5.0 + core.phase).sin();
         tf.scale = Vec3::splat(s);
@@ -1356,5 +1605,132 @@ mod tests {
 
         assert_eq!(*world.entity(light).get::<Visibility>().unwrap(), Visibility::Hidden);
         assert_eq!(world.entity(light).get::<PointLight>().unwrap().intensity, 0.0);
+    }
+
+    fn atrium_ramps(g: &LevelGrid) -> Vec<(IVec2, RampDir)> {
+        RampDir::ALL
+            .map(RampDir::offset)
+            .into_iter()
+            .map(|o| g.tower + o * 2)
+            .filter_map(|c| match g.cell(c) {
+                Cell::Ramp { dir, .. } => Some((c, dir)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn atrium_has_twin_ramps_onto_the_pedestal_clear_of_pillars() {
+        for floor in 1..=5 {
+            for seed in 0..12u64 {
+                let g = generate_level(floor, seed * 104_729 + floor as u64);
+                let ramps = atrium_ramps(&g);
+                assert_eq!(ramps.len(), 2, "floor {floor} seed {seed}: twin ramps");
+                for &(c, dir) in &ramps {
+                    // Rises toward the tower, low end opens onto the atrium floor.
+                    assert_eq!(c + dir.offset() * 2, g.tower);
+                    assert!(g.can_walk(c - dir.offset(), c) && g.can_walk(c, c + dir.offset()), "walk up ramp {c}");
+                    assert!(g.is_reachable(g.spawn, c + dir.offset()));
+                    let (lo, hi) = (tower_world_xz(c) - Vec2::splat(CELL_SIZE * 0.5), tower_world_xz(c) + Vec2::splat(CELL_SIZE * 0.5));
+                    for (p, r) in g.pillars.iter().zip(&g.pillar_radii) {
+                        let inside = p.x + r > lo.x && p.x - r < hi.x && p.y + r > lo.y && p.y - r < hi.y;
+                        assert!(!inside, "pillar {p} overlaps ramp {c}");
+                    }
+                }
+                let (a, b) = (ramps[0].1.offset(), ramps[1].1.offset());
+                assert!(a == -b || a.dot(b) == 0, "opposite or perpendicular");
+            }
+        }
+    }
+
+    #[test]
+    fn jump_pads_and_barrels_are_placed_safely_and_reachably() {
+        for floor in 1..=5 {
+            for seed in [0u64, 7, 99, 1234, 2026, 31337, 0xBEEF] {
+                let g = generate_level(floor, seed);
+                assert!(g.validate());
+                assert!((2..=4).contains(&g.jump_pads.len()), "floor {floor} seed {seed}: {} pads", g.jump_pads.len());
+                let n_barrels = g.barrels.len();
+                assert_eq!(n_barrels, BARREL_BASE_COUNT + (floor as usize).min(4), "floor {floor} seed {seed} barrels");
+                assert!((4..=8).contains(&n_barrels));
+                // At least one pad beside the pedestal, launching up and toward the tower.
+                let atrium = g.jump_pads.iter().find(|p| (p.cell - g.tower).abs().element_sum() == 2 && g.is_roof_open(p.cell));
+                let atrium = atrium.expect("atrium pad");
+                assert!((atrium.launch_vel.y - JUMP_PAD_ATRIUM_UP).abs() < 1e-4);
+                let to_tower = (g.tower - atrium.cell).as_vec2().normalize();
+                assert!(Vec2::new(atrium.launch_vel.x, atrium.launch_vel.z).normalize().dot(to_tower) > 0.99);
+                let mut used: Vec<IVec2> = Vec::new();
+                for c in g.jump_pads.iter().map(|p| p.cell).chain(g.barrels.iter().copied()) {
+                    assert!(!used.contains(&c), "prop cells unique: {c}");
+                    used.push(c);
+                    assert!(matches!(g.cell(c), Cell::Floor { height } if height == 0.0) || matches!(g.cell(c), Cell::AtriumFloor), "{c}: {:?}", g.cell(c));
+                    assert!(c != g.spawn && c != g.tower && !g.jammers.contains(&c));
+                    assert!(g.is_reachable(g.spawn, c), "prop {c} reachable");
+                }
+                for p in &g.jump_pads {
+                    assert!(p.launch_vel.y >= 10.0 && p.launch_vel.y <= JUMP_PAD_ATRIUM_UP);
+                    // Launch path clears hazard pits.
+                    let step = IVec2::new(p.launch_vel.x.signum() as i32, p.launch_vel.z.signum() as i32);
+                    for k in 1..=2 {
+                        assert!(!matches!(g.cell(p.cell + step * k), Cell::HazardPit), "pad {} launches into lava", p.cell);
+                    }
+                }
+                for &b in &g.barrels {
+                    assert!(!is_chokepoint(&g, b), "barrel {b} in a 1-cell chokepoint");
+                    for o in RampDir::ALL.map(RampDir::offset) {
+                        assert!(!matches!(g.cell(b + o), Cell::Ramp { .. } | Cell::HazardPit), "barrel {b} crowds a ramp/pit");
+                    }
+                    let w = barrel_world(&g, b);
+                    assert_eq!(g.world_to_cell(w), b, "nudged barrel stays in its cell");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn props_are_deterministic_per_floor_and_seed() {
+        for floor in 1..=5 {
+            let (a, b) = (generate_level(floor, 4242), generate_level(floor, 4242));
+            assert_eq!(a.jump_pads, b.jump_pads);
+            assert_eq!(a.barrels, b.barrels);
+            assert_eq!(a.cells, b.cells);
+            let c = generate_level(floor, 4243);
+            assert!(c.cells != a.cells || c.barrels != a.barrels);
+        }
+    }
+
+    #[test]
+    fn playtest_bot_seeds_keep_valid_high_speed_layouts() {
+        for seed in [1234u64, 99, 2026, 7, 31337] {
+            for floor in 1..=5 {
+                let g = generate_level(floor, seed);
+                assert!(g.validate(), "seed {seed} floor {floor}");
+                assert_eq!(g.jammers.len(), jammer_count_for_floor(floor));
+                assert_eq!(atrium_ramps(&g).len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn braid_loops_cut_dead_ends() {
+        // Higher loop chance: few dead-end corridor cells on every floor.
+        for floor in 1..=5 {
+            let g = generate_level(floor, 555);
+            let open: Vec<IVec2> = (0..g.width * g.depth).map(|i| IVec2::new(i % g.width, i / g.width)).filter(|&c| !g.cell(c).is_wall()).collect();
+            let dead_ends = open.iter().filter(|&&c| RampDir::ALL.map(RampDir::offset).into_iter().filter(|&o| !g.cell(c + o).is_wall()).count() == 1).count();
+            assert!(dead_ends * 8 < open.len(), "floor {floor}: {dead_ends} dead ends of {} cells", open.len());
+        }
+    }
+
+    #[test]
+    fn barrel_defaults_and_intact_state() {
+        let mut b = ExplosiveBarrel::default();
+        assert_eq!((b.hp, b.max_hp), (BARREL_HP, BARREL_HP));
+        assert!(b.is_intact());
+        b.fuse = Some(0.1);
+        assert!(!b.is_intact());
+        b.fuse = None;
+        b.exploded = true;
+        assert!(!b.is_intact());
     }
 }

@@ -18,12 +18,12 @@ use crate::bot_input::{take_flag, BotControl};
 use crate::enemies::{damage_enemy, Enemy, EnemyAssets, EnemyKind, PingMarked, FIEND_FIELD_RADIUS};
 use crate::fx::{overlay_layer, spawn_beam, Fx, FxFade, FxMotion, spawn_burst, spawn_flash_light, spawn_lightning, spawn_shockwave, BurstColor, FxAssets, HudFeed};
 use crate::fx::beam_glows;
-use crate::level::{CullableLight, DemonJammer, LevelEntity, LevelGrid};
+use crate::level::{CullableLight, DemonJammer, ExplosiveBarrel, LevelEntity, LevelGrid};
 use crate::physics::sample_floor_height;
 use crate::player::{CursorCaptured, Player};
 use crate::signal::{bars_from_strength, SignalState};
 use crate::state::PlayerModifiers;
-use crate::weapons::{damage_jammer, knockback_scale, CombatDamage};
+use crate::weapons::{damage_barrel, damage_jammer, knockback_scale, CombatDamage, BARREL_CENTER_Y, BARREL_RADIUS};
 
 pub const PING_COOLDOWN: f32 = 4.0;
 pub const PING_MIN_BARS: u8 = 1;
@@ -350,7 +350,7 @@ fn phone_apps(
     (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
     (players, decoys): (Query<&Transform, With<Player>>, Query<Entity, With<DecoyHandset>>),
     mut enemies: Query<(Entity, &mut Enemy, &GlobalTransform, Option<&mut PingMarked>)>,
-    mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
+    (mut jammers, mut barrels): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut ExplosiveBarrel, &GlobalTransform)>),
     mut bot: Option<ResMut<BotControl>>,
 ) {
     apps.tick(time.delta_secs());
@@ -489,6 +489,13 @@ fn phone_apps(
                         damage_jammer(&mut j, dmg);
                         spawn_lightning(&mut commands, &fx, center, g.translation() + Vec3::Y * 2.7);
                         jhit += 1;
+                    }
+                }
+                // Volatile coolant barrels in the EMP blast cook off.
+                for (mut b, g) in &mut barrels {
+                    let c = g.translation() + Vec3::Y * BARREL_CENTER_Y;
+                    if b.is_intact() && c.distance(center) <= radius + BARREL_RADIUS && damage_barrel(&mut b, dmg, false) {
+                        spawn_lightning(&mut commands, &fx, center, c);
                     }
                 }
                 if mods.emp_chains && !hit_pos.is_empty() {

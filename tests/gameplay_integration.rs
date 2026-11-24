@@ -1119,7 +1119,7 @@ fn emergency_callback_unlocks_any_signal_overload() {
 #[test]
 fn missed_call_decoy_lures_imp_away_from_player() {
     let mut app = build_headless_test_app();
-    begin_run(&mut app, 41);
+    begin_run(&mut app, 42); // M11 layouts: seed with a straight lane off a blackout cell
     godmode(&mut app);
     despawn_all_enemies(&mut app);
     install(&mut app, UpgradeId::MissedCall);
@@ -2544,4 +2544,277 @@ fn high_capacity_cell_and_floor_patch_cover_rockets() {
     assert_eq!(UpgradeId::ALL.len(), 17);
     assert_eq!(segnale_debole::meta::default_catalog().len(), segnale_debole::meta::ACTIVE_CATALOG_SIZE);
     assert_eq!(segnale_debole::meta::ACTIVE_CATALOG_SIZE, 12);
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 11: signal jump pads, explosive barrels, sector themes
+// ---------------------------------------------------------------------------
+
+use segnale_debole::assets_gen::{FloorTheme, GameAssets};
+use segnale_debole::level::{spawn_barrel, ExplosiveBarrel, JumpPad, JumpPadGlow};
+use segnale_debole::weapons::{BARREL_DAMAGE, BARREL_SELF_DAMAGE_FRAC};
+
+/// Remove every level jump pad and barrel (scenario isolation).
+fn clear_props(app: &mut App) {
+    let mut q = app.world_mut().query_filtered::<Entity, Or<(With<JumpPad>, With<ExplosiveBarrel>)>>();
+    let ids: Vec<Entity> = q.iter(app.world()).collect();
+    for e in ids {
+        app.world_mut().entity_mut(e).despawn();
+    }
+}
+
+fn spawn_test_barrel(app: &mut App, pos: Vec3) -> Entity {
+    app.world_mut()
+        .run_system_once(move |mut commands: Commands, a: Res<GameAssets>| spawn_barrel(&mut commands, &a, pos))
+        .unwrap();
+    let mut q = app.world_mut().query::<(Entity, &Transform, &ExplosiveBarrel)>();
+    let e = q.iter(app.world()).find(|(_, tf, _)| tf.translation.distance(pos) < 1e-3).map(|(e, _, _)| e).expect("barrel spawned");
+    step(app, 1);
+    e
+}
+
+fn barrel_alive(app: &App, e: Entity) -> bool {
+    app.world().get::<ExplosiveBarrel>(e).is_some()
+}
+
+fn pad_at(app: &mut App, pos: Vec3) -> (Entity, JumpPad) {
+    let mut q = app.world_mut().query::<(Entity, &JumpPad)>();
+    q.iter(app.world()).find(|(_, p)| p.pos.distance(pos) < 1e-3).map(|(e, p)| (e, p.clone())).expect("jump pad")
+}
+
+fn pad_glow_is(app: &mut App, pad: Entity, mat: &Handle<StandardMaterial>) -> bool {
+    let children: Vec<Entity> = app.world().get::<Children>(pad).unwrap().iter().collect();
+    children.into_iter().any(|c| {
+        app.world().get::<JumpPadGlow>(c).is_some() && app.world().get::<MeshMaterial3d<StandardMaterial>>(c).is_some_and(|m| m.0 == *mat)
+    })
+}
+
+#[test]
+fn every_floor_spawns_its_jump_pads_and_barrels() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 2027);
+    for floor in 1..=3u32 {
+        let g = grid(&app);
+        assert_eq!(g.floor, floor);
+        assert_eq!(count::<JumpPad>(&mut app), g.jump_pads.len(), "floor {floor} pads");
+        assert_eq!(count::<ExplosiveBarrel>(&mut app), g.barrels.len(), "floor {floor} barrels");
+        assert!((2..=4).contains(&g.jump_pads.len()) && (4..=8).contains(&g.barrels.len()));
+        // The camera fog and sky follow the sector theme.
+        let spec = FloorTheme::for_floor(floor).spec();
+        let mut fog = app.world_mut().query_filtered::<&bevy::pbr::DistanceFog, With<PlayerCamera>>();
+        assert_eq!(fog.single(app.world()).unwrap().color, spec.fog_color, "floor {floor} fog");
+        assert_eq!(app.world().resource::<ClearColor>().0, spec.sky_color, "floor {floor} sky");
+        fast_clear_floor(&mut app);
+        assert_eq!(app_state(&app), AppState::UpgradeSelect);
+        bot(&mut app).pick_upgrade = Some(0);
+        step(&mut app, 3);
+    }
+}
+
+#[test]
+fn jump_pad_dormant_under_jammer_then_powers_up_and_launches_onto_pedestal() {
+    use segnale_debole::player::{JUMP_PAD_COOLDOWN, JUMP_PAD_EVAL_SECS};
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 1234);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    let g = grid(&app);
+    let spec = g.jump_pads[0];
+    assert_eq!((spec.cell - g.tower).abs().element_sum(), 2, "first pad sits by the tower pedestal");
+    let pad_pos = g.cell_center(spec.cell);
+    let (powered_mat, dormant_mat) = {
+        let a = app.world().resource::<GameAssets>();
+        (a.pad_powered.clone(), a.pad_dormant.clone())
+    };
+    step(&mut app, (JUMP_PAD_EVAL_SECS * 60.0) as usize + 2);
+    let (pad, state) = pad_at(&mut app, pad_pos);
+    assert!(state.powered, "5 bars inside the signal ring power the pad");
+    assert!(pad_glow_is(&mut app, pad, &powered_mat));
+
+    // A jammer parked on the pad drags it below 2 bars.
+    let jam = app.world_mut().spawn((DemonJammer::for_floor(1), Transform::from_translation(pad_pos))).id();
+    step(&mut app, (JUMP_PAD_EVAL_SECS * 60.0) as usize + 2);
+    assert!(!pad_at(&mut app, pad_pos).1.powered, "jammed pad goes dormant");
+    assert!(pad_glow_is(&mut app, pad, &dormant_mat));
+
+    // Standing on the dormant pad: no launch, one rate-limited toast.
+    teleport(&mut app, pad_pos, g.tower_world() + Vec3::Y * 2.0);
+    step(&mut app, 10);
+    let p = player(&mut app);
+    assert!(p.grounded && p.velocity.y.abs() < 0.5, "dormant pad never launches: {:?}", p.velocity);
+    let offline = |app: &App| app.world().resource::<HudFeed>().toasts.iter().filter(|t| t.text.contains("JUMP PAD OFFLINE")).count();
+    assert_eq!(offline(&app), 1);
+    step(&mut app, 30);
+    assert_eq!(offline(&app), 1, "toast is rate-limited");
+
+    // Clear the jammer: the pad powers up and launches the player standing on it.
+    app.world_mut().get_mut::<DemonJammer>(jam).unwrap().hp = 0.0;
+    let mut launched_at = None;
+    for f in 0..30 {
+        step(&mut app, 1);
+        if player(&mut app).velocity.y > 10.0 {
+            launched_at = Some(f);
+            break;
+        }
+    }
+    assert!(launched_at.is_some(), "cleared jammer powered the pad and it launched");
+    assert!(pad_at(&mut app, pad_pos).1.powered);
+    assert!(pad_glow_is(&mut app, pad, &powered_mat));
+    let cd = pad_at(&mut app, pad_pos).1.cooldown;
+    assert!(cd > 0.0 && cd <= JUMP_PAD_COOLDOWN, "cooldown armed: {cd}");
+    assert!(!player(&mut app).grounded);
+    let mut apex = 0.0f32;
+    for _ in 0..(1.4 * FPS as f32) as usize {
+        step(&mut app, 1);
+        apex = apex.max(player_feet(&mut app).y);
+    }
+    let feet = player_feet(&mut app);
+    assert!(apex > 3.5, "launched well above the pedestal: apex {apex}");
+    assert!((feet.y - g.tower_world().y).abs() < 0.05 && player(&mut app).grounded, "landed on the pedestal: {feet}");
+    assert_eq!(g.world_to_cell(feet).as_vec2().distance(g.tower.as_vec2()).round() as i32, 1, "on the pedestal ring");
+}
+
+#[test]
+fn powered_jump_pad_keeps_a_fast_bhoppers_momentum() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 1234);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    let g = grid(&app);
+    let pad_pos = g.cell_center(g.jump_pads[0].cell);
+    step(&mut app, 20);
+    assert!(pad_at(&mut app, pad_pos).1.powered);
+    // Mid-hop over the pad at 30 m/s, sideways to the pad's push.
+    let push = g.jump_pads[0].launch_vel;
+    let side = Vec3::new(-push.z, 0.0, push.x).normalize() * 30.0;
+    teleport(&mut app, pad_pos + Vec3::Y * 0.3 - side.normalize() * 0.4, pad_pos + side * 5.0 + Vec3::Y * 1.6);
+    with_player(&mut app, |p| {
+        p.velocity = side;
+        p.grounded = false;
+    });
+    step(&mut app, 1);
+    let p = player(&mut app);
+    assert!(p.velocity.y > 13.0, "launched: {:?}", p.velocity);
+    assert!(horizontal_speed(&p) >= 29.5, "bhop speed kept: {}", horizontal_speed(&p));
+    assert!(!p.grounded);
+}
+
+#[test]
+fn shotgun_barrel_chain_reaction_hits_demons_and_jammers_in_line_of_sight() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 77);
+    godmode(&mut app);
+    let c = open_arena(&mut app);
+    clear_props(&mut app);
+    let a = spawn_test_barrel(&mut app, c + Vec3::new(0.0, 0.0, -7.0));
+    let b = spawn_test_barrel(&mut app, c + Vec3::new(3.5, 0.0, -9.0));
+    let far = spawn_test_barrel(&mut app, c + Vec3::new(-14.0, 0.0, -7.0));
+    let baron = stunned_baron(&mut app, c + Vec3::new(-2.5, 0.0, -9.5));
+    let jam = app.world_mut().spawn((DemonJammer::for_floor(1), Transform::from_translation(c + Vec3::new(6.5, 0.0, -10.0)))).id();
+    step(&mut app, 2);
+    let jam_hp0 = app.world().get::<DemonJammer>(jam).unwrap().hp;
+
+    aim_at(&mut app, c + Vec3::new(0.0, 0.6, -7.0));
+    step(&mut app, 2);
+    fire_once(&mut app);
+    step(&mut app, 1);
+    assert!(!barrel_alive(&app, a), "one shotgun blast detonates a barrel");
+    assert!(barrel_alive(&app, b), "neighbour waits out its staggered chain fuse");
+    assert!(app.world().get::<ExplosiveBarrel>(b).unwrap().fuse.is_some(), "chain fuse armed");
+    step(&mut app, 12);
+    assert!(!barrel_alive(&app, b), "chain reaction");
+    assert!(barrel_alive(&app, far), "out-of-range barrel untouched");
+    let lost = 5_000.0 - enemy(&app, baron).unwrap().hp;
+    assert!(lost > 0.0 && lost <= 2.0 * BARREL_DAMAGE, "baron caught in the blast: {lost}");
+    assert!(app.world().get::<DemonJammer>(jam).unwrap().hp < jam_hp0, "jammer caught in the chain blast");
+}
+
+#[test]
+fn barrel_blast_is_blocked_by_walls() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 78);
+    godmode(&mut app);
+    let wall = "#".repeat(18);
+    let row = format!("#{}#", ".".repeat(16));
+    let pillar = format!("#{}#{}#", ".".repeat(8), ".".repeat(7));
+    let mut rows: Vec<&str> = vec![wall.as_str()];
+    rows.extend(std::iter::repeat_n(row.as_str(), 6));
+    rows.push(pillar.as_str()); // wall cell (9, 7): x 36..40, z 28..32
+    rows.extend(std::iter::repeat_n(row.as_str(), 9));
+    rows.push(wall.as_str());
+    app.world_mut().insert_resource(LevelGrid::from_ascii(&rows));
+    step(&mut app, 2);
+    despawn_all_enemies(&mut app);
+    clear_props(&mut app);
+    teleport(&mut app, Vec3::new(10.0, 0.0, 62.0), Vec3::new(10.0, 1.6, 50.0));
+    let barrel = spawn_test_barrel(&mut app, Vec3::new(38.0, 0.0, 27.0));
+    let hidden = stunned_baron(&mut app, Vec3::new(38.0, 0.0, 33.0));
+    let open = stunned_baron(&mut app, Vec3::new(43.0, 0.0, 27.0));
+    step(&mut app, 2);
+    app.world_mut().get_mut::<ExplosiveBarrel>(barrel).unwrap().fuse = Some(0.0);
+    step(&mut app, 2);
+    assert!(!barrel_alive(&app, barrel));
+    assert_eq!(enemy(&app, hidden).unwrap().hp, 5_000.0, "wall blocks the blast");
+    assert!(enemy(&app, open).unwrap().hp < 5_000.0, "open-air demon is hit");
+}
+
+#[test]
+fn plasma_rocket_and_emp_all_detonate_barrels() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 79);
+    godmode(&mut app);
+    let c = open_arena(&mut app);
+    clear_props(&mut app);
+
+    // Plasma: two bolts.
+    let p = spawn_test_barrel(&mut app, c + Vec3::new(0.0, 0.0, -10.0));
+    bot(&mut app).switch_weapon = Some(Weapon::Plasma);
+    settle_weapon(&mut app);
+    aim_at(&mut app, c + Vec3::new(0.0, 0.6, -10.0));
+    step(&mut app, 2);
+    fire_once(&mut app);
+    step(&mut app, 20);
+    assert!(barrel_alive(&app, p), "one bolt is not enough");
+    fire_once(&mut app);
+    step(&mut app, 20);
+    assert!(!barrel_alive(&app, p), "second bolt detonates it");
+
+    // Rocket: direct hit.
+    let r = spawn_test_barrel(&mut app, c + Vec3::new(10.0, 0.0, -10.0));
+    bot(&mut app).switch_weapon = Some(Weapon::Rocket);
+    settle_weapon(&mut app);
+    aim_at(&mut app, c + Vec3::new(10.0, 0.6, -10.0));
+    step(&mut app, 2);
+    fire_once(&mut app);
+    step(&mut app, FPS);
+    assert!(!barrel_alive(&app, r), "rocket detonates it");
+
+    // 5G Overload EMP (armed via Emergency Callback so the gate opens anywhere).
+    let e = spawn_test_barrel(&mut app, c + Vec3::new(-5.0, 0.0, 3.0));
+    app.world_mut().resource_mut::<PhoneApps>().callback_timer = CALLBACK_SECS;
+    app.world_mut().resource_mut::<PhoneApps>().overload_cooldown = 0.0;
+    bot(&mut app).overload = true;
+    step(&mut app, 3);
+    assert!(!barrel_alive(&app, e), "EMP cooks off the barrel");
+}
+
+#[test]
+fn barrel_blast_jumps_the_player_with_forgiving_self_damage() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 80);
+    let c = open_arena(&mut app);
+    clear_props(&mut app);
+    let barrel = spawn_test_barrel(&mut app, c + Vec3::new(1.2, 0.0, 0.0));
+    let (hp0, armor0) = {
+        let p = player(&mut app);
+        (p.hp, p.armor)
+    };
+    app.world_mut().get_mut::<ExplosiveBarrel>(barrel).unwrap().fuse = Some(0.0);
+    step(&mut app, 1);
+    let p = player(&mut app);
+    assert!(!barrel_alive(&app, barrel));
+    assert!(p.velocity.y > 5.0 && !p.grounded, "blast jump: {:?}", p.velocity);
+    assert!(p.velocity.x < -3.0, "pushed away from the barrel: {:?}", p.velocity);
+    let taken = (hp0 - p.hp) + (armor0 - p.armor);
+    assert!(taken > 0.0 && taken <= BARREL_DAMAGE * BARREL_SELF_DAMAGE_FRAC + 1e-3, "forgiving self damage: {taken}");
 }

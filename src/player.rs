@@ -15,12 +15,17 @@ use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
+use crate::apps::{HijackedHotspot, HIJACK_STRENGTH};
+use crate::assets_gen::{FloorTheme, GameAssets};
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::{take_flag, BotControl};
-use crate::level::LevelGrid;
+use crate::enemies::{fiend_jammer_fields_iter, Enemy};
+use crate::fx::{spawn_burst, spawn_flash_light, spawn_particles, spawn_shockwave, BurstColor, FxAssets, HudFeed};
+use crate::level::{DemonJammer, JumpPad, JumpPadGlow, JumpPadLight, LevelGrid, SignalTower, PAD_DORMANT_LIGHT, PAD_POWERED_LIGHT};
 use crate::meta::{RunLoadout, StarterChip};
 use crate::physics::{resolve_player_movement, JUMP_VELOCITY, PLAYER_HEIGHT, PLAYER_RADIUS, PLAYER_STEP_HEIGHT};
-use crate::signal::{overclock_move_factor, SignalState};
+use crate::physics::count_wall_occlusions;
+use crate::signal::{active_jammer_fields_iter, boost_reading, compute_signal_at, hotspot_boost, overclock_move_factor, HotspotField, JammerField, SignalState};
 use crate::state::{AppState, GameSet, PlayerModifiers};
 
 pub const PLAYER_EYE_HEIGHT: f32 = 1.6;
@@ -95,6 +100,67 @@ pub const OVER_CAP_DRAG_MULT: f32 = 2.5;
 /// Minimum bleed (m/s^2) while above the air speed ceiling.
 pub const OVER_CAP_MIN_BLEED: f32 = 6.0;
 
+// --- Signal Jump Pads ----------------------------------------------------------
+/// Horizontal trigger radius of a jump pad (m).
+pub const JUMP_PAD_RADIUS: f32 = 1.35;
+/// Feet must be within this height of the pad surface (m).
+pub const JUMP_PAD_VERTICAL: f32 = 1.2;
+/// Seconds before a pad can launch again.
+pub const JUMP_PAD_COOLDOWN: f32 = 0.35;
+/// Signal bars at a pad's position that power it.
+pub const JUMP_PAD_MIN_BARS: u8 = 2;
+/// Seconds between pad power re-evaluations.
+pub const JUMP_PAD_EVAL_SECS: f32 = 0.25;
+/// Seconds between "pad offline" toasts.
+pub const JUMP_PAD_TOAST_SECS: f32 = 3.0;
+/// Launch shockwave glow `(color, alpha)`.
+pub const JUMP_PAD_GLOW: (Color, f32) = (Color::srgb(0.25, 1.0, 0.7), 0.8);
+
+/// A pad is powered at [`JUMP_PAD_MIN_BARS`]+ bars.
+pub fn jump_pad_powered(bars: u8) -> bool {
+    bars >= JUMP_PAD_MIN_BARS
+}
+
+/// Whether feet at `feet` stand on the pad at `pad`.
+pub fn on_jump_pad(feet: Vec3, pad: Vec3) -> bool {
+    Vec2::new(feet.x - pad.x, feet.z - pad.z).length() <= JUMP_PAD_RADIUS && (feet.y - pad.y).abs() <= JUMP_PAD_VERTICAL
+}
+
+/// Whether the horizontal/vertical segment `from -> to` crossed the pad trigger
+/// cylinder (prevents high-speed bhoppers from skipping across a pad between ticks).
+pub fn crossed_jump_pad(from: Vec3, to: Vec3, pad: Vec3) -> bool {
+    let seg = Vec2::new(to.x - from.x, to.z - from.z);
+    let len_sq = seg.length_squared();
+    let t = if len_sq > 1e-6 {
+        (Vec2::new(pad.x - from.x, pad.z - from.z).dot(seg) / len_sq).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    on_jump_pad(from.lerp(to, t), pad)
+}
+
+/// Jump pad launch: vertical speed at least `launch_vel.y`, horizontal pad
+/// boost blended into the existing momentum so the result is at least the
+/// pad's own horizontal speed and never slower than the incoming bhop speed
+/// (clamped only to [`AIR_SPEED_HARD_CAP`]). Detaches from the ground.
+pub fn apply_jump_pad(p: &mut Player, launch_vel: Vec3) {
+    let v = Vec2::new(p.velocity.x, p.velocity.z);
+    let pad = Vec2::new(launch_vel.x, launch_vel.z);
+    let target = v.length().max(pad.length()).min(AIR_SPEED_HARD_CAP);
+    let mut h = v + pad;
+    if h.length() < target {
+        h = h.normalize_or(pad.normalize_or(v.normalize_or_zero())) * target;
+    }
+    if h.length() > AIR_SPEED_HARD_CAP {
+        h = h.normalize() * AIR_SPEED_HARD_CAP;
+    }
+    p.velocity = Vec3::new(h.x, p.velocity.y.max(launch_vel.y), h.y);
+    p.grounded = false;
+    p.coyote_timer = 0.0;
+    p.dash_timer = 0.0;
+    p.jump_buffer_timer = 0.0;
+}
+
 #[derive(Component, Debug, Clone)]
 pub struct Player {
     pub hp: f32,
@@ -135,6 +201,8 @@ pub struct Player {
     pub ground_time: f32,
     /// Damped strafe camera roll (radians; negative = leaning right).
     pub strafe_tilt: f32,
+    /// Feet position before this frame's `move_player` step (for swept pad contact).
+    pub prev_pos: Option<Vec3>,
 }
 
 impl Default for Player {
@@ -167,6 +235,7 @@ impl Default for Player {
             bhop_chain: 0,
             ground_time: 0.0,
             strafe_tilt: 0.0,
+            prev_pos: None,
         }
     }
 }
@@ -232,7 +301,9 @@ impl Plugin for PlayerPlugin {
                     .in_set(GameSet::Input),
             )
             .add_systems(Update, check_death.in_set(GameSet::World).after(hazard_damage))
+            .add_systems(Startup, prewarm_pad_fades)
             .add_systems(Update, move_player.in_set(GameSet::Movement))
+            .add_systems(Update, update_jump_pads.in_set(GameSet::Movement).after(move_player).run_if(resource_exists::<LevelGrid>))
             .add_systems(Update, (view_bob, hazard_damage).chain().in_set(GameSet::World));
     }
 }
@@ -262,15 +333,21 @@ fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip) {
                     far: 400.0,
                     ..default()
                 }),
-                DistanceFog {
-                    color: Color::srgb(0.16, 0.025, 0.02),
-                    directional_light_color: Color::srgba(1.0, 0.3, 0.2, 0.4),
-                    directional_light_exponent: 20.0,
-                    falloff: FogFalloff::Linear { start: 10.0, end: 70.0 },
-                },
+                theme_fog(grid.floor),
                 Transform::from_xyz(0.0, PLAYER_EYE_HEIGHT, 0.0),
             ));
         });
+}
+
+/// The camera's distance fog for a floor's sector theme.
+pub fn theme_fog(floor: u32) -> DistanceFog {
+    let spec = FloorTheme::for_floor(floor).spec();
+    DistanceFog {
+        color: spec.fog_color,
+        directional_light_color: spec.fog_dir_color,
+        directional_light_exponent: 20.0,
+        falloff: FogFalloff::Linear { start: 10.0, end: 70.0 },
+    }
 }
 
 /// Spawn the player once a level exists (player persists across floors).
@@ -288,7 +365,7 @@ fn ensure_player(mut commands: Commands, grid: Option<Res<LevelGrid>>, loadout: 
 fn snap_player_to_spawn(
     grid: Res<LevelGrid>,
     mut q: Query<(&mut Player, &mut Transform), Without<PlayerCamera>>,
-    mut cams: Query<(&mut Transform, &mut Projection), With<PlayerCamera>>,
+    mut cams: Query<(&mut Transform, &mut Projection, Option<&mut DistanceFog>), With<PlayerCamera>>,
 ) {
     for (mut p, mut tf) in &mut q {
         tf.translation = grid.spawn_world();
@@ -304,9 +381,13 @@ fn snap_player_to_spawn(
         p.ground_time = 0.0;
         p.strafe_tilt = 0.0;
         p.bob_phase = 0.0;
+        p.prev_pos = Some(tf.translation);
         tf.rotation = Quat::from_rotation_y(p.yaw);
     }
-    for (mut cam, mut proj) in &mut cams {
+    for (mut cam, mut proj, fog) in &mut cams {
+        if let Some(mut fog) = fog {
+            *fog = theme_fog(grid.floor);
+        }
         cam.translation = Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
         cam.rotation = Quat::IDENTITY;
         if let Projection::Perspective(pp) = proj.as_mut() {
@@ -606,6 +687,7 @@ fn move_player(
     let shift = keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight) || take_flag(&mut bot, |b| &mut b.dash);
     let space_held = keys.pressed(KeyCode::Space) || bot_jump;
     p.dash_started = false;
+    p.prev_pos = Some(tf.translation);
 
     // Uniform substeps of at most `MOVE_SUBSTEP_DT` (the epsilon keeps an
     // exact 60 Hz frame at two substeps despite float rounding).
@@ -733,6 +815,99 @@ fn view_bob(
     if let Projection::Perspective(pp) = proj.as_mut() {
         let want = BASE_FOV_DEG + fov_bonus_deg(speed, p.dash_timer > 0.0);
         pp.fov += (want.to_radians() - pp.fov) * smooth_factor(10.0, time.delta_secs());
+    }
+}
+
+fn prewarm_pad_fades(fx: Res<FxAssets>, mut materials: ResMut<Assets<StandardMaterial>>) {
+    fx.prewarm_fades(&mut materials, &[JUMP_PAD_GLOW]);
+}
+
+/// Signal Jump Pads: re-evaluate each pad's power from the signal field at
+/// its position (same solver, jammer and fiend fields as the player's bars),
+/// swap its shared glow material + light color, and launch a living player
+/// standing on a powered, cooled-down pad.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn update_jump_pads(
+    mut commands: Commands,
+    time: Res<Time>,
+    grid: Res<LevelGrid>,
+    mods: Res<PlayerModifiers>,
+    (assets, fx): (Res<GameAssets>, Res<FxAssets>),
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    (mut sfx, mut feed): (ResMut<SfxQueue>, ResMut<HudFeed>),
+    mut players: Query<(&mut Player, &Transform)>,
+    mut pads: Query<(&mut JumpPad, &Children)>,
+    mut glows: Query<&mut MeshMaterial3d<StandardMaterial>, With<JumpPadGlow>>,
+    mut lights: Query<&mut PointLight, With<JumpPadLight>>,
+    (tower, jammers, fiends, hotspots): (
+        Query<&SignalTower>,
+        Query<(&DemonJammer, &GlobalTransform)>,
+        Query<(&Enemy, &GlobalTransform)>,
+        Query<(&HijackedHotspot, &Transform)>,
+    ),
+    (mut eval_timer, mut toast_timer, mut fields, mut spots): (Local<f32>, Local<f32>, Local<Vec<JammerField>>, Local<Vec<HotspotField>>),
+) {
+    let dt = time.delta_secs();
+    *toast_timer = (*toast_timer - dt).max(0.0);
+    *eval_timer -= dt;
+    let mut eval = false;
+    if *eval_timer <= 0.0 || pads.iter().any(|(p, _)| !p.primed) {
+        *eval_timer = JUMP_PAD_EVAL_SECS;
+        eval = true;
+        fields.clear();
+        fields.extend(active_jammer_fields_iter(jammers.iter()));
+        fields.extend(fiend_jammer_fields_iter(fiends.iter()));
+        spots.clear();
+        spots.extend(hotspots.iter().map(|(h, tf)| HotspotField { pos: tf.translation, radius: h.radius, strength: HIJACK_STRENGTH }));
+    }
+    let tower_ref = grid.tower_world() + Vec3::Y * 1.5;
+    let beacon = tower.single().map(|t| t.beacon).unwrap_or(tower_ref);
+    let mut player = players.single_mut().ok();
+    for (mut pad, children) in &mut pads {
+        pad.cooldown = (pad.cooldown - dt).max(0.0);
+        if eval {
+            let eye = pad.pos + Vec3::Y * PLAYER_EYE_HEIGHT;
+            let walls = count_wall_occlusions(&grid, eye, beacon);
+            let base = compute_signal_at(eye, tower_ref, &fields, walls, &mods);
+            let boosted = boost_reading(base, hotspot_boost(eye, &spots));
+            let powered = jump_pad_powered(boosted.bars);
+            if powered != pad.powered || !pad.primed {
+                if powered && pad.primed {
+                    // A cleared jammer or hotspot brought this pad online.
+                    spawn_burst(&mut commands, &fx, pad.pos + Vec3::Y * 0.4, BurstColor::Green, 10, 5.0, 0.07);
+                }
+                pad.powered = powered;
+                pad.primed = true;
+                for c in children.iter() {
+                    if let Ok(mut m) = glows.get_mut(c) {
+                        m.0 = if powered { assets.pad_powered.clone() } else { assets.pad_dormant.clone() };
+                    }
+                    if let Ok(mut l) = lights.get_mut(c) {
+                        l.color = if powered { PAD_POWERED_LIGHT } else { PAD_DORMANT_LIGHT };
+                    }
+                }
+            }
+        }
+        let Some((p, ptf)) = player.as_mut() else { continue };
+        let prev = p.prev_pos.unwrap_or(ptf.translation);
+        if p.is_dead() || pad.cooldown > 0.0 || !crossed_jump_pad(prev, ptf.translation, pad.pos) {
+            continue;
+        }
+        if !pad.powered {
+            if *toast_timer <= 0.0 {
+                *toast_timer = JUMP_PAD_TOAST_SECS;
+                feed.toast("JUMP PAD OFFLINE - PAD NEEDS 2+ BARS", PAD_DORMANT_LIGHT);
+            }
+            continue;
+        }
+        apply_jump_pad(p, pad.launch_vel);
+        pad.cooldown = JUMP_PAD_COOLDOWN;
+        sfx.play(SfxEvent::JumpPad);
+        let base = pad.pos + Vec3::Y * 0.25;
+        spawn_shockwave(&mut commands, &fx, &mut materials, base, 2.4, 0.3, JUMP_PAD_GLOW.0, JUMP_PAD_GLOW.1, true);
+        spawn_particles(&mut commands, &fx, base, BurstColor::Cyan, 8, 7.0, 0.06);
+        spawn_burst(&mut commands, &fx, base + Vec3::Y * 0.5, BurstColor::Green, 6, 4.0, 0.06);
+        spawn_flash_light(&mut commands, base + Vec3::Y, PAD_POWERED_LIGHT, 300_000.0, 8.0, 0.15);
     }
 }
 
@@ -1277,5 +1452,74 @@ mod tests {
         assert_eq!(cam.rotation, Quat::IDENTITY);
         let Projection::Perspective(pp) = proj else { panic!() };
         assert!((pp.fov - BASE_FOV_DEG.to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jump_pad_power_gate_is_two_bars() {
+        assert!(!jump_pad_powered(0));
+        assert!(!jump_pad_powered(1));
+        assert!(jump_pad_powered(2));
+        assert!(jump_pad_powered(5));
+    }
+
+    #[test]
+    fn jump_pad_trigger_volume() {
+        let pad = Vec3::new(10.0, 0.0, 10.0);
+        assert!(on_jump_pad(pad, pad));
+        assert!(on_jump_pad(pad + Vec3::new(1.3, 0.0, 0.0), pad));
+        assert!(!on_jump_pad(pad + Vec3::new(1.0, 0.0, 1.0), pad), "outside the 1.35 m radius");
+        assert!(on_jump_pad(pad + Vec3::Y * 1.1, pad));
+        assert!(!on_jump_pad(pad + Vec3::Y * 1.3, pad), "flying over it");
+        assert!(!on_jump_pad(pad - Vec3::Y * 2.4, pad), "under it");
+        // Swept pass: both endpoints outside 1.35 m radius at 1.2 m offset, midpoint crosses pad.
+        let from = pad + Vec3::new(-0.9, 0.0, 1.2);
+        let to = pad + Vec3::new(0.9, 0.0, 1.2);
+        assert!(!on_jump_pad(from, pad) && !on_jump_pad(to, pad));
+        assert!(crossed_jump_pad(from, to, pad), "fast grazing bhop still triggers pad");
+        assert!(!crossed_jump_pad(pad + Vec3::new(-2.0, 0.0, 2.0), pad + Vec3::new(2.0, 0.0, 2.0), pad));
+    }
+
+    #[test]
+    fn jump_pad_launch_from_rest_uses_pad_velocity_and_detaches() {
+        let mut p = Player { grounded: true, coyote_timer: COYOTE_TIME, dash_timer: 0.1, jump_buffer_timer: 0.1, ..default() };
+        let launch = Vec3::new(-5.0, 13.5, 0.0);
+        apply_jump_pad(&mut p, launch);
+        assert!((p.velocity - launch).length() < 1e-4, "{:?}", p.velocity);
+        assert!(!p.grounded);
+        assert_eq!((p.coyote_timer, p.dash_timer, p.jump_buffer_timer), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn jump_pad_never_slows_a_bhopper_and_respects_hard_cap() {
+        let launch = Vec3::new(9.0, 10.0, 0.0);
+        for v in [Vec2::new(30.0, 0.0), Vec2::new(-30.0, 0.0), Vec2::new(0.0, 30.0), Vec2::new(-6.0, 3.0), Vec2::new(46.0, 0.0)] {
+            let mut p = Player { velocity: Vec3::new(v.x, -4.0, v.y), ..default() };
+            apply_jump_pad(&mut p, launch);
+            let h = Vec2::new(p.velocity.x, p.velocity.z).length();
+            assert!(h + 1e-3 >= v.length().min(AIR_SPEED_HARD_CAP), "{v}: slowed to {h}");
+            assert!(h + 1e-3 >= 9.0, "{v}: at least the pad's push ({h})");
+            assert!(h <= AIR_SPEED_HARD_CAP + 1e-3, "{v}: hard cap ({h})");
+            assert_eq!(p.velocity.y, 10.0);
+        }
+        // Already rising faster than the pad: vertical speed is kept.
+        let mut p = Player { velocity: Vec3::new(0.0, 16.0, 0.0), ..default() };
+        apply_jump_pad(&mut p, launch);
+        assert_eq!(p.velocity.y, 16.0);
+        // Aligned with the push: boost adds on top (capped).
+        let mut p = Player { velocity: Vec3::new(20.0, 0.0, 0.0), ..default() };
+        apply_jump_pad(&mut p, launch);
+        assert!((p.velocity.x - 29.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn theme_fog_follows_the_floor_theme() {
+        for floor in 1..=10 {
+            let spec = FloorTheme::for_floor(floor).spec();
+            let fog = theme_fog(floor);
+            assert_eq!(fog.color, spec.fog_color);
+            assert_eq!(fog.directional_light_color, spec.fog_dir_color);
+        }
+        assert_ne!(theme_fog(1).color, theme_fog(2).color);
+        assert_eq!(theme_fog(1).color, theme_fog(6).color);
     }
 }
