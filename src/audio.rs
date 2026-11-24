@@ -934,7 +934,7 @@ pub struct MusicCues {
 /// Target stem weights `[drone, pulse, rush, boss]` for the current game situation.
 pub fn target_music_weights(c: MusicCues) -> [f32; MUSIC_LAYERS] {
     match c.state {
-        AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats | AppState::Settings => [0.45, 0.15, 0.0, 0.0],
+        AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats | AppState::Settings | AppState::Compendium => [0.45, 0.15, 0.0, 0.0],
         AppState::Paused => [0.25, 0.0, 0.0, 0.0],
         AppState::UpgradeSelect | AppState::Victory => [0.15, 0.55, 0.0, 0.0],
         AppState::GameOver => [0.50, 0.0, 0.0, 0.0],

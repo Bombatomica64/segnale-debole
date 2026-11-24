@@ -3823,3 +3823,205 @@ fn weapon_inspect_cancels_on_fire_swap_and_pause_and_landing_dips_viewmodel() {
     assert!(lowest < -0.005, "landing dipped the viewmodel ({lowest})");
     assert!(app.world().resource::<ViewmodelFeel>().dip.abs() < 2e-3, "dip springs back");
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 21: shareable custom seeds + 3D Bestiary / Armory viewer
+// ---------------------------------------------------------------------------
+
+use segnale_debole::compendium::{
+    format_seed_code, seed_from_code, Category, CompendiumEntity, CompendiumState, CustomSeedState, ExhibitId, ExhibitModel, TurntableRoot,
+};
+
+fn seed_state(app: &App) -> CustomSeedState {
+    app.world().resource::<CustomSeedState>().clone()
+}
+
+#[test]
+fn enemy_deaths_count_kills_per_kind() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 2101);
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    step(&mut app, 2);
+    let far = player_feet(&mut app);
+    let demons = [EnemyKind::Imp, EnemyKind::Imp, EnemyKind::HellBaron, EnemyKind::RelaySniper].map(|k| spawn_demon(&mut app, k, far));
+    step(&mut app, 1);
+    let before = app.world().resource::<RunStats>().clone();
+    for e in demons {
+        kill(&mut app, e);
+    }
+    step(&mut app, 3);
+    let run = app.world().resource::<RunStats>().clone();
+    let k = |kind: EnemyKind| run.enemy_kills[kind.index()] - before.enemy_kills[kind.index()];
+    assert_eq!((k(EnemyKind::Imp), k(EnemyKind::HellBaron), k(EnemyKind::RelaySniper), k(EnemyKind::Cacodemon)), (2, 1, 1, 0));
+    assert_eq!(run.kills - before.kills, 4);
+    assert_eq!(run.enemy_kills.iter().sum::<u32>(), run.kills, "per-kind table sums to the kill counter");
+}
+
+#[test]
+fn seed_editor_mutes_menu_hotkeys_and_arms_the_run() {
+    let mut app = build_menu_app(None);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    tap(&mut app, KeyCode::KeyS);
+    assert!(seed_state(&app).editing, "S opens the inline seed editor");
+    // Every main menu hotkey letter types instead of launching a screen.
+    for key in [KeyCode::KeyD, KeyCode::KeyO, KeyCode::KeyO, KeyCode::KeyM, KeyCode::KeyB, KeyCode::KeyT, KeyCode::KeyL, KeyCode::KeyC] {
+        tap(&mut app, key);
+        assert_eq!(app_state(&app), AppState::MainMenu, "{key:?} must not leave the main menu while typing");
+    }
+    assert_eq!(seed_state(&app).code, "DOOMBTLC");
+    for _ in 0..4 {
+        tap(&mut app, KeyCode::Backspace);
+    }
+    tap(&mut app, KeyCode::Minus);
+    tap(&mut app, KeyCode::Digit7);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "SEED: DOOM-7_  [S]"), "live editor readout on the SEED switch");
+    tap(&mut app, KeyCode::Enter);
+    let s = seed_state(&app);
+    assert!(!s.editing);
+    assert_eq!(app_state(&app), AppState::MainMenu, "Enter locks the code without starting a run");
+    assert_eq!(s.armed(), seed_from_code("DOOM-7"));
+    assert!(ui_texts(&mut app).iter().any(|t| t == "SEED: DOOM-7  [S]"));
+
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    let run = app.world().resource::<RunStats>().clone();
+    assert_eq!(Some(run.run_seed), seed_from_code("DOOM-7"));
+    assert!(run.custom_seed);
+    assert_eq!(run.seed_label.as_deref(), Some("DOOM-7"));
+    step(&mut app, 2);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "SEED DOOM-7"), "HUD plate shows the custom seed");
+    let grid_a = format!("{:?}", app.world().resource::<LevelGrid>());
+
+    // Pause: the readout carries the seed and S re-arms it for sharing.
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert!(ui_texts(&mut app).iter().any(|t| t.ends_with("//  SEED DOOM-7")));
+    // Restarting a custom-seed run rebuilds the very same bunker.
+    tap(&mut app, KeyCode::KeyR);
+    step(&mut app, 3);
+    assert_eq!(app_state(&app), AppState::Playing);
+    let run = app.world().resource::<RunStats>().clone();
+    assert_eq!(Some(run.run_seed), seed_from_code("DOOM-7"));
+    assert_eq!(format!("{:?}", app.world().resource::<LevelGrid>()), grid_a, "same code = same bunker");
+}
+
+#[test]
+fn share_seed_from_pause_and_random_runs_get_round_trip_codes() {
+    let mut app = build_menu_app(None);
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    let run = app.world().resource::<RunStats>().clone();
+    assert!(!run.custom_seed);
+    assert!(run.run_seed <= u32::MAX as u64, "random runs roll 32-bit seeds");
+    let code = run.seed_label.clone().unwrap();
+    assert_eq!(code, format_seed_code(run.run_seed));
+    assert_eq!(seed_from_code(&code), Some(run.run_seed));
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "SHARE SEED  [S]"));
+    tap(&mut app, KeyCode::KeyS);
+    assert_eq!(seed_state(&app).code, code);
+    assert!(ui_texts(&mut app).iter().any(|t| *t == format!("SEED {code} ARMED  [S]")));
+    // Back on the menu the shared code is armed for the next deployment.
+    tap(&mut app, KeyCode::KeyM);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    assert!(ui_texts(&mut app).iter().any(|t| *t == format!("SEED: {code}  [S]")));
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app.world().resource::<RunStats>().run_seed, run.run_seed, "replays the shared bunker");
+}
+
+fn visible_exhibits(app: &mut App) -> Vec<ExhibitId> {
+    let mut q = app.world_mut().query::<(&ExhibitModel, &Visibility)>();
+    q.iter(app.world()).filter(|(_, v)| **v != Visibility::Hidden).map(|(m, _)| m.0).collect()
+}
+
+fn count_with<F: bevy::ecs::query::QueryFilter>(app: &mut App) -> usize {
+    let mut q = app.world_mut().query_filtered::<Entity, F>();
+    q.iter(app.world()).count()
+}
+
+#[test]
+fn compendium_opens_cycles_exhibits_and_tears_down_cleanly() {
+    let mut app = build_menu_app(None);
+    assert_eq!(count_with::<With<Mesh3d>>(&mut app), 0, "the main menu has no 3D meshes");
+    tap(&mut app, KeyCode::KeyB);
+    assert_eq!(app_state(&app), AppState::Compendium);
+    assert_eq!(count_with::<With<TurntableRoot>>(&mut app), 1);
+    assert_eq!(count_with::<With<ExhibitModel>>(&mut app), ExhibitId::ALL.len());
+    assert_eq!(count_with::<(With<PointLight>, With<CompendiumEntity>)>(&mut app), 2, "exactly two stage lights");
+    assert_eq!(count_with::<With<PointLight>>(&mut app), 2);
+    assert_eq!(visible_exhibits(&mut app), vec![ExhibitId::Imp]);
+    // Every staged mesh is Solari-convertible.
+    {
+        let handles: Vec<Handle<Mesh>> = {
+            let mut q = app.world_mut().query::<&Mesh3d>();
+            q.iter(app.world()).map(|m| m.0.clone()).collect()
+        };
+        assert!(handles.len() > 30, "real demon + gun models are staged ({})", handles.len());
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        for h in handles {
+            assert!(segnale_debole::raytracing::rt_mesh_convertible(meshes.get(&h).expect("mesh loaded")));
+        }
+    }
+    // No per-frame asset allocation while the turntable spins.
+    let assets = |app: &App| (app.world().resource::<Assets<Mesh>>().len(), app.world().resource::<Assets<StandardMaterial>>().len());
+    let before = assets(&app);
+    let yaw0 = app.world().resource::<CompendiumState>().yaw;
+    step(&mut app, 30);
+    assert_eq!(assets(&app), before);
+    assert_ne!(app.world().resource::<CompendiumState>().yaw, yaw0, "auto-rotates");
+
+    tap(&mut app, KeyCode::KeyD);
+    assert_eq!(app_state(&app), AppState::Compendium, "D cycles here, it never launches the Daily Run");
+    assert_eq!(visible_exhibits(&mut app), vec![ExhibitId::Cacodemon]);
+    tap(&mut app, KeyCode::KeyA);
+    tap(&mut app, KeyCode::ArrowLeft);
+    assert_eq!(visible_exhibits(&mut app), vec![ExhibitId::CarrierDaemon]);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "THE CARRIER DAEMON"));
+    assert!(ui_texts(&mut app).iter().any(|t| t == "07/07"));
+    tap(&mut app, KeyCode::Tab);
+    let st = app.world().resource::<CompendiumState>().clone();
+    assert_eq!((st.category, st.current()), (Category::Armory, ExhibitId::Shotgun));
+    tap(&mut app, KeyCode::ArrowRight);
+    tap(&mut app, KeyCode::KeyD);
+    assert_eq!(visible_exhibits(&mut app), vec![ExhibitId::Mortar]);
+    let texts = ui_texts(&mut app);
+    assert!(texts.iter().any(|t| t == "UAC FIELD TERMINAL // ARMORY"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "03/03"));
+    assert!(texts.iter().any(|t| t == "SIGNAL-MORTAR LAUNCHER"));
+    assert!(assets(&app) == before, "switching exhibits only toggles visibility");
+
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    step(&mut app, 2);
+    assert_eq!(count_with::<With<CompendiumEntity>>(&mut app), 0);
+    assert_eq!(count_with::<With<ExhibitModel>>(&mut app), 0);
+    assert_eq!(count_with::<With<TurntableRoot>>(&mut app), 0);
+    assert_eq!(count_with::<With<Mesh3d>>(&mut app), 0, "the whole stage is gone");
+    assert_eq!(count_with::<With<PointLight>>(&mut app), 0);
+
+    // Re-entering rebuilds one stage (no duplicates) and remembers the exhibit.
+    tap(&mut app, KeyCode::KeyB);
+    assert_eq!(app_state(&app), AppState::Compendium);
+    assert_eq!(count_with::<With<TurntableRoot>>(&mut app), 1);
+    assert_eq!(count_with::<With<PointLight>>(&mut app), 2);
+    assert_eq!(visible_exhibits(&mut app), vec![ExhibitId::Mortar]);
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+}
+
+#[test]
+fn compendium_is_a_pre_run_screen() {
+    assert!(AppState::Compendium.is_pre_run());
+    // Lifetime kills reach the dossier.
+    let mut profile = PlayerProfile::default();
+    profile.stats.enemy_kills[EnemyKind::PhaseStalker.index()] = 17;
+    let mut app = build_menu_app(Some(ProfileStore::in_memory(profile)));
+    app.world_mut().resource_mut::<CompendiumState>().select(ExhibitId::PhaseStalker);
+    tap(&mut app, KeyCode::KeyB);
+    let texts = ui_texts(&mut app);
+    assert!(texts.iter().any(|t| t == "LIFETIME KILLS"));
+    assert!(texts.iter().any(|t| t == "17"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "FLANKER // FLOOR 2+"));
+}

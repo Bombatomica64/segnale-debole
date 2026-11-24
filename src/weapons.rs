@@ -1054,81 +1054,13 @@ fn spawn_viewmodels(
         Projection::Perspective(p) => p.fov,
         _ => 85f32.to_radians(),
     };
-    let cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-    let cyl = meshes.add(vm_cylinder());
-    let thin_ring = meshes.add(vm_thin_ring());
-    let bead = meshes.add(vm_bead());
+    let kit = vm_kit(&mut meshes, &mut materials, &mut images);
+    let VmKit { cube, cyl, thin_ring, bead, steel, brushed, dark_steel, grip, glove, glove_plate, coil, warhead_glow, .. } = kit.clone();
     let screen_quad = meshes.add(Rectangle::new(0.118, 0.177));
-    // Beveled faceted accelerator ring for the animated plasma coils (same unit
-    // footprint as the old 0.68..1.0 torus so the ripple scale is unchanged).
-    let coil_ring = meshes.add(sculpt::armored_ring(0.84, 0.16, 0.16, 20, true));
     // Rigid untagged parts are baked per (pivot, material) into a few meshes;
     // tagged / animated parts (skin slots, LEDs, coils, screen) stay separate.
     let src = VmSourceMeshes::new();
     let mut vb = ParentedBatches::new();
-
-    let mat = |m: &mut Assets<StandardMaterial>, c: Color, rough: f32, metal: f32| {
-        m.add(StandardMaterial { base_color: c, perceptual_roughness: rough, metallic: metal, ..default() })
-    };
-    // Muzzle flashes: lit but matte/non-reflective so the HDR emissive drives them
-    // (an unlit material ignores emissive and tonemaps a 1.0 base to flat beige/grey).
-    let glow = |m: &mut Assets<StandardMaterial>, c: Color, e: LinearRgba| {
-        m.add(StandardMaterial { base_color: c, emissive: e, perceptual_roughness: 1.0, metallic: 0.0, reflectance: 0.0, ..default() })
-    };
-    // Lit emissive: the (moderate) emissive carries a saturated hue that never clips
-    // to white, the base colour still catches the key light, and the emissive stays
-    // animatable (unlit materials ignore emissive entirely).
-    let lit_glow =
-        |m: &mut Assets<StandardMaterial>, c: Color, e: LinearRgba| m.add(StandardMaterial { base_color: c, emissive: e, perceptual_roughness: 0.6, metallic: 0.0, reflectance: 0.2, ..default() });
-    // Retro pixel-art surfaces (neutral-bright, tinted by base_colour).
-    let gunmetal_img = images.add(gunmetal_plate_texture().into_image());
-    let wood_img = images.add(wood_grain_texture().into_image());
-    let hazard_img = images.add(hazard_stripe_texture().into_image());
-    let obsidian_img = images.add(obsidian_tech_texture().into_image());
-    let gold_img = images.add(engraved_gold_texture().into_image());
-    let tex = |m: &mut Assets<StandardMaterial>, img: &Handle<Image>, c: Color, rough: f32, metal: f32| {
-        m.add(StandardMaterial { base_color: c, base_color_texture: Some(img.clone()), perceptual_roughness: rough, metallic: metal, ..default() })
-    };
-
-    // Rich metallic / composite / tactical palette.
-    let steel = mat(&mut materials, Color::srgb(0.46, 0.49, 0.54), 0.28, 0.9);
-    let brushed = mat(&mut materials, Color::srgb(0.32, 0.35, 0.39), 0.38, 0.85);
-    let dark_steel = mat(&mut materials, Color::srgb(0.12, 0.13, 0.15), 0.44, 0.78);
-    // Heat-blued muzzle hardware (cool violet-blue temper).
-    let heat_blued = mat(&mut materials, Color::srgb(0.20, 0.22, 0.36), 0.3, 0.88);
-    let shell_red = mat(&mut materials, Color::srgb(0.72, 0.08, 0.05), 0.45, 0.1);
-    let grip = mat(&mut materials, Color::srgb(0.055, 0.055, 0.06), 0.92, 0.05);
-    let glove = mat(&mut materials, Color::srgb(0.17, 0.20, 0.14), 0.88, 0.05);
-    let glove_plate = mat(&mut materials, Color::srgb(0.26, 0.29, 0.22), 0.55, 0.45);
-    let bolt_silver = mat(&mut materials, Color::srgb(0.68, 0.72, 0.76), 0.25, 0.95);
-    // Textured gun surfaces.
-    let gm_steel = tex(&mut materials, &gunmetal_img, Color::srgb(0.62, 0.65, 0.70), 0.3, 0.82);
-    let gm_titanium = tex(&mut materials, &gunmetal_img, Color::srgb(0.43, 0.46, 0.51), 0.34, 0.78);
-    let gm_dark = tex(&mut materials, &gunmetal_img, Color::srgb(0.25, 0.27, 0.31), 0.4, 0.72);
-    let wood = tex(&mut materials, &wood_img, Color::srgb(1.0, 0.94, 0.9), 0.6, 0.0);
-    let hazard = tex(&mut materials, &hazard_img, Color::WHITE, 0.5, 0.15);
-    // Signal-Mortar shroud: warm tint + a hazard-textured #F2A20C self-glow so the amber
-    // stripes stay punchy on dark floors (the black stripes stay black).
-    let rk_hazard = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.84, 0.55),
-        base_color_texture: Some(hazard_img.clone()),
-        emissive: LinearRgba::from(Color::srgb(0.949, 0.635, 0.047)) * 0.32,
-        emissive_texture: Some(hazard_img.clone()),
-        perceptual_roughness: 0.42,
-        metallic: 0.15,
-        ..default()
-    });
-    // Mars Combat Pump: light brushed-gunmetal top planes over a black-oxide receiver
-    // side (gunmetal texture averages ~0.78, so tints are pre-compensated).
-    let sg_top = tex(&mut materials, &gunmetal_img, Color::srgb(0.49, 0.54, 0.60), 0.30, 0.85);
-    let sg_oxide = tex(&mut materials, &gunmetal_img, Color::srgb(0.14, 0.155, 0.18), 0.42, 0.78);
-    // UAC Plasma Repeater: dark industrial slate chassis + dark brushed titanium accents,
-    // so the cyan coils are the brightest thing on the gun.
-    let pl_slate = tex(&mut materials, &obsidian_img, Color::srgb(0.16, 0.18, 0.23), 0.36, 0.74);
-    let pl_titanium = tex(&mut materials, &gunmetal_img, Color::srgb(0.30, 0.34, 0.41), 0.32, 0.82);
-    let pl_edge = mat(&mut materials, Color::srgb(0.52, 0.56, 0.62), 0.22, 0.95);
-    let brass = tex(&mut materials, &gold_img, Color::srgb(1.0, 0.9, 0.72), 0.28, 0.9);
-    let copper = tex(&mut materials, &gold_img, Color::srgb(0.95, 0.56, 0.38), 0.32, 0.88);
     // Handset skin: unique materials for every skinned phone chassis slot.
     let mut skin_mat = |slot: SkinSlot| materials.add(palette.slot(slot).to_material());
     let (bezel, phone_frame, bumper, phone_ptt, phone_coil, phone_bolts) = (
@@ -1139,24 +1071,6 @@ fn spawn_viewmodels(
         skin_mat(SkinSlot::Coil),
         skin_mat(SkinSlot::Bolts),
     );
-
-    // Saturated glow accents (lit + emissive so the hue survives tonemapping).
-    let sight_green = lit_glow(&mut materials, Color::srgb(0.12, 0.95, 0.3), LinearRgba::rgb(0.25, 3.2, 0.55));
-    let sight_red = lit_glow(&mut materials, Color::srgb(1.0, 0.1, 0.05), LinearRgba::rgb(3.8, 0.32, 0.1));
-    let vent_amber = lit_glow(&mut materials, Color::srgb(1.0, 0.54, 0.12), ROCKET_GLOW);
-    // Incandescent yellow-white core, saturated orange-amber flame tongues.
-    let flash_core = glow(&mut materials, Color::srgb(1.0, 0.96, 0.72), LinearRgba::rgb(4.2, 3.2, 0.9));
-    let flash_fire = glow(&mut materials, Color::srgb(1.0, 0.48, 0.06), LinearRgba::rgb(1.45, 0.34, 0.006));
-    let flash_cyan = glow(&mut materials, Color::srgb(0.3, 0.9, 1.0), LinearRgba::rgb(0.5, 4.2, 7.5));
-    let flash_cyan_halo = materials.add(additive_glow(Color::srgb(0.2, 0.92, 1.0), 0.65));
-    let flash_amber_halo = materials.add(additive_glow(Color::srgb(1.0, 0.5, 0.1), 0.6));
-    // Animated (per-shot reactive) glows live in PhoneMaterials, replaced every run.
-    let coil = lit_glow(&mut materials, Color::srgb(0.05, 0.62, 0.95), PLASMA_GLOW);
-    // Static brighter inner plasma core (conduit tube / capacitor) over the deeper coils.
-    let plasma_core = lit_glow(&mut materials, Color::srgb(0.45, 0.9, 1.0), LinearRgba::rgb(0.18, 1.6, 2.6));
-    let warhead_glow = lit_glow(&mut materials, Color::srgb(1.0, 0.54, 0.12), ROCKET_GLOW);
-    // Recessed ignition ring deep in the muzzle brake (static, a touch hotter/redder).
-    let bore_glow = lit_glow(&mut materials, Color::srgb(1.0, 0.42, 0.05), LinearRgba::rgb(2.4, 0.55, 0.02));
     // Status LED / antenna beacon: LIT (unlit ignores emissive), dark hued base +
     // saturated emissive, both rewritten every frame by `animate_viewmodels`.
     let (led_base, led_emissive) = phone_led_glow(5, false, false, 0.0);
@@ -1212,6 +1126,224 @@ fn spawn_viewmodels(
     // RIGHT HAND: SCULPTED WEAPON VIEWMODELS
     // =========================================================================
     let wroot = commands.spawn((ChildOf(cam), WeaponViewmodel, Transform::from_translation(WEAPON_REST), Visibility::default())).id();
+    spawn_gun_models(&mut commands, wroot, &kit, &src, &mut vb, true);
+    let rx = Quat::from_rotation_x(FRAC_PI_2);
+    let rz = Quat::from_rotation_z(FRAC_PI_2);
+    let id = Quat::IDENTITY;
+
+    // =========================================================================
+    // LEFT HAND: ELABORATE TACTICAL SMARTPHONE WITH LIVE 160x240 OLED DISPLAY
+    // =========================================================================
+    let phone_rot = Quat::from_rotation_y(0.24) * Quat::from_rotation_x(0.11) * Quat::from_rotation_z(-0.04);
+    let proot = commands
+        .spawn((ChildOf(cam), PhoneViewmodel, PhoneSkin(skin), Transform::from_translation(PHONE_REST).with_rotation(phone_rot), Visibility::default()))
+        .id();
+    // Main ruggedized anodized chassis + recessed stepped titanium frame rails.
+    commands.spawn((PhoneSkinPart(SkinSlot::Bezel), vm_part(proot, &cube, &bezel, Vec3::ZERO, Vec3::new(0.136, 0.214, 0.020), id)));
+    commands.spawn((PhoneSkinPart(SkinSlot::Frame), vm_part(proot, &cube, &phone_frame, Vec3::new(0.0, 0.0, -0.002), Vec3::new(0.142, 0.200, 0.014), id)));
+    // Rubberized grip ribs along left and right chassis edges.
+    for k in 0..6 {
+        let y = -0.062 + k as f32 * 0.024;
+        for s in [-1.0f32, 1.0] {
+            vb.part(proot, &src.cube, &grip, Vec3::new(0.072 * s, y, 0.0), Vec3::new(0.005, 0.010, 0.016), id);
+        }
+    }
+    // 4 sculpted rugged corner armor bumpers with silver hex bolts.
+    for (x, y) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        commands.spawn((PhoneSkinPart(SkinSlot::Bumper), vm_part(proot, &cube, &bumper, Vec3::new(x * 0.066, y * 0.104, 0.001), Vec3::new(0.018, 0.018, 0.024), id)));
+        commands.spawn((
+            PhoneSkinPart(SkinSlot::Bolts),
+            vm_part(proot, &cyl, &phone_bolts, Vec3::new(x * 0.064, y * 0.102, 0.0135), Vec3::new(0.0032, 0.003, 0.0032), rx),
+        ));
+    }
+    // Top bulkhead: speaker grille slot + front-facing lens + blinking status LED.
+    vb.part(proot, &src.cube, &dark_steel, Vec3::new(0.0, 0.097, 0.0105), Vec3::new(0.036, 0.005, 0.003), id);
+    vb.part(proot, &src.cyl, &brushed, Vec3::new(-0.032, 0.097, 0.0105), Vec3::new(0.0045, 0.003, 0.0045), rx);
+    commands.spawn((PhoneLed, vm_part(proot, &bead, &led, Vec3::new(0.034, 0.097, 0.0115), Vec3::splat(0.0038), id)));
+    // Bottom chin tactile home bar + lanyard loop.
+    vb.part(proot, &src.cube, &brushed, Vec3::new(0.0, -0.098, 0.0105), Vec3::new(0.044, 0.006, 0.003), id);
+    // Side hardware controls: orange PTT button on left, volume rockers on right.
+    commands.spawn((PhoneSkinPart(SkinSlot::Ptt), vm_part(proot, &cube, &phone_ptt, Vec3::new(-0.074, 0.036, 0.0), Vec3::new(0.006, 0.026, 0.010), id)));
+    vb.part(proot, &src.cube, &steel, Vec3::new(0.074, 0.046, 0.0), Vec3::new(0.005, 0.018, 0.008), id);
+    vb.part(proot, &src.cube, &steel, Vec3::new(0.074, 0.020, 0.0), Vec3::new(0.005, 0.018, 0.008), id);
+    // Knurled antenna collar + telescoping tactical whip antenna + helical coil + glowing beacon bead.
+    vb.part(proot, &src.cyl, &brushed, Vec3::new(0.048, 0.114, -0.001), Vec3::new(0.011, 0.018, 0.011), id);
+    vb.part(proot, &src.cyl, &dark_steel, Vec3::new(0.048, 0.145, -0.001), Vec3::new(0.0048, 0.052, 0.0048), id);
+    commands.spawn((PhoneSkinPart(SkinSlot::Coil), vm_part(proot, &thin_ring, &phone_coil, Vec3::new(0.048, 0.132, -0.001), Vec3::new(0.008, 0.006, 0.008), id)));
+    commands.spawn((PhoneLed, vm_part(proot, &bead, &led, Vec3::new(0.048, 0.174, -0.001), Vec3::splat(0.0062), id)));
+    // Raised screen surround lip + LIVE 160x240 pixel-art OLED screen quad!
+    vb.part(proot, &src.cube, &grip, Vec3::new(0.0, 0.0, 0.0096), Vec3::new(0.123, 0.182, 0.002), id);
+    commands.spawn((
+        PhoneScreen,
+        ChildOf(proot),
+        Mesh3d(screen_quad),
+        MeshMaterial3d(screen),
+        Transform::from_xyz(0.0, 0.0, 0.0112),
+        overlay_layer(),
+    ));
+    // Articulated gloved marine left hand & armored cuff gripping bottom & sides (never blocking the screen!).
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.012, -0.118, -0.022), Vec3::new(0.088, 0.058, 0.058), rz); // palm base
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.072, -0.042, -0.014), Vec3::new(0.026, 0.088, 0.032), Quat::from_rotation_z(-0.08)); // left hand heel
+    // 3 wrapped armored fingers gripping the right spine from behind.
+    for k in 0..3 {
+        let y = -0.058 + k as f32 * 0.030;
+        vb.part(proot, &src.cap, &glove, Vec3::new(0.072, y, -0.004), Vec3::new(0.018, 0.022, 0.022), rz);
+        vb.part(proot, &src.cube, &glove_plate, Vec3::new(0.076, y, 0.004), Vec3::new(0.012, 0.014, 0.012), id);
+    }
+    // Curled thumb gripping the lower-left armor bumper cleanly clear of the OLED screen!
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.080, -0.098, 0.011), Vec3::new(0.018, 0.030, 0.018), Quat::from_rotation_z(-0.42));
+    // Left armored forearm descending into bottom-left corner.
+    vb.part(proot, &src.cap, &glove, Vec3::new(-0.045, -0.20, -0.065), Vec3::new(0.082, 0.11, 0.072), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22));
+    vb.part(proot, &src.cyl, &glove_plate, Vec3::new(-0.036, -0.165, -0.05), Vec3::new(0.048, 0.034, 0.048), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22));
+    for (parent, mesh, mat) in vb.finish(&mut meshes) {
+        commands.spawn(vm_part(parent, &mesh, &mat, Vec3::ZERO, Vec3::ONE, Quat::IDENTITY));
+    }
+}
+
+/// Shared viewmodel meshes + materials: built once per player viewmodel (or
+/// Armory showcase) and shared by the gun models and the phone chassis.
+#[derive(Clone)]
+struct VmKit {
+    cube: Handle<Mesh>,
+    cyl: Handle<Mesh>,
+    thin_ring: Handle<Mesh>,
+    bead: Handle<Mesh>,
+    coil_ring: Handle<Mesh>,
+    steel: Handle<StandardMaterial>,
+    brushed: Handle<StandardMaterial>,
+    dark_steel: Handle<StandardMaterial>,
+    heat_blued: Handle<StandardMaterial>,
+    shell_red: Handle<StandardMaterial>,
+    grip: Handle<StandardMaterial>,
+    glove: Handle<StandardMaterial>,
+    glove_plate: Handle<StandardMaterial>,
+    bolt_silver: Handle<StandardMaterial>,
+    gm_steel: Handle<StandardMaterial>,
+    gm_titanium: Handle<StandardMaterial>,
+    gm_dark: Handle<StandardMaterial>,
+    wood: Handle<StandardMaterial>,
+    hazard: Handle<StandardMaterial>,
+    rk_hazard: Handle<StandardMaterial>,
+    sg_top: Handle<StandardMaterial>,
+    sg_oxide: Handle<StandardMaterial>,
+    pl_slate: Handle<StandardMaterial>,
+    pl_titanium: Handle<StandardMaterial>,
+    pl_edge: Handle<StandardMaterial>,
+    brass: Handle<StandardMaterial>,
+    copper: Handle<StandardMaterial>,
+    sight_green: Handle<StandardMaterial>,
+    sight_red: Handle<StandardMaterial>,
+    vent_amber: Handle<StandardMaterial>,
+    flash_core: Handle<StandardMaterial>,
+    flash_fire: Handle<StandardMaterial>,
+    flash_cyan: Handle<StandardMaterial>,
+    flash_cyan_halo: Handle<StandardMaterial>,
+    flash_amber_halo: Handle<StandardMaterial>,
+    coil: Handle<StandardMaterial>,
+    plasma_core: Handle<StandardMaterial>,
+    warhead_glow: Handle<StandardMaterial>,
+    bore_glow: Handle<StandardMaterial>,
+}
+
+/// Bake the [`VmKit`] (procedural gun textures included).
+fn vm_kit(meshes: &mut Assets<Mesh>, materials: &mut Assets<StandardMaterial>, images: &mut Assets<Image>) -> VmKit {
+    let cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let cyl = meshes.add(vm_cylinder());
+    let thin_ring = meshes.add(vm_thin_ring());
+    let bead = meshes.add(vm_bead());
+    // Beveled faceted accelerator ring for the animated plasma coils (same unit
+    // footprint as the old 0.68..1.0 torus so the ripple scale is unchanged).
+    let coil_ring = meshes.add(sculpt::armored_ring(0.84, 0.16, 0.16, 20, true));
+
+    let mat = |m: &mut Assets<StandardMaterial>, c: Color, rough: f32, metal: f32| {
+        m.add(StandardMaterial { base_color: c, perceptual_roughness: rough, metallic: metal, ..default() })
+    };
+    // Muzzle flashes: lit but matte/non-reflective so the HDR emissive drives them
+    // (an unlit material ignores emissive and tonemaps a 1.0 base to flat beige/grey).
+    let glow = |m: &mut Assets<StandardMaterial>, c: Color, e: LinearRgba| {
+        m.add(StandardMaterial { base_color: c, emissive: e, perceptual_roughness: 1.0, metallic: 0.0, reflectance: 0.0, ..default() })
+    };
+    // Lit emissive: the (moderate) emissive carries a saturated hue that never clips
+    // to white, the base colour still catches the key light, and the emissive stays
+    // animatable (unlit materials ignore emissive entirely).
+    let lit_glow =
+        |m: &mut Assets<StandardMaterial>, c: Color, e: LinearRgba| m.add(StandardMaterial { base_color: c, emissive: e, perceptual_roughness: 0.6, metallic: 0.0, reflectance: 0.2, ..default() });
+    // Retro pixel-art surfaces (neutral-bright, tinted by base_colour).
+    let gunmetal_img = images.add(gunmetal_plate_texture().into_image());
+    let wood_img = images.add(wood_grain_texture().into_image());
+    let hazard_img = images.add(hazard_stripe_texture().into_image());
+    let obsidian_img = images.add(obsidian_tech_texture().into_image());
+    let gold_img = images.add(engraved_gold_texture().into_image());
+    let tex = |m: &mut Assets<StandardMaterial>, img: &Handle<Image>, c: Color, rough: f32, metal: f32| {
+        m.add(StandardMaterial { base_color: c, base_color_texture: Some(img.clone()), perceptual_roughness: rough, metallic: metal, ..default() })
+    };
+
+    // Rich metallic / composite / tactical palette.
+    let steel = mat(materials, Color::srgb(0.46, 0.49, 0.54), 0.28, 0.9);
+    let brushed = mat(materials, Color::srgb(0.32, 0.35, 0.39), 0.38, 0.85);
+    let dark_steel = mat(materials, Color::srgb(0.12, 0.13, 0.15), 0.44, 0.78);
+    // Heat-blued muzzle hardware (cool violet-blue temper).
+    let heat_blued = mat(materials, Color::srgb(0.20, 0.22, 0.36), 0.3, 0.88);
+    let shell_red = mat(materials, Color::srgb(0.72, 0.08, 0.05), 0.45, 0.1);
+    let grip = mat(materials, Color::srgb(0.055, 0.055, 0.06), 0.92, 0.05);
+    let glove = mat(materials, Color::srgb(0.17, 0.20, 0.14), 0.88, 0.05);
+    let glove_plate = mat(materials, Color::srgb(0.26, 0.29, 0.22), 0.55, 0.45);
+    let bolt_silver = mat(materials, Color::srgb(0.68, 0.72, 0.76), 0.25, 0.95);
+    // Textured gun surfaces.
+    let gm_steel = tex(materials, &gunmetal_img, Color::srgb(0.62, 0.65, 0.70), 0.3, 0.82);
+    let gm_titanium = tex(materials, &gunmetal_img, Color::srgb(0.43, 0.46, 0.51), 0.34, 0.78);
+    let gm_dark = tex(materials, &gunmetal_img, Color::srgb(0.25, 0.27, 0.31), 0.4, 0.72);
+    let wood = tex(materials, &wood_img, Color::srgb(1.0, 0.94, 0.9), 0.6, 0.0);
+    let hazard = tex(materials, &hazard_img, Color::WHITE, 0.5, 0.15);
+    // Signal-Mortar shroud: warm tint + a hazard-textured #F2A20C self-glow so the amber
+    // stripes stay punchy on dark floors (the black stripes stay black).
+    let rk_hazard = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.84, 0.55),
+        base_color_texture: Some(hazard_img.clone()),
+        emissive: LinearRgba::from(Color::srgb(0.949, 0.635, 0.047)) * 0.32,
+        emissive_texture: Some(hazard_img.clone()),
+        perceptual_roughness: 0.42,
+        metallic: 0.15,
+        ..default()
+    });
+    // Mars Combat Pump: light brushed-gunmetal top planes over a black-oxide receiver
+    // side (gunmetal texture averages ~0.78, so tints are pre-compensated).
+    let sg_top = tex(materials, &gunmetal_img, Color::srgb(0.49, 0.54, 0.60), 0.30, 0.85);
+    let sg_oxide = tex(materials, &gunmetal_img, Color::srgb(0.14, 0.155, 0.18), 0.42, 0.78);
+    // UAC Plasma Repeater: dark industrial slate chassis + dark brushed titanium accents,
+    // so the cyan coils are the brightest thing on the gun.
+    let pl_slate = tex(materials, &obsidian_img, Color::srgb(0.16, 0.18, 0.23), 0.36, 0.74);
+    let pl_titanium = tex(materials, &gunmetal_img, Color::srgb(0.30, 0.34, 0.41), 0.32, 0.82);
+    let pl_edge = mat(materials, Color::srgb(0.52, 0.56, 0.62), 0.22, 0.95);
+    let brass = tex(materials, &gold_img, Color::srgb(1.0, 0.9, 0.72), 0.28, 0.9);
+    let copper = tex(materials, &gold_img, Color::srgb(0.95, 0.56, 0.38), 0.32, 0.88);
+
+    // Saturated glow accents (lit + emissive so the hue survives tonemapping).
+    let sight_green = lit_glow(materials, Color::srgb(0.12, 0.95, 0.3), LinearRgba::rgb(0.25, 3.2, 0.55));
+    let sight_red = lit_glow(materials, Color::srgb(1.0, 0.1, 0.05), LinearRgba::rgb(3.8, 0.32, 0.1));
+    let vent_amber = lit_glow(materials, Color::srgb(1.0, 0.54, 0.12), ROCKET_GLOW);
+    // Incandescent yellow-white core, saturated orange-amber flame tongues.
+    let flash_core = glow(materials, Color::srgb(1.0, 0.96, 0.72), LinearRgba::rgb(4.2, 3.2, 0.9));
+    let flash_fire = glow(materials, Color::srgb(1.0, 0.48, 0.06), LinearRgba::rgb(1.45, 0.34, 0.006));
+    let flash_cyan = glow(materials, Color::srgb(0.3, 0.9, 1.0), LinearRgba::rgb(0.5, 4.2, 7.5));
+    let flash_cyan_halo = materials.add(additive_glow(Color::srgb(0.2, 0.92, 1.0), 0.65));
+    let flash_amber_halo = materials.add(additive_glow(Color::srgb(1.0, 0.5, 0.1), 0.6));
+    // Animated (per-shot reactive) glows live in PhoneMaterials, replaced every run.
+    let coil = lit_glow(materials, Color::srgb(0.05, 0.62, 0.95), PLASMA_GLOW);
+    // Static brighter inner plasma core (conduit tube / capacitor) over the deeper coils.
+    let plasma_core = lit_glow(materials, Color::srgb(0.45, 0.9, 1.0), LinearRgba::rgb(0.18, 1.6, 2.6));
+    let warhead_glow = lit_glow(materials, Color::srgb(1.0, 0.54, 0.12), ROCKET_GLOW);
+    // Recessed ignition ring deep in the muzzle brake (static, a touch hotter/redder).
+    let bore_glow = lit_glow(materials, Color::srgb(1.0, 0.42, 0.05), LinearRgba::rgb(2.4, 0.55, 0.02));
+    VmKit { cube, cyl, thin_ring, bead, coil_ring, steel, brushed, dark_steel, heat_blued, shell_red, grip, glove, glove_plate, bolt_silver, gm_steel, gm_titanium, gm_dark, wood, hazard, rk_hazard, sg_top, sg_oxide, pl_slate, pl_titanium, pl_edge, brass, copper, sight_green, sight_red, vent_amber, flash_core, flash_fire, flash_cyan, flash_cyan_halo, flash_amber_halo, coil, plasma_core, warhead_glow, bore_glow }
+}
+
+/// Spawn the three sculpted gun models (Shotgun, Plasma Repeater, Signal-Mortar) under
+/// `wroot`, batching rigid parts into `vb`. Returns the [`GunModel`] pivots; only the
+/// Shotgun starts visible. `hands` adds the armored marine glove gripping each gun
+/// (the first-person viewmodel); the Armory showcase leaves it out.
+fn spawn_gun_models(commands: &mut Commands, wroot: Entity, kit: &VmKit, src: &VmSourceMeshes, vb: &mut ParentedBatches, hands: bool) -> [Entity; 3] {
+    let VmKit { coil_ring, steel, brushed, dark_steel, heat_blued, shell_red, grip, glove, glove_plate, bolt_silver, gm_steel, gm_titanium, gm_dark, wood, hazard, rk_hazard, sg_top, sg_oxide, pl_slate, pl_titanium, pl_edge, brass, copper, sight_green, sight_red, vent_amber, flash_core, flash_fire, flash_cyan, flash_cyan_halo, flash_amber_halo, coil, plasma_core, warhead_glow, bore_glow, .. } = kit.clone();
     let rx = Quat::from_rotation_x(FRAC_PI_2);
     let rz = Quat::from_rotation_z(FRAC_PI_2);
     let id = Quat::IDENTITY;
@@ -1335,10 +1467,12 @@ fn spawn_viewmodels(
     vb.part(sg, &trigger_guard, &gm_dark, Vec3::new(0.0, -0.066, -0.01), guard_scale, guard_rot);
     vb.part(sg, &trigger_blade, &steel, Vec3::new(0.0, -0.058, -0.006), one, Quat::from_rotation_x(PI));
     // Armored marine glove + knuckle plate + wrist cuff.
-    vb.part(sg, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.082), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.35));
-    vb.part(sg, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.065), one, Quat::from_rotation_x(-0.3));
-    vb.part(sg, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.20), Vec3::new(0.088, 0.11, 0.088), arm_rot);
-    vb.part(sg, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.165), one, arm_rot);
+    if hands {
+        vb.part(sg, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.082), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.35));
+        vb.part(sg, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.065), one, Quat::from_rotation_x(-0.3));
+        vb.part(sg, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.20), Vec3::new(0.088, 0.11, 0.088), arm_rot);
+        vb.part(sg, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.165), one, arm_rot);
+    }
 
     // Sliding pump forend: contoured walnut with dark rubber grip grooves + dual action bars.
     let pump = commands.spawn((ChildOf(sg), PumpForend, Transform::from_xyz(0.0, -0.012, -0.30), Visibility::default())).id();
@@ -1486,10 +1620,12 @@ fn spawn_viewmodels(
     vb.part(pl, &sculpt::beveled_box(Vec3::new(0.040, 0.088, 0.05), 0.009), &grip, Vec3::new(0.0, -0.092, 0.032), one, Quat::from_rotation_x(-0.32));
     vb.part(pl, &trigger_guard, &gm_dark, Vec3::new(0.0, -0.060, -0.025), guard_scale, guard_rot);
     vb.part(pl, &trigger_blade, &steel, Vec3::new(0.0, -0.052, -0.022), one, Quat::from_rotation_x(PI));
-    vb.part(pl, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
-    vb.part(pl, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.03), one, Quat::from_rotation_x(-0.28));
-    vb.part(pl, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), arm_rot);
-    vb.part(pl, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.135), one, arm_rot);
+    if hands {
+        vb.part(pl, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
+        vb.part(pl, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.03), one, Quat::from_rotation_x(-0.28));
+        vb.part(pl, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), arm_rot);
+        vb.part(pl, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.135), one, arm_rot);
+    }
     // Reciprocating flux slide on the top shroud (snaps back on every shot).
     let slide = commands.spawn((ChildOf(pl), PlasmaFluxSlide, Transform::from_translation(PLASMA_SLIDE_REST), Visibility::default())).id();
     vb.part(slide, &sculpt::beveled_box(Vec3::new(0.046, 0.016, 0.13), 0.004), &pl_titanium, Vec3::ZERO, one, id);
@@ -1633,10 +1769,12 @@ fn spawn_viewmodels(
     vb.part(rk, &trigger_guard, &gm_dark, Vec3::new(0.0, -0.058, -0.025), guard_scale, guard_rot);
     vb.part(rk, &trigger_blade, &steel, Vec3::new(0.0, -0.05, -0.02), one, Quat::from_rotation_x(PI));
     // Armored marine glove + knuckle plate + wrist cuff.
-    vb.part(rk, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
-    vb.part(rk, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.03), one, Quat::from_rotation_x(-0.28));
-    vb.part(rk, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), arm_rot);
-    vb.part(rk, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.135), one, arm_rot);
+    if hands {
+        vb.part(rk, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
+        vb.part(rk, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.03), one, Quat::from_rotation_x(-0.28));
+        vb.part(rk, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), arm_rot);
+        vb.part(rk, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.135), one, arm_rot);
+    }
     // Open-frame breech cradle carrying the exposed finned warhead: kicks back on fire
     // and lifts/vents through the reload cycle.
     let breech = commands.spawn((ChildOf(rk), RocketBreech, Transform::from_translation(ROCKET_BREECH_REST), Visibility::default())).id();
@@ -1670,75 +1808,30 @@ fn spawn_viewmodels(
     vb.part(rk_flash, &src.sphere, &flash_core, Vec3::ZERO, Vec3::splat(0.05), id);
     vb.part(rk_flash, &src.sphere, &flash_amber_halo, Vec3::ZERO, Vec3::splat(0.11), id);
     vb.part(rk_flash, &src.thin_ring, &flash_fire, Vec3::new(0.0, 0.0, 0.01), Vec3::new(0.085, 0.015, 0.085), rx);
-
-    // =========================================================================
-    // LEFT HAND: ELABORATE TACTICAL SMARTPHONE WITH LIVE 160x240 OLED DISPLAY
-    // =========================================================================
-    let phone_rot = Quat::from_rotation_y(0.24) * Quat::from_rotation_x(0.11) * Quat::from_rotation_z(-0.04);
-    let proot = commands
-        .spawn((ChildOf(cam), PhoneViewmodel, PhoneSkin(skin), Transform::from_translation(PHONE_REST).with_rotation(phone_rot), Visibility::default()))
-        .id();
-    // Main ruggedized anodized chassis + recessed stepped titanium frame rails.
-    commands.spawn((PhoneSkinPart(SkinSlot::Bezel), vm_part(proot, &cube, &bezel, Vec3::ZERO, Vec3::new(0.136, 0.214, 0.020), id)));
-    commands.spawn((PhoneSkinPart(SkinSlot::Frame), vm_part(proot, &cube, &phone_frame, Vec3::new(0.0, 0.0, -0.002), Vec3::new(0.142, 0.200, 0.014), id)));
-    // Rubberized grip ribs along left and right chassis edges.
-    for k in 0..6 {
-        let y = -0.062 + k as f32 * 0.024;
-        for s in [-1.0f32, 1.0] {
-            vb.part(proot, &src.cube, &grip, Vec3::new(0.072 * s, y, 0.0), Vec3::new(0.005, 0.010, 0.016), id);
-        }
-    }
-    // 4 sculpted rugged corner armor bumpers with silver hex bolts.
-    for (x, y) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-        commands.spawn((PhoneSkinPart(SkinSlot::Bumper), vm_part(proot, &cube, &bumper, Vec3::new(x * 0.066, y * 0.104, 0.001), Vec3::new(0.018, 0.018, 0.024), id)));
-        commands.spawn((
-            PhoneSkinPart(SkinSlot::Bolts),
-            vm_part(proot, &cyl, &phone_bolts, Vec3::new(x * 0.064, y * 0.102, 0.0135), Vec3::new(0.0032, 0.003, 0.0032), rx),
-        ));
-    }
-    // Top bulkhead: speaker grille slot + front-facing lens + blinking status LED.
-    vb.part(proot, &src.cube, &dark_steel, Vec3::new(0.0, 0.097, 0.0105), Vec3::new(0.036, 0.005, 0.003), id);
-    vb.part(proot, &src.cyl, &brushed, Vec3::new(-0.032, 0.097, 0.0105), Vec3::new(0.0045, 0.003, 0.0045), rx);
-    commands.spawn((PhoneLed, vm_part(proot, &bead, &led, Vec3::new(0.034, 0.097, 0.0115), Vec3::splat(0.0038), id)));
-    // Bottom chin tactile home bar + lanyard loop.
-    vb.part(proot, &src.cube, &brushed, Vec3::new(0.0, -0.098, 0.0105), Vec3::new(0.044, 0.006, 0.003), id);
-    // Side hardware controls: orange PTT button on left, volume rockers on right.
-    commands.spawn((PhoneSkinPart(SkinSlot::Ptt), vm_part(proot, &cube, &phone_ptt, Vec3::new(-0.074, 0.036, 0.0), Vec3::new(0.006, 0.026, 0.010), id)));
-    vb.part(proot, &src.cube, &steel, Vec3::new(0.074, 0.046, 0.0), Vec3::new(0.005, 0.018, 0.008), id);
-    vb.part(proot, &src.cube, &steel, Vec3::new(0.074, 0.020, 0.0), Vec3::new(0.005, 0.018, 0.008), id);
-    // Knurled antenna collar + telescoping tactical whip antenna + helical coil + glowing beacon bead.
-    vb.part(proot, &src.cyl, &brushed, Vec3::new(0.048, 0.114, -0.001), Vec3::new(0.011, 0.018, 0.011), id);
-    vb.part(proot, &src.cyl, &dark_steel, Vec3::new(0.048, 0.145, -0.001), Vec3::new(0.0048, 0.052, 0.0048), id);
-    commands.spawn((PhoneSkinPart(SkinSlot::Coil), vm_part(proot, &thin_ring, &phone_coil, Vec3::new(0.048, 0.132, -0.001), Vec3::new(0.008, 0.006, 0.008), id)));
-    commands.spawn((PhoneLed, vm_part(proot, &bead, &led, Vec3::new(0.048, 0.174, -0.001), Vec3::splat(0.0062), id)));
-    // Raised screen surround lip + LIVE 160x240 pixel-art OLED screen quad!
-    vb.part(proot, &src.cube, &grip, Vec3::new(0.0, 0.0, 0.0096), Vec3::new(0.123, 0.182, 0.002), id);
-    commands.spawn((
-        PhoneScreen,
-        ChildOf(proot),
-        Mesh3d(screen_quad),
-        MeshMaterial3d(screen),
-        Transform::from_xyz(0.0, 0.0, 0.0112),
-        overlay_layer(),
-    ));
-    // Articulated gloved marine left hand & armored cuff gripping bottom & sides (never blocking the screen!).
-    vb.part(proot, &src.cap, &glove, Vec3::new(-0.012, -0.118, -0.022), Vec3::new(0.088, 0.058, 0.058), rz); // palm base
-    vb.part(proot, &src.cap, &glove, Vec3::new(-0.072, -0.042, -0.014), Vec3::new(0.026, 0.088, 0.032), Quat::from_rotation_z(-0.08)); // left hand heel
-    // 3 wrapped armored fingers gripping the right spine from behind.
-    for k in 0..3 {
-        let y = -0.058 + k as f32 * 0.030;
-        vb.part(proot, &src.cap, &glove, Vec3::new(0.072, y, -0.004), Vec3::new(0.018, 0.022, 0.022), rz);
-        vb.part(proot, &src.cube, &glove_plate, Vec3::new(0.076, y, 0.004), Vec3::new(0.012, 0.014, 0.012), id);
-    }
-    // Curled thumb gripping the lower-left armor bumper cleanly clear of the OLED screen!
-    vb.part(proot, &src.cap, &glove, Vec3::new(-0.080, -0.098, 0.011), Vec3::new(0.018, 0.030, 0.018), Quat::from_rotation_z(-0.42));
-    // Left armored forearm descending into bottom-left corner.
-    vb.part(proot, &src.cap, &glove, Vec3::new(-0.045, -0.20, -0.065), Vec3::new(0.082, 0.11, 0.072), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22));
-    vb.part(proot, &src.cyl, &glove_plate, Vec3::new(-0.036, -0.165, -0.05), Vec3::new(0.048, 0.034, 0.048), Quat::from_rotation_x(0.45) * Quat::from_rotation_z(-0.22));
-    for (parent, mesh, mat) in vb.finish(&mut meshes) {
-        commands.spawn(vm_part(parent, &mesh, &mat, Vec3::ZERO, Vec3::ONE, Quat::IDENTITY));
-    }
+    [sg, pl, rk]
 }
+
+/// Armory showcase (Compendium turntable): the real sculpted viewmodel guns, built
+/// by the same code as the player viewmodel, parented under `parent` on the
+/// [`OVERLAY_LAYER`]. Returns `[shotgun, plasma, mortar]` pivots (only the shotgun
+/// starts visible). Allocates once per call, never per frame.
+pub(crate) fn spawn_gun_showcase(
+    commands: &mut Commands,
+    parent: Entity,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> [Entity; 3] {
+    let kit = vm_kit(meshes, materials, images);
+    let src = VmSourceMeshes::new();
+    let mut vb = ParentedBatches::new();
+    let guns = spawn_gun_models(commands, parent, &kit, &src, &mut vb, false);
+    for (p, mesh, mat) in vb.finish(meshes) {
+        commands.spawn(vm_part(p, &mesh, &mat, Vec3::ZERO, Vec3::ONE, Quat::IDENTITY));
+    }
+    guns
+}
+
 
 fn sync_overlay_fov(main: Query<&Projection, (With<PlayerCamera>, Without<OverlayCamera>)>, mut overlay: Query<&mut Projection, With<OverlayCamera>>) {
     let (Ok(Projection::Perspective(m)), Ok(mut o)) = (main.single(), overlay.single_mut()) else { return };

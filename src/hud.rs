@@ -20,6 +20,7 @@ use bevy::window::PrimaryWindow;
 use crate::assets_gen::FloorTheme;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::boss::BossHud;
+use crate::compendium::{apply_custom_label, pick_run_seed, seed_key_char, shareable_code, CustomSeedState};
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
 use crate::fx::HudFeed;
 use crate::meta::{live_settings, record_game_over, record_victory, start_run_with_loadout, CrosshairColor, CrosshairStyle, ProfileStore, RunLoadout};
@@ -85,6 +86,16 @@ pub enum MenuAction {
     StartTimeTrial,
     /// Time Trial finish card: instant retry (no level rebuild).
     RetryTimeTrial,
+    /// Main menu: the 3D Bestiary & Armory viewer.
+    OpenCompendium,
+    /// Main menu SEED switch: open the inline seed editor / lock the code.
+    ToggleSeedEdit,
+    /// Main menu `RND`: arm a fresh random seed code.
+    RollSeed,
+    /// Main menu `CLR`: back to random seeds.
+    ClearSeed,
+    /// Pause / end screens: arm (and on the web, link) the run's seed code.
+    ShareSeed,
 }
 
 /// A clickable menu switch (see [`crate::ui_kit::punk_button`]).
@@ -142,6 +153,19 @@ pub fn mode_hotkey_action(state: AppState, mode: RunMode, d: bool, t: bool, r: b
     }
 }
 
+/// Milestone 21 hotkeys: `B` opens the Bestiary & Armory from `MainMenu`;
+/// `S` shares the run's seed from `Paused` / `GameOver` / `Victory` (not in
+/// the seedless Time Trial). `S` on the main menu opens the seed editor (see
+/// [`seed_entry_keys`]), and while that editor is open every main menu
+/// hotkey is suppressed so typing `DOOM` or `BOSS` never launches a screen.
+pub fn seed_hotkey_action(state: AppState, mode: RunMode, b: bool, s: bool) -> Option<MenuAction> {
+    match state {
+        AppState::MainMenu if b => Some(MenuAction::OpenCompendium),
+        AppState::Paused | AppState::GameOver | AppState::Victory if s && mode != RunMode::TimeTrial => Some(MenuAction::ShareSeed),
+        _ => None,
+    }
+}
+
 /// App Store card for offer `n` (0..3).
 #[derive(Component)]
 struct UpgradeCard(usize);
@@ -159,6 +183,8 @@ impl Plugin for HudPlugin {
             .add_systems(OnEnter(AppState::GameOver), spawn_game_over.after(record_game_over))
             .add_systems(OnEnter(AppState::Victory), spawn_victory.after(record_victory))
             .add_systems(Update, (menu_buttons, menu_keys).run_if(not(in_state(AppState::Playing))))
+            .add_systems(Update, seed_entry_keys.after(menu_keys).after(menu_buttons).run_if(in_state(AppState::MainMenu)))
+            .add_systems(Update, refresh_seed_ui.after(seed_entry_keys).run_if(not(in_state(AppState::Playing))))
             .add_systems(Update, upgrade_cards.run_if(in_state(AppState::UpgradeSelect)))
             .init_resource::<VelGauge>()
             .add_systems(
@@ -231,7 +257,13 @@ pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("SYSTEM", &[(&["CLICK"], "capture mouse"), (&["ESC", "P"], "pause"), (&["F9"], "debug: skip floor")]),
 ];
 
-fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>, msaa: Option<Res<crate::perf::RenderMsaa>>) {
+fn spawn_main_menu(
+    mut commands: Commands,
+    store: Res<ProfileStore>,
+    seed: Res<CustomSeedState>,
+    tex: Option<Res<UiKitTextures>>,
+    msaa: Option<Res<crate::perf::RenderMsaa>>,
+) {
     let tex = tex.as_deref();
     let msaa = msaa.map(|m| m.0).unwrap_or(bevy::render::view::Msaa::Sample2);
     // Menu needs its own camera: the player camera only exists in a run.
@@ -247,13 +279,13 @@ fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option
     // One poster column, exactly as wide as the wordmark: every block below
     // the title shares its left and right edges.
     let column = commands
-        .spawn((ChildOf(root), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(10.0), ..default() }))
+        .spawn((ChildOf(root), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(6.0), ..default() }))
         .id();
 
     // Hero lockup: firmware stamp + a dying 1-bar signal above the wordmark,
     // the caution tape tag + genre line below it.
     let lockup = commands
-        .spawn((ChildOf(column), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(6.0), ..default() }))
+        .spawn((ChildOf(column), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(4.0), ..default() }))
         .id();
     let stamp_row = commands
         .spawn((ChildOf(lockup), Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::FlexEnd, ..default() }))
@@ -266,7 +298,7 @@ fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option
     let weak = commands.spawn((ChildOf(stamp_row), Node { column_gap: Val::Px(10.0), align_items: AlignItems::FlexEnd, ..default() })).id();
     commands.spawn((ChildOf(weak), text("SIGNAL 1/5", 12.0, PUNK_RED)));
     signal_bars(&mut commands, weak, 1, PUNK_RED, 6.0);
-    hero_title(&mut commands, lockup, "SEGNALE DEBOLE", 92.0, BONE_TEXT, PUNK_RED);
+    hero_title(&mut commands, lockup, "SEGNALE DEBOLE", 84.0, BONE_TEXT, PUNK_RED);
     commands.spawn((
         ChildOf(lockup),
         Node { margin: UiRect::top(Val::Px(2.0)), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
@@ -347,6 +379,138 @@ fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option
             Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() },
             children![text(sub, 12.0, color.with_alpha(0.9))],
         ));
+    }
+    commands.spawn((ChildOf(modes), punk_button("BESTIARY & ARMORY  [B]", MenuAction::OpenCompendium, 16.0, ButtonStyle::DangerRed)));
+
+    // Run seed: compact selector strip (armed code or RANDOM) + RND / CLR.
+    let seed_row = commands
+        .spawn((
+            ChildOf(column),
+            Node {
+                column_gap: Val::Px(10.0),
+                align_items: AlignItems::Center,
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
+                border: plate_rect((3.0, 1.0, 1.0, 1.0)),
+                ..default()
+            },
+            BorderColor { left: ARC_CYAN, ..inset_border() },
+            BackgroundColor(INK_BLACK.with_alpha(0.62)),
+        ))
+        .id();
+    commands.spawn((ChildOf(seed_row), text("RUN SEED", 11.0, ASH_DIM)));
+    commands.spawn((ChildOf(seed_row), punk_button(&seed_button_label(&seed), MenuAction::ToggleSeedEdit, 14.0, ButtonStyle::PrimaryAcid)));
+    commands.spawn((ChildOf(seed_row), punk_button("RND", MenuAction::RollSeed, 14.0, ButtonStyle::ScrapSteel)));
+    commands.spawn((ChildOf(seed_row), punk_button("CLR", MenuAction::ClearSeed, 14.0, ButtonStyle::ScrapSteel)));
+    commands.spawn((ChildOf(seed_row), SeedStatusText, text(seed_status_line(&seed), 12.0, ARC_CYAN.with_alpha(0.85))));
+}
+
+/// Live seed status line of the main menu.
+#[derive(Component)]
+pub struct SeedStatusText;
+
+/// Label of the main menu SEED switch.
+pub fn seed_button_label(seed: &CustomSeedState) -> String {
+    format!("SEED: {}  [S]", seed.readout())
+}
+
+fn seed_status_line(seed: &CustomSeedState) -> String {
+    seed.status_msg.clone().unwrap_or_else(|| "SAME CODE = SAME BUNKER // TYPE A WORD OR ROLL ONE".to_string())
+}
+
+/// Label of the pause / end screen SHARE SEED switch (confirms once armed).
+pub fn share_button_label(run: &RunStats, seed: &CustomSeedState) -> String {
+    match shareable_code(run) {
+        Some(code) if seed.code == code && !seed.editing => format!("SEED {code} ARMED  [S]"),
+        _ => "SHARE SEED  [S]".to_string(),
+    }
+}
+
+/// Inline seed editor on the main menu (runs after [`menu_keys`], which is
+/// muted while editing): `S` opens it, `A-Z` / `0-9` / `-` type, `Backspace`
+/// deletes, `Enter` locks, `Esc` closes. Consumes ordered `KeyboardInput`
+/// messages when present so fast same-frame typing preserves character order.
+pub fn seed_entry_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut key_events: MessageReader<bevy::input::keyboard::KeyboardInput>,
+    mut seed: ResMut<CustomSeedState>,
+) {
+    let pressed_ordered: Vec<KeyCode> = key_events
+        .read()
+        .filter(|e| e.state == bevy::input::ButtonState::Pressed && !e.repeat)
+        .map(|e| e.key_code)
+        .collect();
+    if !seed.editing {
+        if pressed_ordered.contains(&KeyCode::KeyS) || (pressed_ordered.is_empty() && keys.just_pressed(KeyCode::KeyS)) {
+            seed.toggle_edit();
+        }
+        return;
+    }
+    if !pressed_ordered.is_empty() {
+        for k in pressed_ordered {
+            match k {
+                KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Escape => {
+                    seed.lock();
+                    #[cfg(target_arch = "wasm32")]
+                    crate::compendium::sync_url_hash_seed(&seed.code);
+                    return;
+                }
+                KeyCode::Backspace => seed.backspace(),
+                other => {
+                    if let Some(c) = seed_key_char(other) {
+                        seed.push_char(c);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter, KeyCode::Escape]) {
+        seed.lock();
+        #[cfg(target_arch = "wasm32")]
+        crate::compendium::sync_url_hash_seed(&seed.code);
+        return;
+    }
+    if keys.just_pressed(KeyCode::Backspace) {
+        seed.backspace();
+    }
+    for k in keys.get_just_pressed() {
+        if let Some(c) = seed_key_char(*k) {
+            seed.push_char(c);
+        }
+    }
+}
+
+/// Keep the SEED switch label, the seed status line and the SHARE SEED
+/// switch in sync with [`CustomSeedState`].
+fn refresh_seed_ui(
+    seed: Res<CustomSeedState>,
+    run: Res<RunStats>,
+    buttons: Query<(&MenuAction, &Children)>,
+    mut status: Query<&mut Text, With<SeedStatusText>>,
+    mut labels: Query<&mut Text, Without<SeedStatusText>>,
+) {
+    if !seed.is_changed() {
+        return;
+    }
+    for (action, children) in &buttons {
+        let want = match action {
+            MenuAction::ToggleSeedEdit => seed_button_label(&seed),
+            MenuAction::ShareSeed => share_button_label(&run, &seed),
+            _ => continue,
+        };
+        for c in children {
+            if let Ok(mut t) = labels.get_mut(*c)
+                && t.0 != want
+            {
+                t.0 = want.clone();
+            }
+        }
+    }
+    let line = seed_status_line(&seed);
+    for mut t in &mut status {
+        if t.0 != line {
+            t.0 = line.clone();
+        }
     }
 }
 
@@ -726,7 +890,7 @@ fn spawn_end_screen(
     endless_cta: bool,
     run: &RunStats,
     loadout: &RunLoadout,
-    store: &ProfileStore,
+    (store, seed): (&ProfileStore, &CustomSeedState),
     tex: Option<&UiKitTextures>,
 ) {
     // Victory stacks the Endless switch + its subtitle under a full unlock
@@ -790,14 +954,15 @@ fn spawn_end_screen(
     commands.spawn((ChildOf(readout), text(summary(run), 18.0, BONE_TEXT)));
     commands.spawn((ChildOf(readout), text(movement_line(run), 14.0, ARC_CYAN)));
     commands.spawn((ChildOf(readout), text(installed_list(run), 14.0, look.apps)));
+    let loadout_line = with_seed(end_loadout_line(loadout), run);
     match run.mode.daily_date() {
         Some(date) => {
             let row = commands.spawn((ChildOf(readout), Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() })).id();
             commands.spawn((ChildOf(row), stamped_tag(&format!("DAILY {}", date.format_iso()), HAZARD_YELLOW, INK_BLACK, 11.0)));
-            commands.spawn((ChildOf(row), text(end_loadout_line(loadout), 13.0, ASH_DIM)));
+            commands.spawn((ChildOf(row), text(loadout_line, 13.0, ASH_DIM)));
         }
         None => {
-            commands.spawn((ChildOf(readout), text(end_loadout_line(loadout), 13.0, ASH_DIM)));
+            commands.spawn((ChildOf(readout), text(loadout_line, 13.0, ASH_DIM)));
         }
     }
     if show_splits {
@@ -869,14 +1034,34 @@ fn spawn_end_screen(
             text("Floor 6+ // keep HP, armor, ammo & apps // boss rematch every 5th floor", 13.0, COLOR_ENDLESS),
         ));
     }
-    button_row(commands, root, &look.buttons, if compact { 18.0 } else { 21.0 }, if compact { 2.0 } else { 10.0 });
+    let mut buttons = look.buttons.to_vec();
+    let share = share_button_label(run, seed);
+    if shareable_code(run).is_some() {
+        buttons.push((&share, MenuAction::ShareSeed, ButtonStyle::ScrapSteel));
+    }
+    button_row(commands, root, &buttons, if compact { 18.0 } else { 21.0 }, if compact { 2.0 } else { 10.0 });
+}
+
+/// `<line>  //  SEED <code>` (unchanged for seedless runs).
+pub fn with_seed(line: String, run: &RunStats) -> String {
+    match shareable_code(run) {
+        Some(code) => format!("{line}  //  SEED {code}"),
+        None => line,
+    }
 }
 
 /// Victory call to action of Endless Overdrive.
 pub const ENDLESS_CTA: &str = "KEEP DESCENDING (ENDLESS)  [E]";
 
-fn spawn_game_over(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
-    spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), false, &run, &loadout, &store, tex.as_deref());
+fn spawn_game_over(
+    mut commands: Commands,
+    run: Res<RunStats>,
+    loadout: Res<RunLoadout>,
+    store: Res<ProfileStore>,
+    seed: Res<CustomSeedState>,
+    tex: Option<Res<UiKitTextures>>,
+) {
+    spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), false, &run, &loadout, (&store, &seed), tex.as_deref());
 }
 
 fn spawn_victory(
@@ -885,13 +1070,14 @@ fn spawn_victory(
     loadout: Res<RunLoadout>,
     store: Res<ProfileStore>,
     trial: Res<TimeTrialState>,
+    seed: Res<CustomSeedState>,
     tex: Option<Res<UiKitTextures>>,
 ) {
     if run.mode == RunMode::TimeTrial {
         spawn_trial_finish(&mut commands, &run, &trial, &store, tex.as_deref());
         return;
     }
-    spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), true, &run, &loadout, &store, tex.as_deref());
+    spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), true, &run, &loadout, (&store, &seed), tex.as_deref());
 }
 
 /// Time Trial finish card: final time, PB delta / NEW PB, movement telemetry,
@@ -977,7 +1163,7 @@ fn spawn_trial_finish(commands: &mut Commands, run: &RunStats, trial: &TimeTrial
 /// In-run pause overlay (`Esc` / `P`): keeps the frozen 3D scene behind a dark
 /// tactical overlay + hazard-taped terminal and lets the player resume,
 /// restart, edit loadout, or quit.
-fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, tex: Option<Res<UiKitTextures>>) {
+fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, seed: Res<CustomSeedState>, tex: Option<Res<UiKitTextures>>) {
     let tex = tex.as_deref();
     let root = punk_screen_root(&mut commands, AppState::Paused, tex, Color::srgba(0.02, 0.015, 0.012, 0.74), 0.3);
     let card = terminal_chassis(&mut commands, root, tex, 700.0, false);
@@ -1006,7 +1192,7 @@ fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<Run
         ))
         .id();
     commands.spawn((ChildOf(readout), text(summary(&run), 17.0, BONE_TEXT)));
-    commands.spawn((ChildOf(readout), text(end_loadout_line(&loadout), 13.0, HAZARD_YELLOW)));
+    commands.spawn((ChildOf(readout), text(with_seed(end_loadout_line(&loadout), &run), 13.0, HAZARD_YELLOW)));
     commands.spawn((ChildOf(readout), Node { max_width: Val::Px(620.0), ..default() }, children![text(installed_list(&run), 13.0, ASH_DIM)]));
     let wrap = centered(&mut commands, card);
     let btns = commands
@@ -1016,7 +1202,7 @@ fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<Run
                 margin: UiRect { top: Val::Px(10.0), bottom: Val::Px(12.0), ..default() },
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Stretch,
-                row_gap: Val::Px(13.0),
+                row_gap: Val::Px(10.0),
                 width: Val::Px(380.0),
                 ..default()
             },
@@ -1032,6 +1218,9 @@ fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<Run
     ] {
         commands.spawn((ChildOf(btns), punk_button(label, action, font, style)));
     }
+    if shareable_code(&run).is_some() {
+        commands.spawn((ChildOf(btns), punk_button(&share_button_label(&run, &seed), MenuAction::ShareSeed, 15.0, ButtonStyle::ScrapSteel)));
+    }
 }
 
 /// Menu action. "START" snapshots the profile's equipped loadout (chip, skin,
@@ -1043,7 +1232,7 @@ fn perform(
     action: MenuAction,
     run: &mut RunStats,
     mods: &mut PlayerModifiers,
-    (store, loadout, trial): (&mut ProfileStore, &mut RunLoadout, &mut TimeTrialState),
+    (store, loadout, trial, seed): (&mut ProfileStore, &mut RunLoadout, &mut TimeTrialState, &mut CustomSeedState),
     time: &Time,
     (state, ret): (AppState, &mut SettingsReturn),
     next: &mut NextState<AppState>,
@@ -1056,8 +1245,14 @@ fn perform(
     };
     match action {
         MenuAction::StartRun => {
-            let seed = time.elapsed().as_nanos() as u64 ^ 0xA5A5_5A5A_1234_5678;
-            start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
+            if seed.editing {
+                seed.lock();
+                #[cfg(target_arch = "wasm32")]
+                crate::compendium::sync_url_hash_seed(&seed.code);
+            }
+            let (s, label) = pick_run_seed(seed, time.elapsed().as_nanos() as u64 ^ 0xA5A5_5A5A_1234_5678);
+            start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, s);
+            apply_custom_label(run, label);
         }
         MenuAction::RestartRun if run.mode == RunMode::TimeTrial => {
             // Instant reset on the same course (no level rebuild).
@@ -1075,9 +1270,19 @@ fn perform(
                 begin_daily_attempt(&mut store.profile.daily_records, date);
                 let _ = store.try_save();
                 start_daily_run(run, mods, loadout, next, date, store.profile.build_loadout().skin);
+            } else if run.custom_seed {
+                // A custom seed restarts on the very same bunker.
+                commands.remove_resource::<crate::level::LevelGrid>();
+                let (s, label) = (run.run_seed, run.seed_label.clone());
+                start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, s);
+                apply_custom_label(run, label);
             } else {
-                let seed = time.elapsed().as_nanos() as u64 ^ run.run_seed.wrapping_add(0x9E37_79B9);
-                start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
+                let (s, label) = pick_run_seed(seed, time.elapsed().as_nanos() as u64 ^ run.run_seed.wrapping_add(0x9E37_79B9));
+                if label.is_some() {
+                    commands.remove_resource::<crate::level::LevelGrid>();
+                }
+                start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, s);
+                apply_custom_label(run, label);
             }
         }
         MenuAction::StartDaily => {
@@ -1120,6 +1325,30 @@ fn perform(
                 continue_into_endless(run, next);
             }
         }
+        MenuAction::OpenCompendium => next.set(AppState::Compendium),
+        MenuAction::ToggleSeedEdit => {
+            seed.toggle_edit();
+            if !seed.editing {
+                #[cfg(target_arch = "wasm32")]
+                crate::compendium::sync_url_hash_seed(&seed.code);
+            }
+        }
+        MenuAction::RollSeed => {
+            seed.roll(time.elapsed().as_nanos() as u64 ^ 0x5EED_C0DE);
+            #[cfg(target_arch = "wasm32")]
+            crate::compendium::sync_url_hash_seed(&seed.code);
+        }
+        MenuAction::ClearSeed => {
+            seed.clear();
+            #[cfg(target_arch = "wasm32")]
+            crate::compendium::sync_url_hash_seed("");
+        }
+        MenuAction::ShareSeed => {
+            if let Some(_code) = seed.arm_from_run(run) {
+                #[cfg(target_arch = "wasm32")]
+                crate::compendium::sync_url_hash_seed(&_code);
+            }
+        }
     }
 }
 
@@ -1136,7 +1365,7 @@ fn menu_buttons(
     mut labels: Query<&mut TextColor>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
-    (mut store, mut loadout, mut trial): (ResMut<ProfileStore>, ResMut<RunLoadout>, ResMut<TimeTrialState>),
+    (mut store, mut loadout, mut trial, mut seed): (ResMut<ProfileStore>, ResMut<RunLoadout>, ResMut<TimeTrialState>, ResMut<CustomSeedState>),
     time: Res<Time>,
     (state, mut ret): (Res<State<AppState>>, ResMut<SettingsReturn>),
     mut next: ResMut<NextState<AppState>>,
@@ -1168,7 +1397,7 @@ fn menu_buttons(
                 *action,
                 &mut run,
                 &mut mods,
-                (&mut store, &mut loadout, &mut trial),
+                (&mut store, &mut loadout, &mut trial, &mut seed),
                 &time,
                 (*state.get(), &mut ret),
                 &mut next,
@@ -1186,11 +1415,15 @@ fn menu_keys(
     state: Res<State<AppState>>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
-    (mut store, mut loadout, mut trial): (ResMut<ProfileStore>, ResMut<RunLoadout>, ResMut<TimeTrialState>),
+    (mut store, mut loadout, mut trial, mut seed): (ResMut<ProfileStore>, ResMut<RunLoadout>, ResMut<TimeTrialState>, ResMut<CustomSeedState>),
     time: Res<Time>,
     mut ret: ResMut<SettingsReturn>,
     mut next: ResMut<NextState<AppState>>,
 ) {
+    // Typing a seed (`DOOM`, `BOSS`...) never fires main menu hotkeys.
+    if *state.get() == AppState::MainMenu && seed.editing {
+        return;
+    }
     let enter = keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]);
     let action = menu_key_action(
         *state.get(),
@@ -1210,7 +1443,8 @@ fn menu_keys(
             keys.just_pressed(KeyCode::KeyT),
             keys.just_pressed(KeyCode::KeyR),
         )
-    });
+    })
+    .or_else(|| seed_hotkey_action(*state.get(), run.mode, keys.just_pressed(KeyCode::KeyB), keys.just_pressed(KeyCode::KeyS)));
     if let Some(action) = action {
         perform(
             &mut commands,
@@ -1218,7 +1452,7 @@ fn menu_keys(
             action,
             &mut run,
             &mut mods,
-            (&mut store, &mut loadout, &mut trial),
+            (&mut store, &mut loadout, &mut trial, &mut seed),
             &time,
             (*state.get(), &mut ret),
             &mut next,
@@ -1831,7 +2065,7 @@ fn spawn_vel_plate(commands: &mut Commands, root: Entity) {
     ));
 }
 
-fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Option<Res<ProfileStore>>) {
+fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Option<Res<ProfileStore>>, run: Res<RunStats>) {
     let tex = tex.as_deref();
     let settings = live_settings(store.as_deref());
     let root = commands.spawn((DespawnOnExit(AppState::Playing), abs_full())).id();
@@ -1877,8 +2111,8 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
         children![(HudText::Hitmarker, text("X", 34.0, Color::NONE))],
     ));
 
-    // Top-left: floor + kills / jammers.
-    commands.spawn((
+    // Top-left: floor + kills / jammers (+ the custom seed code when one is live).
+    let plate = commands.spawn((
         ChildOf(root),
         hud_plate(
             Node {
@@ -1908,7 +2142,12 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
                 ],
             ),
         ],
-    ));
+    )).id();
+    if run.custom_seed
+        && let Some(code) = shareable_code(&run)
+    {
+        commands.spawn((ChildOf(plate), text(format!("SEED {code}"), 11.0, ARC_CYAN)));
+    }
 
     // Top-center: status panel (+ SOS uplink), alert under it.
     let top = commands
@@ -3081,6 +3320,34 @@ mod tests {
         assert!(overclock_active(4, 0.25));
         assert!(!overclock_active(3, 0.25));
         assert!(!overclock_active(5, 0.0));
+    }
+
+    #[test]
+    fn seed_and_compendium_hotkeys_per_state() {
+        use MenuAction::*;
+        assert_eq!(seed_hotkey_action(AppState::MainMenu, RunMode::Standard, true, false), Some(OpenCompendium));
+        assert_eq!(seed_hotkey_action(AppState::MainMenu, RunMode::Standard, false, true), None, "S on the menu opens the editor instead");
+        for st in [AppState::Paused, AppState::GameOver, AppState::Victory] {
+            assert_eq!(seed_hotkey_action(st, RunMode::Standard, false, true), Some(ShareSeed));
+            assert_eq!(seed_hotkey_action(st, RunMode::TimeTrial, false, true), None, "time trials have no seed");
+            assert_eq!(seed_hotkey_action(st, RunMode::Standard, true, false), None);
+        }
+        for st in [AppState::Compendium, AppState::Loadout, AppState::Settings, AppState::Playing] {
+            assert_eq!(seed_hotkey_action(st, RunMode::Standard, true, true), None);
+        }
+        // Seed labels on the menu switch and the end screens.
+        let mut seed = CustomSeedState::default();
+        assert_eq!(seed_button_label(&seed), "SEED: RANDOM  [S]");
+        seed.code = "MARS7".into();
+        assert_eq!(seed_button_label(&seed), "SEED: MARS7  [S]");
+        let mut run = RunStats::default();
+        run.start_new_run(0x791E_0A5A);
+        assert_eq!(with_seed("SURVEY OS".into(), &run), "SURVEY OS  //  SEED 791E-0A5A");
+        assert_eq!(share_button_label(&run, &seed), "SHARE SEED  [S]");
+        seed.arm_from_run(&run);
+        assert_eq!(share_button_label(&run, &seed), "SEED 791E-0A5A ARMED  [S]");
+        run.mode = RunMode::TimeTrial;
+        assert_eq!(with_seed("X".into(), &run), "X");
     }
 
     #[test]

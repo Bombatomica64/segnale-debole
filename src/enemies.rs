@@ -2878,6 +2878,7 @@ fn enemy_deaths(
             decals.push(DecalRequest::floor(kind, feet, size * (0.9 + e.stats.radius)));
         }
         run.kills += 1;
+        run.enemy_kills[e.kind.index()] += 1;
         sfx.play_at(SfxEvent::EnemyDeath, center);
         if e.kind == EnemyKind::CarrierDaemon {
             // Massive golden / crimson multi-burst.

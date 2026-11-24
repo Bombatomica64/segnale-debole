@@ -16,6 +16,7 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::enemies::KIND_COUNT;
 use crate::trials::DailyDate;
 
 /// Last floor of a standard run. Clearing it means victory.
@@ -39,6 +40,9 @@ pub enum AppState {
     /// and `Paused`; it is NOT a pre-run screen, so opening it mid-run keeps
     /// the player and the level alive (see [`SettingsReturn`]).
     Settings,
+    /// 3D Bestiary & Armory viewer (see `compendium.rs`): a pre-run screen
+    /// reachable from `MainMenu`.
+    Compendium,
 }
 
 /// Where `Settings` returns to (`MainMenu` or `Paused`).
@@ -54,7 +58,7 @@ impl Default for SettingsReturn {
 impl AppState {
     /// Pre-run screens where no run is alive (player and level torn down).
     pub fn is_pre_run(self) -> bool {
-        matches!(self, AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats)
+        matches!(self, AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats | AppState::Compendium)
     }
 }
 
@@ -296,6 +300,8 @@ pub struct RecordedRunTotals {
     pub fiends: u32,
     pub blackout_kills: u32,
     pub sos_completed: u32,
+    /// Per-kind kills (indexed by [`crate::enemies::EnemyKind::index`]).
+    pub enemy_kills: [u32; KIND_COUNT],
 }
 
 impl RecordedRunTotals {
@@ -306,6 +312,7 @@ impl RecordedRunTotals {
             fiends: run.fiends_killed,
             blackout_kills: run.blackout_kills,
             sos_completed: run.sos_completed,
+            enemy_kills: run.enemy_kills,
         }
     }
 
@@ -317,6 +324,7 @@ impl RecordedRunTotals {
             fiends: self.fiends.saturating_sub(earlier.fiends),
             blackout_kills: self.blackout_kills.saturating_sub(earlier.blackout_kills),
             sos_completed: self.sos_completed.saturating_sub(earlier.sos_completed),
+            enemy_kills: std::array::from_fn(|i| self.enemy_kills[i].saturating_sub(earlier.enemy_kills[i])),
         }
     }
 }
@@ -392,6 +400,13 @@ pub struct RunStats {
     pub mode: RunMode,
     /// Cumulative `time_elapsed` at the end of each cleared floor (speedrun splits).
     pub floor_splits: Vec<f32>,
+    /// Shareable seed code of the run (`MARS7`, `791E-0A5A`, ...); `None` for
+    /// seedless modes. See [`crate::compendium::format_seed_code`].
+    pub seed_label: Option<String>,
+    /// The run was launched from a player-entered custom seed.
+    pub custom_seed: bool,
+    /// Kills per demon kind this run (indexed by [`crate::enemies::EnemyKind::index`]).
+    pub enemy_kills: [u32; KIND_COUNT],
 }
 
 impl Default for RunStats {
@@ -415,15 +430,21 @@ impl Default for RunStats {
             recorded_snapshot: None,
             mode: RunMode::Standard,
             floor_splits: Vec::new(),
+            seed_label: None,
+            custom_seed: false,
+            enemy_kills: [0; KIND_COUNT],
         }
     }
 }
 
 impl RunStats {
     /// Reset everything for a fresh run with the given seed.
+    /// The run's seed label defaults to its formatted code (see
+    /// [`crate::compendium::format_seed_code`]); custom seeds overwrite it.
     pub fn start_new_run(&mut self, seed: u64) {
         *self = RunStats {
             run_seed: seed,
+            seed_label: Some(crate::compendium::format_seed_code(seed)),
             ..Default::default()
         };
     }

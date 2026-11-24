@@ -694,6 +694,10 @@ pub struct LifetimeStats {
     pub best_bhop_chain: u32,
     /// Deepest floor reached in Endless Overdrive (0 = never entered).
     pub best_endless_floor: u32,
+    /// Lifetime kills per demon kind (indexed by [`crate::enemies::EnemyKind::index`]).
+    /// Absent in pre-Milestone 21 profiles (defaults to zeros).
+    #[serde(default)]
+    pub enemy_kills: [u32; crate::enemies::KIND_COUNT],
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -959,6 +963,9 @@ impl PlayerProfile {
         s.total_fiends += run.fiends_killed;
         s.total_blackout_kills += run.blackout_kills;
         s.total_sos_completed += run.sos_completed;
+        for (total, k) in s.enemy_kills.iter_mut().zip(run.enemy_kills) {
+            *total = total.saturating_add(k);
+        }
         if victory {
             s.victories += 1;
             s.fastest_victory_secs = Some(s.fastest_victory_secs.map_or(run.time_elapsed, |t| t.min(run.time_elapsed)));
@@ -998,6 +1005,9 @@ impl PlayerProfile {
         s.total_fiends += d.fiends;
         s.total_blackout_kills += d.blackout_kills;
         s.total_sos_completed += d.sos_completed;
+        for (total, k) in s.enemy_kills.iter_mut().zip(d.enemy_kills) {
+            *total = total.saturating_add(k);
+        }
         self.record_bests(run);
         let contracts = loadout.contract_count();
         let rec = RunRecord {
@@ -1129,11 +1139,11 @@ pub fn profile_path_policy(
 
 /// Where the profile lives: `SEGNALE_PROFILE` (`memory`/`none` = in-memory)
 /// overrides; otherwise only windowed, non-bot, non-screenshot (`SEGNALE_SHOTS`,
-/// `SEGNALE_META_SHOTS`) launches touch
+/// `SEGNALE_META_SHOTS`, `SEGNALE_TRIAL_SHOTS`, `SEGNALE_COMPENDIUM_SHOTS`) launches touch
 /// `$XDG_DATA_HOME/segnale-debole/profile.json` (or `~/.local/share/...`).
 pub fn resolve_profile_path(windowed: bool) -> Option<PathBuf> {
     let var = |k: &str| std::env::var(k).ok();
-    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS"].into_iter().any(|k| var(k).is_some());
+    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS", "SEGNALE_COMPENDIUM_SHOTS"].into_iter().any(|k| var(k).is_some());
     profile_path_policy(var("SEGNALE_PROFILE").as_deref(), windowed, bot_or_shots, var("XDG_DATA_HOME").as_deref(), var("HOME").as_deref())
 }
 
@@ -1434,6 +1444,7 @@ impl Plugin for MetaPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enemies::EnemyKind;
 
     fn test_dir(name: &str) -> PathBuf {
         let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-profiles").join(name);
@@ -1860,6 +1871,51 @@ mod tests {
         };
         let json = serde_json::to_string(&q).unwrap();
         assert_eq!(parse_profile(&json).unwrap(), q);
+    }
+
+    #[test]
+    fn legacy_profiles_without_enemy_kills_load_and_fold_per_kind_kills() {
+        // A Milestone 20 profile: lifetime stats without `enemy_kills`.
+        let legacy = r#"{
+            "schema_version": 1,
+            "stats": {"runs_played": 9, "victories": 1, "best_floor": 5, "total_kills": 210, "best_endless_floor": 7}
+        }"#;
+        let mut p = parse_profile(legacy).unwrap();
+        assert_eq!(p.stats.enemy_kills, [0; crate::enemies::KIND_COUNT]);
+        assert_eq!((p.stats.runs_played, p.stats.total_kills, p.stats.best_endless_floor), (9, 210, 7));
+        // A stats block that omits every field still parses.
+        assert_eq!(parse_profile(r#"{"stats":{}}"#).unwrap().stats.enemy_kills, [0; crate::enemies::KIND_COUNT]);
+
+        let mut run = run_with(2);
+        run.kills = 6;
+        run.enemy_kills[EnemyKind::Imp.index()] = 4;
+        run.enemy_kills[EnemyKind::PhaseStalker.index()] = 2;
+        p.record_run(&run, &RunLoadout::default(), false);
+        p.record_run(&run, &RunLoadout::default(), false);
+        assert_eq!(p.stats.enemy_kills[EnemyKind::Imp.index()], 8);
+        assert_eq!(p.stats.enemy_kills[EnemyKind::PhaseStalker.index()], 4);
+        assert_eq!(p.stats.enemy_kills.iter().sum::<u32>(), 12);
+        // Round trip keeps the per-kind table.
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("enemy_kills"));
+        assert_eq!(parse_profile(&json).unwrap().stats.enemy_kills, p.stats.enemy_kills);
+    }
+
+    #[test]
+    fn endless_extension_folds_only_new_per_kind_kills() {
+        let mut store = ProfileStore::in_memory(PlayerProfile::default());
+        let loadout = RunLoadout::default();
+        let mut run = RunStats { floor: 5, floors_cleared: 5, ..default() };
+        run.enemy_kills[EnemyKind::CarrierDaemon.index()] = 1;
+        run.enemy_kills[EnemyKind::Imp.index()] = 30;
+        record_run_outcome(true, &mut run, &loadout, &mut store).unwrap();
+        let mut next = NextState::<AppState>::default();
+        crate::state::continue_into_endless(&mut run, &mut next);
+        run.enemy_kills[EnemyKind::Imp.index()] += 5;
+        run.enemy_kills[EnemyKind::HellBaron.index()] += 2;
+        record_run_outcome(false, &mut run, &loadout, &mut store).unwrap();
+        let k = store.profile.stats.enemy_kills;
+        assert_eq!((k[EnemyKind::Imp.index()], k[EnemyKind::HellBaron.index()], k[EnemyKind::CarrierDaemon.index()]), (35, 2, 1));
     }
 
     #[test]

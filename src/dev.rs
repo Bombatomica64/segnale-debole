@@ -30,6 +30,10 @@
 //!   with PBs on record: `01_daily_hud.png` (split plate under 5 toasts),
 //!   `02_daily_victory.png` (Daily badge + floor splits), `03_trial_hud.png`
 //!   (Time Trial plate after CP 1), `04_trial_finish.png`, then exits.
+//! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
+//!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
+//!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
+//!   on the turntable) and `03_armory_mortar.png` (3D Signal-Mortar), then exits.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -96,6 +100,20 @@ impl Plugin for DevPlugin {
                 }
             }
             app.insert_resource(TrialShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, trial_shots_tour.after(GameSet::Ui));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_COMPENDIUM_SHOTS") {
+            let showcase = meta_showcase_profile();
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.profile = showcase;
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(showcase));
+                }
+            }
+            app.insert_resource(CompendiumShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, compendium_shots_tour);
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_META_SHOTS") {
@@ -404,6 +422,8 @@ pub fn meta_showcase_profile() -> PlayerProfile {
         best_speed: 27.4,
         best_bhop_chain: 6,
         best_endless_floor: 0,
+        // Sums to `total_kills` (Imp, Caco, Fiend, Baron, Stalker, Sniper, Carrier).
+        enemy_kills: [312, 71, 3, 9, 53, 38, 0],
     };
     p
 }
@@ -640,6 +660,80 @@ fn trial_shots_tour(
             true
         }
         (10, AppState::Victory) if t > 1.5 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_COMPENDIUM_SHOTS (Milestone 21)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct CompendiumShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+/// Main menu with `MARS7` armed -> Bestiary (Carrier Daemon) -> Armory (Mortar).
+#[allow(clippy::too_many_arguments)]
+fn compendium_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<CompendiumShots>,
+    state: Res<State<AppState>>,
+    mut seed: ResMut<crate::compendium::CustomSeedState>,
+    mut comp: ResMut<crate::compendium::CompendiumState>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use crate::compendium::ExhibitId;
+    cfg.timer += time.delta_secs();
+    let dir = cfg.dir.clone();
+    let t = cfg.timer;
+    let advance = match (cfg.stage, *state.get()) {
+        (0, AppState::MainMenu) if t > 1.0 => {
+            seed.code = "MARS7".into();
+            seed.lock();
+            true
+        }
+        (1, AppState::MainMenu) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "01_main_menu_seed.png");
+            true
+        }
+        (2, AppState::MainMenu) if t > 0.7 => {
+            comp.select(ExhibitId::CarrierDaemon);
+            next.set(AppState::Compendium);
+            true
+        }
+        (3, AppState::Compendium) if t > 2.5 => {
+            comp.yaw = 0.35;
+            true
+        }
+        (4, AppState::Compendium) if t > 0.15 => {
+            meta_shot(&mut commands, &dir, "02_bestiary_boss.png");
+            true
+        }
+        (5, AppState::Compendium) if t > 0.7 => {
+            comp.select(ExhibitId::Mortar);
+            true
+        }
+        (6, AppState::Compendium) if t > 2.0 => {
+            comp.yaw = 1.2;
+            true
+        }
+        (7, AppState::Compendium) if t > 0.15 => {
+            meta_shot(&mut commands, &dir, "03_armory_mortar.png");
+            true
+        }
+        (8, _) if t > 1.5 => {
             exit.write(AppExit::Success);
             true
         }

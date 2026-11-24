@@ -56,7 +56,7 @@ bevy = { version = "0.20.1", default-features = false, features = ["webgl2", "we
 # rand 0.9 -> rand_core -> getrandom 0.3 (the only getrandom in the wasm graph).
 getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Storage", "Document", "Element"] }
+web-sys = { version = "0.3", features = ["Window", "Storage", "Document", "Element", "Location"] }
 
 [features]
 default = []
