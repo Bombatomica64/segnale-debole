@@ -3513,3 +3513,54 @@ fn adaptive_music_mix_goes_rush_during_boss_fight() {
     }
     assert!(after[2] > before[2], "rush rises under the boss");
 }
+
+#[test]
+fn architecture_batches_are_static_rt_ready_and_hazards_flow() {
+    use segnale_debole::assets_gen::GameAssets;
+    use segnale_debole::raytracing::{rt_mesh_convertible, MAX_EMISSIVE_TRIANGLES};
+
+    let mut app = build_menu_app(None);
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    godmode(&mut app);
+    step(&mut app, 5);
+    let mats0 = material_count(&app);
+    for _ in 0..3 {
+        let g = grid(&app);
+        let theme = app.world().resource::<GameAssets>().theme_for_floor(g.floor).clone();
+        // Trim + accent are two static batches each (no per-prop entities).
+        let mut q = app.world_mut().query_filtered::<(&Mesh3d, &MeshMaterial3d<StandardMaterial>), With<LevelBatch>>();
+        let batches: Vec<(Handle<Mesh>, AssetId<StandardMaterial>)> = q.iter(app.world()).map(|(m, mat)| (m.0.clone(), mat.0.id())).collect();
+        assert!(batches.len() <= 16, "floor {}: {} level batches", g.floor, batches.len());
+        for (slot, id) in [("trim", theme.trim.id()), ("accent", theme.accent_emissive.id())] {
+            let mine: Vec<_> = batches.iter().filter(|(_, m)| *m == id).collect();
+            assert_eq!(mine.len(), 1, "floor {}: one {slot} batch", g.floor);
+            let meshes = app.world().resource::<Assets<Mesh>>();
+            let mesh = meshes.get(&mine[0].0).expect("batch mesh");
+            assert!(rt_mesh_convertible(mesh), "{slot} batch converts for Solari");
+            let tris = mesh.indices().unwrap().len() / 3;
+            if slot == "accent" {
+                assert!(tris * 8 < MAX_EMISSIVE_TRIANGLES, "floor {}: {tris} emissive accent triangles", g.floor);
+            }
+        }
+        // Hazard flow animates the shared lava + accent materials in place.
+        let read = |app: &App| {
+            let mats = app.world().resource::<Assets<StandardMaterial>>();
+            let lava = mats.get(&theme.lava).unwrap();
+            (lava.uv_transform.translation, lava.emissive, mats.get(&theme.accent_emissive).unwrap().emissive)
+        };
+        let a = read(&app);
+        step(&mut app, 30);
+        let b = read(&app);
+        assert!(b.0.is_finite() && b.0 != a.0, "floor {}: lava UV drifts ({:?} -> {:?})", g.floor, a.0, b.0);
+        assert!(b.1.red.is_finite() && b.2.red.is_finite());
+        assert!(b.1.red <= theme.lava_emissive_base.red + 1e-4 && b.1.red >= theme.lava_emissive_base.red * 0.7);
+        assert_eq!(material_count(&app), mats0, "animation allocates no materials");
+        fast_clear_floor(&mut app);
+        bot(&mut app).pick_upgrade = Some(0);
+        step(&mut app, 3);
+        assert_eq!(app_state(&app), AppState::Playing);
+        godmode(&mut app);
+        step(&mut app, 3);
+    }
+}

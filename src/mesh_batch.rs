@@ -136,6 +136,15 @@ impl MeshBatch {
     }
 
     /// Finish into a renderable mesh (`None` when nothing was appended).
+    /// Move every triangle of `other` (already in this batch's space) into `self`.
+    pub fn extend(&mut self, other: MeshBatch) {
+        let base = self.positions.len() as u32;
+        self.positions.extend(other.positions);
+        self.normals.extend(other.normals);
+        self.uvs.extend(other.uvs);
+        self.indices.extend(other.indices.into_iter().map(|i| i + base));
+    }
+
     pub fn build(self) -> Option<Mesh> {
         if self.is_empty() {
             return None;
@@ -175,6 +184,18 @@ impl MaterialBatches {
 
     pub fn add(&mut self, src: &Mesh, material: &Handle<StandardMaterial>, transform: Transform) {
         self.batch(material).append(src, &transform);
+    }
+
+    /// Merge a pre-baked batch into `material`'s batch (no-op when empty).
+    pub fn merge(&mut self, material: &Handle<StandardMaterial>, batch: MeshBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        if let Some((_, existing)) = self.batches.iter_mut().find(|(m, _)| m.id() == material.id()) {
+            existing.extend(batch);
+        } else {
+            self.batches.push((material.clone(), batch));
+        }
     }
 
     pub fn len(&self) -> usize {

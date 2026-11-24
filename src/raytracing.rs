@@ -113,7 +113,7 @@ pub fn prepare_rt_mesh(mesh: &mut Mesh) -> bool {
 }
 
 /// Whether [`prepare_rt_mesh`] can convert `mesh`.
-fn rt_mesh_convertible(mesh: &Mesh) -> bool {
+pub fn rt_mesh_convertible(mesh: &Mesh) -> bool {
     if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
         return false;
     }

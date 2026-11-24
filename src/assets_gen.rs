@@ -69,6 +69,14 @@ pub struct ThemeMaterials {
     pub ceiling: Handle<StandardMaterial>,
     pub lava: Handle<StandardMaterial>,
     pub lamp: Handle<StandardMaterial>,
+    /// Dark gunmetal architectural trim (pilasters, skirting, trusses, racks).
+    pub trim: Handle<StandardMaterial>,
+    /// Theme-colored emissive accents (rack LEDs, emitter strips, slag grilles).
+    pub accent_emissive: Handle<StandardMaterial>,
+    /// Unanimated emissive of `lava` (the hazard pulse scales this).
+    pub lava_emissive_base: LinearRgba,
+    /// Unanimated emissive of `accent_emissive` (the LED pulse scales this).
+    pub accent_emissive_base: LinearRgba,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,8 +113,11 @@ pub struct FloorThemeSpec {
     pub wall_tint: [f32; 3],
     pub floor_tint: [f32; 3],
     pub regolith_tint: [f32; 3],
-    /// Hazard stripe / trim accent on walls and catwalks.
+    /// Hazard stripe / trim accent on walls and catwalks (also the emissive
+    /// accent color of racks and sector props).
     pub trim: [u8; 3],
+    /// Dark gunmetal of architectural trim (pilasters, trusses, racks).
+    pub gunmetal: Color,
     /// Hazard pit gradient: crust, mid glow, hottest.
     pub pit_ramp: [[u8; 3]; 3],
     /// Hazard pit emissive strength (linear).
@@ -150,6 +161,7 @@ impl FloorTheme {
                 floor_tint: [1.0, 1.0, 1.0],
                 regolith_tint: [1.0, 1.0, 1.0],
                 trim: [222, 170, 20],
+                gunmetal: Color::srgb(0.17, 0.13, 0.11),
                 pit_ramp: [[30, 8, 6], [255, 90, 10], [255, 240, 120]],
                 pit_emissive: [6.0, 3.0, 1.0],
             },
@@ -167,6 +179,7 @@ impl FloorTheme {
                 floor_tint: [0.8, 0.92, 0.72],
                 regolith_tint: [0.62, 0.78, 0.5],
                 trim: [120, 230, 40],
+                gunmetal: Color::srgb(0.11, 0.14, 0.12),
                 pit_ramp: [[8, 28, 6], [50, 190, 20], [200, 255, 100]],
                 pit_emissive: [1.6, 6.0, 0.8],
             },
@@ -184,6 +197,7 @@ impl FloorTheme {
                 floor_tint: [0.78, 0.88, 1.06],
                 regolith_tint: [0.7, 0.78, 1.0],
                 trim: [200, 235, 255],
+                gunmetal: Color::srgb(0.17, 0.2, 0.24),
                 pit_ramp: [[6, 14, 40], [30, 120, 230], [210, 245, 255]],
                 pit_emissive: [1.0, 3.6, 7.0],
             },
@@ -201,6 +215,7 @@ impl FloorTheme {
                 floor_tint: [0.66, 0.58, 0.54],
                 regolith_tint: [0.55, 0.42, 0.38],
                 trim: [255, 140, 20],
+                gunmetal: Color::srgb(0.14, 0.1, 0.085),
                 pit_ramp: [[40, 6, 2], [255, 80, 0], [255, 225, 90]],
                 pit_emissive: [9.0, 3.6, 0.6],
             },
@@ -218,6 +233,7 @@ impl FloorTheme {
                 floor_tint: [0.46, 0.42, 0.52],
                 regolith_tint: [0.42, 0.3, 0.4],
                 trim: [200, 30, 70],
+                gunmetal: Color::srgb(0.075, 0.06, 0.095),
                 pit_ramp: [[20, 4, 24], [170, 20, 100], [255, 130, 235]],
                 pit_emissive: [5.0, 1.0, 6.0],
             },
@@ -720,6 +736,23 @@ fn build_theme_materials(theme: FloorTheme, images: &mut Assets<Image>, material
         unlit: true,
         ..default()
     };
+    let lava_emissive_base = lava.emissive;
+    let [tr, tg, tb] = spec.trim;
+    let accent_color = Color::srgb_u8(tr, tg, tb);
+    let accent_emissive_base = linear_scaled(accent_color, 5.0);
+    let accent = StandardMaterial {
+        base_color: accent_color,
+        emissive: accent_emissive_base,
+        perceptual_roughness: 0.35,
+        ..default()
+    };
+    let trim = StandardMaterial {
+        base_color: spec.gunmetal,
+        metallic: 0.82,
+        perceptual_roughness: 0.42,
+        reflectance: 0.45,
+        ..default()
+    };
     ThemeMaterials {
         theme,
         wall: materials.add(wall),
@@ -730,6 +763,10 @@ fn build_theme_materials(theme: FloorTheme, images: &mut Assets<Image>, material
         ceiling: materials.add(textured(tex_ceiling, 0.9, 0.2)),
         lava: materials.add(lava),
         lamp: materials.add(lamp),
+        trim: materials.add(trim),
+        accent_emissive: materials.add(accent),
+        lava_emissive_base,
+        accent_emissive_base,
     }
 }
 
@@ -944,6 +981,32 @@ mod tests {
         }
         assert_eq!(FloorTheme::for_floor(0), FloorTheme::RustBunker);
         assert_eq!(FloorTheme::RustBunker.sky_color(), Color::srgb(0.32, 0.04, 0.03));
+    }
+
+    #[test]
+    fn every_theme_has_distinct_trim_and_accent_materials() {
+        let mut images = Assets::<Image>::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let themes = FloorTheme::ALL.map(|t| build_theme_materials(t, &mut images, &mut materials));
+        let mut ids = std::collections::HashSet::new();
+        for (i, a) in themes.iter().enumerate() {
+            assert!(ids.insert(a.trim.id()) && ids.insert(a.accent_emissive.id()), "unique handles");
+            let trim = materials.get(&a.trim).unwrap();
+            let accent = materials.get(&a.accent_emissive).unwrap();
+            let lava = materials.get(&a.lava).unwrap();
+            assert_eq!(lava.emissive, a.lava_emissive_base);
+            assert_eq!(accent.emissive, a.accent_emissive_base);
+            assert_ne!(accent.emissive, LinearRgba::BLACK, "accent glows (Solari emitter)");
+            assert!(!accent.unlit, "accent stays lit so Solari treats it as an emissive surface");
+            assert_eq!(trim.emissive, LinearRgba::BLACK);
+            assert!(trim.metallic > 0.5);
+            let g = trim.base_color.to_srgba();
+            assert!(g.red.max(g.green).max(g.blue) < 0.3, "{:?} trim is dark gunmetal", a.theme);
+            for b in themes.iter().skip(i + 1) {
+                assert_ne!(trim.base_color, materials.get(&b.trim).unwrap().base_color, "{:?} vs {:?} trim", a.theme, b.theme);
+                assert_ne!(accent.emissive, materials.get(&b.accent_emissive).unwrap().emissive, "{:?} vs {:?} accent", a.theme, b.theme);
+            }
+        }
     }
 
     #[test]

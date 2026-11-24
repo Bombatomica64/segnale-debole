@@ -1,6 +1,7 @@
 //! SEGNALE DEBOLE — Doom-style retro boomer shooter roguelike (Bevy 0.20).
 
 pub mod apps;
+pub mod architecture;
 pub mod assets_gen;
 pub mod audio;
 pub mod boss;

@@ -1018,7 +1018,7 @@ pub fn cull_world_lights(
 
 /// Top of the wall block spawned at `c` (`None`: not a wall, or a wall fully
 /// enclosed by walls, which is never spawned).
-fn spawned_wall_top(g: &LevelGrid, c: IVec2) -> Option<f32> {
+pub(crate) fn spawned_wall_top(g: &LevelGrid, c: IVec2) -> Option<f32> {
     if !g.in_bounds(c) || !g.cell(c).is_wall() {
         return None;
     }
@@ -1031,7 +1031,7 @@ fn spawned_wall_top(g: &LevelGrid, c: IVec2) -> Option<f32> {
 }
 
 /// Top of the floor slab of a non-wall cell.
-fn slab_top(cell: Cell) -> Option<f32> {
+pub(crate) fn slab_top(cell: Cell) -> Option<f32> {
     match cell {
         Cell::Wall => None,
         Cell::Floor { height } => Some(height),
@@ -1239,6 +1239,15 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, assets: &GameAss
         batches.add(&src.lamp, &a.lamp, Transform::from_translation(pos + Vec3::Y * 0.45));
     }
 
+    // Milestone 16 architecture: pilasters, skirting, crown trim, trusses,
+    // conduits, lamp cages, column + catwalk detail, atrium framing and flush
+    // wall props, merged into the static per-material batches (two extra
+    // batches per floor: trim + accent; plates join the ceiling batch).
+    let arch = crate::architecture::build_architecture(g);
+    batches.merge(&a.trim, arch.trim);
+    batches.merge(&a.accent_emissive, arch.accent);
+    batches.merge(&a.ceiling, arch.plate);
+
     spawn_signal_tower(commands, g, assets, a, &src, &mut batches);
     for (mesh, mat) in batches.finish(meshes) {
         commands.spawn((LevelEntity, LevelBatch, Mesh3d(mesh), MeshMaterial3d(mat), Transform::IDENTITY));
@@ -1397,13 +1406,32 @@ fn spawn_jammer(commands: &mut Commands, g: &LevelGrid, a: &GameAssets, src: &Le
         });
 }
 
+/// Active theme assets + grid + material store for the hazard / accent pulse.
+type HazardMaterials<'w> = (Option<Res<'w, GameAssets>>, Option<Res<'w, LevelGrid>>, Option<ResMut<'w, Assets<StandardMaterial>>>);
+
 fn animate_props(
     time: Res<Time>,
     mut cores: Query<(&JammerCore, &mut Transform), Without<JumpPadGlow>>,
     mut beacons: Query<&mut PointLight, With<TowerBeacon>>,
     mut pads: Query<(&JumpPadGlow, &mut Transform), Without<JammerCore>>,
+    hazard: HazardMaterials,
 ) {
     let t = time.elapsed_secs();
+    // Hazard pit flow + accent LED pulse: only the active theme's two shared
+    // startup materials are touched (no per-frame allocations). Note: Solari RT
+    // ignores `uv_transform` on reflected hits, so emissive pulsing carries the
+    // animation there while rasterized pits also scroll their UVs.
+    if let (Some(assets), Some(grid), Some(mut materials)) = hazard {
+        let theme = assets.theme_for_floor(grid.floor);
+        let pulse = crate::architecture::hazard_pulse(t);
+        if let Some(mut m) = materials.get_mut(theme.lava.id()) {
+            m.uv_transform = pulse.uv;
+            m.emissive = crate::architecture::scale_rgb(theme.lava_emissive_base, pulse.lava_gain);
+        }
+        if let Some(mut m) = materials.get_mut(theme.accent_emissive.id()) {
+            m.emissive = crate::architecture::scale_rgb(theme.accent_emissive_base, pulse.accent_gain);
+        }
+    }
     for (glow, mut tf) in &mut pads {
         let s = 1.0 + 0.07 * (t * 4.0 + glow.phase).sin();
         tf.scale = Vec3::new(s, 1.0, s);
