@@ -12,6 +12,7 @@
 
 use bevy::ecs::system::RunSystemOnce;
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
+use bevy::input::mouse::MouseMotion;
 use bevy::input::ButtonState;
 use bevy::prelude::*;
 
@@ -25,22 +26,25 @@ use segnale_debole::{build_headless_test_app, HeadlessGamePlugin};
 use segnale_debole::enemies::{
     garrison_size, spawn_enemy, spawn_enemy_projectile, spawn_pos_for, Enemy, EnemyAssets, EnemyKind, PingMarked, ENRAGE_SPEED_MULT,
 };
-use segnale_debole::extraction::{upload_duration, ExtractionState};
+use segnale_debole::extraction::{rush_cap, upload_duration, ExtractionState};
 use segnale_debole::fx::{BurstColor, FxAssets, HudFeed};
-use segnale_debole::hud::HudPlugin;
-use segnale_debole::meta_ui::{commit_meta_edit, EditOutcome, MetaCard, MetaTarget, NO_UNLOCKS_LINE};
+use segnale_debole::hud::{HudCrosshair, HudPlugin, ENDLESS_CTA};
+use segnale_debole::meta_ui::{
+    commit_meta_edit, commit_settings_edit, EditOutcome, MetaCard, MetaTarget, ReticlePreview, SettingKnob, SettingToggle, SettingsControl,
+    SettingsTarget, NO_UNLOCKS_LINE,
+};
 use segnale_debole::meta::{
-    load_profile, start_run_with_loadout, CarrierContract, FeatId, HandsetSkin, PlayerProfile, ProfileStore, RunLoadout, SkinSlot,
-    StarterChip,
+    load_profile, start_run_with_loadout, CarrierContract, CrosshairColor, CrosshairStyle, FeatId, HandsetSkin, PlayerProfile, ProfileStore,
+    RunLoadout, SkinSlot, StarterChip, UserSettings,
 };
 use segnale_debole::phone_screen::{PhoneScreenTexture, SCREEN_W, SPOOF_CYAN};
 use segnale_debole::extraction::SignalRingFx;
 use segnale_debole::level::{jammer_count_for_floor, Cell, DemonJammer, LevelBatch, LevelGrid, SignalTower, TowerBeacon};
 use segnale_debole::perf::{PerfOverlay, PerfOverlayText, PerfSettings};
 use segnale_debole::physics::has_line_of_sight;
-use segnale_debole::player::{hazard_damage, Player, PlayerCamera, BASE_FOV_DEG, DASH_SPEED, MOVE_SPEED, PLAYER_EYE_HEIGHT};
+use segnale_debole::player::{hazard_damage, CursorCaptured, Player, PlayerCamera, BASE_FOV_DEG, DASH_SPEED, MOUSE_SENSITIVITY, MOVE_SPEED, PLAYER_EYE_HEIGHT};
 use segnale_debole::signal::{bars_from_strength, SignalState, TOWER_RING_RADIUS};
-use segnale_debole::state::{complete_floor, start_run, AppState, PlayerModifiers, RunStats, UpgradeId, FINAL_FLOOR};
+use segnale_debole::state::{complete_floor, is_boss_floor, start_run, AppState, PlayerModifiers, RunStats, SettingsReturn, UpgradeId, FINAL_FLOOR};
 use segnale_debole::upgrades::{apply_upgrade, UpgradeChoices};
 use segnale_debole::weapons::{Pickup, PhoneSkin, PhoneSkinPart, PlayerProjectile, Weapon, WeaponState, PLASMA_DAMAGE};
 
@@ -269,6 +273,9 @@ fn full_floor_extraction_upgrade_and_floor2_transition() {
     assert_eq!(extraction(&app), ExtractionState::Searching { hold: 0.0 });
 
     godmode(&mut app);
+    // A randomly placed garrison Jammer Fiend near the ring would shave a bar
+    // off the reading (jamming has its own test).
+    cull_kind(&mut app, EnemyKind::JammerFiend, None);
     trigger_uplink(&mut app);
     assert_eq!(signal(&app).bars, 5);
 
@@ -2817,4 +2824,245 @@ fn barrel_blast_jumps_the_player_with_forgiving_self_damage() {
     assert!(p.velocity.x < -3.0, "pushed away from the barrel: {:?}", p.velocity);
     let taken = (hp0 - p.hp) + (armor0 - p.armor);
     assert!(taken > 0.0 && taken <= BARREL_DAMAGE * BARREL_SELF_DAMAGE_FRAC + 1e-3, "forgiving self damage: {taken}");
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 12: Settings screen, live user settings, Endless Overdrive
+// ---------------------------------------------------------------------------
+
+fn settings_edit(app: &mut App, t: SettingsTarget) -> EditOutcome {
+    app.world_mut().run_system_once(move |mut store: ResMut<ProfileStore>| commit_settings_edit(&mut store, t)).unwrap()
+}
+
+fn hud_crosshair(app: &mut App) -> Option<HudCrosshair> {
+    let mut q = app.world_mut().query::<&HudCrosshair>();
+    q.iter(app.world()).next().copied()
+}
+
+/// Yaw change produced by `dx` pixels of real mouse motion this frame.
+fn yaw_turn(app: &mut App, dx: f32) -> f32 {
+    app.world_mut().resource_mut::<CursorCaptured>().0 = true;
+    bot(app).look_yaw = None;
+    let y0 = player(app).yaw;
+    app.world_mut().write_message(MouseMotion { delta: Vec2::new(dx, 0.0) });
+    step(app, 1);
+    (player(app).yaw - y0).abs()
+}
+
+#[test]
+fn settings_open_from_main_menu_and_mid_run_pause_and_apply_live() {
+    let mut app = build_menu_app(None);
+    assert!(ui_texts(&mut app).iter().any(|t| t.contains("SETTINGS")), "main menu SETTINGS button");
+
+    // Main menu -> Settings -> back to the main menu.
+    tap(&mut app, KeyCode::KeyO);
+    assert_eq!(app_state(&app), AppState::Settings);
+    assert_eq!(app.world().resource::<SettingsReturn>().0, AppState::MainMenu);
+    // 5 knobs x (-/+), 3 toggles, the style pills, the color swatches, RESET.
+    assert_eq!(count::<SettingsControl>(&mut app), 5 * 2 + 3 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
+    assert_eq!(count::<ReticlePreview>(&mut app), 1);
+    assert_eq!(count::<Camera3d>(&mut app), 1, "settings brings its own camera from the menu");
+    let texts = ui_texts(&mut app);
+    assert!(texts.iter().any(|t| t.contains("INPUT & CAMERA")) && texts.iter().any(|t| t.contains("AUDIO & RETICLE")), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "RESET DEFAULTS") && texts.iter().any(|t| t.contains("BACK  [ESC]")));
+    for _ in 0..3 {
+        assert!(matches!(settings_edit(&mut app, SettingsTarget::Up(SettingKnob::BaseFov)), EditOutcome::Changed(_)));
+    }
+    settings_edit(&mut app, SettingsTarget::Style(CrosshairStyle::Dot));
+    step(&mut app, 2);
+    let preview = {
+        let mut q = app.world_mut().query::<&ReticlePreview>();
+        *q.iter(app.world()).next().unwrap()
+    };
+    assert_eq!(preview.0, CrosshairStyle::Dot, "live preview rebuilt");
+    assert!(ui_texts(&mut app).contains(&"100 DEG".to_string()));
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    assert_eq!(count::<SettingsControl>(&mut app), 0);
+    assert_eq!(count::<Camera3d>(&mut app), 1);
+
+    // Deploy: the camera spawns at the user's base FOV with the chosen reticle.
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 30);
+    assert!((camera_fov_deg(&mut app) - 100.0).abs() < 0.5, "fov {}", camera_fov_deg(&mut app));
+    assert_eq!(hud_crosshair(&mut app).unwrap().0, CrosshairStyle::Dot);
+    let base_turn = yaw_turn(&mut app, 100.0);
+    assert!((base_turn - 100.0 * MOUSE_SENSITIVITY).abs() < 1e-4, "turn {base_turn}");
+
+    // Mid-run: Pause -> Settings keeps the run alive, then back to the game.
+    with_player(&mut app, |p| p.hp = 61.0);
+    let floor_seed = grid(&app).seed;
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "SETTINGS  [O]"), "pause menu SETTINGS button");
+    let run_cameras = count::<Camera3d>(&mut app);
+    tap(&mut app, KeyCode::KeyO);
+    assert_eq!(app_state(&app), AppState::Settings);
+    assert_eq!(app.world().resource::<SettingsReturn>().0, AppState::Paused);
+    assert_eq!(count::<Player>(&mut app), 1, "Settings never tears the run down");
+    assert_eq!(grid(&app).seed, floor_seed, "level kept");
+    assert_eq!(count::<Camera3d>(&mut app), run_cameras, "no extra camera over the frozen player + viewmodel cameras");
+    assert!(ui_texts(&mut app).iter().any(|t| t.contains("MID-RUN")));
+    for _ in 0..6 {
+        settings_edit(&mut app, SettingsTarget::Down(SettingKnob::BaseFov));
+    }
+    for _ in 0..20 {
+        settings_edit(&mut app, SettingsTarget::Up(SettingKnob::Sensitivity));
+    }
+    settings_edit(&mut app, SettingsTarget::Style(CrosshairStyle::Chevron));
+    settings_edit(&mut app, SettingsTarget::Color(CrosshairColor::Amber));
+    settings_edit(&mut app, SettingsTarget::Toggle(SettingToggle::Mute));
+    let s = profile(&app).profile.settings;
+    assert_eq!((s.base_fov_deg, s.mouse_sensitivity, s.audio_muted), (70.0, 2.0, true));
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert_eq!(player(&mut app).hp, 61.0, "vitals untouched");
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(grid(&app).seed, floor_seed, "same floor resumed");
+    step(&mut app, 60);
+    assert!((camera_fov_deg(&mut app) - 70.0).abs() < 0.5, "new base FOV live: {}", camera_fov_deg(&mut app));
+    assert_eq!(hud_crosshair(&mut app), Some(HudCrosshair(CrosshairStyle::Chevron, CrosshairColor::Amber)), "HUD reticle rebuilt");
+    let fast_turn = yaw_turn(&mut app, 100.0);
+    assert!((fast_turn - 2.0 * base_turn).abs() < 1e-4, "sensitivity x2: {fast_turn} vs {base_turn}");
+
+    // Reset defaults through Pause -> Settings again.
+    tap(&mut app, KeyCode::Escape);
+    tap(&mut app, KeyCode::KeyO);
+    assert!(matches!(settings_edit(&mut app, SettingsTarget::ResetDefaults), EditOutcome::Changed(_)));
+    assert_eq!(profile(&app).profile.settings, UserSettings::default());
+}
+
+#[test]
+fn speed_fov_and_strafe_roll_toggles_flatten_the_camera() {
+    let mut store = ProfileStore::in_memory(Default::default());
+    store.profile.settings.speed_fov_enabled = false;
+    store.profile.settings.strafe_roll_enabled = false;
+    let mut app = build_headless_test_app();
+    app.world_mut().insert_resource(store);
+    begin_run(&mut app, 5);
+    open_arena(&mut app);
+    godmode(&mut app);
+    // Dash + hold right: normally widens the FOV and rolls the camera.
+    bot(&mut app).strafe_axes = Vec2::new(1.0, 0.0);
+    bot(&mut app).dash = true;
+    step(&mut app, 8);
+    assert!((camera_fov_deg(&mut app) - BASE_FOV_DEG).abs() < 0.05, "speed FOV disabled: {}", camera_fov_deg(&mut app));
+    assert_eq!(player(&mut app).strafe_tilt, 0.0, "strafe roll disabled");
+    assert!(run_stats(&app).peak_speed > MOVE_SPEED, "dash speed tracked: {}", run_stats(&app).peak_speed);
+}
+
+#[test]
+fn endless_overdrive_continues_past_victory_and_records_once() {
+    let mut app = build_menu_app(None);
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 2);
+    // Floors 1-5 exactly as before: Floor 5 ends in Victory.
+    for floor in 1..=FINAL_FLOOR {
+        assert_eq!(grid(&app).floor, floor);
+        fast_clear_floor(&mut app);
+        if floor < FINAL_FLOOR {
+            assert_eq!(app_state(&app), AppState::UpgradeSelect);
+            bot(&mut app).pick_upgrade = Some(0);
+            step(&mut app, 3);
+        }
+    }
+    assert_eq!(app_state(&app), AppState::Victory);
+    assert!(is_boss_floor(FINAL_FLOOR));
+    let st = profile(&app);
+    assert_eq!((st.profile.stats.runs_played, st.profile.stats.victories), (1, 1));
+    let kills_at_victory = run_stats(&app).kills;
+    assert_eq!(st.profile.stats.total_kills, kills_at_victory);
+    assert!(ui_texts(&mut app).iter().any(|t| t == ENDLESS_CTA), "KEEP DESCENDING button");
+    assert!(ui_texts(&mut app).iter().any(|t| t.starts_with("PEAK SPEED")), "movement telemetry on Victory");
+    assert_eq!(count::<Player>(&mut app), 1, "the player survives Victory");
+    with_player(&mut app, |p| p.hp = 40.0);
+    let upgrades = run_stats(&app).upgrades.len();
+
+    // E: keep descending -> Floor 5 -> 6 upgrade draft -> Floor 6.
+    tap(&mut app, KeyCode::KeyE);
+    assert_eq!(app_state(&app), AppState::UpgradeSelect);
+    let r = run_stats(&app);
+    assert!(r.endless && !r.run_recorded && r.recorded_snapshot.is_some());
+    assert_eq!(r.floor, FINAL_FLOOR + 1);
+    bot(&mut app).pick_upgrade = Some(1);
+    step(&mut app, 3);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(grid(&app).floor, 6);
+    assert_eq!(run_stats(&app).upgrades.len(), upgrades + 1, "upgrades kept + one more");
+    assert_eq!(player(&mut app).hp, 65.0, "HP carried over (+25 field repair)");
+    step(&mut app, 2);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "ENDLESS FL 6"), "endless floor plate");
+    assert_eq!(count::<DemonJammer>(&mut app), jammer_count_for_floor(6));
+
+    // Floors 6 -> 7 -> 8 never re-trigger Victory.
+    for floor in 6..=7 {
+        fast_clear_floor(&mut app);
+        assert_eq!(app_state(&app), AppState::UpgradeSelect, "floor {floor} advances");
+        bot(&mut app).pick_upgrade = Some(0);
+        step(&mut app, 3);
+        assert_eq!(grid(&app).floor, floor + 1);
+    }
+    assert_eq!(profile(&app).profile.stats.victories, 1);
+    // Some kills after Floor 5, then die on Floor 8.
+    let far = player_feet(&mut app) + Vec3::new(30.0, 0.0, 0.0);
+    let e = spawn_demon(&mut app, EnemyKind::Imp, far);
+    kill(&mut app, e);
+    step(&mut app, 3);
+    with_player(&mut app, |p| p.velocity = Vec3::new(36.0, 0.0, 0.0));
+    step(&mut app, 1);
+    die(&mut app);
+    let r = run_stats(&app);
+    assert!(r.kills > kills_at_victory, "post-victory kills: {} vs {kills_at_victory}", r.kills);
+    let s = profile(&app).profile.stats;
+    assert_eq!(s.runs_played, 1, "Endless never double-counts the run");
+    assert_eq!(s.victories, 1);
+    assert_eq!(s.total_kills, r.kills, "Floor 1-5 kills counted exactly once");
+    assert_eq!(s.total_sos_completed, r.sos_completed);
+    assert_eq!((s.best_floor, s.best_endless_floor), (8, 8));
+    assert_eq!(s.best_speed, r.peak_speed);
+    assert!(s.best_speed > 20.0, "peak speed recorded: {}", s.best_speed);
+    assert_eq!(s.best_bhop_chain, r.max_bhop_chain);
+    let h = profile(&app).profile.history;
+    assert_eq!(h.len(), 1);
+    assert!(h[0].endless && h[0].victory && h[0].floor == 8);
+    assert!(ui_texts(&mut app).iter().any(|t| t.starts_with("ENDLESS FL 8")), "Game Over shows the endless floor");
+}
+
+#[test]
+fn endless_boss_rematch_floor_spawns_an_overdrive_baron_wave() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 77);
+    // Jump the run into Endless Floor 10 and rebuild through Paused -> Playing.
+    {
+        let mut run = app.world_mut().resource_mut::<RunStats>();
+        run.endless = true;
+        run.floor = 10;
+    }
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Paused);
+    step(&mut app, 2);
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Playing);
+    step(&mut app, 3);
+    let g = grid(&app);
+    assert_eq!(g.floor, 10);
+    assert!(g.validate() && is_boss_floor(10));
+    assert_eq!(count::<DemonJammer>(&mut app), jammer_count_for_floor(10));
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    trigger_uplink(&mut app);
+    if let ExtractionState::Uploading { progress, .. } = &mut *app.world_mut().resource_mut::<ExtractionState>() {
+        *progress = 0.32;
+    }
+    step(&mut app, 2);
+    let alert = app.world().resource::<HudFeed>().alert.clone().map(|a| a.text).unwrap_or_default();
+    assert_eq!(alert, "ENDLESS BOSS REMATCH - FLOOR 10!");
+    let barons = {
+        let mut q = app.world_mut().query::<&Enemy>();
+        q.iter(app.world()).filter(|e| e.kind == EnemyKind::HellBaron && e.is_alive()).count()
+    };
+    assert!(barons >= 2, "rematch wave: {barons} barons");
+    assert!(EnemyKind::HellBaron.stats(35).fire_cooldown >= 1.0);
+    assert!(rush_cap(30) <= 26);
 }

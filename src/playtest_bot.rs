@@ -278,16 +278,19 @@ pub fn bfs_path(g: &LevelGrid, from: IVec2, goal: IVec2) -> Option<Vec<IVec2>> {
     None
 }
 
-/// Pedestal cell next to the tower mast (inside the Signal Ring), reachable from `from`.
+/// Pedestal cell next to the tower mast (inside the Signal Ring), reachable from `from`
+/// (falls back to spawn distances if `from` is inside a hazard pit so `navigate` can jump out).
 pub fn tower_stand_cell(g: &LevelGrid, from: IVec2) -> Option<IVec2> {
-    let d = g.walk_distances(from);
-    [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y]
-        .into_iter()
-        .map(|o| g.tower + o)
-        .filter(|c| matches!(g.cell(*c), Cell::Floor { .. }))
-        .filter_map(|c| d[(c.y * g.width + c.x) as usize].map(|v| (v, c)))
-        .min_by_key(|(v, _)| *v)
-        .map(|(_, c)| c)
+    let pick_with = |d: &[Option<u32>]| {
+        [IVec2::X, IVec2::NEG_X, IVec2::Y, IVec2::NEG_Y]
+            .into_iter()
+            .map(|o| g.tower + o)
+            .filter(|c| matches!(g.cell(*c), Cell::Floor { .. }))
+            .filter_map(|c| d[(c.y * g.width + c.x) as usize].map(|v| (v, c)))
+            .min_by_key(|(v, _)| *v)
+            .map(|(_, c)| c)
+    };
+    pick_with(&g.walk_distances(from)).or_else(|| pick_with(&g.walk_distances(g.spawn)))
 }
 
 /// Best jammer to hunt: cheapest detour `spawn -> jammer -> tower`.
@@ -302,7 +305,15 @@ pub fn pick_jammer(g: &LevelGrid, from: IVec2, alive: &[IVec2]) -> Option<IVec2>
             .filter_map(|n| d[(n.y * g.width + n.x) as usize])
             .min()
     };
-    alive.iter().filter_map(|&j| Some((at(&ds, j)? + at(&dt, j)?, j))).min_by_key(|(c, _)| *c).map(|(_, j)| j)
+    alive
+        .iter()
+        .filter_map(|&j| Some((at(&ds, j)? + at(&dt, j)?, j)))
+        .min_by_key(|(c, _)| *c)
+        .map(|(_, j)| j)
+        .or_else(|| {
+            let dspawn = g.walk_distances(g.spawn);
+            alive.iter().filter_map(|&j| Some((at(&dspawn, j)? + at(&dt, j)?, j))).min_by_key(|(c, _)| *c).map(|(_, j)| j)
+        })
 }
 
 /// Escape a JSON string.

@@ -70,6 +70,7 @@ impl EnemyKind {
     }
 
     pub fn stats(self, floor: u32) -> EnemyStats {
+        const HELL_BARON_MIN_COOLDOWN: f32 = 1.1;
         let f = floor.max(1) as f32;
         match self {
             EnemyKind::Imp => EnemyStats {
@@ -120,7 +121,8 @@ impl EnemyKind {
                 radius: 0.95,
                 height: 3.3,
                 eye_height: 2.85,
-                fire_cooldown: 2.9 - 0.1 * f,
+                // Floored so deep Endless floors never reach a 0 s cooldown.
+                fire_cooldown: (2.9 - 0.1 * f).max(HELL_BARON_MIN_COOLDOWN),
                 proj_speed: 15.0,
                 // Floor-scaled: a survivable Floor 1 boss, a brute deeper down.
                 proj_damage: 11.0 + 1.0 * f,
@@ -831,7 +833,7 @@ pub fn garrison_size(floor: u32) -> usize {
 }
 
 pub fn garrison_fiends(floor: u32) -> usize {
-    (floor.max(1) as usize).div_ceil(2)
+    (floor.max(1) as usize).div_ceil(2).min(5)
 }
 
 /// Initial demons of a floor: walkable cells far from the airlock, spread out.
@@ -846,7 +848,7 @@ pub fn garrison_plan(grid: &LevelGrid, rng: &mut impl Rng) -> Vec<(EnemyKind, IV
     cands.shuffle(rng);
     let total = garrison_size(floor);
     let fiends = garrison_fiends(floor);
-    let cacos = 1 + floor as usize / 2;
+    let cacos = (1 + floor as usize / 2).min(5);
     let mut picked: Vec<IVec2> = Vec::new();
     for c in cands {
         if picked.len() >= total {
@@ -1666,6 +1668,15 @@ mod tests {
             assert!(!k.stats(1).hit_spheres.is_empty());
         }
         assert!(EnemyKind::HellBaron.stats(1).hp > 4.0 * EnemyKind::Cacodemon.stats(1).hp);
+        assert!((EnemyKind::HellBaron.stats(5).fire_cooldown - 2.4).abs() < 1e-5, "standard floors unchanged");
+        for floor in [10u32, 18, 29, 35, 200] {
+            for k in [EnemyKind::Imp, EnemyKind::Cacodemon, EnemyKind::JammerFiend, EnemyKind::HellBaron] {
+                let st = k.stats(floor);
+                assert!(st.fire_cooldown >= 1.0 && st.fire_cooldown.is_finite(), "{k:?} floor {floor}");
+                assert!(st.hp.is_finite() && st.hp > 0.0);
+            }
+        }
+        assert!(garrison_fiends(40) <= 5 && garrison_size(40) <= 16);
     }
 
     #[test]

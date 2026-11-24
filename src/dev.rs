@@ -14,7 +14,7 @@
 //! - `SEGNALE_META_SHOTS=<dir>`: meta-progression screenshot tour on an
 //!   in-memory showcase profile (jam demo on, Survey OS + 5G Chrome Gold, two
 //!   signature apps drafted, ROAM + PRIO contracts, 3 feats, lifetime stats):
-//!   `01_main_menu.png`, `02_loadout.png`, `03_contracts_feats.png`,
+//!   `01_main_menu.png`, `02_loadout.png`, `03_contracts_feats.png`, `03b_settings.png`,
 //!   `04_in_hand_gold.png` (live Floor 1 spawn), `04b_pause_menu.png`,
 //!   `05_victory_unlocks.png` (a staged earned Floor 5 win) and
 //!   `06_game_over.png` (a separate staged Floor 2 death with its own
@@ -283,6 +283,9 @@ pub fn meta_showcase_profile() -> PlayerProfile {
         total_sos_completed: 2,
         fastest_victory_secs: None,
         max_contracts_cleared: 0,
+        best_speed: 27.4,
+        best_bhop_chain: 6,
+        best_endless_floor: 0,
     };
     p
 }
@@ -293,7 +296,7 @@ fn meta_shot(commands: &mut Commands, dir: &str, name: &str) {
     commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
 }
 
-/// Main menu -> Loadout -> Contracts & Feats -> live Floor 1 -> Pause ->
+/// Main menu -> Loadout -> Contracts & Feats -> Settings -> live Floor 1 -> Pause ->
 /// Victory -> a separate Floor 2 Game Over.
 #[allow(clippy::too_many_arguments)]
 fn meta_shots_tour(
@@ -337,23 +340,32 @@ fn meta_shots_tour(
             true
         }
         (5, AppState::ContractsFeats) if t > 0.7 => {
+            // Settings opened from the menus (`SettingsReturn` stays MainMenu).
+            next.set(AppState::Settings);
+            true
+        }
+        (6, AppState::Settings) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "03b_settings.png");
+            true
+        }
+        (7, AppState::Settings) if t > 0.7 => {
             commands.insert_resource(DevFreezeAi);
             start_run_with_loadout(&mut run, &mut mods, &mut loadout, store.profile.build_loadout(), &mut next, 1234);
             true
         }
-        (6, AppState::Playing) if t > 4.0 => {
+        (8, AppState::Playing) if t > 4.0 => {
             meta_shot(&mut commands, &dir, "04_in_hand_gold.png");
             true
         }
-        (7, AppState::Playing) if t > 0.8 => {
+        (9, AppState::Playing) if t > 0.8 => {
             next.set(AppState::Paused);
             true
         }
-        (8, AppState::Paused) if t > 1.2 => {
+        (10, AppState::Paused) if t > 1.2 => {
             meta_shot(&mut commands, &dir, "04b_pause_menu.png");
             true
         }
-        (9, AppState::Paused) if t > 0.7 => {
+        (11, AppState::Paused) if t > 0.7 => {
             // Stage a fast earned contract victory (non-demo) so the Victory
             // screenshot showcases real newly-unlocked feats and rewards.
             loadout.jam_demo = false;
@@ -369,11 +381,11 @@ fn meta_shots_tour(
             complete_floor(&mut run, &mut next);
             true
         }
-        (10, AppState::Victory) if t > 2.0 => {
+        (12, AppState::Victory) if t > 2.0 => {
             meta_shot(&mut commands, &dir, "05_victory_unlocks.png");
             true
         }
-        (11, AppState::Victory) if t > 1.0 => {
+        (13, AppState::Victory) if t > 1.0 => {
             // A separate, genuinely lost run (not the victory replayed): died on
             // Floor 2 after one uplink, with a single app installed. It is
             // recorded like any real death, so NO SERVICE shows its own
@@ -394,11 +406,11 @@ fn meta_shots_tour(
             next.set(AppState::GameOver);
             true
         }
-        (12, AppState::GameOver) if t > 1.5 => {
+        (14, AppState::GameOver) if t > 1.5 => {
             meta_shot(&mut commands, &dir, "06_game_over.png");
             true
         }
-        (13, AppState::GameOver) if t > 1.5 => {
+        (15, AppState::GameOver) if t > 1.5 => {
             exit.write(AppExit::Success);
             true
         }

@@ -383,9 +383,15 @@ pub fn grid_size_for_floor(floor: u32) -> i32 {
     21 + 2 * (floor.clamp(1, 5) as i32 - 1)
 }
 
+/// Demon Jammers on a floor: 3 on Floor 1, +1 per floor, capped at
+/// [`MAX_JAMMERS`] so deep Endless floors (whose grid stops growing at Floor 5)
+/// can always place them.
 pub fn jammer_count_for_floor(floor: u32) -> usize {
-    2 + floor.max(1) as usize
+    (2 + floor.max(1) as usize).min(MAX_JAMMERS)
 }
+
+/// Jammer cap for Endless Overdrive floors.
+pub const MAX_JAMMERS: usize = 10;
 
 /// Generate a fully validated labyrinth. Deterministic for a given `(floor, seed)`.
 pub fn generate_level(floor: u32, seed: u64) -> LevelGrid {
@@ -435,8 +441,8 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
 
     // 2. Braid: knock out some separating walls to create loops (less dead ends).
     // High-speed flow: generous loops so bhop routes circle back instead of
-    // dead-ending.
-    let loop_chance = 0.16 + 0.015 * floor as f64;
+    // dead-ending (capped so deep Endless floors never overflow random_bool).
+    let loop_chance = (0.16 + 0.015 * floor as f64).min(0.45);
     for z in 1..n - 1 {
         for x in 1..n - 1 {
             let c = IVec2::new(x, z);
@@ -1477,6 +1483,21 @@ mod tests {
     }
 
     #[test]
+    fn deep_endless_floors_generate_and_validate() {
+        assert_eq!(jammer_count_for_floor(5), 7, "standard floors unchanged");
+        assert_eq!(jammer_count_for_floor(8), MAX_JAMMERS);
+        assert_eq!(jammer_count_for_floor(40), MAX_JAMMERS);
+        for floor in [6u32, 10, 15, 25, 40] {
+            for seed in 0..12u64 {
+                let g = generate_level(floor, seed * 104_729 + floor as u64);
+                assert!(g.validate(), "floor {floor} seed {seed}");
+                assert_eq!(g.jammers.len(), jammer_count_for_floor(floor), "floor {floor} seed {seed}");
+                assert!(g.is_reachable(g.spawn, g.tower));
+            }
+        }
+    }
+
+    #[test]
     fn generation_is_deterministic() {
         let a = generate_level(3, 42);
         let b = generate_level(3, 42);
@@ -1732,5 +1753,14 @@ mod tests {
         b.fuse = None;
         b.exploded = true;
         assert!(!b.is_intact());
+    }
+
+    #[test]
+    fn extreme_endless_floors_never_panic_on_loop_chance() {
+        for floor in [58u32, 60, 100] {
+            let g = generate_level(floor, 777);
+            assert!(g.validate(), "floor {floor} invalid");
+            assert_eq!(g.jammers.len(), jammer_count_for_floor(floor));
+        }
     }
 }

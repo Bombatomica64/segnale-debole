@@ -21,13 +21,13 @@ use crate::assets_gen::FloorTheme;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
 use crate::fx::HudFeed;
-use crate::meta::{record_game_over, record_victory, start_run_with_loadout, ProfileStore, RunLoadout};
+use crate::meta::{live_settings, record_game_over, record_victory, start_run_with_loadout, CrosshairColor, CrosshairStyle, ProfileStore, RunLoadout};
 use crate::meta_ui::{
     end_loadout_line, loadout_summary_line, loadout_tag_parts, unlock_reward_lines, MetaBox, MetaUiPlugin, NO_UNLOCKS_LINE,
 };
 use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::SignalState;
-use crate::state::{complete_floor, AppState, GameSet, PlayerModifiers, RunStats, FINAL_FLOOR};
+use crate::state::{complete_floor, continue_into_endless, AppState, GameSet, PlayerModifiers, RunStats, SettingsReturn, FINAL_FLOOR};
 use crate::ui_kit::{
     hard_shadow, hazard_strip, hero_title, hud_plate, inset_border, keycap, plate_border, plate_rect, punk_button, punk_screen_root,
     punk_screen_root_tinted, recessed_bezel, screen_rails, section_crate, signal_bars, stamped_tag, stencil_title, stencil_title_layers,
@@ -68,6 +68,12 @@ pub enum MenuAction {
     BackToMenu,
     OpenLoadout,
     OpenContractsFeats,
+    /// Open the Settings screen (remembers where to return).
+    OpenSettings,
+    /// Leave Settings for [`SettingsReturn`].
+    CloseSettings,
+    /// Victory: keep descending into Endless Overdrive (Floor 6+).
+    ContinueEndless,
 }
 
 /// A clickable menu switch (see [`crate::ui_kit::punk_button`]).
@@ -80,6 +86,9 @@ pub struct MenuButton;
 /// - `Loadout`: ENTER deploy, ESC back, C contracts & feats
 /// - `ContractsFeats`: ENTER deploy, ESC back, L loadout
 /// - `GameOver` / `Victory`: ENTER main menu, L loadout
+/// - `Settings`: ESC back
+///
+/// The `O` (settings) and `E` (endless) hotkeys live in [`menu_hotkey_action`].
 pub fn menu_key_action(state: AppState, enter: bool, esc: bool, l: bool, c: bool, r: bool, m: bool) -> Option<MenuAction> {
     use MenuAction::*;
     match state {
@@ -96,6 +105,17 @@ pub fn menu_key_action(state: AppState, enter: bool, esc: bool, l: bool, c: bool
         AppState::ContractsFeats if l => Some(OpenLoadout),
         AppState::GameOver | AppState::Victory if enter => Some(BackToMenu),
         AppState::GameOver | AppState::Victory if l => Some(OpenLoadout),
+        AppState::Settings if esc => Some(CloseSettings),
+        _ => None,
+    }
+}
+
+/// Extra menu hotkeys: `O` opens Settings from `MainMenu` / `Paused`, `E`
+/// keeps descending into Endless Overdrive from `Victory`.
+pub fn menu_hotkey_action(state: AppState, o: bool, e: bool) -> Option<MenuAction> {
+    match state {
+        AppState::MainMenu | AppState::Paused if o => Some(MenuAction::OpenSettings),
+        AppState::Victory if e => Some(MenuAction::ContinueEndless),
         _ => None,
     }
 }
@@ -121,7 +141,15 @@ impl Plugin for HudPlugin {
             .init_resource::<VelGauge>()
             .add_systems(
                 Update,
-                (track_vel_gauge.before(update_hud).before(update_hud_boxes), update_hud, update_hud_boxes, pause_input, debug_skip_floor).in_set(GameSet::Ui),
+                (
+                    track_vel_gauge.before(update_hud).before(update_hud_boxes),
+                    update_hud,
+                    update_hud_boxes,
+                    refresh_hud_crosshair,
+                    pause_input,
+                    debug_skip_floor,
+                )
+                    .in_set(GameSet::Ui),
             );
     }
 }
@@ -280,6 +308,7 @@ fn spawn_main_menu(mut commands: Commands, store: Res<ProfileStore>, tex: Option
     ));
     commands.spawn((ChildOf(actions), punk_button("LOADOUT  [L]", MenuAction::OpenLoadout, 19.0, ButtonStyle::HazardAmber)));
     commands.spawn((ChildOf(actions), punk_button("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, 19.0, ButtonStyle::DangerRed)));
+    commands.spawn((ChildOf(actions), punk_button("SETTINGS  [O]", MenuAction::OpenSettings, 19.0, ButtonStyle::ScrapSteel)));
 }
 
 // ---------------------------------------------------------------------------
@@ -544,14 +573,27 @@ fn upgrade_cards(
 fn summary(run: &RunStats) -> String {
     let t = run.time_elapsed as u32;
     format!(
-        "Floor {}  |  Kills {}  |  Jammers destroyed {}  |  Time {:02}:{:02}",
-        run.floor,
+        "{}  |  Kills {}  |  Jammers destroyed {}  |  Time {:02}:{:02}",
+        floor_label(run),
         run.kills,
         run.jammers_destroyed,
         t / 60,
         t % 60
     )
 }
+
+/// `FLOOR 3/5`, or `ENDLESS FL 8` once past Victory.
+pub fn floor_label(run: &RunStats) -> String {
+    if run.endless { format!("ENDLESS FL {}", run.floor) } else { format!("FLOOR {}/{}", run.floor, FINAL_FLOOR) }
+}
+
+/// End-screen movement telemetry line.
+pub fn movement_line(run: &RunStats) -> String {
+    format!("PEAK SPEED {:.1} M/S  |  MAX BHOP CHAIN x{}", run.peak_speed.max(0.0), run.max_bhop_chain)
+}
+
+/// Endless Overdrive accent (hot magenta: distinct from every floor theme tag).
+pub const COLOR_ENDLESS: Color = Color::srgb(1.0, 0.25, 0.85);
 
 /// Look of an end screen.
 struct EndLook {
@@ -621,15 +663,21 @@ fn full_signal_look() -> EndLook {
 /// Shared GAME OVER / VICTORY layout: tape rails, a full-width static band
 /// carrying the signal bars + stencil title, flavor, the recessed run readout,
 /// the RUN UNLOCKS crate and the action switches.
+#[allow(clippy::too_many_arguments)]
 fn spawn_end_screen(
     commands: &mut Commands,
     state: AppState,
     look: EndLook,
+    endless_cta: bool,
     run: &RunStats,
     loadout: &RunLoadout,
     store: &ProfileStore,
     tex: Option<&UiKitTextures>,
 ) {
+    // Victory stacks the Endless switch + its subtitle under a full unlock
+    // crate: it runs a tighter title and button row so the stack clears both
+    // tape rails at 720p.
+    let compact = endless_cta;
     let root = punk_screen_root_tinted(commands, state, tex, look.bg, look.backdrop, (look.link, look.accent));
     screen_rails(commands, root, tex, 16.0, look.tape);
 
@@ -642,7 +690,7 @@ fn spawn_end_screen(
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
                 row_gap: Val::Px(4.0),
-                padding: UiRect { top: Val::Px(10.0), bottom: Val::Px(12.0), ..default() },
+                padding: UiRect { top: Val::Px(6.0), bottom: Val::Px(8.0), ..default() },
                 border: UiRect::vertical(Val::Px(2.0)),
                 ..default()
             },
@@ -656,7 +704,7 @@ fn spawn_end_screen(
     let stamp = commands.spawn((ChildOf(band), Node { column_gap: Val::Px(14.0), align_items: AlignItems::FlexEnd, ..default() })).id();
     signal_bars(commands, stamp, look.bars, look.accent, 8.0);
     commands.spawn((ChildOf(stamp), text(look.stamp, 13.0, look.accent)));
-    stencil_title_layers(commands, band, look.title, 84.0, look.title_color, look.title_color, &[(8.0, Color::BLACK), (4.0, look.title_slab)]);
+    stencil_title_layers(commands, band, look.title, if compact { 76.0 } else { 84.0 }, look.title_color, look.title_color, &[(8.0, Color::BLACK), (4.0, look.title_slab)]);
 
     commands.spawn((ChildOf(root), text(look.flavor, 19.0, BONE_TEXT)));
     let readout = commands
@@ -666,8 +714,8 @@ fn spawn_end_screen(
                 max_width: Val::Px(1000.0),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
-                row_gap: Val::Px(4.0),
-                padding: UiRect::axes(Val::Px(22.0), Val::Px(8.0)),
+                row_gap: Val::Px(2.0),
+                padding: UiRect::axes(Val::Px(22.0), Val::Px(6.0)),
                 border: plate_rect((4.0, 2.0, 2.0, 2.0)),
                 ..default()
             },
@@ -676,6 +724,7 @@ fn spawn_end_screen(
         ))
         .id();
     commands.spawn((ChildOf(readout), text(summary(run), 18.0, BONE_TEXT)));
+    commands.spawn((ChildOf(readout), text(movement_line(run), 14.0, ARC_CYAN)));
     commands.spawn((ChildOf(readout), text(installed_list(run), 14.0, look.apps)));
     commands.spawn((ChildOf(readout), text(end_loadout_line(loadout), 13.0, ASH_DIM)));
 
@@ -685,7 +734,7 @@ fn spawn_end_screen(
         root,
         "RUN UNLOCKS",
         look.accent,
-        Node { margin: UiRect::top(Val::Px(4.0)), max_width: Val::Px(1000.0), min_width: Val::Px(600.0), align_items: AlignItems::Center, ..default() },
+        Node { max_width: Val::Px(1000.0), min_width: Val::Px(600.0), align_items: AlignItems::Center, ..default() },
     );
     commands.entity(panel).insert((MetaBox::UnlockPanel, hard_shadow(6.0)));
     commands.spawn((ChildOf(header), Node { flex_grow: 1.0, ..default() }));
@@ -706,28 +755,56 @@ fn spawn_end_screen(
         let feats = commands
             .spawn((
                 ChildOf(panel),
-                Node { flex_wrap: FlexWrap::Wrap, justify_content: JustifyContent::Center, column_gap: Val::Px(8.0), row_gap: Val::Px(6.0), ..default() },
+                Node { flex_wrap: FlexWrap::Wrap, justify_content: JustifyContent::Center, column_gap: Val::Px(8.0), row_gap: Val::Px(5.0), ..default() },
             ))
             .id();
         for f in &summary.new_feats {
             commands.spawn((ChildOf(feats), stamped_tag(&format!("[DONE] {}", f.name()), COLOR_GOLD, INK_BLACK, 14.0)));
         }
+        // One tight block, so the reward lines read as a list.
+        let rewards = commands
+            .spawn((ChildOf(panel), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(2.0), ..default() }))
+            .id();
         for line in unlock_reward_lines(&summary) {
-            commands.spawn((ChildOf(panel), text(line, 15.0, ARC_CYAN)));
+            commands.spawn((ChildOf(rewards), text(line, 15.0, ARC_CYAN)));
         }
     }
     if let Some(err) = &store.last_save_error {
         commands.spawn((ChildOf(panel), text(format!("SAVE PENDING ({err}) - will retry at menu"), 13.0, PUNK_RED)));
     }
-    button_row(commands, root, &look.buttons, 21.0, 10.0);
+    if endless_cta {
+        // The loud alternative to cashing out: keep the run (HP, armor, ammo,
+        // apps) and descend into Endless Overdrive.
+        let cta = commands
+            .spawn((
+                ChildOf(root),
+                Node {
+                    margin: UiRect::top(Val::Px(4.0)),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(4.0),
+                    ..default()
+                },
+            ))
+            .id();
+        commands.spawn((ChildOf(cta), punk_button(ENDLESS_CTA, MenuAction::ContinueEndless, 24.0, ButtonStyle::HazardAmber)));
+        commands.spawn((
+            ChildOf(cta),
+            text("Floor 6+ // keep HP, armor, ammo & apps // boss rematch every 5th floor", 13.0, COLOR_ENDLESS),
+        ));
+    }
+    button_row(commands, root, &look.buttons, if compact { 18.0 } else { 21.0 }, if compact { 2.0 } else { 10.0 });
 }
 
+/// Victory call to action of Endless Overdrive.
+pub const ENDLESS_CTA: &str = "KEEP DESCENDING (ENDLESS)  [E]";
+
 fn spawn_game_over(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
-    spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), &run, &loadout, &store, tex.as_deref());
+    spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), false, &run, &loadout, &store, tex.as_deref());
 }
 
 fn spawn_victory(mut commands: Commands, run: Res<RunStats>, loadout: Res<RunLoadout>, store: Res<ProfileStore>, tex: Option<Res<UiKitTextures>>) {
-    spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), &run, &loadout, &store, tex.as_deref());
+    spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), true, &run, &loadout, &store, tex.as_deref());
 }
 
 /// In-run pause overlay (`Esc` / `P`): keeps the frozen 3D scene behind a dark
@@ -782,6 +859,7 @@ fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<Run
     for (label, action, style, font) in [
         ("RESUME  [ESC]", MenuAction::Continue, ButtonStyle::HeroAcid, 24.0),
         ("RESTART RUN  [R]", MenuAction::RestartRun, ButtonStyle::HazardAmber, 18.0),
+        ("SETTINGS  [O]", MenuAction::OpenSettings, ButtonStyle::ScrapSteel, 18.0),
         ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::ScrapSteel, 18.0),
         ("MAIN MENU  [M]", MenuAction::BackToMenu, ButtonStyle::DangerRed, 18.0),
     ] {
@@ -798,16 +876,24 @@ fn perform(
     action: MenuAction,
     run: &mut RunStats,
     mods: &mut PlayerModifiers,
-    (store, loadout): (&ProfileStore, &mut RunLoadout),
+    (store, loadout): (&mut ProfileStore, &mut RunLoadout),
     time: &Time,
+    (state, ret): (AppState, &mut SettingsReturn),
     next: &mut NextState<AppState>,
 ) {
+    // Abandoning an active Endless run from Pause preserves earned Endless records/deltas.
+    let finalize_endless = |run: &mut RunStats, loadout: &RunLoadout, store: &mut ProfileStore| {
+        if state == AppState::Paused && run.endless && !run.run_recorded {
+            crate::meta::record_run_outcome(false, run, loadout, store);
+        }
+    };
     match action {
         MenuAction::StartRun => {
             let seed = time.elapsed().as_nanos() as u64 ^ 0xA5A5_5A5A_1234_5678;
             start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
         }
         MenuAction::RestartRun => {
+            finalize_endless(run, loadout, store);
             for e in players.iter() {
                 commands.entity(e).despawn();
             }
@@ -815,9 +901,27 @@ fn perform(
             start_run_with_loadout(run, mods, loadout, store.profile.build_loadout(), next, seed);
         }
         MenuAction::Continue => next.set(AppState::Playing),
-        MenuAction::BackToMenu => next.set(AppState::MainMenu),
-        MenuAction::OpenLoadout => next.set(AppState::Loadout),
+        MenuAction::BackToMenu => {
+            finalize_endless(run, loadout, store);
+            next.set(AppState::MainMenu);
+        }
+        MenuAction::OpenLoadout => {
+            finalize_endless(run, loadout, store);
+            next.set(AppState::Loadout);
+        }
         MenuAction::OpenContractsFeats => next.set(AppState::ContractsFeats),
+        MenuAction::OpenSettings => {
+            if state != AppState::Settings {
+                ret.0 = if state == AppState::Paused { AppState::Paused } else { AppState::MainMenu };
+            }
+            next.set(AppState::Settings);
+        }
+        MenuAction::CloseSettings => next.set(ret.0),
+        MenuAction::ContinueEndless => {
+            if state == AppState::Victory {
+                continue_into_endless(run, next);
+            }
+        }
     }
 }
 
@@ -834,8 +938,9 @@ fn menu_buttons(
     mut labels: Query<&mut TextColor>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
-    (store, mut loadout): (Res<ProfileStore>, ResMut<RunLoadout>),
+    (mut store, mut loadout): (ResMut<ProfileStore>, ResMut<RunLoadout>),
     time: Res<Time>,
+    (state, mut ret): (Res<State<AppState>>, ResMut<SettingsReturn>),
     mut next: ResMut<NextState<AppState>>,
 ) {
     let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
@@ -859,7 +964,7 @@ fn menu_buttons(
             }
         }
         if hovered && mouse.just_released(MouseButton::Left) {
-            perform(&mut commands, &players, *action, &mut run, &mut mods, (&store, &mut loadout), &time, &mut next);
+            perform(&mut commands, &players, *action, &mut run, &mut mods, (&mut store, &mut loadout), &time, (*state.get(), &mut ret), &mut next);
             return;
         }
     }
@@ -873,8 +978,9 @@ fn menu_keys(
     state: Res<State<AppState>>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
-    (store, mut loadout): (Res<ProfileStore>, ResMut<RunLoadout>),
+    (mut store, mut loadout): (ResMut<ProfileStore>, ResMut<RunLoadout>),
     time: Res<Time>,
+    mut ret: ResMut<SettingsReturn>,
     mut next: ResMut<NextState<AppState>>,
 ) {
     let enter = keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]);
@@ -886,9 +992,10 @@ fn menu_keys(
         keys.just_pressed(KeyCode::KeyC),
         keys.just_pressed(KeyCode::KeyR),
         keys.just_pressed(KeyCode::KeyM),
-    );
+    )
+    .or_else(|| menu_hotkey_action(*state.get(), keys.just_pressed(KeyCode::KeyO), keys.just_pressed(KeyCode::KeyE)));
     if let Some(action) = action {
-        perform(&mut commands, &players, action, &mut run, &mut mods, (&store, &mut loadout), &time, &mut next);
+        perform(&mut commands, &players, action, &mut run, &mut mods, (&mut store, &mut loadout), &time, (*state.get(), &mut ret), &mut next);
     }
 }
 
@@ -1454,8 +1561,9 @@ fn spawn_vel_plate(commands: &mut Commands, root: Entity) {
     ));
 }
 
-fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
+fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Option<Res<ProfileStore>>) {
     let tex = tex.as_deref();
+    let settings = live_settings(store.as_deref());
     let root = commands.spawn((DespawnOnExit(AppState::Playing), abs_full())).id();
 
     // Dead Zone: a thin dark-red edge frame + barely-there tint. The real
@@ -1470,18 +1578,23 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>) {
     // Damage flash overlay.
     commands.spawn((ChildOf(root), HudBox::DamageFlash, abs_full(), BackgroundColor(Color::NONE)));
 
-    // Crosshair + hitmarker.
-    commands.spawn((
-        ChildOf(root),
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Percent(50.0),
-            top: Val::Percent(50.0),
-            margin: UiRect { left: Val::Px(-7.0), top: Val::Px(-12.0), ..default() },
-            ..default()
-        },
-        children![text("+", 24.0, Color::srgba(1.0, 0.9, 0.8, 0.8))],
-    ));
+    // Crosshair (user style + color) + hitmarker.
+    let reticle = commands
+        .spawn((
+            ChildOf(root),
+            HudCrosshair(settings.crosshair_style, settings.crosshair_color),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(50.0),
+                top: Val::Percent(50.0),
+                width: Val::Px(CROSSHAIR_BOX),
+                height: Val::Px(CROSSHAIR_BOX),
+                margin: UiRect { left: Val::Px(-CROSSHAIR_BOX * 0.5), top: Val::Px(-CROSSHAIR_BOX * 0.5), ..default() },
+                ..default()
+            },
+        ))
+        .id();
+    spawn_crosshair(&mut commands, reticle, settings.crosshair_style, settings.crosshair_color.color(), 1.0);
     commands.spawn((
         ChildOf(root),
         Node {
@@ -1848,8 +1961,13 @@ fn update_hud(
         b.clear();
         let c: Color = match *slot {
             HudText::Floor => {
-                let _ = write!(b, "FLOOR {}/{}", run.floor, FINAL_FLOOR);
-                COLOR_TEXT
+                if run.endless {
+                    let _ = write!(b, "ENDLESS FL {}", run.floor);
+                    COLOR_ENDLESS
+                } else {
+                    let _ = write!(b, "FLOOR {}/{}", run.floor, FINAL_FLOOR);
+                    COLOR_TEXT
+                }
             }
             HudText::Sector => {
                 let _ = write!(b, "SECTOR {:02} // {}", run.floor, FloorTheme::for_floor(run.floor).name());
@@ -2155,6 +2273,114 @@ fn update_hud_boxes(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Crosshair
+// ---------------------------------------------------------------------------
+
+/// Side (px) of the reticle box centered on the screen.
+pub const CROSSHAIR_BOX: f32 = 32.0;
+
+/// The HUD reticle container and the style / color it was built with.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HudCrosshair(pub CrosshairStyle, pub CrosshairColor);
+
+/// Thin ink outline so every reticle color reads over bright fire and sky.
+const RETICLE_OUTLINE: Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
+
+/// One reticle stroke: an absolutely placed bar centered on `(cx, cy)`.
+fn reticle_bar(cx: f32, cy: f32, w: f32, h: f32, color: Color, rot_deg: f32) -> impl Bundle {
+    (
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(cx - w * 0.5),
+            top: Val::Px(cy - h * 0.5),
+            width: Val::Px(w),
+            height: Val::Px(h),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BorderColor::all(RETICLE_OUTLINE),
+        BackgroundColor(color),
+        UiTransform::from_rotation(Rot2::degrees(rot_deg)),
+    )
+}
+
+/// Build a reticle of `style` inside `parent` (a box `CROSSHAIR_BOX * scale`
+/// px square). Shared by the HUD and the Settings live preview.
+pub fn spawn_crosshair(commands: &mut Commands, parent: Entity, style: CrosshairStyle, color: Color, scale: f32) {
+    let c = CROSSHAIR_BOX * scale * 0.5;
+    let k = scale;
+    match style {
+        CrosshairStyle::Cross => {
+            let (len, thick, gap) = (8.0 * k, 3.0 * k, 4.0 * k);
+            let off = gap + len * 0.5;
+            for (dx, dy, w, h) in [(-off, 0.0, len, thick), (off, 0.0, len, thick), (0.0, -off, thick, len), (0.0, off, thick, len)] {
+                commands.spawn((ChildOf(parent), reticle_bar(c + dx, c + dy, w, h, color, 0.0)));
+            }
+        }
+        CrosshairStyle::Dot => {
+            let d = 6.0 * k;
+            commands.spawn((
+                ChildOf(parent),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(c - d * 0.5),
+                    top: Val::Px(c - d * 0.5),
+                    width: Val::Px(d),
+                    height: Val::Px(d),
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(RETICLE_OUTLINE),
+                BackgroundColor(color),
+            ));
+        }
+        CrosshairStyle::Circle => {
+            let d = 20.0 * k;
+            commands.spawn((
+                ChildOf(parent),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(c - d * 0.5),
+                    top: Val::Px(c - d * 0.5),
+                    width: Val::Px(d),
+                    height: Val::Px(d),
+                    border: UiRect::all(Val::Px(2.0 * k)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(color),
+                BackgroundColor(Color::NONE),
+            ));
+            commands.spawn((ChildOf(parent), reticle_bar(c, c, 3.0 * k, 3.0 * k, color, 0.0)));
+        }
+        CrosshairStyle::Chevron => {
+            // A "^" whose apex sits on the aim point (screen Y points down, so
+            // left arm tilts -45 deg up-right and right arm tilts +45 deg down-right).
+            let (len, thick) = (11.0 * k, 3.0 * k);
+            let o = len * 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+            commands.spawn((ChildOf(parent), reticle_bar(c - o, c + o, len, thick, color, -45.0)));
+            commands.spawn((ChildOf(parent), reticle_bar(c + o, c + o, len, thick, color, 45.0)));
+            commands.spawn((ChildOf(parent), reticle_bar(c, c, 2.0 * k, 2.0 * k, color, 0.0)));
+        }
+    }
+}
+
+/// Rebuild the HUD reticle whenever the profile's reticle settings differ
+/// from the ones it was built with (a no-op compare otherwise).
+fn refresh_hud_crosshair(mut commands: Commands, store: Option<Res<ProfileStore>>, mut q: Query<(Entity, &mut HudCrosshair)>) {
+    let s = live_settings(store.as_deref());
+    for (e, mut cur) in &mut q {
+        let want = HudCrosshair(s.crosshair_style, s.crosshair_color);
+        if *cur != want {
+            *cur = want;
+            commands.entity(e).despawn_children();
+            spawn_crosshair(&mut commands, e, want.0, want.1.color(), 1.0);
+        }
+    }
+}
+
 /// Esc or P during play pauses the run and opens the pause overlay.
 fn pause_input(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppState>>) {
     if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::KeyP) {
@@ -2174,6 +2400,17 @@ fn debug_skip_floor(keys: Res<ButtonInput<KeyCode>>, mut run: ResMut<RunStats>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endless_floor_plate_and_movement_line() {
+        let mut run = RunStats { floor: 3, peak_speed: 27.46, max_bhop_chain: 7, ..default() };
+        assert_eq!(floor_label(&run), "FLOOR 3/5");
+        run.endless = true;
+        run.floor = 8;
+        assert_eq!(floor_label(&run), "ENDLESS FL 8");
+        assert!(summary(&run).starts_with("ENDLESS FL 8"));
+        assert_eq!(movement_line(&run), "PEAK SPEED 27.5 M/S  |  MAX BHOP CHAIN x7");
+    }
 
     #[test]
     fn floor_plate_names_the_sector_theme() {
@@ -2382,6 +2619,14 @@ mod tests {
         assert_eq!(k(AppState::Victory, false, false, false, true), None);
         assert_eq!(k(AppState::Playing, true, true, true, true), None);
         assert_eq!(k(AppState::UpgradeSelect, true, false, true, true), None);
+        assert_eq!(k(AppState::Settings, false, true, false, false), Some(CloseSettings));
+        assert_eq!(k(AppState::Settings, true, false, true, true), None);
+        assert_eq!(menu_hotkey_action(AppState::MainMenu, true, false), Some(OpenSettings));
+        assert_eq!(menu_hotkey_action(AppState::Paused, true, false), Some(OpenSettings));
+        assert_eq!(menu_hotkey_action(AppState::Victory, false, true), Some(ContinueEndless));
+        assert_eq!(menu_hotkey_action(AppState::GameOver, true, true), None);
+        assert_eq!(menu_hotkey_action(AppState::Playing, true, true), None);
+        assert_eq!(menu_hotkey_action(AppState::Settings, true, false), None);
         assert_eq!(loadout_contract_color(1), COLOR_SIGNAL_AMBER);
         assert_eq!(loadout_contract_color(4), COLOR_SIGNAL_RED);
     }

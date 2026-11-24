@@ -24,7 +24,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::player::Player;
-use crate::state::{start_run, AppState, PlayerModifiers, RunStats, UpgradeId};
+use crate::state::{start_run, AppState, PlayerModifiers, RecordedRunTotals, RunStats, UpgradeId};
 
 /// Current on-disk profile schema.
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
@@ -524,6 +524,149 @@ pub fn start_run_with_loadout(
 }
 
 // ---------------------------------------------------------------------------
+// User settings (input, camera, audio, reticle)
+// ---------------------------------------------------------------------------
+
+/// HUD reticle shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CrosshairStyle {
+    #[default]
+    Cross,
+    Dot,
+    Circle,
+    Chevron,
+}
+
+impl CrosshairStyle {
+    pub const ALL: [CrosshairStyle; 4] = [CrosshairStyle::Cross, CrosshairStyle::Dot, CrosshairStyle::Circle, CrosshairStyle::Chevron];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CrosshairStyle::Cross => "CROSS",
+            CrosshairStyle::Dot => "DOT",
+            CrosshairStyle::Circle => "CIRCLE",
+            CrosshairStyle::Chevron => "CHEVRON",
+        }
+    }
+
+    /// The next style in [`CrosshairStyle::ALL`] (wraps around).
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
+/// HUD reticle tint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CrosshairColor {
+    #[default]
+    White,
+    Cyan,
+    AcidGreen,
+    Amber,
+    Crimson,
+}
+
+impl CrosshairColor {
+    pub const ALL: [CrosshairColor; 5] =
+        [CrosshairColor::White, CrosshairColor::Cyan, CrosshairColor::AcidGreen, CrosshairColor::Amber, CrosshairColor::Crimson];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CrosshairColor::White => "WHITE",
+            CrosshairColor::Cyan => "CYAN",
+            CrosshairColor::AcidGreen => "ACID",
+            CrosshairColor::Amber => "AMBER",
+            CrosshairColor::Crimson => "CRIMSON",
+        }
+    }
+
+    /// Reticle color (slightly translucent so it never hides a demon).
+    pub fn color(self) -> Color {
+        match self {
+            CrosshairColor::White => Color::srgba(1.0, 0.94, 0.86, 0.88),
+            CrosshairColor::Cyan => Color::srgba(0.3, 0.95, 1.0, 0.92),
+            CrosshairColor::AcidGreen => Color::srgba(0.55, 1.0, 0.2, 0.92),
+            CrosshairColor::Amber => Color::srgba(1.0, 0.72, 0.12, 0.92),
+            CrosshairColor::Crimson => Color::srgba(1.0, 0.18, 0.12, 0.92),
+        }
+    }
+}
+
+/// Clamp ranges of the numeric [`UserSettings`].
+pub const MOUSE_SENS_RANGE: (f32, f32) = (0.25, 3.0);
+pub const BASE_FOV_RANGE: (f32, f32) = (70.0, 110.0);
+pub const EFFECT_SCALE_RANGE: (f32, f32) = (0.0, 1.5);
+pub const VOLUME_RANGE: (f32, f32) = (0.0, 1.0);
+
+/// Player-facing options persisted inside the profile (never gameplay power).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserSettings {
+    /// Multiplier on `player::MOUSE_SENSITIVITY`.
+    pub mouse_sensitivity: f32,
+    /// Resting vertical FOV in degrees.
+    pub base_fov_deg: f32,
+    /// Dynamic FOV widening with speed / dash.
+    pub speed_fov_enabled: bool,
+    pub speed_fov_scale: f32,
+    /// Camera roll into strafes.
+    pub strafe_roll_enabled: bool,
+    pub strafe_roll_scale: f32,
+    pub audio_master_volume: f32,
+    pub audio_muted: bool,
+    pub crosshair_style: CrosshairStyle,
+    pub crosshair_color: CrosshairColor,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        UserSettings {
+            mouse_sensitivity: 1.0,
+            base_fov_deg: 85.0,
+            speed_fov_enabled: true,
+            speed_fov_scale: 1.0,
+            strafe_roll_enabled: true,
+            strafe_roll_scale: 1.0,
+            audio_master_volume: 1.0,
+            audio_muted: false,
+            crosshair_style: CrosshairStyle::Cross,
+            crosshair_color: CrosshairColor::White,
+        }
+    }
+}
+
+/// Clamp `v` into `(lo, hi)`, replacing NaN / infinities with `default`.
+fn sane(v: f32, (lo, hi): (f32, f32), default: f32) -> f32 {
+    if v.is_finite() { v.clamp(lo, hi) } else { default }
+}
+
+impl UserSettings {
+    /// Clamp every float into its range (NaN / Inf fall back to defaults).
+    pub fn sanitize(&mut self) {
+        let d = UserSettings::default();
+        self.mouse_sensitivity = sane(self.mouse_sensitivity, MOUSE_SENS_RANGE, d.mouse_sensitivity);
+        self.base_fov_deg = sane(self.base_fov_deg, BASE_FOV_RANGE, d.base_fov_deg);
+        self.speed_fov_scale = sane(self.speed_fov_scale, EFFECT_SCALE_RANGE, d.speed_fov_scale);
+        self.strafe_roll_scale = sane(self.strafe_roll_scale, EFFECT_SCALE_RANGE, d.strafe_roll_scale);
+        self.audio_master_volume = sane(self.audio_master_volume, VOLUME_RANGE, d.audio_master_volume);
+    }
+
+    /// Sanitized copy.
+    pub fn sanitized(&self) -> Self {
+        let mut s = self.clone();
+        s.sanitize();
+        s
+    }
+}
+
+/// The live settings: the profile's when a [`ProfileStore`] exists, defaults
+/// otherwise (bare headless harnesses).
+pub fn live_settings(store: Option<&ProfileStore>) -> UserSettings {
+    store.map(|s| s.profile.settings.sanitized()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // Profile
 // ---------------------------------------------------------------------------
 
@@ -540,6 +683,12 @@ pub struct LifetimeStats {
     pub total_sos_completed: u32,
     pub fastest_victory_secs: Option<f32>,
     pub max_contracts_cleared: u32,
+    /// Top horizontal speed ever reached (m/s).
+    pub best_speed: f32,
+    /// Longest bunny-hop chain ever linked.
+    pub best_bhop_chain: u32,
+    /// Deepest floor reached in Endless Overdrive (0 = never entered).
+    pub best_endless_floor: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -553,6 +702,10 @@ pub struct RunRecord {
     pub chip: StarterChip,
     pub contracts_count: u32,
     pub skin: HandsetSkin,
+    /// The run continued past Floor 5 into Endless Overdrive.
+    pub endless: bool,
+    pub peak_speed: f32,
+    pub max_bhop_chain: u32,
 }
 
 /// What the last finished run unlocked (for the end screens / Milestone B).
@@ -589,6 +742,8 @@ pub struct PlayerProfile {
     pub stats: LifetimeStats,
     /// The last [`RUN_HISTORY_LEN`] runs, oldest first.
     pub history: Vec<RunRecord>,
+    /// Input / camera / audio / reticle options.
+    pub settings: UserSettings,
 }
 
 impl Default for PlayerProfile {
@@ -603,6 +758,7 @@ impl Default for PlayerProfile {
             jam_demo_unlock_all: false,
             stats: LifetimeStats::default(),
             history: Vec::new(),
+            settings: UserSettings::default(),
         }
     }
 }
@@ -720,6 +876,11 @@ impl PlayerProfile {
             self.equipped_skin = HandsetSkin::UacOrange;
         }
         self.active_catalog = self.normalized_catalog();
+        self.settings.sanitize();
+        let st = &mut self.stats;
+        if !st.best_speed.is_finite() || st.best_speed < 0.0 {
+            st.best_speed = 0.0;
+        }
         if self.history.len() > RUN_HISTORY_LEN {
             let extra = self.history.len() - RUN_HISTORY_LEN;
             self.history.drain(..extra);
@@ -764,7 +925,6 @@ impl PlayerProfile {
         let contracts = loadout.contract_count();
         let s = &mut self.stats;
         s.runs_played += 1;
-        s.best_floor = s.best_floor.max(run.floor);
         s.total_kills += run.kills;
         s.total_jammers += run.jammers_destroyed;
         s.total_fiends += run.fiends_killed;
@@ -775,6 +935,7 @@ impl PlayerProfile {
             s.fastest_victory_secs = Some(s.fastest_victory_secs.map_or(run.time_elapsed, |t| t.min(run.time_elapsed)));
             s.max_contracts_cleared = s.max_contracts_cleared.max(contracts);
         }
+        self.record_bests(run);
         self.history.push(RunRecord {
             floor: run.floor,
             victory,
@@ -784,11 +945,72 @@ impl PlayerProfile {
             chip: loadout.chip,
             contracts_count: contracts,
             skin: loadout.skin,
+            endless: run.endless,
+            peak_speed: run.peak_speed,
+            max_bhop_chain: run.max_bhop_chain,
         });
         if self.history.len() > RUN_HISTORY_LEN {
             let extra = self.history.len() - RUN_HISTORY_LEN;
             self.history.drain(..extra);
         }
+        self.unlock_qualifying(run, loadout, victory)
+    }
+
+    /// Fold the Endless Overdrive continuation of an already-recorded victory:
+    /// only the counters accumulated *after* the Floor 5 snapshot are added,
+    /// `runs_played` / `victories` are untouched, the bests are refreshed and the
+    /// run's history entry (appended at Victory) is updated in place.
+    pub fn record_endless_extension(&mut self, run: &RunStats, snapshot: &RecordedRunTotals, loadout: &RunLoadout) -> RunUnlockSummary {
+        let d = RecordedRunTotals::of(run).delta_since(snapshot);
+        let s = &mut self.stats;
+        s.total_kills += d.kills;
+        s.total_jammers += d.jammers;
+        s.total_fiends += d.fiends;
+        s.total_blackout_kills += d.blackout_kills;
+        s.total_sos_completed += d.sos_completed;
+        self.record_bests(run);
+        let contracts = loadout.contract_count();
+        let rec = RunRecord {
+            floor: run.floor,
+            victory: true,
+            kills: run.kills,
+            jammers: run.jammers_destroyed,
+            time_secs: run.time_elapsed,
+            chip: loadout.chip,
+            contracts_count: contracts,
+            skin: loadout.skin,
+            endless: true,
+            peak_speed: run.peak_speed,
+            max_bhop_chain: run.max_bhop_chain,
+        };
+        match self.history.last_mut() {
+            Some(last) if last.victory && last.chip == rec.chip && last.skin == rec.skin && last.floor <= rec.floor => *last = rec,
+            _ => {
+                self.history.push(rec);
+                if self.history.len() > RUN_HISTORY_LEN {
+                    let extra = self.history.len() - RUN_HISTORY_LEN;
+                    self.history.drain(..extra);
+                }
+            }
+        }
+        // Victory-only feats were already granted at Floor 5.
+        self.unlock_qualifying(run, loadout, false)
+    }
+
+    /// Best floor / endless floor / speed / bhop chain.
+    fn record_bests(&mut self, run: &RunStats) {
+        let s = &mut self.stats;
+        s.best_floor = s.best_floor.max(run.floor);
+        if run.endless {
+            s.best_endless_floor = s.best_endless_floor.max(run.floor);
+        }
+        if run.peak_speed.is_finite() {
+            s.best_speed = s.best_speed.max(run.peak_speed);
+        }
+        s.best_bhop_chain = s.best_bhop_chain.max(run.max_bhop_chain);
+    }
+
+    fn unlock_qualifying(&mut self, run: &RunStats, loadout: &RunLoadout, victory: bool) -> RunUnlockSummary {
         let new_feats: Vec<FeatId> = self.qualifying_feats(run, loadout, victory).into_iter().filter(|f| !self.has_feat(*f)).collect();
         self.unlocked_feats.extend(new_feats.iter().copied());
         RunUnlockSummary {
@@ -997,7 +1219,14 @@ pub fn record_run_outcome(victory: bool, run: &mut RunStats, loadout: &RunLoadou
         store.last_run_summary = Some(summary.clone());
         return Some(summary);
     }
-    let summary = store.profile.record_run(run, loadout, victory);
+    let summary = match run.recorded_snapshot {
+        // Endless continuation of a victory that was already folded in.
+        Some(snap) => store.profile.record_endless_extension(run, &snap, loadout),
+        None => store.profile.record_run(run, loadout, victory),
+    };
+    if victory {
+        run.recorded_snapshot = Some(RecordedRunTotals::of(run));
+    }
     store.last_run_summary = Some(summary.clone());
     if let Err(e) = store.try_save() {
         warn!("profile save failed (marked dirty for retry): {e}");
@@ -1395,6 +1624,144 @@ mod tests {
         // In-memory stores never touch the disk.
         assert!(ProfileStore::in_memory(PlayerProfile::default()).save().is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_settings_defaults_and_sanitize() {
+        let d = UserSettings::default();
+        assert_eq!(d.mouse_sensitivity, 1.0);
+        assert_eq!(d.base_fov_deg, 85.0);
+        assert!(d.speed_fov_enabled && d.strafe_roll_enabled && !d.audio_muted);
+        assert_eq!((d.speed_fov_scale, d.strafe_roll_scale, d.audio_master_volume), (1.0, 1.0, 1.0));
+        assert_eq!((d.crosshair_style, d.crosshair_color), (CrosshairStyle::Cross, CrosshairColor::White));
+        assert_eq!(PlayerProfile::default().settings, d);
+
+        let mut s = UserSettings {
+            mouse_sensitivity: 9.0,
+            base_fov_deg: 20.0,
+            speed_fov_scale: -1.0,
+            strafe_roll_scale: 4.0,
+            audio_master_volume: 1.7,
+            ..d.clone()
+        };
+        s.sanitize();
+        assert_eq!(
+            (s.mouse_sensitivity, s.base_fov_deg, s.speed_fov_scale, s.strafe_roll_scale, s.audio_master_volume),
+            (3.0, 70.0, 0.0, 1.5, 1.0)
+        );
+        let mut n = UserSettings {
+            mouse_sensitivity: f32::NAN,
+            base_fov_deg: f32::INFINITY,
+            speed_fov_scale: f32::NEG_INFINITY,
+            strafe_roll_scale: f32::NAN,
+            audio_master_volume: f32::NAN,
+            ..d.clone()
+        };
+        n.sanitize();
+        assert_eq!(n, d, "NaN / Inf fall back to defaults");
+
+        // The profile sanitizer covers settings too.
+        let mut p = PlayerProfile::default();
+        p.settings.base_fov_deg = 500.0;
+        p.stats.best_speed = f32::NAN;
+        p.sanitize();
+        assert_eq!(p.settings.base_fov_deg, 110.0);
+        assert_eq!(p.stats.best_speed, 0.0);
+        assert_eq!(live_settings(None), d);
+        for st in CrosshairStyle::ALL {
+            assert!(!st.name().is_empty());
+            assert_ne!(st.next(), st);
+        }
+        assert_eq!(CrosshairStyle::Chevron.next(), CrosshairStyle::Cross);
+        let colors: BTreeSet<String> = CrosshairColor::ALL.iter().map(|c| format!("{:?}", c.color())).collect();
+        assert_eq!(colors.len(), CrosshairColor::ALL.len(), "distinct reticle colors");
+    }
+
+    #[test]
+    fn old_profiles_without_settings_or_records_still_load() {
+        // A Milestone 11 profile: no `settings`, no movement records, no endless fields.
+        let old = r#"{
+            "schema_version": 1,
+            "unlocked_feats": ["FirstExtraction", "SignalScout"],
+            "equipped_chip": "SurveyOs",
+            "stats": {"runs_played": 4, "victories": 0, "best_floor": 3, "total_kills": 90},
+            "history": [{"floor": 3, "victory": false, "kills": 30, "jammers": 4, "time_secs": 200.0, "chip": "SurveyOs", "contracts_count": 0, "skin": "UacOrange"}]
+        }"#;
+        let p = parse_profile(old).unwrap();
+        assert_eq!(p.schema_version, PROFILE_SCHEMA_VERSION);
+        assert_eq!(p.settings, UserSettings::default());
+        assert_eq!(p.stats.runs_played, 4);
+        assert_eq!((p.stats.best_speed, p.stats.best_bhop_chain, p.stats.best_endless_floor), (0.0, 0, 0));
+        let h = &p.history[0];
+        assert!(!h.endless && h.peak_speed == 0.0 && h.max_bhop_chain == 0);
+        assert_eq!(p.equipped_chip, StarterChip::SurveyOs);
+        // Partial settings keep the rest at defaults; wild values are clamped.
+        let partial = parse_profile(r#"{"settings":{"base_fov_deg":200.0,"crosshair_color":"Amber"}}"#).unwrap();
+        assert_eq!(partial.settings.base_fov_deg, 110.0);
+        assert_eq!(partial.settings.crosshair_color, CrosshairColor::Amber);
+        assert_eq!(partial.settings.mouse_sensitivity, 1.0);
+        // Round trip.
+        let q = PlayerProfile {
+            settings: UserSettings { crosshair_style: CrosshairStyle::Chevron, audio_muted: true, mouse_sensitivity: 1.35, ..default() },
+            ..default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert_eq!(parse_profile(&json).unwrap(), q);
+    }
+
+    #[test]
+    fn endless_death_adds_only_post_victory_deltas() {
+        let mut store = ProfileStore::in_memory(PlayerProfile::default());
+        let loadout = RunLoadout::default();
+        let mut run = RunStats {
+            floor: 5,
+            kills: 40,
+            jammers_destroyed: 20,
+            fiends_killed: 6,
+            blackout_kills: 3,
+            sos_completed: 5,
+            floors_cleared: 5,
+            time_elapsed: 900.0,
+            peak_speed: 24.0,
+            max_bhop_chain: 5,
+            ..default()
+        };
+        record_run_outcome(true, &mut run, &loadout, &mut store).unwrap();
+        let s = &store.profile.stats;
+        assert_eq!((s.runs_played, s.victories, s.total_kills, s.best_floor), (1, 1, 40, 5));
+        assert_eq!((s.best_speed, s.best_bhop_chain, s.best_endless_floor), (24.0, 5, 0));
+        assert_eq!(run.recorded_snapshot, Some(RecordedRunTotals::of(&run)));
+        assert!(store.profile.has_feat(FeatId::BunkerCleared));
+
+        // Keep descending: Floors 6, 7, 8, then die on 8.
+        let mut next = NextState::<AppState>::default();
+        crate::state::continue_into_endless(&mut run, &mut next);
+        assert!(!run.run_recorded);
+        run.advance_floor();
+        run.advance_floor();
+        assert_eq!(run.floor, 8);
+        run.kills += 25;
+        run.jammers_destroyed += 9;
+        run.fiends_killed += 1;
+        run.sos_completed += 2;
+        run.track_movement(33.5, 11);
+        let sum = record_run_outcome(false, &mut run, &loadout, &mut store).unwrap();
+        assert!(!sum.victory);
+        let s = &store.profile.stats;
+        assert_eq!(s.runs_played, 1, "an Endless continuation is the same run");
+        assert_eq!(s.victories, 1);
+        assert_eq!((s.total_kills, s.total_jammers, s.total_fiends, s.total_sos_completed, s.total_blackout_kills), (65, 29, 7, 7, 3));
+        assert_eq!((s.best_floor, s.best_endless_floor), (8, 8));
+        assert_eq!((s.best_speed, s.best_bhop_chain), (33.5, 11));
+        assert_eq!(store.profile.history.len(), 1, "the victory record is updated in place");
+        let h = store.profile.history.last().unwrap();
+        assert!(h.victory && h.endless);
+        assert_eq!((h.floor, h.kills, h.max_bhop_chain), (8, 65, 11));
+        // Guarded: a second call is a no-op.
+        assert!(record_run_outcome(false, &mut run, &loadout, &mut store).is_none());
+        assert_eq!(store.profile.stats.total_kills, 65);
+        // Jammer Hunter (8 lifetime jammers) was already earned at Floor 5.
+        assert!(store.profile.has_feat(FeatId::JammerHunter));
     }
 
     #[test]

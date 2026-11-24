@@ -12,6 +12,8 @@ use std::f32::consts::TAU;
 
 use bevy::prelude::*;
 
+use crate::meta::UserSettings;
+
 pub const SAMPLE_RATE: u32 = 22_050;
 
 /// Sound effects the game can request.
@@ -352,15 +354,31 @@ mod backend {
         commands.insert_resource(SfxHandles(map));
     }
 
-    pub fn play(commands: &mut Commands, handles: &SfxHandles, sfx: SfxEvent) {
+    pub fn play(commands: &mut Commands, handles: &SfxHandles, sfx: SfxEvent, volume: f32) {
         if let Some(h) = handles.0.get(&sfx) {
-            commands.spawn((AudioPlayer(h.clone()), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(sfx.volume()))));
+            commands.spawn((AudioPlayer(h.clone()), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume))));
         }
     }
 }
 
+/// Final playback volume of `sfx` under the user's audio settings
+/// (0 when muted, else the sound's own mix level times the master volume).
+pub fn effective_sfx_volume(sfx: SfxEvent, settings: &UserSettings) -> f32 {
+    if settings.audio_muted {
+        return 0.0;
+    }
+    let master = if settings.audio_master_volume.is_finite() { settings.audio_master_volume.clamp(0.0, 1.0) } else { 1.0 };
+    sfx.volume() * master
+}
+
 #[cfg(feature = "audio")]
-fn drain_sfx(mut commands: Commands, mut queue: ResMut<SfxQueue>, handles: Option<Res<backend::SfxHandles>>) {
+fn drain_sfx(
+    mut commands: Commands,
+    mut queue: ResMut<SfxQueue>,
+    handles: Option<Res<backend::SfxHandles>>,
+    store: Option<Res<crate::meta::ProfileStore>>,
+) {
+    let settings = crate::meta::live_settings(store.as_deref());
     let mut played: Vec<SfxEvent> = Vec::new();
     for sfx in queue.0.drain(..) {
         // One instance of each sound per frame (8 pellets = 1 bang).
@@ -368,8 +386,11 @@ fn drain_sfx(mut commands: Commands, mut queue: ResMut<SfxQueue>, handles: Optio
             continue;
         }
         played.push(sfx);
-        if let Some(h) = &handles {
-            backend::play(&mut commands, h, sfx);
+        let volume = effective_sfx_volume(sfx, &settings);
+        if volume > 0.0
+            && let Some(h) = &handles
+        {
+            backend::play(&mut commands, h, sfx, volume);
         }
     }
 }
@@ -388,6 +409,22 @@ mod tests {
     }
     fn u16_at(b: &[u8], i: usize) -> u16 {
         u16::from_le_bytes([b[i], b[i + 1]])
+    }
+
+    #[test]
+    fn master_volume_and_mute_scale_every_sfx() {
+        let d = UserSettings::default();
+        for sfx in SfxEvent::ALL {
+            assert_eq!(effective_sfx_volume(sfx, &d), sfx.volume());
+            let half = UserSettings { audio_master_volume: 0.5, ..d.clone() };
+            assert!((effective_sfx_volume(sfx, &half) - 0.5 * sfx.volume()).abs() < 1e-6);
+            let muted = UserSettings { audio_muted: true, ..d.clone() };
+            assert_eq!(effective_sfx_volume(sfx, &muted), 0.0);
+            let loud = UserSettings { audio_master_volume: 7.0, ..d.clone() };
+            assert_eq!(effective_sfx_volume(sfx, &loud), sfx.volume(), "master clamps at 1.0");
+            let nan = UserSettings { audio_master_volume: f32::NAN, ..d.clone() };
+            assert_eq!(effective_sfx_volume(sfx, &nan), sfx.volume());
+        }
     }
 
     #[test]

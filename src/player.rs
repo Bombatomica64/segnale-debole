@@ -22,11 +22,11 @@ use crate::bot_input::{take_flag, BotControl};
 use crate::enemies::{fiend_jammer_fields_iter, Enemy};
 use crate::fx::{spawn_burst, spawn_flash_light, spawn_particles, spawn_shockwave, BurstColor, FxAssets, HudFeed};
 use crate::level::{DemonJammer, JumpPad, JumpPadGlow, JumpPadLight, LevelGrid, SignalTower, PAD_DORMANT_LIGHT, PAD_POWERED_LIGHT};
-use crate::meta::{RunLoadout, StarterChip};
+use crate::meta::{live_settings, ProfileStore, RunLoadout, StarterChip, UserSettings, BASE_FOV_RANGE, EFFECT_SCALE_RANGE, MOUSE_SENS_RANGE};
 use crate::physics::{resolve_player_movement, JUMP_VELOCITY, PLAYER_HEIGHT, PLAYER_RADIUS, PLAYER_STEP_HEIGHT};
 use crate::physics::count_wall_occlusions;
 use crate::signal::{active_jammer_fields_iter, boost_reading, compute_signal_at, hotspot_boost, overclock_move_factor, HotspotField, JammerField, SignalState};
-use crate::state::{AppState, GameSet, PlayerModifiers};
+use crate::state::{AppState, GameSet, PlayerModifiers, RunStats};
 
 pub const PLAYER_EYE_HEIGHT: f32 = 1.6;
 /// Base run speed (m/s) before upgrades / 5G Overclock.
@@ -315,7 +315,7 @@ pub fn new_run_player(chip: StarterChip, yaw: f32) -> Player {
     p
 }
 
-fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip) {
+fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip, settings: &UserSettings) {
     let pos = grid.spawn_world();
     commands
         .spawn((
@@ -328,7 +328,7 @@ fn spawn_player(commands: &mut Commands, grid: &LevelGrid, chip: StarterChip) {
                 PlayerCamera,
                 Camera3d::default(),
                 Projection::Perspective(PerspectiveProjection {
-                    fov: BASE_FOV_DEG.to_radians(),
+                    fov: base_fov_rad(settings),
                     near: 0.05,
                     far: 400.0,
                     ..default()
@@ -351,11 +351,17 @@ pub fn theme_fog(floor: u32) -> DistanceFog {
 }
 
 /// Spawn the player once a level exists (player persists across floors).
-fn ensure_player(mut commands: Commands, grid: Option<Res<LevelGrid>>, loadout: Option<Res<RunLoadout>>, players: Query<(), With<Player>>) {
+fn ensure_player(
+    mut commands: Commands,
+    grid: Option<Res<LevelGrid>>,
+    loadout: Option<Res<RunLoadout>>,
+    store: Option<Res<ProfileStore>>,
+    players: Query<(), With<Player>>,
+) {
     if let Some(grid) = grid
         && players.is_empty() {
             let chip = loadout.map(|l| l.chip).unwrap_or_default();
-            spawn_player(&mut commands, &grid, chip);
+            spawn_player(&mut commands, &grid, chip, &live_settings(store.as_deref()));
         }
 }
 
@@ -364,6 +370,7 @@ fn ensure_player(mut commands: Commands, grid: Option<Res<LevelGrid>>, loadout: 
 #[allow(clippy::type_complexity)]
 fn snap_player_to_spawn(
     grid: Res<LevelGrid>,
+    store: Option<Res<ProfileStore>>,
     mut q: Query<(&mut Player, &mut Transform), Without<PlayerCamera>>,
     mut cams: Query<(&mut Transform, &mut Projection, Option<&mut DistanceFog>), With<PlayerCamera>>,
 ) {
@@ -391,7 +398,7 @@ fn snap_player_to_spawn(
         cam.translation = Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
         cam.rotation = Quat::IDENTITY;
         if let Projection::Perspective(pp) = proj.as_mut() {
-            pp.fov = BASE_FOV_DEG.to_radians();
+            pp.fov = base_fov_rad(&live_settings(store.as_deref()));
         }
     }
 }
@@ -437,14 +444,16 @@ fn cursor_capture_input(
 fn mouse_look(
     motion: Res<AccumulatedMouseMotion>,
     captured: Res<CursorCaptured>,
+    store: Option<Res<ProfileStore>>,
     bot: Option<Res<BotControl>>,
     mut players: Query<(&mut Player, &mut Transform), Without<PlayerCamera>>,
     mut cams: Query<&mut Transform, With<PlayerCamera>>,
 ) {
     let Ok((mut p, mut tf)) = players.single_mut() else { return };
     if captured.0 && motion.delta != Vec2::ZERO {
-        p.yaw -= motion.delta.x * MOUSE_SENSITIVITY;
-        p.pitch = (p.pitch - motion.delta.y * MOUSE_SENSITIVITY).clamp(-1.5, 1.5);
+        let sens = effective_mouse_sensitivity(&live_settings(store.as_deref()));
+        p.yaw -= motion.delta.x * sens;
+        p.pitch = (p.pitch - motion.delta.y * sens).clamp(-1.5, 1.5);
     }
     if let Some(bot) = bot {
         if let Some(yaw) = bot.look_yaw {
@@ -645,6 +654,36 @@ pub fn fov_bonus_deg(horizontal_speed: f32, dashing: bool) -> f32 {
     (speed_fov.max(dash_fov) + 0.25 * speed_fov.min(dash_fov)).min(MAX_FOV_BONUS_DEG)
 }
 
+/// Radians of mouse look per pixel of motion (user sensitivity applied).
+pub fn effective_mouse_sensitivity(settings: &UserSettings) -> f32 {
+    let m = if settings.mouse_sensitivity.is_finite() { settings.mouse_sensitivity.clamp(MOUSE_SENS_RANGE.0, MOUSE_SENS_RANGE.1) } else { 1.0 };
+    MOUSE_SENSITIVITY * m
+}
+
+/// The user's resting FOV (vertical, radians).
+pub fn base_fov_rad(settings: &UserSettings) -> f32 {
+    let deg = if settings.base_fov_deg.is_finite() { settings.base_fov_deg.clamp(BASE_FOV_RANGE.0, BASE_FOV_RANGE.1) } else { BASE_FOV_DEG };
+    deg.to_radians()
+}
+
+/// [`fov_bonus_deg`] honoring the Dynamic Speed FOV toggle and intensity.
+pub fn effective_fov_bonus_deg(horizontal_speed: f32, dashing: bool, settings: &UserSettings) -> f32 {
+    if !settings.speed_fov_enabled {
+        return 0.0;
+    }
+    let scale = if settings.speed_fov_scale.is_finite() { settings.speed_fov_scale.clamp(EFFECT_SCALE_RANGE.0, EFFECT_SCALE_RANGE.1) } else { 1.0 };
+    fov_bonus_deg(horizontal_speed, dashing) * scale
+}
+
+/// [`strafe_tilt_target`] honoring the Strafe Roll toggle and intensity.
+pub fn effective_strafe_tilt_target(input_right: f32, side_speed_frac: f32, grounded: bool, settings: &UserSettings) -> f32 {
+    if !settings.strafe_roll_enabled {
+        return 0.0;
+    }
+    let scale = if settings.strafe_roll_scale.is_finite() { settings.strafe_roll_scale.clamp(EFFECT_SCALE_RANGE.0, EFFECT_SCALE_RANGE.1) } else { 1.0 };
+    strafe_tilt_target(input_right, side_speed_frac, grounded) * scale
+}
+
 #[allow(clippy::too_many_arguments)]
 fn move_player(
     time: Res<Time>,
@@ -654,6 +693,7 @@ fn move_player(
     signal: Res<SignalState>,
     mut sfx: ResMut<SfxQueue>,
     mut bot: Option<ResMut<BotControl>>,
+    (store, run): (Option<Res<ProfileStore>>, Option<ResMut<RunStats>>),
     mut q: Query<(&mut Player, &mut Transform)>,
 ) {
     let Some(grid) = grid else { return };
@@ -786,12 +826,21 @@ fn move_player(
     // Strafe roll toward the strafe key / sideways drift (applied by `view_bob`).
     let right_xz = Vec2::new(p.yaw.cos(), -p.yaw.sin());
     let side_frac = Vec2::new(p.velocity.x, p.velocity.z).dot(right_xz) / base_max_speed.max(1.0);
-    let target = strafe_tilt_target(input.right, side_frac, p.grounded);
+    let target = effective_strafe_tilt_target(input.right, side_frac, p.grounded, &live_settings(store.as_deref()));
     p.strafe_tilt += (target - p.strafe_tilt) * smooth_factor(STRAFE_TILT_RATE, dt);
+
+    // Movement telemetry (peak speed / longest bhop chain) for records.
+    if let Some(mut run) = run {
+        let speed = Vec2::new(p.velocity.x, p.velocity.z).length();
+        if speed > run.peak_speed || p.bhop_chain > run.max_bhop_chain {
+            run.track_movement(speed, p.bhop_chain);
+        }
+    }
 }
 
 fn view_bob(
     time: Res<Time>,
+    store: Option<Res<ProfileStore>>,
     mut players: Query<&mut Player>,
     mut cams: Query<(&mut Transform, &mut Projection), With<PlayerCamera>>,
 ) {
@@ -813,8 +862,9 @@ fn view_bob(
     cam.rotation = camera_rotation(p.pitch, p.strafe_tilt);
     // FOV widens with speed, kicks while dashing.
     if let Projection::Perspective(pp) = proj.as_mut() {
-        let want = BASE_FOV_DEG + fov_bonus_deg(speed, p.dash_timer > 0.0);
-        pp.fov += (want.to_radians() - pp.fov) * smooth_factor(10.0, time.delta_secs());
+        let settings = live_settings(store.as_deref());
+        let want = base_fov_rad(&settings) + effective_fov_bonus_deg(speed, p.dash_timer > 0.0, &settings).to_radians();
+        pp.fov += (want - pp.fov) * smooth_factor(10.0, time.delta_secs());
     }
 }
 
@@ -1162,6 +1212,31 @@ mod tests {
         assert_eq!(fov_bonus_deg(0.0, true), DASH_FOV_DEG);
         assert!((fov_bonus_deg(SPEED_FOV_FULL, true) - (SPEED_FOV_MAX_DEG + 0.25 * DASH_FOV_DEG)).abs() < 1e-4);
         assert!(fov_bonus_deg(1000.0, true) <= MAX_FOV_BONUS_DEG);
+    }
+
+    #[test]
+    fn user_settings_scale_look_fov_and_roll() {
+        let d = UserSettings::default();
+        assert_eq!(effective_mouse_sensitivity(&d), MOUSE_SENSITIVITY);
+        assert!((base_fov_rad(&d) - BASE_FOV_DEG.to_radians()).abs() < 1e-6);
+        assert_eq!(effective_fov_bonus_deg(25.0, true, &d), fov_bonus_deg(25.0, true));
+        assert_eq!(effective_strafe_tilt_target(1.0, 0.5, false, &d), strafe_tilt_target(1.0, 0.5, false));
+
+        let s = UserSettings { mouse_sensitivity: 2.0, base_fov_deg: 100.0, speed_fov_scale: 0.5, strafe_roll_scale: 1.5, ..d.clone() };
+        assert!((effective_mouse_sensitivity(&s) - 2.0 * MOUSE_SENSITIVITY).abs() < 1e-9);
+        assert!((base_fov_rad(&s) - 100f32.to_radians()).abs() < 1e-6);
+        assert!((effective_fov_bonus_deg(SPEED_FOV_FULL, false, &s) - 0.5 * SPEED_FOV_MAX_DEG).abs() < 1e-4);
+        assert!((effective_strafe_tilt_target(1.0, 0.0, false, &s) - 1.5 * strafe_tilt_target(1.0, 0.0, false)).abs() < 1e-6);
+
+        let off = UserSettings { speed_fov_enabled: false, strafe_roll_enabled: false, ..d.clone() };
+        assert_eq!(effective_fov_bonus_deg(40.0, true, &off), 0.0);
+        assert_eq!(effective_strafe_tilt_target(1.0, 1.0, false, &off), 0.0);
+
+        // Out-of-range / NaN values never leak into the camera.
+        let wild = UserSettings { mouse_sensitivity: f32::NAN, base_fov_deg: 400.0, speed_fov_scale: f32::INFINITY, ..d };
+        assert_eq!(effective_mouse_sensitivity(&wild), MOUSE_SENSITIVITY);
+        assert!((base_fov_rad(&wild) - 110f32.to_radians()).abs() < 1e-6);
+        assert_eq!(effective_fov_bonus_deg(SPEED_FOV_FULL, false, &wild), SPEED_FOV_MAX_DEG);
     }
 
     #[test]

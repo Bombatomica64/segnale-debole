@@ -18,7 +18,7 @@ use crate::level::{Cell, CullableLight, LevelEntity, LevelGrid, TowerBeacon};
 use crate::physics::has_line_of_sight;
 use crate::player::{Player, PLAYER_EYE_HEIGHT};
 use crate::signal::{SignalState, TOWER_RING_RADIUS};
-use crate::state::{complete_floor, AppState, GameSet, PlayerModifiers, RunStats};
+use crate::state::{complete_floor, is_boss_floor, AppState, GameSet, PlayerModifiers, RunStats, FINAL_FLOOR};
 use crate::weapons::{spawn_pickup, CombatDamage, PickupAssets, PickupKind};
 
 pub const UPLINK_HOLD_RADIUS: f32 = 4.5;
@@ -66,7 +66,27 @@ impl Default for ExtractionState {
 
 /// Seconds of uplink at 100% rate for a floor.
 pub fn upload_duration(floor: u32) -> f32 {
-    24.0 + (floor.max(1) - 1) as f32 * 5.0
+    // Endless floors stop lengthening the uplink at Floor 10 (69 s).
+    24.0 + (floor.clamp(1, 10) - 1) as f32 * 5.0
+}
+
+/// Living-demon ceiling of the Demon Rush (keeps deep Endless floors at 90-120 FPS).
+pub const MAX_RUSH_CAP: usize = 26;
+
+/// Endless Boss Rematch floors (10, 15, 20, ...): an extra Overdrive Hell
+/// Baron wave crashes the SOS. Floor 5 keeps its standard single Baron.
+pub fn is_endless_rematch(floor: u32) -> bool {
+    floor > FINAL_FLOOR && is_boss_floor(floor)
+}
+
+/// Hell Barons in an Endless Boss Rematch wave (2 on Floor 10, 3 from Floor 20).
+pub fn rematch_baron_count(floor: u32) -> usize {
+    if floor >= 4 * FINAL_FLOOR { 3 } else { 2 }
+}
+
+/// The rematch alert text.
+pub fn rematch_alert(floor: u32) -> String {
+    format!("ENDLESS BOSS REMATCH - FLOOR {floor}!")
 }
 
 /// Upload speed multiplier.
@@ -92,7 +112,7 @@ pub fn fiend_jams_uplink(fiends: &[Vec3], tower: Vec3) -> bool {
 
 /// Max living demons during the rush (FPS + fairness cap).
 pub fn rush_cap(floor: u32) -> usize {
-    9 + 2 * floor.max(1) as usize
+    (9 + 2 * floor.max(1) as usize).min(MAX_RUSH_CAP)
 }
 
 /// Seconds between Demon Rush waves: 5.0..6.5s on Floor 1, tighter deeper down.
@@ -299,7 +319,7 @@ fn update_extraction(
     mut players: Query<(&Transform, &mut Player)>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform)>,
     projectiles: Query<Entity, With<EnemyProjectile>>,
-    (mut bot, pickups, mut beacon_timer, mut supply_idx, mut second_wind, mut supply_cells, mut fiends): (
+    (mut bot, pickups, mut beacon_timer, mut supply_idx, mut second_wind, mut supply_cells, mut fiends, mut rematch_spawned): (
         Option<ResMut<BotControl>>,
         Option<Res<PickupAssets>>,
         Local<f32>,
@@ -307,6 +327,7 @@ fn update_extraction(
         Local<bool>,
         Local<Option<Vec<IVec2>>>,
         Local<Vec<Vec3>>,
+        Local<bool>,
     ),
 ) {
     // Ring supply cells are a pure function of the current LevelGrid: refresh
@@ -348,6 +369,7 @@ fn update_extraction(
                 // Tactical supply drops on the ring perimeter: kiting the tower pays.
                 *supply_idx = 0;
                 *second_wind = false;
+                *rematch_spawned = false;
                 *beacon_timer = 0.0;
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, if run.floor <= 1 { PickupKind::Armor } else { PickupKind::Shells }, &mut supply_idx);
@@ -458,6 +480,20 @@ fn update_extraction(
                 feed.alert("WARNING: HELL BARON INBOUND!", Color::srgb(1.0, 0.55, 0.1), 3.5);
                 // Emergency medkit on the ring edge.
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
+            }
+            // Endless Boss Rematch: an Overdrive Hell Baron wave at 30%.
+            if is_endless_rematch(floor) && *progress >= 0.3 && !*rematch_spawned {
+                *rematch_spawned = true;
+                for _ in 0..rematch_baron_count(floor) {
+                    if let Some(c) = pick_cell(&mut rng) {
+                        let pos = spawn_pos_for(EnemyKind::HellBaron, &grid, c);
+                        spawn_enemy(&mut commands, &ea, &mut materials, EnemyKind::HellBaron, pos, floor, true);
+                        spawn_burst(&mut commands, &fx, pos + Vec3::Y * 1.5, BurstColor::Gold, 24, 6.0, 0.2);
+                    }
+                }
+                sfx.play(SfxEvent::BaronAlert);
+                feed.alert(rematch_alert(floor), Color::srgb(1.0, 0.25, 0.85), 4.0);
+                drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Armor, &mut supply_idx);
             }
             if state.advance_upload(dt, ring, jam) {
                 // Orbital extraction: beam + vaporize.
@@ -643,6 +679,12 @@ mod tests {
         assert!(cells.len() > 10);
         assert!(rush_cap(5) > rush_cap(1));
         assert_eq!(rush_cap(1), 11);
+        assert_eq!(rush_cap(5), 19, "standard floors unchanged");
+        assert!(rush_cap(30) <= MAX_RUSH_CAP && rush_cap(500) == MAX_RUSH_CAP);
+        assert_eq!(upload_duration(5), 44.0);
+        assert_eq!(upload_duration(40), upload_duration(10));
+        assert!(!is_endless_rematch(5) && !is_endless_rematch(9) && is_endless_rematch(10) && is_endless_rematch(15));
+        assert_eq!(rematch_alert(10), "ENDLESS BOSS REMATCH - FLOOR 10!");
     }
 
     #[test]

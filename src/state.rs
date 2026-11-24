@@ -7,6 +7,11 @@
 //! [`RunStats::advance_floor`], which tells the caller where to go next; the level
 //! module rebuilds the labyrinth automatically on the next `OnEnter(Playing)`
 //! whenever `RunStats::floor` differs from the floor of the current `LevelGrid`.
+//!
+//! Endless Overdrive: from `Victory` the player may keep descending
+//! ([`continue_into_endless`]): `Victory -> UpgradeSelect -> Playing` on Floor 6+,
+//! where every cleared floor simply advances (no further victories). Every
+//! [`FINAL_FLOOR`]-th floor is a boss floor ([`is_boss_floor`]).
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -28,6 +33,20 @@ pub enum AppState {
     Loadout,
     /// Carrier contracts toggles, lifetime stats and the feats list.
     ContractsFeats,
+    /// Input / camera / audio / reticle options. Reachable from `MainMenu`
+    /// and `Paused`; it is NOT a pre-run screen, so opening it mid-run keeps
+    /// the player and the level alive (see [`SettingsReturn`]).
+    Settings,
+}
+
+/// Where `Settings` returns to (`MainMenu` or `Paused`).
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsReturn(pub AppState);
+
+impl Default for SettingsReturn {
+    fn default() -> Self {
+        SettingsReturn(AppState::MainMenu)
+    }
 }
 
 impl AppState {
@@ -261,6 +280,45 @@ impl Default for PlayerModifiers {
     }
 }
 
+/// Boss floors: 5, 10, 15, 20, ... (Floor 10+ are Endless boss rematches).
+pub fn is_boss_floor(floor: u32) -> bool {
+    floor >= FINAL_FLOOR && floor.is_multiple_of(FINAL_FLOOR)
+}
+
+/// Lifetime counters of a run already folded into the profile (at Victory),
+/// so an Endless continuation only adds what happened afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecordedRunTotals {
+    pub kills: u32,
+    pub jammers: u32,
+    pub fiends: u32,
+    pub blackout_kills: u32,
+    pub sos_completed: u32,
+}
+
+impl RecordedRunTotals {
+    pub fn of(run: &RunStats) -> Self {
+        RecordedRunTotals {
+            kills: run.kills,
+            jammers: run.jammers_destroyed,
+            fiends: run.fiends_killed,
+            blackout_kills: run.blackout_kills,
+            sos_completed: run.sos_completed,
+        }
+    }
+
+    /// Saturating per-counter difference `self - earlier`.
+    pub fn delta_since(&self, earlier: &RecordedRunTotals) -> Self {
+        RecordedRunTotals {
+            kills: self.kills.saturating_sub(earlier.kills),
+            jammers: self.jammers.saturating_sub(earlier.jammers),
+            fiends: self.fiends.saturating_sub(earlier.fiends),
+            blackout_kills: self.blackout_kills.saturating_sub(earlier.blackout_kills),
+            sos_completed: self.sos_completed.saturating_sub(earlier.sos_completed),
+        }
+    }
+}
+
 /// Where to go after clearing a floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloorAdvance {
@@ -272,7 +330,7 @@ pub enum FloorAdvance {
 
 #[derive(Resource, Debug, Clone)]
 pub struct RunStats {
-    /// Current floor, `1..=FINAL_FLOOR`.
+    /// Current floor, `1..=FINAL_FLOOR` (beyond it in Endless Overdrive).
     pub floor: u32,
     pub kills: u32,
     pub jammers_destroyed: u32,
@@ -293,6 +351,14 @@ pub struct RunStats {
     pub run_recorded: bool,
     /// F9 debug floor skip was used during this run (disqualifies profile recording).
     pub debug_skipped: bool,
+    /// Top horizontal speed reached this run (m/s).
+    pub peak_speed: f32,
+    /// Longest bunny-hop chain linked this run.
+    pub max_bhop_chain: u32,
+    /// The run continued past Victory into Endless Overdrive (Floor 6+).
+    pub endless: bool,
+    /// Counters already folded into the profile at the Floor 5 Victory.
+    pub recorded_snapshot: Option<RecordedRunTotals>,
 }
 
 impl Default for RunStats {
@@ -310,6 +376,10 @@ impl Default for RunStats {
             floors_cleared: 0,
             run_recorded: false,
             debug_skipped: false,
+            peak_speed: 0.0,
+            max_bhop_chain: 0,
+            endless: false,
+            recorded_snapshot: None,
         }
     }
 }
@@ -323,6 +393,14 @@ impl RunStats {
         };
     }
 
+    /// Fold this frame's movement into the run's telemetry.
+    pub fn track_movement(&mut self, horizontal_speed: f32, bhop_chain: u32) {
+        if horizontal_speed.is_finite() {
+            self.peak_speed = self.peak_speed.max(horizontal_speed);
+        }
+        self.max_bhop_chain = self.max_bhop_chain.max(bhop_chain);
+    }
+
     /// Deterministic labyrinth seed for the current floor.
     pub fn floor_seed(&self) -> u64 {
         self.run_seed
@@ -333,7 +411,10 @@ impl RunStats {
     /// Mark the current floor cleared. Returns where the game should go next.
     pub fn advance_floor(&mut self) -> FloorAdvance {
         self.floors_cleared += 1;
-        if self.floor >= FINAL_FLOOR {
+        if self.endless {
+            self.floor += 1;
+            FloorAdvance::NextFloor(self.floor)
+        } else if self.floor >= FINAL_FLOOR {
             FloorAdvance::Victory
         } else {
             self.floor += 1;
@@ -362,11 +443,23 @@ pub fn complete_floor(run: &mut RunStats, next: &mut NextState<AppState>) -> Flo
     adv
 }
 
+/// Victory "KEEP DESCENDING": enter Endless Overdrive. The player, level and
+/// upgrades stay alive; the Floor 5 -> 6 upgrade is drafted first. The Victory
+/// record stays in the profile (`recorded_snapshot`), so a later death only
+/// adds what happened after Floor 5.
+pub fn continue_into_endless(run: &mut RunStats, next: &mut NextState<AppState>) {
+    run.endless = true;
+    run.floor = run.floor.max(FINAL_FLOOR) + 1;
+    run.run_recorded = false;
+    next.set(AppState::UpgradeSelect);
+}
+
 pub struct StatePlugin;
 
 impl Plugin for StatePlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<AppState>()
+            .init_resource::<SettingsReturn>()
             .init_resource::<RunStats>()
             .init_resource::<PlayerModifiers>()
             .configure_sets(
@@ -403,6 +496,43 @@ mod tests {
         assert_eq!(run.advance_floor(), FloorAdvance::Victory);
         assert_eq!(run.floor, FINAL_FLOOR);
         assert_eq!(run.floors_cleared, FINAL_FLOOR, "victory counts the final floor");
+    }
+
+    #[test]
+    fn endless_never_retriggers_victory_and_boss_floors_repeat() {
+        let mut run = RunStats { floor: FINAL_FLOOR, ..default() };
+        assert_eq!(run.advance_floor(), FloorAdvance::Victory);
+        run.run_recorded = true;
+        run.recorded_snapshot = Some(RecordedRunTotals::default());
+        let mut next = NextState::<AppState>::default();
+        continue_into_endless(&mut run, &mut next);
+        assert!(matches!(next, NextState::Pending(AppState::UpgradeSelect)));
+        assert!(run.endless && !run.run_recorded && run.recorded_snapshot.is_some());
+        assert_eq!(run.floor, FINAL_FLOOR + 1);
+        for f in FINAL_FLOOR + 2..=FINAL_FLOOR + 12 {
+            assert_eq!(run.advance_floor(), FloorAdvance::NextFloor(f));
+        }
+        assert!(!is_boss_floor(1) && !is_boss_floor(4) && !is_boss_floor(6) && !is_boss_floor(0));
+        assert!(is_boss_floor(5) && is_boss_floor(10) && is_boss_floor(15) && is_boss_floor(20));
+        assert!(!AppState::Settings.is_pre_run(), "Settings mid-run keeps the run alive");
+        assert_eq!(SettingsReturn::default().0, AppState::MainMenu);
+    }
+
+    #[test]
+    fn movement_telemetry_and_totals_delta() {
+        let mut run = RunStats::default();
+        run.track_movement(12.0, 1);
+        run.track_movement(31.5, 4);
+        run.track_movement(5.0, 0);
+        run.track_movement(f32::NAN, 0);
+        assert_eq!((run.peak_speed, run.max_bhop_chain), (31.5, 4));
+        run.kills = 10;
+        run.sos_completed = 5;
+        let snap = RecordedRunTotals::of(&run);
+        run.kills = 14;
+        run.sos_completed = 7;
+        let d = RecordedRunTotals::of(&run).delta_since(&snap);
+        assert_eq!((d.kills, d.sos_completed, d.jammers), (4, 2, 0));
     }
 
     #[test]

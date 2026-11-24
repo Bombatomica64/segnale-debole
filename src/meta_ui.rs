@@ -18,7 +18,7 @@ use bevy::ui::UiGlobalTransform;
 use bevy::window::PrimaryWindow;
 
 use crate::audio::{SfxEvent, SfxQueue};
-use crate::hud::{text, MenuAction, COLOR_BG, COLOR_CYAN, COLOR_DIM, COLOR_GOLD, COLOR_SIGNAL_AMBER, COLOR_SIGNAL_GREEN, COLOR_SIGNAL_RED};
+use crate::hud::{spawn_crosshair, text, MenuAction, CROSSHAIR_BOX, COLOR_BG, COLOR_CYAN, COLOR_DIM, COLOR_GOLD, COLOR_SIGNAL_AMBER, COLOR_SIGNAL_GREEN, COLOR_SIGNAL_RED};
 use crate::ui_kit::{
     hard_shadow, inset_border, plate_border, plate_rect, punk_button, punk_screen_root, rivet_card, section_crate, set_strip_tape, stamped_tag,
     stencil_title, tape_image, terminal_chassis, ButtonStyle, ChassisStrip, Tape, TerminalChassis, UiKitTextures, ACID_DARK, ACID_GREEN,
@@ -26,10 +26,12 @@ use crate::ui_kit::{
     STEEL_BORDER,
 };
 use crate::meta::{
-    default_catalog, CarrierContract, FeatId, HandsetSkin, LifetimeStats, PlayerProfile, ProfileStore, RunLoadout, RunUnlockSummary,
-    StarterChip, ACTIVE_CATALOG_SIZE,
+    default_catalog, CarrierContract, CrosshairColor, CrosshairStyle, FeatId, HandsetSkin, LifetimeStats, PlayerProfile, ProfileStore,
+    RunLoadout, RunUnlockSummary, StarterChip, UserSettings, ACTIVE_CATALOG_SIZE, BASE_FOV_RANGE, EFFECT_SCALE_RANGE, MOUSE_SENS_RANGE,
+    VOLUME_RANGE,
 };
-use crate::state::{AppState, UpgradeId, FINAL_FLOOR};
+use crate::player::PlayerCamera;
+use crate::state::{AppState, SettingsReturn, UpgradeId, FINAL_FLOOR};
 
 const PHONE_WIDTH: f32 = 1240.0;
 /// Height of the danger-tape trim on contract cards (an authored tape height).
@@ -189,12 +191,21 @@ pub fn lifetime_stat_cells(s: &LifetimeStats) -> Vec<(&'static str, String)> {
     vec![
         ("RUNS", s.runs_played.to_string()),
         ("WINS", s.victories.to_string()),
-        ("BEST FLOOR", format!("{}/{}", s.best_floor, FINAL_FLOOR)),
+        ("BEST FLOOR", if s.best_floor > FINAL_FLOOR { format!("FL {}", s.best_floor) } else { format!("{}/{}", s.best_floor, FINAL_FLOOR) }),
         ("KILLS", s.total_kills.to_string()),
         ("JAMMERS", s.total_jammers.to_string()),
         ("0-BAR KILLS", s.total_blackout_kills.to_string()),
         ("BEST TIME", s.fastest_victory_secs.map_or_else(|| "--:--".to_string(), fmt_mmss)),
         ("MAX CONTRACTS", format!("{}/{}", s.max_contracts_cleared, CarrierContract::ALL.len())),
+    ]
+}
+
+/// The movement / Endless records strip: `(label, value)` cells.
+pub fn record_stat_cells(s: &LifetimeStats) -> Vec<(&'static str, String)> {
+    vec![
+        ("TOP SPEED", if s.best_speed > 0.0 { format!("{:.1} M/S", s.best_speed) } else { "--.- M/S".to_string() }),
+        ("BEST BHOP CHAIN", if s.best_bhop_chain > 0 { format!("x{}", s.best_bhop_chain) } else { "0".to_string() }),
+        ("ENDLESS BEST", if s.best_endless_floor > 0 { format!("FL {}", s.best_endless_floor) } else { "--".to_string() }),
     ]
 }
 
@@ -548,6 +559,7 @@ pub struct MetaUiPlugin;
 impl Plugin for MetaUiPlugin {
     fn build(&self, app: &mut App) {
         let meta_screen = in_state(AppState::Loadout).or_else(in_state(AppState::ContractsFeats));
+        add_settings_systems(app);
         app.init_resource::<MetaFeedback>()
             .init_resource::<MetaHover>()
             .add_systems(OnEnter(AppState::Loadout), (reset_feedback, spawn_loadout_screen).chain())
@@ -559,7 +571,7 @@ impl Plugin for MetaUiPlugin {
             )
             .add_systems(
                 Update,
-                refresh_meta_ui.after(meta_card_clicks).run_if(not(in_state(AppState::Playing)).and_then(not(in_state(AppState::UpgradeSelect)))),
+                refresh_meta_ui.after(meta_card_clicks).after(settings_clicks).run_if(not(in_state(AppState::Playing)).and_then(not(in_state(AppState::UpgradeSelect)))),
             );
     }
 }
@@ -1055,47 +1067,11 @@ fn spawn_contracts_screen(
         commands.spawn((ChildOf(cardx), text(c.description(), 12.0, BONE_TEXT.with_alpha(0.78))));
     }
 
-    // Lifetime-stats readout: a stamped tape block + eight recessed cells.
+    // Lifetime-stats readout: a stamped tape block + eight recessed cells,
+    // then the movement / Endless records strip.
     // Untouched records (0 / --:--) stay dim so real numbers carry the eye.
-    let strip = commands
-        .spawn((
-            ChildOf(phone),
-            Node { width: Val::Percent(100.0), align_items: AlignItems::Stretch, border: plate_rect((0.0, 2.0, 2.0, 2.0)), ..default() },
-            BorderColor { left: Color::NONE, ..inset_border() },
-            BackgroundColor(INK_BLACK.with_alpha(0.74)),
-        ))
-        .id();
-    commands.spawn((
-        ChildOf(strip),
-        Node {
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::FlexStart,
-            justify_content: JustifyContent::Center,
-            padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-            flex_shrink: 0.0,
-            ..default()
-        },
-        BackgroundColor(HAZARD_YELLOW),
-        children![text("LIFETIME", 13.0, INK_BLACK), text("SERVICE LOG", 10.0, INK_BLACK.with_alpha(0.8))],
-    ));
-    for (label, value) in lifetime_stat_cells(&p.stats) {
-        let blank = stat_is_blank(&value);
-        commands.spawn((
-            ChildOf(strip),
-            Node {
-                flex_grow: 1.0,
-                flex_basis: Val::Px(0.0),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(1.0),
-                padding: UiRect::vertical(Val::Px(5.0)),
-                border: UiRect::left(Val::Px(1.0)),
-                ..default()
-            },
-            BorderColor::all(STEEL_BORDER.with_alpha(0.5)),
-            children![text(label, 10.0, ASH_DIM), text(value, 19.0, if blank { ASH_DIM.with_alpha(0.7) } else { BONE_TEXT })],
-        ));
-    }
+    stat_strip(&mut commands, phone, ("LIFETIME", "SERVICE LOG"), HAZARD_YELLOW, lifetime_stat_cells(&p.stats), 19.0);
+    stat_strip(&mut commands, phone, ("RECORDS", "MOVEMENT // ENDLESS"), ARC_CYAN, record_stat_cells(&p.stats), 16.0);
 
     // Feats manifest.
     let done = FeatId::ALL.iter().filter(|f| p.has_feat(**f)).count();
@@ -1149,6 +1125,50 @@ fn spawn_contracts_screen(
 
 /// Contracts screen: the terminal's tape strips + left rail flip to crimson
 /// danger stripes while any contract is signed.
+/// Recessed stat readout: a stamped tape block followed by equal cells.
+fn stat_strip(commands: &mut Commands, parent: Entity, (title, sub): (&str, &str), tape: Color, cells: Vec<(&'static str, String)>, font: f32) {
+    let strip = commands
+        .spawn((
+            ChildOf(parent),
+            Node { width: Val::Percent(100.0), align_items: AlignItems::Stretch, border: plate_rect((0.0, 2.0, 2.0, 2.0)), ..default() },
+            BorderColor { left: Color::NONE, ..inset_border() },
+            BackgroundColor(INK_BLACK.with_alpha(0.74)),
+        ))
+        .id();
+    commands.spawn((
+        ChildOf(strip),
+        Node {
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::FlexStart,
+            justify_content: JustifyContent::Center,
+            padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+            width: Val::Px(150.0),
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BackgroundColor(tape),
+        children![text(title, 13.0, INK_BLACK), text(sub, 10.0, INK_BLACK.with_alpha(0.8))],
+    ));
+    for (label, value) in cells {
+        let blank = stat_is_blank(&value);
+        commands.spawn((
+            ChildOf(strip),
+            Node {
+                flex_grow: 1.0,
+                flex_basis: Val::Px(0.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(1.0),
+                padding: UiRect::vertical(Val::Px(if font > 17.0 { 5.0 } else { 3.0 })),
+                border: UiRect::left(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(STEEL_BORDER.with_alpha(0.5)),
+            children![text(label, 10.0, ASH_DIM), text(value, font, if blank { ASH_DIM.with_alpha(0.7) } else { BONE_TEXT })],
+        ));
+    }
+}
+
 fn refresh_contract_chassis(
     store: Res<ProfileStore>,
     tex: Option<Res<UiKitTextures>>,
@@ -1169,10 +1189,656 @@ fn refresh_contract_chassis(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SETTINGS screen
+// ---------------------------------------------------------------------------
+
+/// A numeric setting adjusted with `-` / `+`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingKnob {
+    Sensitivity,
+    BaseFov,
+    SpeedFov,
+    StrafeRoll,
+    Volume,
+}
+
+impl SettingKnob {
+    pub const ALL: [SettingKnob; 5] = [SettingKnob::Sensitivity, SettingKnob::BaseFov, SettingKnob::SpeedFov, SettingKnob::StrafeRoll, SettingKnob::Volume];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingKnob::Sensitivity => "MOUSE SENSITIVITY",
+            SettingKnob::BaseFov => "BASE FOV",
+            SettingKnob::SpeedFov => "SPEED FOV INTENSITY",
+            SettingKnob::StrafeRoll => "STRAFE ROLL INTENSITY",
+            SettingKnob::Volume => "MASTER VOLUME",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            SettingKnob::Sensitivity => "multiplier on mouse look",
+            SettingKnob::BaseFov => "resting vertical field of view",
+            SettingKnob::SpeedFov => "view widening at speed / dash",
+            SettingKnob::StrafeRoll => "camera lean into strafes",
+            SettingKnob::Volume => "every sound effect",
+        }
+    }
+
+    /// `(min, max, step)`.
+    pub fn range(self) -> (f32, f32, f32) {
+        match self {
+            SettingKnob::Sensitivity => (MOUSE_SENS_RANGE.0, MOUSE_SENS_RANGE.1, 0.05),
+            SettingKnob::BaseFov => (BASE_FOV_RANGE.0, BASE_FOV_RANGE.1, 5.0),
+            SettingKnob::SpeedFov | SettingKnob::StrafeRoll => (EFFECT_SCALE_RANGE.0, EFFECT_SCALE_RANGE.1, 0.25),
+            SettingKnob::Volume => (VOLUME_RANGE.0, VOLUME_RANGE.1, 0.1),
+        }
+    }
+
+    pub fn get(self, s: &UserSettings) -> f32 {
+        match self {
+            SettingKnob::Sensitivity => s.mouse_sensitivity,
+            SettingKnob::BaseFov => s.base_fov_deg,
+            SettingKnob::SpeedFov => s.speed_fov_scale,
+            SettingKnob::StrafeRoll => s.strafe_roll_scale,
+            SettingKnob::Volume => s.audio_master_volume,
+        }
+    }
+
+    fn slot(self, s: &mut UserSettings) -> &mut f32 {
+        match self {
+            SettingKnob::Sensitivity => &mut s.mouse_sensitivity,
+            SettingKnob::BaseFov => &mut s.base_fov_deg,
+            SettingKnob::SpeedFov => &mut s.speed_fov_scale,
+            SettingKnob::StrafeRoll => &mut s.strafe_roll_scale,
+            SettingKnob::Volume => &mut s.audio_master_volume,
+        }
+    }
+
+    /// The toggle gating this knob (its meter dims while the toggle is off).
+    pub fn gate(self) -> Option<SettingToggle> {
+        match self {
+            SettingKnob::SpeedFov => Some(SettingToggle::SpeedFov),
+            SettingKnob::StrafeRoll => Some(SettingToggle::StrafeRoll),
+            SettingKnob::Volume => Some(SettingToggle::Mute),
+            SettingKnob::Sensitivity | SettingKnob::BaseFov => None,
+        }
+    }
+
+    /// Readout of the current value.
+    pub fn value_text(self, s: &UserSettings) -> String {
+        let v = self.get(s);
+        match self {
+            SettingKnob::Sensitivity => format!("{v:.2}x"),
+            SettingKnob::BaseFov => format!("{v:.0} DEG"),
+            SettingKnob::SpeedFov | SettingKnob::StrafeRoll | SettingKnob::Volume => format!("{:.0}%", v * 100.0),
+        }
+    }
+
+    /// Position of the value in its range (0..=1).
+    pub fn fraction(self, s: &UserSettings) -> f32 {
+        let (lo, hi, _) = self.range();
+        ((self.get(s) - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
+}
+
+/// An on/off setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingToggle {
+    SpeedFov,
+    StrafeRoll,
+    Mute,
+}
+
+impl SettingToggle {
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingToggle::SpeedFov => "DYNAMIC SPEED FOV",
+            SettingToggle::StrafeRoll => "STRAFE ROLL",
+            SettingToggle::Mute => "MUTE ALL AUDIO",
+        }
+    }
+
+    fn slot(self, s: &mut UserSettings) -> &mut bool {
+        match self {
+            SettingToggle::SpeedFov => &mut s.speed_fov_enabled,
+            SettingToggle::StrafeRoll => &mut s.strafe_roll_enabled,
+            SettingToggle::Mute => &mut s.audio_muted,
+        }
+    }
+
+    pub fn get(self, s: &UserSettings) -> bool {
+        match self {
+            SettingToggle::SpeedFov => s.speed_fov_enabled,
+            SettingToggle::StrafeRoll => s.strafe_roll_enabled,
+            SettingToggle::Mute => s.audio_muted,
+        }
+    }
+
+    /// Whether the effect this toggle gates is live (mute inverts).
+    pub fn effect_live(self, s: &UserSettings) -> bool {
+        if self == SettingToggle::Mute { !s.audio_muted } else { self.get(s) }
+    }
+
+    pub fn state_text(self, s: &UserSettings) -> &'static str {
+        match (self, self.get(s)) {
+            (SettingToggle::Mute, true) => "MUTED",
+            (SettingToggle::Mute, false) => "LIVE",
+            (_, true) => "ON",
+            (_, false) => "OFF",
+        }
+    }
+}
+
+/// Something clickable on the Settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingsTarget {
+    Down(SettingKnob),
+    Up(SettingKnob),
+    Toggle(SettingToggle),
+    Style(CrosshairStyle),
+    Color(CrosshairColor),
+    ResetDefaults,
+}
+
+/// Apply a Settings click (no saving; see [`commit_settings_edit`]).
+pub fn apply_settings_edit(s: &mut UserSettings, t: SettingsTarget) -> EditOutcome {
+    s.sanitize();
+    match t {
+        SettingsTarget::Down(k) | SettingsTarget::Up(k) => {
+            let (lo, hi, step) = k.range();
+            let dir = if matches!(t, SettingsTarget::Up(_)) { 1.0 } else { -1.0 };
+            let slot = k.slot(s);
+            // Snap to the step grid so repeated clicks never drift.
+            let want = (((*slot + dir * step) / step).round() * step).clamp(lo, hi);
+            if (want - *slot).abs() < 1e-4 {
+                let edge = if dir > 0.0 { "MAX" } else { "MIN" };
+                EditOutcome::Unchanged(format!("{} already at {edge}", k.label()))
+            } else {
+                *slot = want;
+                EditOutcome::Changed(format!("{} -> {}", k.label(), k.value_text(s)))
+            }
+        }
+        SettingsTarget::Toggle(g) => {
+            let slot = g.slot(s);
+            *slot = !*slot;
+            EditOutcome::Changed(format!("{}: {}", g.label(), g.state_text(s)))
+        }
+        SettingsTarget::Style(st) => {
+            if s.crosshair_style == st {
+                EditOutcome::Unchanged(format!("Reticle already {}", st.name()))
+            } else {
+                s.crosshair_style = st;
+                EditOutcome::Changed(format!("Reticle style -> {}", st.name()))
+            }
+        }
+        SettingsTarget::Color(c) => {
+            if s.crosshair_color == c {
+                EditOutcome::Unchanged(format!("Reticle already {}", c.name()))
+            } else {
+                s.crosshair_color = c;
+                EditOutcome::Changed(format!("Reticle color -> {}", c.name()))
+            }
+        }
+        SettingsTarget::ResetDefaults => {
+            if *s == UserSettings::default() {
+                EditOutcome::Unchanged("Settings already at factory defaults".to_string())
+            } else {
+                *s = UserSettings::default();
+                EditOutcome::Changed("Settings reset to factory defaults".to_string())
+            }
+        }
+    }
+}
+
+/// Apply a Settings click to the profile and persist it immediately (same
+/// save / retry semantics as [`commit_meta_edit`]).
+pub fn commit_settings_edit(store: &mut ProfileStore, t: SettingsTarget) -> EditOutcome {
+    let out = apply_settings_edit(&mut store.profile.settings, t);
+    let changed = matches!(out, EditOutcome::Changed(_));
+    if changed || store.dirty {
+        if let Err(e) = store.try_save() {
+            warn!("profile save failed (marked dirty): {e}");
+            return EditOutcome::Denied(format!("SAVE FAILED ({e}) - unsaved changes kept, retry anytime"));
+        }
+        if !changed {
+            return EditOutcome::Changed("Saved pending profile changes".to_string());
+        }
+    }
+    out
+}
+
+/// Clickable control on the Settings screen.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsControl(pub SettingsTarget);
+
+/// Live Settings readouts.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsLabel {
+    Knob(SettingKnob),
+    Toggle(SettingToggle),
+    /// Label inside a clickable control (follows the control's text color).
+    Control(SettingsTarget),
+    PreviewCaption,
+}
+
+/// Pip `i` of a knob's meter.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsPip(pub SettingKnob, pub u8);
+
+/// Container of the live reticle preview (rebuilt on reticle changes).
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReticlePreview(pub CrosshairStyle, pub CrosshairColor);
+
+/// Pips per knob meter.
+pub const SETTINGS_PIPS: u8 = 12;
+
+/// Lit pips of a knob meter.
+pub fn lit_settings_pips(k: SettingKnob, s: &UserSettings) -> u8 {
+    (k.fraction(s) * SETTINGS_PIPS as f32).round() as u8
+}
+
+/// The control under the cursor this frame.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+struct SettingsHover(Option<SettingsTarget>);
+
+/// Whether a control currently reads "selected / on".
+fn control_active(s: &UserSettings, t: SettingsTarget) -> bool {
+    match t {
+        SettingsTarget::Toggle(g) => g.get(s),
+        SettingsTarget::Style(st) => s.crosshair_style == st,
+        SettingsTarget::Color(c) => s.crosshair_color == c,
+        SettingsTarget::Down(_) | SettingsTarget::Up(_) | SettingsTarget::ResetDefaults => false,
+    }
+}
+
+/// `(fill, rail, edge, text)` of a control.
+fn control_look(t: SettingsTarget, active: bool, hovered: bool) -> (Color, Color, Color, Color) {
+    let accent = match t {
+        SettingsTarget::ResetDefaults => PUNK_RED,
+        SettingsTarget::Toggle(SettingToggle::Mute) => PUNK_RED,
+        SettingsTarget::Toggle(_) => ACID_GREEN,
+        SettingsTarget::Style(_) => ARC_CYAN,
+        SettingsTarget::Color(c) => c.color().with_alpha(1.0),
+        SettingsTarget::Down(_) | SettingsTarget::Up(_) => HAZARD_YELLOW,
+    };
+    if let SettingsTarget::Color(_) = t {
+        // The equipped (or hovered) swatch shows full paint in a bone frame;
+        // the others sit dimmed, so the pick reads even on the white swatch.
+        let lit = active || hovered;
+        let fill = if lit { accent } else { accent.mix(&INK_BLACK, 0.4) };
+        let edge = if active { BONE_TEXT } else if hovered { accent } else { STEEL_BORDER };
+        return (fill, if active { BONE_TEXT } else { accent.mix(&INK_BLACK, 0.55) }, edge, INK_BLACK);
+    }
+    match (active, hovered) {
+        (_, true) => (accent, accent, BONE_TEXT, INK_BLACK),
+        (true, false) => (accent.mix(&INK_BLACK, 0.72), accent, accent.with_alpha(0.8), accent.mix(&BONE_TEXT, 0.35)),
+        (false, false) => (IRON_MID, STEEL_BORDER, STEEL_BORDER, BONE_TEXT),
+    }
+}
+
+/// Settings screen plugin pieces (registered by [`MetaUiPlugin`]).
+fn add_settings_systems(app: &mut App) {
+    app.init_resource::<SettingsHover>()
+        .add_systems(OnEnter(AppState::Settings), (reset_feedback, spawn_settings_screen).chain())
+        .add_systems(Update, (settings_clicks, refresh_settings_ui).chain().run_if(in_state(AppState::Settings)));
+}
+
+fn settings_clicks(
+    window: Query<&Window, With<PrimaryWindow>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    controls: Query<(&ComputedNode, &UiGlobalTransform, &SettingsControl)>,
+    mut store: ResMut<ProfileStore>,
+    mut fb: ResMut<MetaFeedback>,
+    mut hover: ResMut<SettingsHover>,
+    mut sfx: ResMut<SfxQueue>,
+) {
+    let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
+    let now = cursor.and_then(|c| controls.iter().find(|(n, tf, _)| n.contains_point(**tf, c)).map(|(_, _, ctl)| ctl.0));
+    if hover.0 != now {
+        hover.0 = now;
+    }
+    if let Some(t) = hover.0
+        && mouse.just_released(MouseButton::Left)
+    {
+        let (text, color) = match commit_settings_edit(&mut store, t) {
+            EditOutcome::Changed(s) => {
+                sfx.play(SfxEvent::UpgradeSelect);
+                (s, COLOR_SIGNAL_GREEN)
+            }
+            EditOutcome::Denied(s) => {
+                sfx.play(SfxEvent::Denied);
+                (s, COLOR_SIGNAL_RED)
+            }
+            EditOutcome::Unchanged(s) => (s, COLOR_CYAN),
+        };
+        *fb = MetaFeedback { text, color };
+    }
+}
+
+/// Restyle controls, meters and readouts from the live settings; rebuild the
+/// reticle preview when its style / color changed.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn refresh_settings_ui(
+    mut commands: Commands,
+    store: Res<ProfileStore>,
+    hover: Res<SettingsHover>,
+    mut controls: Query<(&SettingsControl, &mut BackgroundColor, &mut BorderColor), Without<SettingsPip>>,
+    mut pips: Query<(&SettingsPip, &mut BackgroundColor), Without<SettingsControl>>,
+    mut labels: Query<(&SettingsLabel, &mut Text, &mut TextColor)>,
+    mut preview: Query<(Entity, &mut ReticlePreview)>,
+    fresh: Query<(), Added<SettingsLabel>>,
+) {
+    let s = store.profile.settings.sanitized();
+    for (ctl, mut bg, mut border) in &mut controls {
+        let (fill, rail, edge, _) = control_look(ctl.0, control_active(&s, ctl.0), hover.0 == Some(ctl.0));
+        if bg.0 != fill {
+            bg.0 = fill;
+        }
+        let nb = plate_border(rail, edge);
+        if *border != nb {
+            *border = nb;
+        }
+    }
+    for (pip, mut bg) in &mut pips {
+        let live = pip.0.gate().is_none_or(|g| g.effect_live(&s));
+        let lit = pip.1 < lit_settings_pips(pip.0, &s);
+        let accent = if pip.0 == SettingKnob::Volume { ACID_GREEN } else { ARC_CYAN };
+        let c = match (lit, live) {
+            (true, true) => accent,
+            (true, false) => ASH_DIM.with_alpha(0.55),
+            (false, _) => Color::srgba(1.0, 1.0, 1.0, 0.07),
+        };
+        if bg.0 != c {
+            bg.0 = c;
+        }
+    }
+    let retext = store.is_changed() || !fresh.is_empty();
+    for (label, mut txt, mut col) in &mut labels {
+        let (value, color): (Option<String>, Color) = match *label {
+            SettingsLabel::Knob(k) => {
+                let live = k.gate().is_none_or(|g| g.effect_live(&s));
+                (retext.then(|| k.value_text(&s)), if live { BONE_TEXT } else { ASH_DIM })
+            }
+            SettingsLabel::Toggle(g) => {
+                let on = g.effect_live(&s);
+                (retext.then(|| g.state_text(&s).to_string()), if on { ACID_GREEN } else { PUNK_RED })
+            }
+            SettingsLabel::Control(t) => (None, control_look(t, control_active(&s, t), hover.0 == Some(t)).3),
+            SettingsLabel::PreviewCaption => {
+                (retext.then(|| format!("{} // {}", s.crosshair_style.name(), s.crosshair_color.name())), s.crosshair_color.color().with_alpha(1.0))
+            }
+        };
+        if let Some(v) = value {
+            set_text(&mut txt, &v);
+        }
+        if col.0 != color {
+            col.0 = color;
+        }
+    }
+    for (e, mut cur) in &mut preview {
+        let want = ReticlePreview(s.crosshair_style, s.crosshair_color);
+        if *cur != want {
+            *cur = want;
+            commands.entity(e).despawn_children();
+            spawn_crosshair(&mut commands, e, want.0, want.1.color(), PREVIEW_SCALE);
+        }
+    }
+}
+
+/// Reticle preview magnification.
+const PREVIEW_SCALE: f32 = 2.5;
+/// Pip meter width: 12 whole-pixel pips (10 px) + 11 gaps (2 px) + frame and
+/// padding (4 px), so every pip and gap lands on the pixel grid.
+const METER_WIDTH: f32 = 146.0;
+const SETTINGS_WIDTH: f32 = 1120.0;
+
+/// A clickable Settings plate holding one label.
+fn settings_button(commands: &mut Commands, parent: Entity, t: SettingsTarget, label: &str, font: f32, pad: (f32, f32)) -> Entity {
+    commands
+        .spawn((
+            ChildOf(parent),
+            SettingsControl(t),
+            Node {
+                border: plate_rect((3.0, 1.0, 1.0, 3.0)),
+                padding: UiRect::axes(Val::Px(pad.0), Val::Px(pad.1)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                flex_shrink: 0.0,
+                ..default()
+            },
+            plate_border(STEEL_BORDER, STEEL_BORDER),
+            BackgroundColor(IRON_MID),
+            hard_shadow(3.0),
+            children![(SettingsLabel::Control(t), text(label, font, BONE_TEXT))],
+        ))
+        .id()
+}
+
+/// Label column of a settings row: name + dim hint.
+fn setting_name(commands: &mut Commands, row_e: Entity, name: &str, hint: &str) {
+    commands.spawn((
+        ChildOf(row_e),
+        Node { flex_direction: FlexDirection::Column, flex_grow: 1.0, flex_basis: Val::Px(0.0), row_gap: Val::Px(1.0), ..default() },
+        children![text(name, 14.0, BONE_TEXT), text(hint, 11.0, ASH_DIM)],
+    ));
+}
+
+/// Recessed settings row (rail on the left).
+fn setting_row(commands: &mut Commands, parent: Entity, rail: Color) -> Entity {
+    commands
+        .spawn((
+            ChildOf(parent),
+            Node {
+                width: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                border: plate_rect((3.0, 1.0, 1.0, 1.0)),
+                ..default()
+            },
+            BorderColor { left: rail, ..inset_border() },
+            BackgroundColor(INK_BLACK.with_alpha(0.5)),
+        ))
+        .id()
+}
+
+/// `[-] [pip meter + value] [+]` row of a knob.
+fn knob_row(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSettings) {
+    let r = setting_row(commands, parent, HAZARD_YELLOW.with_alpha(0.8));
+    setting_name(commands, r, k.label(), k.hint());
+    settings_button(commands, r, SettingsTarget::Down(k), "-", 18.0, (11.0, 0.0));
+    let meter = commands
+        .spawn((
+            ChildOf(r),
+            Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(2.0), width: Val::Px(METER_WIDTH), flex_shrink: 0.0, ..default() },
+        ))
+        .id();
+    commands.spawn((ChildOf(meter), SettingsLabel::Knob(k), text(k.value_text(s), 15.0, BONE_TEXT)));
+    let track = commands
+        .spawn((
+            ChildOf(meter),
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Px(9.0),
+                column_gap: Val::Px(2.0),
+                padding: UiRect::all(Val::Px(1.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            inset_border(),
+            BackgroundColor(INK_BLACK),
+        ))
+        .id();
+    for i in 0..SETTINGS_PIPS {
+        commands.spawn((ChildOf(track), SettingsPip(k, i), Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() }, BackgroundColor(Color::NONE)));
+    }
+    settings_button(commands, r, SettingsTarget::Up(k), "+", 18.0, (11.0, 0.0));
+}
+
+/// Toggle row: name | live state | switch.
+fn toggle_row(commands: &mut Commands, parent: Entity, g: SettingToggle, hint: &str, s: &UserSettings) {
+    let r = setting_row(commands, parent, ACID_GREEN.with_alpha(0.8));
+    setting_name(commands, r, g.label(), hint);
+    commands.spawn((
+        ChildOf(r),
+        Node { width: Val::Px(70.0), justify_content: JustifyContent::Center, flex_shrink: 0.0, ..default() },
+        children![(SettingsLabel::Toggle(g), text(g.state_text(s), 15.0, ACID_GREEN))],
+    ));
+    settings_button(commands, r, SettingsTarget::Toggle(g), "TOGGLE", 13.0, (10.0, 3.0));
+}
+
+fn spawn_settings_screen(
+    mut commands: Commands,
+    store: Res<ProfileStore>,
+    fb: Res<MetaFeedback>,
+    ret: Res<SettingsReturn>,
+    tex: Option<Res<UiKitTextures>>,
+    msaa: Option<Res<crate::perf::RenderMsaa>>,
+    player_cams: Query<(), With<PlayerCamera>>,
+) {
+    let tex = tex.as_deref();
+    let s = store.profile.settings.sanitized();
+    let mid_run = ret.0 == AppState::Paused;
+    // Mid-run the frozen player camera keeps rendering the bunker behind a
+    // translucent overlay; from the main menu the screen brings its own camera.
+    let root = if player_cams.is_empty() {
+        let msaa = msaa.map(|m| m.0).unwrap_or(bevy::render::view::Msaa::Sample2);
+        meta_root(&mut commands, AppState::Settings, tex, msaa)
+    } else {
+        punk_screen_root(&mut commands, AppState::Settings, tex, Color::srgba(0.02, 0.015, 0.012, 0.8), 0.3)
+    };
+    let phone = terminal_chassis(&mut commands, root, tex, SETTINGS_WIDTH, false);
+
+    let header = screen_header(&mut commands, phone, "UAC-PHONE // SYSTEM SETTINGS", &fb);
+    if mid_run {
+        commands.spawn((ChildOf(header), stamped_tag("MID-RUN // SIM PAUSED", HAZARD_YELLOW, INK_BLACK, 11.0)));
+    } else {
+        commands.spawn((ChildOf(header), hollow_stamp("SAVED TO PROFILE", ASH_DIM, 11.0)));
+    }
+
+    let split = commands
+        .spawn((ChildOf(phone), Node { width: Val::Percent(100.0), column_gap: Val::Px(10.0), align_items: AlignItems::Stretch, ..default() }))
+        .id();
+
+    // Left: input & camera.
+    let (input, input_head) =
+        section_crate(&mut commands, split, "INPUT & CAMERA", ARC_CYAN, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
+    commands.spawn((ChildOf(input_head), Node { flex_grow: 1.0, ..default() }));
+    commands.spawn((ChildOf(input_head), text("APPLIES INSTANTLY", 11.0, ASH_DIM)));
+    knob_row(&mut commands, input, SettingKnob::Sensitivity, &s);
+    knob_row(&mut commands, input, SettingKnob::BaseFov, &s);
+    toggle_row(&mut commands, input, SettingToggle::SpeedFov, "widen the view at speed & on dash", &s);
+    knob_row(&mut commands, input, SettingKnob::SpeedFov, &s);
+    toggle_row(&mut commands, input, SettingToggle::StrafeRoll, "lean the camera into strafes", &s);
+    knob_row(&mut commands, input, SettingKnob::StrafeRoll, &s);
+
+    // Right: audio & reticle.
+    let (audio, audio_head) =
+        section_crate(&mut commands, split, "AUDIO & RETICLE", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
+    commands.spawn((ChildOf(audio_head), Node { flex_grow: 1.0, ..default() }));
+    commands.spawn((ChildOf(audio_head), text("SFX BUS // HUD RETICLE", 11.0, ASH_DIM)));
+    knob_row(&mut commands, audio, SettingKnob::Volume, &s);
+    toggle_row(&mut commands, audio, SettingToggle::Mute, "silence every sound effect", &s);
+
+    // Reticle block: style pills + color swatches beside the live preview.
+    let reticle = commands
+        .spawn((
+            ChildOf(audio),
+            // Grows to the crate's stretched height so the right column ends flush with the left.
+            Node { width: Val::Percent(100.0), flex_grow: 1.0, column_gap: Val::Px(10.0), align_items: AlignItems::Stretch, ..default() },
+        ))
+        .id();
+    let pickers = commands
+        .spawn((ChildOf(reticle), Node { flex_direction: FlexDirection::Column, flex_grow: 1.0, flex_basis: Val::Px(0.0), row_gap: Val::Px(6.0), ..default() }))
+        .id();
+    let style_row = setting_row(&mut commands, pickers, ARC_CYAN.with_alpha(0.8));
+    commands.entity(style_row).insert(Node {
+        width: Val::Percent(100.0),
+        flex_direction: FlexDirection::Column,
+        flex_grow: 1.0,
+        justify_content: JustifyContent::Center,
+        align_items: AlignItems::Stretch,
+        row_gap: Val::Px(7.0),
+        padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+        border: plate_rect((3.0, 1.0, 1.0, 1.0)),
+        ..default()
+    });
+    commands.spawn((ChildOf(style_row), text("CROSSHAIR STYLE", 14.0, BONE_TEXT)));
+    let pills = commands.spawn((ChildOf(style_row), Node { column_gap: Val::Px(6.0), flex_wrap: FlexWrap::Wrap, row_gap: Val::Px(6.0), ..default() })).id();
+    for st in CrosshairStyle::ALL {
+        settings_button(&mut commands, pills, SettingsTarget::Style(st), st.name(), 12.0, (8.0, 3.0));
+    }
+    let color_row = setting_row(&mut commands, pickers, HAZARD_YELLOW.with_alpha(0.8));
+    commands.entity(color_row).insert(Node {
+        width: Val::Percent(100.0),
+        flex_direction: FlexDirection::Column,
+        flex_grow: 1.0,
+        justify_content: JustifyContent::Center,
+        align_items: AlignItems::Stretch,
+        row_gap: Val::Px(7.0),
+        padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+        border: plate_rect((3.0, 1.0, 1.0, 1.0)),
+        ..default()
+    });
+    commands.spawn((ChildOf(color_row), text("CROSSHAIR COLOR", 14.0, BONE_TEXT)));
+    let swatches = commands.spawn((ChildOf(color_row), Node { column_gap: Val::Px(7.0), ..default() })).id();
+    for c in CrosshairColor::ALL {
+        commands.spawn((
+            ChildOf(swatches),
+            SettingsControl(SettingsTarget::Color(c)),
+            Node { width: Val::Px(38.0), height: Val::Px(24.0), border: plate_rect((3.0, 1.0, 1.0, 3.0)), flex_shrink: 0.0, ..default() },
+            plate_border(STEEL_BORDER, STEEL_BORDER),
+            BackgroundColor(c.color()),
+            hard_shadow(2.0),
+        ));
+    }
+
+    // Live preview: a recessed scope well with the real HUD reticle builder.
+    let well = commands
+        .spawn((
+            ChildOf(reticle),
+            Node {
+                width: Val::Px(150.0),
+                flex_shrink: 0.0,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                padding: UiRect::all(Val::Px(6.0)),
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            inset_border(),
+            BackgroundColor(Color::srgb(0.16, 0.035, 0.03)),
+        ))
+        .id();
+    commands.spawn((ChildOf(well), text("LIVE PREVIEW", 10.0, ASH_DIM)));
+    let side = CROSSHAIR_BOX * PREVIEW_SCALE;
+    let box_e = commands
+        .spawn((
+            ChildOf(well),
+            ReticlePreview(s.crosshair_style, s.crosshair_color),
+            Node { width: Val::Px(side), height: Val::Px(side), flex_shrink: 0.0, ..default() },
+        ))
+        .id();
+    spawn_crosshair(&mut commands, box_e, s.crosshair_style, s.crosshair_color.color(), PREVIEW_SCALE);
+    commands.spawn((ChildOf(well), SettingsLabel::PreviewCaption, text("", 11.0, BONE_TEXT)));
+
+    // Footer.
+    let f = commands
+        .spawn((ChildOf(phone), Node { margin: UiRect { top: Val::Px(2.0), bottom: Val::Px(4.0), ..default() }, ..row(JustifyContent::Center, 24.0) }))
+        .id();
+    settings_button(&mut commands, f, SettingsTarget::ResetDefaults, "RESET DEFAULTS", 17.0, (16.0, 7.0));
+    let back = if mid_run { "BACK TO PAUSE  [ESC]" } else { "BACK  [ESC]" };
+    commands.spawn((ChildOf(f), punk_button(back, MenuAction::CloseSettings, 19.0, ButtonStyle::HeroAcid)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::meta::RunUnlockSummary;
+    use std::path::Path;
 
     #[test]
     fn risk_badge_scales_with_contracts() {
@@ -1252,6 +1918,73 @@ mod tests {
         assert_eq!(cells[6], ("BEST TIME", "--:--".to_string()));
         st.fastest_victory_secs = Some(61.0);
         assert_eq!(lifetime_stat_cells(&st)[6].1, "01:01");
+    }
+
+    #[test]
+    fn settings_edits_step_clamp_toggle_and_reset() {
+        let mut s = UserSettings::default();
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::Up(SettingKnob::Sensitivity)), EditOutcome::Changed(m) if m.contains("1.05x")));
+        for _ in 0..100 {
+            apply_settings_edit(&mut s, SettingsTarget::Up(SettingKnob::Sensitivity));
+        }
+        assert_eq!(s.mouse_sensitivity, 3.0);
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::Up(SettingKnob::Sensitivity)), EditOutcome::Unchanged(m) if m.contains("MAX")));
+        for _ in 0..3 {
+            apply_settings_edit(&mut s, SettingsTarget::Down(SettingKnob::BaseFov));
+        }
+        assert_eq!(s.base_fov_deg, 70.0);
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::Down(SettingKnob::BaseFov)), EditOutcome::Unchanged(m) if m.contains("MIN")));
+        // Repeated volume steps never drift off the 10% grid.
+        for _ in 0..7 {
+            apply_settings_edit(&mut s, SettingsTarget::Down(SettingKnob::Volume));
+        }
+        assert!((s.audio_master_volume - 0.3).abs() < 1e-5);
+        assert_eq!(SettingKnob::Volume.value_text(&s), "30%");
+        assert_eq!(lit_settings_pips(SettingKnob::Volume, &s), 4);
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::Toggle(SettingToggle::Mute)), EditOutcome::Changed(m) if m.contains("MUTED")));
+        assert!(s.audio_muted && !SettingToggle::Mute.effect_live(&s));
+        apply_settings_edit(&mut s, SettingsTarget::Toggle(SettingToggle::SpeedFov));
+        assert!(!s.speed_fov_enabled);
+        assert_eq!(SettingToggle::SpeedFov.state_text(&s), "OFF");
+        apply_settings_edit(&mut s, SettingsTarget::Style(CrosshairStyle::Circle));
+        apply_settings_edit(&mut s, SettingsTarget::Color(CrosshairColor::Crimson));
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::Color(CrosshairColor::Crimson)), EditOutcome::Unchanged(_)));
+        assert_eq!((s.crosshair_style, s.crosshair_color), (CrosshairStyle::Circle, CrosshairColor::Crimson));
+        assert_eq!(SettingKnob::BaseFov.value_text(&s), "70 DEG");
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::ResetDefaults), EditOutcome::Changed(_)));
+        assert_eq!(s, UserSettings::default());
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::ResetDefaults), EditOutcome::Unchanged(_)));
+        for k in SettingKnob::ALL {
+            assert!(!k.label().is_empty() && !k.hint().is_empty());
+            let (lo, hi, step) = k.range();
+            assert!(lo < hi && step > 0.0 && k.fraction(&s) > 0.0);
+        }
+
+        // Commit saves straight to disk.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-profiles").join("settings_commit");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("profile.json");
+        let mut store = ProfileStore::open(Some(path.clone()));
+        assert!(matches!(commit_settings_edit(&mut store, SettingsTarget::Style(CrosshairStyle::Dot)), EditOutcome::Changed(_)));
+        assert_eq!(crate::meta::load_profile(&path).settings.crosshair_style, CrosshairStyle::Dot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_cells_and_endless_best_floor() {
+        let mut st = LifetimeStats::default();
+        let cells = record_stat_cells(&st);
+        assert_eq!(cells.len(), 3);
+        assert!(cells.iter().all(|(_, v)| stat_is_blank(v)), "{cells:?}");
+        st.best_speed = 31.26;
+        st.best_bhop_chain = 9;
+        st.best_endless_floor = 12;
+        st.best_floor = 12;
+        let cells = record_stat_cells(&st);
+        assert_eq!(cells[0].1, "31.3 M/S");
+        assert_eq!(cells[1].1, "x9");
+        assert_eq!(cells[2].1, "FL 12");
+        assert_eq!(lifetime_stat_cells(&st)[2].1, "FL 12");
     }
 
     #[test]
