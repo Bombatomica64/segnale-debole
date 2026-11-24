@@ -41,3 +41,6 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo check --all-targets --features audio
+
+      - name: Clippy (raytracing feature)
+        run: cargo clippy --all-targets --features raytracing -- -D warnings

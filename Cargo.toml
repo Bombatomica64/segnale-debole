@@ -24,6 +24,7 @@ serde_json = "1"
 [features]
 default = []
 audio = ["bevy/bevy_audio", "bevy/wav"]
+raytracing = ["bevy/bevy_solari"]
 
 [profile.dev]
 opt-level = 1
