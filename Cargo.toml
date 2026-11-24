@@ -12,14 +12,25 @@ bevy = { version = "0.20.1", default-features = false, features = [
     "bevy_winit",
     "default_font",
     "multi_threaded",
-    "x11",
-    "wayland",
     "custom_cursor",
     "png",
 ] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Linux windowing backends (native only; never compiled into the web build).
+[target.'cfg(target_os = "linux")'.dependencies]
+bevy = { version = "0.20.1", default-features = false, features = ["x11", "wayland"] }
+
+# Web / itch.io build (`trunk build --release --features audio`): WebGL2
+# renderer, browser time/RNG backends, browser UTC clock + localStorage.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.20.1", default-features = false, features = ["webgl2", "web"] }
+# rand 0.9 -> rand_core -> getrandom 0.3 (the only getrandom in the wasm graph).
+getrandom = { version = "0.3", features = ["wasm_js"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Storage", "Document", "Element"] }
 
 [features]
 default = []
@@ -39,3 +50,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Web / itch.io build: size-tuned release (`trunk build --release --features
+# audio --cargo-profile wasm-release`). Fat LTO + `opt-level = "s"` shrink the
+# post-wasm-opt module from ~45 MB to ~30 MB (~13 -> ~9.6 MB gzipped); native
+# release stays speed-tuned.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = "fat"

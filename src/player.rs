@@ -276,10 +276,63 @@ pub struct PlayerCamera;
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorCaptured(pub bool);
 
+/// Web build: the browser's Pointer Lock state as last observed
+/// (`document.pointerLockElement`). Native never inserts it.
+///
+/// In browsers `Esc` exits Pointer Lock itself and the key event usually never
+/// reaches the page, so `hud::pause_input` cannot see it; alt-tab and focus
+/// loss release the lock the same way.
+#[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserPointerLock {
+    pub locked: bool,
+}
+
+/// Pause when the browser drops a lock we actually held while playing. A lock
+/// that was never granted (pending request, browser cooldown after `Esc`) does
+/// not pause; the player clicks to recapture instead. Our own releases happen
+/// in `OnExit(Playing)`, so they are never seen from `Playing`.
+pub fn browser_unlock_should_pause(was_locked: bool, now_locked: bool, playing: bool) -> bool {
+    playing && was_locked && !now_locked
+}
+
+/// Mouse look needs our capture flag and, in the browser, a granted lock.
+pub fn mouse_look_active(captured: CursorCaptured, browser: Option<&BrowserPointerLock>) -> bool {
+    captured.0 && browser.is_none_or(|b| b.locked)
+}
+
+/// Track the browser Pointer Lock and pause on an external unlock (see
+/// [`browser_unlock_should_pause`]). A transition already queued this frame
+/// (floor clear, death, ...) wins over the pause.
+pub fn sync_browser_pointer_lock(
+    In(now_locked): In<bool>,
+    state: Res<State<AppState>>,
+    mut lock: ResMut<BrowserPointerLock>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    let playing = *state.get() == AppState::Playing;
+    if browser_unlock_should_pause(lock.locked, now_locked, playing) && matches!(*next, NextState::Unchanged) {
+        info!("pointer lock released by the browser - pausing");
+        next.set(AppState::Paused);
+    }
+    if lock.locked != now_locked {
+        lock.locked = now_locked;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_pointer_locked() -> bool {
+    web_sys::window().and_then(|w| w.document()).and_then(|d| d.pointer_lock_element()).is_some()
+}
+
 pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
+        // Runs in every state so the observed lock is fresh when `Playing`
+        // is re-entered (a stale `true` would pause instantly on resume).
+        #[cfg(target_arch = "wasm32")]
+        app.init_resource::<BrowserPointerLock>()
+            .add_systems(Update, browser_pointer_locked.pipe(sync_browser_pointer_lock).before(GameSet::Input));
         app.init_resource::<CursorCaptured>()
             .add_systems(OnEnter(AppState::Playing), capture_cursor)
             .add_systems(OnExit(AppState::Playing), release_cursor)
@@ -428,14 +481,17 @@ fn release_cursor(mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>, mu
     captured.0 = false;
 }
 
-/// Click to recapture the cursor while playing (Esc pauses via `hud::pause_input`).
+/// Click to recapture the cursor while playing (Esc pauses via `hud::pause_input`;
+/// in the browser also via [`sync_browser_pointer_lock`]). In the browser a
+/// click also re-requests a lock that was never granted.
 fn cursor_capture_input(
     mouse: Res<ButtonInput<MouseButton>>,
+    browser: Option<Res<BrowserPointerLock>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut captured: ResMut<CursorCaptured>,
 ) {
     let Ok(mut c) = cursor.single_mut() else { return };
-    if mouse.just_pressed(MouseButton::Left) && !captured.0 {
+    if mouse.just_pressed(MouseButton::Left) && !mouse_look_active(*captured, browser.as_deref()) {
         set_cursor(&mut c, true);
         captured.0 = true;
     }
@@ -444,13 +500,14 @@ fn cursor_capture_input(
 fn mouse_look(
     motion: Res<AccumulatedMouseMotion>,
     captured: Res<CursorCaptured>,
+    browser: Option<Res<BrowserPointerLock>>,
     store: Option<Res<ProfileStore>>,
     bot: Option<Res<BotControl>>,
     mut players: Query<(&mut Player, &mut Transform), Without<PlayerCamera>>,
     mut cams: Query<&mut Transform, With<PlayerCamera>>,
 ) {
     let Ok((mut p, mut tf)) = players.single_mut() else { return };
-    if captured.0 && motion.delta != Vec2::ZERO {
+    if mouse_look_active(*captured, browser.as_deref()) && motion.delta != Vec2::ZERO {
         let sens = effective_mouse_sensitivity(&live_settings(store.as_deref()));
         p.yaw -= motion.delta.x * sens;
         p.pitch = (p.pitch - motion.delta.y * sens).clamp(-1.5, 1.5);
@@ -980,6 +1037,56 @@ pub fn check_death(players: Query<&Player>, mut next: ResMut<NextState<AppState>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_unlock_pauses_only_a_held_lock_while_playing() {
+        assert!(browser_unlock_should_pause(true, false, true));
+        assert!(!browser_unlock_should_pause(false, false, true), "never-granted lock must not pause");
+        assert!(!browser_unlock_should_pause(true, true, true));
+        assert!(!browser_unlock_should_pause(true, false, false), "our own OnExit release");
+        let lock = |locked| Some(BrowserPointerLock { locked });
+        assert!(mouse_look_active(CursorCaptured(true), None), "native ignores the browser lock");
+        assert!(mouse_look_active(CursorCaptured(true), lock(true).as_ref()));
+        assert!(!mouse_look_active(CursorCaptured(true), lock(false).as_ref()));
+        assert!(!mouse_look_active(CursorCaptured(false), lock(true).as_ref()));
+    }
+
+    #[test]
+    fn sync_browser_pointer_lock_pauses_and_respects_queued_transitions() {
+        use bevy::ecs::system::RunSystemOnce;
+        let world_in = |state: AppState, locked: bool| {
+            let mut w = World::new();
+            w.insert_resource(State::new(state));
+            w.init_resource::<NextState<AppState>>();
+            w.insert_resource(BrowserPointerLock { locked });
+            w
+        };
+        let pending = |w: &World| match w.resource::<NextState<AppState>>() {
+            NextState::Pending(s) | NextState::PendingIfDifferent(s) => Some(*s),
+            NextState::Unchanged => None,
+        };
+
+        // Lock granted (pending request resolves): tracked, no pause.
+        let mut w = world_in(AppState::Playing, false);
+        w.run_system_once_with(sync_browser_pointer_lock, true).unwrap();
+        assert!(w.resource::<BrowserPointerLock>().locked && pending(&w).is_none());
+
+        // Browser drops the held lock (Esc / focus loss): pause.
+        w.run_system_once_with(sync_browser_pointer_lock, false).unwrap();
+        assert_eq!(pending(&w), Some(AppState::Paused));
+        assert!(!w.resource::<BrowserPointerLock>().locked);
+
+        // A transition already queued this frame wins.
+        let mut w = world_in(AppState::Playing, true);
+        w.resource_mut::<NextState<AppState>>().set(AppState::UpgradeSelect);
+        w.run_system_once_with(sync_browser_pointer_lock, false).unwrap();
+        assert_eq!(pending(&w), Some(AppState::UpgradeSelect));
+
+        // Outside `Playing` (our own release on exit) only tracks the state.
+        let mut w = world_in(AppState::Paused, true);
+        w.run_system_once_with(sync_browser_pointer_lock, false).unwrap();
+        assert!(pending(&w).is_none() && !w.resource::<BrowserPointerLock>().locked);
+    }
 
     #[test]
     fn armor_absorbs_half_and_invuln_blocks() {

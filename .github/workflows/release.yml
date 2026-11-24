@@ -77,9 +77,57 @@ jobs:
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
+  build-web:
+    name: Build web (WebGL2 / itch.io HTML5)
+    runs-on: ubuntu-latest
+    env:
+      ARCHIVE: segnale-debole-web-itch.zip
+      TRUNK_VERSION: v0.22.2
+      BINARYEN_VERSION: version_131
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-web
+
+      - name: Install trunk + binaryen (wasm-opt)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | tar -xz -C "$HOME"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      # trunk fetches the wasm-bindgen CLI matching Cargo.lock; the
+      # `wasm-release` profile is size-tuned (see Cargo.toml).
+      - name: trunk build (release, audio)
+        run: trunk build --release --features audio --cargo-profile wasm-release
+
+      # itch.io requires index.html at the zip root.
+      - name: Package for itch.io
+        run: |
+          cd dist
+          zip -r -9 "../$ARCHIVE" . -x '.*'
+          cd ..
+          unzip -l "$ARCHIVE"
+          unzip -l "$ARCHIVE" | grep -qE ' index\.html$'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-web]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

@@ -992,15 +992,78 @@ impl CullableLight {
     }
 }
 
+/// Concurrent world point-light budget. WebGL2 has no storage buffers, so
+/// Bevy's clustered forward path packs lights into small uniform buffers and
+/// every lit fragment loops the cluster's lights: the web build keeps only the
+/// nearest lit [`CullableLight`]s. Native stays uncapped.
+pub const WEB_POINT_LIGHT_CAP: usize = 12;
+
+pub const fn point_light_cap(is_web: bool) -> Option<usize> {
+    if is_web { Some(WEB_POINT_LIGHT_CAP) } else { None }
+}
+
+/// Override for the concurrent world-light budget (tests / tuning). Absent:
+/// [`point_light_cap`] for the current platform.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointLightBudget(pub Option<usize>);
+
+/// Stable distance + tie-breaker key ordering for [`light_cap_key_cutoff`].
+fn cmp_light_key<K: Ord>(a: &(f32, K), b: &(f32, K)) -> std::cmp::Ordering {
+    a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+}
+
+/// Exact `(distance, key)` cutoff keeping strictly at most `cap` nearest lights
+/// even when multiple lights are equidistant (`None` = uncapped, `Some(None)` =
+/// keep zero). Reorders `entries`.
+pub fn light_cap_key_cutoff<K: Copy + Ord>(entries: &mut [(f32, K)], cap: Option<usize>) -> Option<Option<(f32, K)>> {
+    match cap {
+        None => None,
+        Some(0) => Some(None),
+        Some(n) if entries.len() > n => Some(Some(*entries.select_nth_unstable_by(n - 1, cmp_light_key).1)),
+        Some(_) => None,
+    }
+}
+
+/// Distance cutoff that keeps the `cap` nearest of `dists` (`INFINITY` when
+/// uncapped or within budget). Reorders `dists`.
+pub fn light_cap_cutoff(dists: &mut [f32], cap: Option<usize>) -> f32 {
+    match cap {
+        Some(0) => f32::NEG_INFINITY,
+        Some(n) if dists.len() > n => *dists.select_nth_unstable_by(n - 1, f32::total_cmp).1,
+        _ => f32::INFINITY,
+    }
+}
+
 /// Smoothly attenuate and hide distant world lights. Writes are change-guarded
-/// so `Changed<Visibility>` / `Changed<PointLight>` only fire when needed.
+/// so `Changed<Visibility>` / `Changed<PointLight>` only fire when needed. On
+/// the web build only the nearest [`WEB_POINT_LIGHT_CAP`] lit lights stay on.
 pub fn cull_world_lights(
     players: Query<&Transform, With<crate::player::Player>>,
-    mut lights: Query<(&mut CullableLight, Ref<GlobalTransform>, &mut PointLight, &mut Visibility)>,
+    mut lights: Query<(Entity, &mut CullableLight, Ref<GlobalTransform>, &mut PointLight, &mut Visibility)>,
+    budget: Option<Res<PointLightBudget>>,
+    mut scratch: Local<Vec<(f32, Entity)>>,
 ) {
     let Ok(ptf) = players.single() else { return };
     let eye = ptf.translation + Vec3::Y * crate::player::PLAYER_EYE_HEIGHT;
-    for (mut c, g, mut light, mut vis) in &mut lights {
+    let cap = budget.map_or(point_light_cap(crate::perf::IS_WEB), |b| b.0);
+    let cutoff = match cap {
+        None => None,
+        cap => {
+            scratch.clear();
+            for (entity, mut c, g, light, _) in &mut lights {
+                if g.is_added() {
+                    continue;
+                }
+                let base = *c.base_intensity.get_or_insert(light.intensity);
+                let dist = g.translation().distance(eye);
+                if base > 0.0 && c.fade_factor(dist) > 0.0 {
+                    scratch.push((dist, entity));
+                }
+            }
+            light_cap_key_cutoff(&mut scratch, cap)
+        }
+    };
+    for (entity, mut c, g, mut light, mut vis) in &mut lights {
         // Spawned since the last pass: its GlobalTransform may not be
         // propagated yet, so keep its spawn visibility for this frame.
         if g.is_added() {
@@ -1008,7 +1071,12 @@ pub fn cull_world_lights(
         }
         let base = *c.base_intensity.get_or_insert(light.intensity);
         let dist = g.translation().distance(eye);
-        let fade = c.fade_factor(dist);
+        let within_cap = match cutoff {
+            None => true,
+            Some(None) => false,
+            Some(Some(limit)) => cmp_light_key(&(dist, entity), &limit).is_le(),
+        };
+        let fade = if within_cap { c.fade_factor(dist) } else { 0.0 };
         let target_vis = if fade > 0.0 && base > 0.0 { Visibility::Inherited } else { Visibility::Hidden };
         if *vis != target_vis {
             *vis = target_vis;
@@ -1623,6 +1691,51 @@ mod tests {
     }
 
     #[test]
+    fn light_cap_cutoff_keeps_nearest() {
+        assert_eq!(point_light_cap(false), None);
+        assert_eq!(point_light_cap(true), Some(WEB_POINT_LIGHT_CAP));
+        let mut d = [9.0, 1.0, 5.0, 3.0, 7.0];
+        assert_eq!(light_cap_cutoff(&mut d, None), f32::INFINITY);
+        assert_eq!(light_cap_cutoff(&mut d, Some(5)), f32::INFINITY);
+        assert_eq!(light_cap_cutoff(&mut d, Some(2)), 3.0);
+        assert_eq!(light_cap_cutoff(&mut d, Some(4)), 7.0);
+        assert_eq!(light_cap_cutoff(&mut d, Some(0)), f32::NEG_INFINITY);
+        assert_eq!(light_cap_cutoff(&mut [], Some(3)), f32::INFINITY);
+    }
+
+    #[test]
+    fn web_light_budget_hides_farthest_and_native_stays_uncapped() {
+        let run = |budget: Option<PointLightBudget>| {
+            let mut world = World::new();
+            if let Some(b) = budget {
+                world.insert_resource(b);
+            }
+            let mut sched = Schedule::default();
+            sched.add_systems(cull_world_lights);
+            world.spawn((crate::player::Player::default(), Transform::default()));
+            let lights: Vec<Entity> = (0..5)
+                .map(|i| {
+                    world
+                        .spawn((
+                            CullableLight::for_range(7.0),
+                            PointLight { intensity: 5_000.0, range: 7.0, ..default() },
+                            GlobalTransform::from_xyz(2.0 + i as f32, crate::player::PLAYER_EYE_HEIGHT, 0.0),
+                            Visibility::Inherited,
+                        ))
+                        .id()
+                })
+                .collect();
+            sched.run(&mut world);
+            sched.run(&mut world);
+            lights.iter().map(|e| *world.entity(*e).get::<Visibility>().unwrap() == Visibility::Inherited).collect::<Vec<_>>()
+        };
+        assert_eq!(run(Some(PointLightBudget(Some(3)))), [true, true, true, false, false]);
+        assert_eq!(run(Some(PointLightBudget(None))), [true; 5]);
+        // Without an override the native test build is uncapped.
+        assert_eq!(run(None), [true; 5]);
+    }
+
+    #[test]
     fn extinguished_aura_near_fade_boundary_stays_dark_when_approached() {
         let mut world = World::new();
         let mut sched = Schedule::default();
@@ -1794,5 +1907,13 @@ mod tests {
             assert!(g.validate(), "floor {floor} invalid");
             assert_eq!(g.jammers.len(), jammer_count_for_floor(floor));
         }
+    }
+
+    #[test]
+    fn equidistant_lights_never_exceed_web_cap() {
+        let mut entries: Vec<(f32, u32)> = (0..13).map(|id| (5.0f32, id)).collect();
+        let cutoff = light_cap_key_cutoff(&mut entries, Some(WEB_POINT_LIGHT_CAP)).unwrap().unwrap();
+        let kept = entries.iter().filter(|e| cmp_light_key(e, &cutoff).is_le()).count();
+        assert_eq!(kept, WEB_POINT_LIGHT_CAP, "strictly {WEB_POINT_LIGHT_CAP} of 13 equidistant lights survive");
     }
 }

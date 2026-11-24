@@ -44,3 +44,23 @@ jobs:
 
       - name: Clippy (raytracing feature)
         run: cargo clippy --all-targets --features raytracing -- -D warnings
+
+  wasm:
+    name: Web build clippy (wasm32 / WebGL2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      # No RUSTFLAGS here on purpose: setting it would override the
+      # `getrandom_backend="wasm_js"` cfg from `.cargo/config.toml`.
+      - name: Clippy (wasm32-unknown-unknown, audio)
+        run: cargo clippy --target wasm32-unknown-unknown --features audio -- -D warnings

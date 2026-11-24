@@ -80,7 +80,12 @@ pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(meta::ProfileStore::open(meta::resolve_profile_path(true)))
+        // Web build: browser `localStorage`; native: `profile.json` on disk.
+        #[cfg(target_arch = "wasm32")]
+        let store = meta::ProfileStore::open_web();
+        #[cfg(not(target_arch = "wasm32"))]
+        let store = meta::ProfileStore::open(meta::resolve_profile_path(true));
+        app.insert_resource(store)
             .add_plugins((CoreGameplayPlugin, hud::HudPlugin, dev::DevPlugin));
     }
 }

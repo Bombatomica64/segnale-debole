@@ -3,3 +3,4 @@
 *.pdb
 *.log
 .DS_Store
+/dist/

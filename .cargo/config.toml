@@ -1,0 +1,4 @@
+# getrandom 0.3 needs both the `wasm_js` crate feature (see Cargo.toml) and this
+# cfg to use the browser's `crypto.getRandomValues` on wasm32-unknown-unknown.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

@@ -1,6 +1,7 @@
 //! Performance controls and telemetry:
 //! - `F4` toggles VSync live (`AutoNoVsync` <-> `AutoVsync`) on the primary
-//!   window, with a HUD toast while playing.
+//!   window, with a HUD toast while playing. In the browser the compositor
+//!   owns frame pacing, so `F4` only shows "VSYNC MANAGED BY BROWSER".
 //! - `F3` toggles a compact telemetry overlay (off by default): smoothed FPS,
 //!   avg / 1%-worst / max frame time, entity count, visible / total point
 //!   lights, material and mesh asset counts, VSync mode. Its text refreshes at
@@ -33,7 +34,32 @@ pub struct RenderMsaa(pub Msaa);
 
 impl Default for RenderMsaa {
     fn default() -> Self {
-        RenderMsaa(Msaa::Sample2)
+        RenderMsaa(if IS_WEB { Msaa::Off } else { Msaa::Sample2 })
+    }
+}
+
+/// True for the WebGL2 browser build.
+pub const IS_WEB: bool = cfg!(target_arch = "wasm32");
+
+/// Startup MSAA policy: ray tracing (Solari's single-sample G-buffer) and the
+/// WebGL2 build (multi-camera MSAA resolve hazards, fill-rate on integrated
+/// GPUs) force [`Msaa::Off`]; native otherwise uses [`select_msaa`].
+pub fn platform_msaa(is_web: bool, raytracing: bool, supports_2x: bool, env_override: Option<&str>) -> Msaa {
+    if is_web || raytracing { Msaa::Off } else { select_msaa(supports_2x, env_override) }
+}
+
+/// Toast shown when `F4` is pressed in the browser, where the compositor owns
+/// frame pacing (`requestAnimationFrame`) and `AutoNoVsync` is meaningless.
+pub const WEB_VSYNC_TOAST: &str = "VSYNC MANAGED BY BROWSER";
+
+/// `F4` outcome: the new VSync flag and the toast to show while playing.
+pub fn f4_vsync_toggle(is_web: bool, vsync: bool) -> (bool, &'static str) {
+    if is_web {
+        (vsync, WEB_VSYNC_TOAST)
+    } else if vsync {
+        (false, "VSYNC: OFF")
+    } else {
+        (true, "VSYNC: ON")
     }
 }
 
@@ -63,12 +89,19 @@ pub fn adapter_supports_msaa_2x(adapter: &RenderAdapter) -> bool {
 }
 
 /// Live performance toggles.
-#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerfSettings {
     /// `F3` telemetry overlay visible.
     pub overlay: bool,
     /// `F4` VSync on (`AutoVsync`); off = `AutoNoVsync` (the default).
     pub vsync: bool,
+}
+
+impl Default for PerfSettings {
+    /// Native starts uncapped; the browser always presents vsynced (`AutoVsync`).
+    fn default() -> Self {
+        PerfSettings { overlay: false, vsync: IS_WEB }
+    }
 }
 
 impl PerfSettings {
@@ -170,8 +203,9 @@ impl Plugin for PerfPlugin {
             .map(adapter_supports_msaa_2x)
             .unwrap_or(true);
         let rt = app.world().get_resource::<crate::raytracing::RaytracingActive>().is_some_and(|r| r.0);
-        // Solari's deferred G-buffer needs single-sample targets on every camera.
-        let chosen = if rt { Msaa::Off } else { select_msaa(supports_2x, env_override.as_deref()) };
+        // Solari's deferred G-buffer needs single-sample targets on every
+        // camera; WebGL2 always runs single-sample (see `platform_msaa`).
+        let chosen = platform_msaa(IS_WEB, rt, supports_2x, env_override.as_deref());
         if app.world().contains_resource::<RenderAdapter>() {
             info!("perf: MSAA selected {:?} (adapter 2x support: {})", chosen, supports_2x);
         }
@@ -185,9 +219,10 @@ fn perf_hotkeys(keys: Res<ButtonInput<KeyCode>>, state: Option<Res<State<AppStat
         stats.clear();
     }
     if keys.just_pressed(KeyCode::F4) {
-        settings.vsync = !settings.vsync;
+        let (vsync, toast) = f4_vsync_toggle(IS_WEB, settings.vsync);
+        settings.vsync = vsync;
         if state.is_some_and(|s| *s.get() == AppState::Playing) {
-            feed.toast(if settings.vsync { "VSYNC: ON" } else { "VSYNC: OFF" }, Color::srgb(0.3, 1.0, 0.85));
+            feed.toast(toast, Color::srgb(0.3, 1.0, 0.85));
         }
     }
 }
@@ -325,6 +360,11 @@ mod tests {
         assert_eq!(PerfSettings::default().present_mode(), PresentMode::AutoNoVsync);
         assert_eq!(present_mode_for(true), PresentMode::AutoVsync);
         assert_eq!(vsync_label(false), "NO-VSYNC");
+        // F4: native flips VSync; the browser keeps it and explains why.
+        assert_eq!(f4_vsync_toggle(false, false), (true, "VSYNC: ON"));
+        assert_eq!(f4_vsync_toggle(false, true), (false, "VSYNC: OFF"));
+        assert_eq!(f4_vsync_toggle(true, true), (true, WEB_VSYNC_TOAST));
+        assert_eq!(f4_vsync_toggle(true, false), (false, WEB_VSYNC_TOAST));
     }
 
     #[test]
@@ -334,5 +374,12 @@ mod tests {
         assert_eq!(select_msaa(true, Some("off")), Msaa::Off);
         assert_eq!(select_msaa(true, Some("1")), Msaa::Off);
         assert_eq!(select_msaa(false, Some("4")), Msaa::Sample4);
+        // Web build and ray tracing always run single-sample.
+        assert_eq!(platform_msaa(true, false, true, None), Msaa::Off);
+        assert_eq!(platform_msaa(true, false, true, Some("4")), Msaa::Off);
+        assert_eq!(platform_msaa(false, true, true, None), Msaa::Off);
+        assert_eq!(platform_msaa(false, false, true, None), Msaa::Sample2);
+        assert_eq!(platform_msaa(false, false, true, Some("4")), Msaa::Sample4);
+        assert_eq!(RenderMsaa::default().0, if IS_WEB { Msaa::Off } else { Msaa::Sample2 });
     }
 }

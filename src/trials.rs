@@ -109,11 +109,12 @@ impl DailyDate {
         DailyDate::from_days_since_epoch(secs.div_euclid(86_400))
     }
 
-    /// WASM stub (Milestone 19 swaps in the browser clock): the epoch date, so
-    /// the Daily mode stays deterministic and playable.
+    /// Today's UTC date from the browser clock (`Date.getUTC*`), so web
+    /// players get the same Daily Seeded Run as native players.
     #[cfg(target_arch = "wasm32")]
     pub fn today_utc() -> Self {
-        DailyDate::EPOCH
+        let now = js_sys::Date::new_0();
+        DailyDate { year: now.get_utc_full_year() as i32, month: (now.get_utc_month() + 1) as u8, day: now.get_utc_date() as u8 }
     }
 }
 

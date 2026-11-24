@@ -1,0 +1,18 @@
+# Web / itch.io build (WebGL2).
+#
+#   trunk serve --features audio                 # dev server on http://127.0.0.1:8080
+#   trunk build --release --features audio       # -> dist/ (zip its *contents* for itch.io)
+#
+# Cargo picks up `.cargo/config.toml` (getrandom's `wasm_js` backend cfg).
+
+[build]
+target = "index.html"
+dist = "dist"
+# Relative asset URLs: itch.io serves HTML5 uploads from a nested CDN path,
+# so absolute `/segnale_debole-*.js` URLs would 404 inside its iframe.
+public_url = "./"
+filehash = true
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080

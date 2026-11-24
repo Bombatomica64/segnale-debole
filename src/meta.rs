@@ -1137,6 +1137,82 @@ pub fn resolve_profile_path(windowed: bool) -> Option<PathBuf> {
     profile_path_policy(var("SEGNALE_PROFILE").as_deref(), windowed, bot_or_shots, var("XDG_DATA_HOME").as_deref(), var("HOME").as_deref())
 }
 
+// ---------------------------------------------------------------------------
+// Browser persistence (web build): `localStorage` key/value store
+// ---------------------------------------------------------------------------
+
+/// `localStorage` key holding the web build's profile JSON.
+pub const WEB_PROFILE_KEY: &str = "segnale_debole.profile.v1";
+
+/// Minimal string key/value store (browser `localStorage` on wasm32; a map in
+/// unit tests) so the web load / recovery / save policy is testable natively.
+pub trait ProfileKv {
+    fn get(&self, key: &str) -> io::Result<Option<String>>;
+    fn set(&mut self, key: &str, value: &str) -> io::Result<()>;
+}
+
+/// Load the profile stored under `key`. A missing entry starts fresh; an
+/// unreadable or incompatible one is copied aside to `<key>.bak` (`.bak.1`,
+/// ... never clobbering an earlier backup), mirroring the native `.bak` policy.
+/// Returns `(profile, recovery_notice, writable)` — `writable` is `false` when
+/// reading failed or backing up an incompatible profile failed, keeping the
+/// session in memory so the original data is never overwritten.
+pub fn load_profile_kv(kv: &mut impl ProfileKv, key: &str) -> (PlayerProfile, Option<String>, bool) {
+    let raw = match kv.get(key) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return (PlayerProfile::default(), None, true),
+        Err(e) => {
+            let msg = format!("Browser storage read failed ({e}) - running in memory");
+            warn!("{msg}");
+            return (PlayerProfile::default(), Some(msg), false);
+        }
+    };
+    if let Some(p) = parse_profile(&raw) {
+        return (p, None, true);
+    }
+    let backup = (0..100u32)
+        .map(|idx| if idx == 0 { format!("{key}.bak") } else { format!("{key}.bak.{idx}") })
+        .find(|k| matches!(kv.get(k), Ok(None)))
+        .and_then(|k| kv.set(&k, &raw).ok().map(|_| k));
+    let (msg, writable) = match backup {
+        Some(k) => (format!("Incompatible profile backed up to {k} - started fresh"), true),
+        None => ("Incompatible profile unreadable (backup failed) - running in memory".to_string(), false),
+    };
+    warn!("{msg}");
+    (PlayerProfile::default(), Some(msg), writable)
+}
+
+/// Serialize `profile` under `key` (same JSON as the native `profile.json`).
+pub fn save_profile_kv(kv: &mut impl ProfileKv, key: &str, profile: &PlayerProfile) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(profile).map_err(io::Error::other)?;
+    kv.set(key, &json)
+}
+
+/// Browser `localStorage`.
+#[cfg(target_arch = "wasm32")]
+pub struct LocalStorageKv(web_sys::Storage);
+
+#[cfg(target_arch = "wasm32")]
+impl LocalStorageKv {
+    /// `None` when the browser blocks storage (some private windows, sandboxed
+    /// iframes without `allow-same-origin`).
+    pub fn open() -> Option<Self> {
+        web_sys::window().and_then(|w| w.local_storage().ok().flatten()).map(LocalStorageKv)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ProfileKv for LocalStorageKv {
+    fn get(&self, key: &str) -> io::Result<Option<String>> {
+        self.0.get_item(key).map_err(|e| io::Error::other(format!("localStorage read failed: {e:?}")))
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> io::Result<()> {
+        // Quota exceeded / storage disabled surfaces as a JS exception.
+        self.0.set_item(key, value).map_err(|e| io::Error::other(format!("localStorage write failed: {e:?}")))
+    }
+}
+
 /// The live profile, its disk location (`None` = in-memory only) and the
 /// summary of the last finished run.
 #[derive(Resource, Debug, Clone, Default)]
@@ -1151,6 +1227,9 @@ pub struct ProfileStore {
     pub last_save_error: Option<String>,
     /// Set when an existing file could not be parsed and was backed up aside.
     pub recovery_notice: Option<String>,
+    /// Web build: persist to browser `localStorage` ([`WEB_PROFILE_KEY`])
+    /// instead of `path`. Always `false` on native.
+    pub web_storage: bool,
 }
 
 impl ProfileStore {
@@ -1163,6 +1242,25 @@ impl ProfileStore {
             dirty: false,
             last_save_error: None,
             recovery_notice: None,
+            web_storage: false,
+        }
+    }
+
+    /// Web build: load from browser `localStorage`, recovering corrupt data to
+    /// `<key>.bak`. Falls back to an in-memory store (with a notice) when the
+    /// browser blocks storage.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_web() -> Self {
+        match LocalStorageKv::open() {
+            Some(mut kv) => {
+                let (profile, recovery_notice, writable) = load_profile_kv(&mut kv, WEB_PROFILE_KEY);
+                ProfileStore { recovery_notice, web_storage: writable, ..ProfileStore::in_memory(profile) }
+            }
+            None => {
+                let msg = "Browser storage blocked - progress will not be saved".to_string();
+                warn!("{msg}");
+                ProfileStore { recovery_notice: Some(msg), ..ProfileStore::in_memory(PlayerProfile::default()) }
+            }
         }
     }
 
@@ -1197,11 +1295,19 @@ impl ProfileStore {
             dirty: false,
             last_save_error: None,
             recovery_notice,
+            web_storage: false,
         }
     }
 
     /// Persist the profile (no-op for in-memory stores).
     pub fn save(&self) -> io::Result<()> {
+        #[cfg(target_arch = "wasm32")]
+        if self.web_storage {
+            return match LocalStorageKv::open() {
+                Some(mut kv) => save_profile_kv(&mut kv, WEB_PROFILE_KEY, &self.profile),
+                None => Err(io::Error::other("browser storage unavailable")),
+            };
+        }
         match &self.path {
             Some(p) => save_profile(p, &self.profile),
             None => Ok(()),
@@ -1827,5 +1933,69 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/share/segnale-debole/profile.json"))
         );
         assert_eq!(profile_path_policy(None, true, false, Some(""), None), None);
+    }
+
+    /// In-memory stand-in for browser `localStorage`.
+    #[derive(Default)]
+    struct MapKv {
+        map: std::collections::HashMap<String, String>,
+        fail_writes: bool,
+        fail_reads: bool,
+    }
+
+    impl ProfileKv for MapKv {
+        fn get(&self, key: &str) -> io::Result<Option<String>> {
+            if self.fail_reads {
+                return Err(io::Error::other("SecurityError"));
+            }
+            Ok(self.map.get(key).cloned())
+        }
+        fn set(&mut self, key: &str, value: &str) -> io::Result<()> {
+            if self.fail_writes {
+                return Err(io::Error::other("QuotaExceededError"));
+            }
+            self.map.insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn web_kv_profile_roundtrip_and_corrupt_backup() {
+        let mut kv = MapKv::default();
+        // Missing key: fresh profile, no notice, writable, nothing written.
+        let (p, notice, writable) = load_profile_kv(&mut kv, WEB_PROFILE_KEY);
+        assert_eq!(p, PlayerProfile::default());
+        assert!(notice.is_none() && writable && kv.map.is_empty());
+
+        // Roundtrip through the same JSON as profile.json.
+        let saved = PlayerProfile { time_trial_best_secs: Some(42.5), ..PlayerProfile::default() };
+        save_profile_kv(&mut kv, WEB_PROFILE_KEY, &saved).unwrap();
+        assert_eq!(parse_profile(&kv.map[WEB_PROFILE_KEY]), Some(saved.clone()));
+        assert_eq!(load_profile_kv(&mut kv, WEB_PROFILE_KEY), (saved, None, true));
+
+        // Corrupt JSON is copied to `.bak`, then `.bak.1` (never clobbered).
+        kv.map.insert(WEB_PROFILE_KEY.into(), "{ not json".into());
+        let (p, notice, writable) = load_profile_kv(&mut kv, WEB_PROFILE_KEY);
+        assert_eq!(p, PlayerProfile::default());
+        assert!(writable && notice.unwrap().contains("segnale_debole.profile.v1.bak"));
+        assert_eq!(kv.map["segnale_debole.profile.v1.bak"], "{ not json");
+        kv.map.insert(WEB_PROFILE_KEY.into(), "\"nope\"".into());
+        let (_, _, writable) = load_profile_kv(&mut kv, WEB_PROFILE_KEY);
+        assert!(writable);
+        assert_eq!(kv.map["segnale_debole.profile.v1.bak"], "{ not json");
+        assert_eq!(kv.map["segnale_debole.profile.v1.bak.1"], "\"nope\"");
+
+        // A failing backup keeps the store in-memory (writable = false) so the
+        // original entry cannot be overwritten by a smaller fresh profile.
+        kv.fail_writes = true;
+        assert!(save_profile_kv(&mut kv, WEB_PROFILE_KEY, &PlayerProfile::default()).is_err());
+        kv.map.insert(WEB_PROFILE_KEY.into(), "garbage".into());
+        let (_, notice, writable) = load_profile_kv(&mut kv, WEB_PROFILE_KEY);
+        assert!(!writable && notice.unwrap().contains("running in memory"));
+
+        // A read exception is distinct from a missing key and stays in memory.
+        kv.fail_reads = true;
+        let (_, notice, writable) = load_profile_kv(&mut kv, WEB_PROFILE_KEY);
+        assert!(!writable && notice.unwrap().contains("read failed"));
     }
 }

@@ -19,6 +19,14 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
   - **Rush Metal:** distorted power-bass riff, kick, snare, 16th hats and lead stabs.
 
   The three stems are equal-length 132 BPM looping tracks spawned in parallel. They crossfade live with signal strength, the SOS upload, the boss fight and menu or pause state.
+- **Sculpted 3D models (Milestone 15):** procedurally sculpted meshes for all 7 demons, the Carrier Daemon and its pylons, and all 3 guns, merged into per-material batches at startup.
+- **3D world architecture (Milestone 16):** baseboards, crown trim, pilasters, overhead trusses and conduits, catwalk girders, flush wall-mounted sector props and animated hazards, baked into the static level batches.
+- **Enemy animation and combat feedback (Milestone 17):** procedural attack animations, directional hit-stagger, pooled floor and wall decals (blood, ichor, scorch marks, plasma burns) and gibs.
+- **Daily Seeded Run, split timer and Time Trial (Milestone 18):**
+  - **`DAILY RUN [D]`:** the UTC date picks the seed and the loadout, so every player (native or browser) gets the same bunker that day.
+  - **Speedrun split timer:** per-floor splits with PB deltas.
+  - **`TIME TRIAL [T]`:** a handcrafted movement course with 3 checkpoint rings and the tower finish, plus instant `R` reset.
+- **Web / itch.io build (Milestone 19):** WebGL2 in the browser, with saves in `localStorage` (see [Web / itch.io](#web--itchio)).
 - **90–120 FPS target:** static and demon mesh batching, a `F3` perf overlay and a `F4` VSync toggle.
 
 ## Controls
@@ -75,11 +83,13 @@ xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_META_SHOTS=$HOME/scratch/meta
 ```
 
 ## CI & Releases
-- **`.github/workflows/ci.yml`:** runs on pushes to `main` and on pull requests. It runs `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo check --all-targets --features audio` (with warnings denied) on Ubuntu.
+- **`.github/workflows/ci.yml`:** runs on pushes to `main` and on pull requests. It runs `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo check --all-targets --features audio` (with warnings denied) on Ubuntu. A parallel job runs `cargo clippy --target wasm32-unknown-unknown --features audio -- -D warnings`.
 - **`.github/workflows/release.yml`:** runs on `v*` tags and manual dispatch. It builds `--release --features audio` binaries and packages each binary with this README:
   - `segnale-debole-linux-x86_64.tar.gz`
   - `segnale-debole-windows-x86_64.zip`
   - `segnale-debole-macos-aarch64.tar.gz`
+
+  - `segnale-debole-web-itch.zip`: the WebGL2 build (`trunk build --release --features audio --cargo-profile wasm-release`), with `index.html` at the zip root so it can be uploaded to itch.io as-is.
 
   Every run uploads the archives as workflow artifacts. A `v*` tag also publishes them to a GitHub Release.
 
@@ -89,6 +99,32 @@ git tag v1.0.0 && git push origin v1.0.0
 ```
 
 ## Web / itch.io
-A browser build is not shipped yet. [DESIGN.md](DESIGN.md#8-web--itchio-wasm-feasibility) lists what already works on `wasm32` and the concrete remaining blockers.
+The game also runs in the browser on WebGL2. One-time setup:
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install --locked trunk      # trunk fetches the matching wasm-bindgen CLI
+# plus binaryen's wasm-opt on PATH (apt/brew `binaryen`, or a GitHub release)
+```
+
+Build and run:
+```bash
+# Dev server with live reload on http://127.0.0.1:8080
+trunk serve --features audio
+
+# Release build into dist/ (gitignored)
+trunk build --release --features audio
+
+# What CI ships: same, with the size-tuned profile (fat LTO, opt-level "s")
+trunk build --release --features audio --cargo-profile wasm-release
+```
+
+To publish on itch.io, zip the **contents** of `dist/` (`cd dist && zip -r ../segnale-debole-web-itch.zip .`), upload it as an HTML5 project and tick **"This file will be played in the browser"**. The `segnale-debole-web-itch.zip` release asset is already in that shape. `Trunk.toml` sets `public_url = "./"` so asset URLs stay relative inside itch.io's iframe.
+
+Differences from the native build:
+- **Saves:** the profile lives in browser `localStorage` under `segnale_debole.profile.v1`. A corrupt entry is copied to `segnale_debole.profile.v1.bak` before starting fresh. If the browser blocks storage (some private windows), progress is not saved and the Loadout and Contracts screens say so.
+- **Mouse:** click the game to capture the mouse. Pressing `Esc` (or switching tabs) releases the browser's pointer lock and pauses the run. Some browsers briefly refuse to re-lock right after `Esc`, so click again if mouse look doesn't resume right away.
+- **Rendering:** MSAA is off, and only the nearest 12 world point lights are lit at once (WebGL2 light budget). `F4` shows `VSYNC MANAGED BY BROWSER`, because the browser paces frames. `F3` works as usual.
+- **Audio** starts on your first click or key press (browser autoplay policy).
+- The `raytracing` feature and the `SEGNALE_*` environment switches are native-only.
 
 See [DESIGN.md](DESIGN.md) for the full game design and architecture notes.

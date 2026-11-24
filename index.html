@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SEGNALE DEBOLE</title>
+  <!-- Features come from the CLI: `trunk build --release --features audio`. -->
+  <!-- wasm-opt must accept rustc's default wasm32 features (bulk memory, ...). -->
+  <link data-trunk rel="rust" data-bin="segnale_debole" data-wasm-opt="z"
+        data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue" />
+  <style>
+    :root { --ink: #080606; --bone: #ebdec7; --ash: #8f7d70; --red: #ff2b1a; --acid: #40ff73; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--ink); }
+    #bevy {
+      width: 100vw; height: 100vh; display: block;
+      background: var(--ink); outline: none; touch-action: none;
+    }
+    #boot {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 18px;
+      background: var(--ink); color: var(--bone);
+      font: 600 15px/1.4 ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+      letter-spacing: 0.18em; text-transform: uppercase; text-align: center;
+      transition: opacity 0.45s ease; z-index: 2;
+    }
+    #boot.done { opacity: 0; pointer-events: none; }
+    #boot .title { font-size: 13px; color: var(--ash); }
+    #boot .title b { color: var(--red); font-weight: 700; }
+    #boot .bars { display: flex; gap: 5px; align-items: flex-end; height: 26px; }
+    #boot .bars i { width: 7px; background: var(--acid); animation: rf 1.2s infinite ease-in-out; }
+    #boot .bars i:nth-child(1) { height: 25%; animation-delay: 0s; }
+    #boot .bars i:nth-child(2) { height: 45%; animation-delay: .15s; }
+    #boot .bars i:nth-child(3) { height: 70%; animation-delay: .3s; }
+    #boot .bars i:nth-child(4) { height: 100%; animation-delay: .45s; }
+    #boot .hint { font-size: 11px; color: var(--ash); letter-spacing: 0.12em; max-width: 34em; }
+    #boot.error .bars i { background: var(--red); animation: none; opacity: .35; }
+    #boot.error .status { color: var(--red); }
+    /* Faint CRT scanlines over the boot card only. */
+    #boot::after {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      background: repeating-linear-gradient(0deg, rgba(0,0,0,.22) 0 1px, transparent 1px 3px);
+    }
+    @keyframes rf { 0%, 100% { opacity: .2; } 50% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) { #boot .bars i { animation: none; } }
+  </style>
+</head>
+<body>
+  <!-- Right-click is Ping Scan: never open the browser context menu over the game. -->
+  <canvas id="bevy" tabindex="0" oncontextmenu="return false;"></canvas>
+  <div id="boot" role="status" aria-live="polite">
+    <div class="title"><b>SEGNALE DEBOLE</b> // TUNING RF SIGNAL...</div>
+    <div class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    <div class="status">Downloading bunker uplink</div>
+    <div class="hint">Click the screen to capture the mouse. Esc pauses.</div>
+  </div>
+  <script>
+    (function () {
+      var boot = document.getElementById("boot");
+      var status = boot.querySelector(".status");
+      var hint = boot.querySelector(".hint");
+      var canvas = document.getElementById("bevy");
+      var failed = false;
+
+      function fail(msg, detail) {
+        failed = true;
+        boot.classList.add("error");
+        boot.classList.remove("done");
+        status.textContent = msg;
+        hint.textContent = detail;
+      }
+
+      // The renderer needs WebGL2; say so instead of showing a black screen.
+      var probe = document.createElement("canvas");
+      if (!(probe.getContext && probe.getContext("webgl2"))) {
+        fail("NO SIGNAL // WEBGL2 UNAVAILABLE", "Use a current Chrome, Firefox, Edge or Safari with hardware acceleration enabled.");
+        return;
+      }
+
+      // Browsers start audio suspended until a user gesture: resume every
+      // AudioContext the game creates on the first click / key press.
+      var contexts = [];
+      var Native = window.AudioContext || window.webkitAudioContext;
+      if (Native) {
+        class Tracked extends Native {
+          constructor(...args) { super(...args); contexts.push(this); }
+        }
+        window.AudioContext = Tracked;
+        if (window.webkitAudioContext) window.webkitAudioContext = Tracked;
+        var resume = function () {
+          contexts.forEach(function (c) { if (c.state === "suspended") c.resume(); });
+        };
+        ["pointerdown", "keydown", "touchend"].forEach(function (ev) {
+          window.addEventListener(ev, resume, { capture: true });
+        });
+      }
+
+      // Keyboard focus follows the pointer into the game (itch.io iframe).
+      canvas.addEventListener("pointerdown", function () { canvas.focus(); });
+
+      window.addEventListener("error", function (e) {
+        // winit uses a thrown exception for control flow on the web; ignore it.
+        if (e && e.message && e.message.indexOf("Using exceptions for control flow") !== -1) return;
+        if (!boot.classList.contains("done")) fail("SIGNAL LOST // BOOT FAILED", String(e && e.message || e));
+      });
+      window.addEventListener("unhandledrejection", function (e) {
+        var msg = String(e && e.reason || e);
+        if (msg.indexOf("Using exceptions for control flow") !== -1) return;
+        if (!boot.classList.contains("done")) fail("SIGNAL LOST // BOOT FAILED", msg);
+      });
+
+      // Trunk fires this once the WASM module is instantiated and `main` ran.
+      // Wait until the canvas has been resized and painted a few frames, then
+      // fade — never dismissing an active error diagnostic.
+      addEventListener("TrunkApplicationStarted", function () {
+        if (failed) return;
+        status.textContent = "Signal locked";
+        var frames = 0;
+        (function tick() {
+          if (failed) return;
+          if (canvas.width > 0 && canvas.height > 0 && ++frames > 6) {
+            boot.classList.add("done");
+            canvas.focus();
+            return;
+          }
+          requestAnimationFrame(tick);
+        })();
+      });
+    })();
+  </script>
+</body>
+</html>

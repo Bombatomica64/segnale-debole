@@ -144,21 +144,25 @@ Grid-based room-and-corridor labyrinth (`21x21` to `29x29` cells, cell size `4.0
 
 ### Platform & Build Compatibility Notes
 - **Bevy version:** `0.20.1`
-- **Linux dependency safety:** On environments without `libudev-dev` or `libasound2-dev`, `Cargo.toml` disables `default-features` and explicitly selects the Bevy 0.20 feature collections (`default_app`, `3d_bevy_render`, `ui_bevy_render`, `std`, `bevy_winit`, `default_font`, `multi_threaded`, `x11`, `wayland`, `custom_cursor`, `png`), omitting `bevy_gilrs` and keeping `bevy_audio` behind an optional Cargo feature `audio` (`audio = ["bevy/bevy_audio", "bevy/wav"]`, which can be enabled on systems with ALSA or non-Linux targets).
+- **Linux dependency safety:** On environments without `libudev-dev` or `libasound2-dev`, `Cargo.toml` disables `default-features` and explicitly selects the Bevy 0.20 feature collections (`default_app`, `3d_bevy_render`, `ui_bevy_render`, `std`, `bevy_winit`, `default_font`, `multi_threaded`, `custom_cursor`, `png`), with `x11` + `wayland` added only on `cfg(target_os = "linux")` and `webgl2` + `web` only on `cfg(target_arch = "wasm32")`, omitting `bevy_gilrs` and keeping `bevy_audio` behind an optional Cargo feature `audio` (`audio = ["bevy/bevy_audio", "bevy/wav"]`, which can be enabled on systems with ALSA or non-Linux targets).
 - **Optional ray-traced lighting (`raytracing` feature → `bevy/bevy_solari`):** `src/raytracing.rs` adds Bevy Solari when a renderer exists and `SEGNALE_RT` isn't `off`. It activates only if the GPU exposes ray-query + binding-array features. Under RT, the player camera gets `SolariLighting { restir: true }`, HDR, `Msaa::Off`, a storage main texture, unit exposure and a solid-color sky environment map. The sun and camera ambient are scaled by the raster exposure (≈1/1000) so lit surfaces keep their brightness. World point/spot lights move to an undrawn render layer, since Solari traces only the sun and emissive meshes. Opaque world `StandardMaterial` meshes get `RaytracingMesh3d` while visible. Their meshes are converted in place to Solari's layout (u32 indices, zero UV/tangent fill), and their materials switch to the deferred path. The default renderer method stays forward, so the viewmodel overlay (no deferred prepass) and translucent FX render as before.
 - **Custom Lightweight 3D FPS Physics:** Fast, deterministic swept AABB / cylinder-vs-grid+ramp collision (`src/physics.rs`) — zero external physics crate version conflicts, silky-smooth Doom wall-sliding, ramp climbing, jumping, and instant raycasts for hitscan weapons & signal wall-attenuation!
 
 - **Performance (Milestone 9):** Static level geometry and demon parts are merged into batched meshes (`src/mesh_batch.rs`), MSAA picks 2× only when the adapter supports it (else off), and `F3` (frame-time overlay) / `F4` (VSync) are live perf controls (`src/perf.rs`).
-- **CI / Releases:** `.github/workflows/ci.yml` (test + clippy + `--features audio` check on Ubuntu) and `.github/workflows/release.yml` (Linux x86_64 / Windows x86_64 / macOS aarch64 `--release --features audio` archives, published to a GitHub Release on `v*` tags).
+- **CI / Releases:** `.github/workflows/ci.yml` (test + clippy + `--features audio` check on Ubuntu, plus a `wasm32-unknown-unknown` clippy job) and `.github/workflows/release.yml` (Linux x86_64 / Windows x86_64 / macOS aarch64 `--release --features audio` archives and the `segnale-debole-web-itch.zip` WebGL2 build, published to a GitHub Release on `v*` tags).
 
 ### Module Layout (`src/`)
 ```
 src/
-├── main.rs            # Window config + GamePlugin
+├── main.rs            # Window config (native window / web `#bevy` canvas) + GamePlugin
 ├── lib.rs             # CoreGameplayPlugin, GamePlugin, headless test app builder
 ├── state.rs           # AppState (MainMenu, Playing, Paused, UpgradeSelect, GameOver, Victory, Loadout, ContractsFeats, Settings), RunStats, UpgradeId
 ├── assets_gen.rs      # Procedural 64x64 nearest-neighbor retro textures & shared Materials/Meshes
-├── level.rs           # Procedural 3D Mars Bunker labyrinth generator (rooms, corridors, ramps, catwalks, atrium, tower, jammers)
+├── level.rs           # Procedural 3D Mars Bunker labyrinth generator (rooms, corridors, ramps, catwalks, atrium, tower, jammers), light culling + WebGL2 light cap
+├── architecture.rs    # Sculpted trim, overhead trusses/conduits, catwalk girders and sector props baked into the level batches
+├── sculpt.rs          # Procedural sculpted meshes for demons, boss, pylons and guns
+├── decals.rs          # Pooled blood / ichor / scorch / plasma-burn floor & wall decals
+├── trials.rs          # Daily Seeded Run (UTC date -> seed + loadout), split timer, movement Time Trial course
 ├── physics.rs         # Fast 3D FPS collision (walls, multi-elevation floors, walkable ramps, line-of-sight raycast)
 ├── player.rs          # Quake/CPMA FPS controller (friction, air-strafe, air control, bhop, coyote/buffer), mouse look, Airplane Mode Dash, health/armor/ammo
 ├── signal.rs          # Continuous 0..5 bar signal solver (distance, wall occlusion, Jammers, Dead Zones), Ping Scan pulse, 5G Overload
@@ -168,7 +172,7 @@ src/
 ├── upgrades.rs        # Roguelike upgrade pool (17 upgrades), next-rank previews, stat modifiers, App Store 1-of-3 selection
 ├── apps.rs            # Phone Apps + signature app effects (decoys, spoofing, hotspots, routes)
 ├── boss.rs            # THE CARRIER DAEMON phase machine, Signal Shield pylons, boss HUD snapshot
-├── meta.rs / meta_ui.rs  # Persistent JSON profile, loadout, contracts, feats, settings + their menus
+├── meta.rs / meta_ui.rs  # Persistent JSON profile (disk on native, localStorage on web), loadout, contracts, feats, settings + their menus
 ├── hud.rs / ui_kit.rs / phone_screen.rs  # Doom HUD, menus, procedural UI kit, live phone OLED texture
 ├── fx.rs              # Bursts, flashes, HUD feed toasts
 ├── mesh_batch.rs / perf.rs  # Static/demon mesh batching, MSAA selection, F3/F4 perf controls
@@ -191,25 +195,30 @@ All music is synthesized at startup in pure Rust (no audio files), deterministic
 
 ---
 
-## 8. Web / itch.io WASM Feasibility
+## 8. Web / itch.io Build (WebGL2 WASM)
 
-**Verdict:** feasible with a focused port, not a rewrite. No web build ships yet; `wasm32-unknown-unknown` is not part of the current toolchain/CI.
+Shipped in Milestone 19. The browser build is the same game compiled to `wasm32-unknown-unknown` and rendered with WebGL2; `trunk` handles `wasm-bindgen`, `wasm-opt` and the `dist/` bundle.
 
-**Already web-friendly:**
-- **All content is procedural, in-memory Rust:** 64×64 textures, meshes, UI kit, phone OLED texture and every WAV (SFX + music stems) are generated at startup — there are no asset files to fetch, so no asset-server / HTTP loading work.
-- **Custom CPU physics, signal solver, AI and boss logic** are plain Rust with no threads, native crates or OS APIs.
-- **Bevy 0.20.1 already handles the platform layers:** `bevy_tasks` falls back to a single-threaded executor on `wasm32` (so `multi_threaded` is harmless), `bevy_app`/`bevy_reflect` switch to their `web` features, and `bevy_audio` pulls `rodio` with `wasm-bindgen` (WebAudio) on `wasm32`, so the `audio` feature works in browsers.
-- **Graceful persistence fallback:** `resolve_profile_path` reads `SEGNALE_PROFILE`/`XDG_DATA_HOME`/`HOME`; on `wasm32` those are absent, so `ProfileStore` already degrades to an in-memory profile instead of calling `std::fs` (no crash — but no saved progress).
-- **MSAA selection** already queries adapter support and falls back to `Msaa::Off`; cursor capture already waits for a click (which browsers require for Pointer Lock).
+**Build:** `trunk serve --features audio` (dev) / `trunk build --release --features audio` (release into the gitignored `dist/`). CI and releases add `--cargo-profile wasm-release` (fat LTO, `opt-level = "s"`) to shrink the download. `index.html` passes rustc's default wasm32 features (bulk memory, sign-ext, ...) to `wasm-opt -Oz`. `Trunk.toml` sets `public_url = "./"` so asset URLs stay relative inside itch.io's iframe.
 
-**Concrete remaining blockers:**
-1. **Linux-only Bevy features:** `x11` and `wayland` are unconditional in `Cargo.toml`. Move them into `[target.'cfg(target_os = "linux")'.dependencies]` (a second `bevy` entry adding those features) and add `webgl2` (or `webgpu`) under `[target.'cfg(target_arch = "wasm32")'.dependencies]`.
-2. **Persistence:** abstract `ProfileStore` load/save behind a small backend trait with a `wasm32` implementation over `web_sys::Storage` (`localStorage`, JSON string under one key) so settings, unlocks and records survive reloads.
-3. **Randomness:** `rand 0.9` → `getrandom 0.3` needs the `wasm_js` feature plus `--cfg getrandom_backend="wasm_js"` (in `.cargo/config.toml`) to compile on `wasm32-unknown-unknown`.
-4. **Rendering limits:** WebGL2 has a much smaller clustered-forward point-light budget and no compute; the game spawns `PointLight`s from 7 modules (lamps, alarms, beacons, muzzle/explosion FX, boss) — cap concurrent lights / disable their shadows on web, and default to `Msaa::Off` or `Sample4` (WebGL2 rarely exposes 2×).
-5. **Windowing/input differences:** `bevy_winit` on web needs `Window { canvas: Some("#bevy"), fit_canvas_to_parent: true, .. }`; `CursorGrabMode::Locked` maps to Pointer Lock (only granted after a user click; `Esc` releases it, which must be treated as "pause"); the `F4` VSync toggle is meaningless in browsers (while `F3` perf overlay still works).
-6. **Dev-only native APIs:** `playtest_bot.rs` uses `std::time::Instant` (panics on `wasm32-unknown-unknown`) — swap to `bevy::platform::time::Instant` or compile the bot out on web.
-7. **Toolchain & packaging:** `rustup target add wasm32-unknown-unknown`, add `wasm-bindgen` via `trunk` (an `index.html` with a `<canvas id="bevy">` and `trunk build --release --features audio`), then `wasm-opt -Oz` and zip `dist/` for an itch.io HTML5 upload (optionally a `release.yml` job).
+**Why it ports cleanly:**
+- **All content is procedural, in-memory Rust:** textures, meshes, UI kit, phone OLED texture and every WAV are generated at startup, so there are no asset files to fetch.
+- **Physics, signal solver, AI and boss logic** are plain Rust with no threads or OS APIs. `bevy_tasks` falls back to a single-threaded executor on wasm32, so `multi_threaded` and `custom_cursor` stay enabled.
+- **Audio:** `bevy_audio` pulls `rodio` with `wasm-bindgen` (WebAudio). `index.html` resumes every `AudioContext` on the first click or key press, because browsers start audio suspended.
+
+**Platform layer (all `cfg(target_arch = "wasm32")`; native code paths unchanged):**
+- **Cargo:** `bevy` adds `webgl2` + `web`; `getrandom 0.3` (via `rand 0.9`) uses `wasm_js`, with `--cfg getrandom_backend="wasm_js"` in `.cargo/config.toml`; `js-sys` + `web-sys` (`Window`, `Storage`, `Document`, `Element`).
+- **Window (`main.rs`):** `canvas: "#bevy"`, `fit_canvas_to_parent`, `prevent_default_event_handling` (the right-click Ping Scan and the F-keys reach the game), `PresentMode::AutoVsync`.
+- **Daily date (`trials.rs`):** `DailyDate::today_utc` reads `js_sys::Date` (`getUTCFullYear/Month/Date`), so web and native players share the same Daily Seeded Run.
+- **Persistence (`meta.rs`):** `ProfileStore::open_web` loads and saves through `ProfileKv`, a small key/value trait. On wasm32 it is backed by `localStorage` under `segnale_debole.profile.v1`. Corrupt or incompatible JSON is copied to `segnale_debole.profile.v1.bak` (then `.bak.1`, ...), mirroring the native `.bak` policy. Blocked storage falls back to an in-memory profile with a notice. The same JSON format is used as the native `profile.json`, and `load_profile_kv` / `save_profile_kv` are unit-tested natively against a map.
+- **Rendering (`perf.rs`, `level.rs`):** `platform_msaa` forces `Msaa::Off`, avoiding multi-camera MSAA resolve hazards and fill-rate cost on integrated GPUs. WebGL2 has no storage buffers, so clustered forward packs lights into small uniform buffers, and the world point-light budget is `WEB_POINT_LIGHT_CAP = 12`: `cull_world_lights` keeps only the nearest 12 lit `CullableLight`s (`light_cap_cutoff`). Native is uncapped (`point_light_cap(false) == None`). `F4` shows `VSYNC MANAGED BY BROWSER` instead of toggling `AutoNoVsync`.
+- **Pointer Lock (`player.rs`):** browsers handle `Esc` themselves (exit Pointer Lock) and usually never deliver the key, so `sync_browser_pointer_lock` polls `document.pointerLockElement` every frame. It pauses when a lock we actually held disappears while `Playing` (`browser_unlock_should_pause`). A lock that was never granted (pending request, or the browser's re-lock cooldown after `Esc`) never pauses; a click re-requests it, and mouse look waits for the real lock (`mouse_look_active`). Our own `OnExit(Playing)` release is never seen from `Playing`, and a state transition already queued that frame wins over the pause.
+- **Dev tooling:** the playtest bot uses `bevy::platform::time::Instant` (web-safe). `SEGNALE_*` lookups via `std::env::var` return `Err` on wasm32, so the bot, screenshot tours and `std::fs` paths are never reached in the browser.
+
+**Browser caveats:**
+- Expect lower frame rates than native on integrated GPUs, and a multi-second first-load shader compile.
+- Chrome (and possibly other browsers) briefly refuses to re-lock the pointer right after `Esc`, so resuming may need one extra click to re-capture.
+- itch.io needs the "played in the browser" option, and fullscreen is via itch's button.
 
 ---
 
@@ -226,4 +235,9 @@ All music is synthesized at startup in pure Rust (no audio files), deterministic
 - **Milestone 11 (High-Speed Bunker Arenas):** Signal-Gated Jump Pads, Explosive Server-Rack Barrels, twin atrium ramps, and 5 sector visual themes.
 - **Milestone 12 (Settings, Endless & Records):** Persistent Settings menu (`O`), Endless Overdrive mode (`E` after Floor 5), Peak Speed / Max Bhop Chain records, playtest-bot pit recovery.
 - **Milestone 13 (New Demons & Boss):** Phase Stalker, Catwalk Relay Sniper, and THE CARRIER DAEMON shield-pylon boss on Floor 5 and every 5th Endless floor.
-- **Milestone 14 (Soundtrack, CI/Release & Web Feasibility):** 3-layer adaptive industrial-synth soundtrack (Dead-Zone Drone / Signal Pulse / Rush Metal) with live ECS mixing, GitHub Actions CI and cross-platform release packaging, and the WASM / itch.io feasibility study above (310 passing tests).
+- **Milestone 14 (Soundtrack, CI/Release & Web Feasibility):** 3-layer adaptive industrial-synth soundtrack (Dead-Zone Drone / Signal Pulse / Rush Metal) with live ECS mixing, GitHub Actions CI and cross-platform release packaging, and the WASM / itch.io feasibility study (310 passing tests).
+- **Milestone 15 (3D Models Overhaul):** procedurally sculpted meshes (`src/sculpt.rs`) for all 7 enemies, the Carrier Daemon and its pylons, and all 3 guns.
+- **Milestone 16 (World Architecture & Sector Props):** sculpted trim, overhead trusses and conduits, catwalk girders, flush wall-mounted sector props and animated hazards (`src/architecture.rs`), baked into the static level batches.
+- **Milestone 17 (Enemy Animation, Decals & Gibs):** procedural enemy attack animations, directional hit-stagger, pooled combat decals (`src/decals.rs`) and gibs.
+- **Milestone 18 (Daily Runs, Splits & Time Trials):** Daily Seeded Runs (UTC date -> seed + loadout, per-date records), the speedrun split timer with PB deltas, and the movement Time Trial course with checkpoints and instant `R` reset (`src/trials.rs`; 374 passing tests).
+- **Milestone 19 (Web / itch.io):** the WebGL2 WASM build described in section 8: `trunk` + `index.html` + `Trunk.toml`, browser UTC clock, `localStorage` profile, a WebGL2 light cap and MSAA off, pointer-lock pause, a wasm32 clippy CI job and the `segnale-debole-web-itch.zip` release asset (379 passing tests).

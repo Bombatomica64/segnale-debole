@@ -19,7 +19,10 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `std::time::Instant::now()` panics on wasm32; Bevy's re-export is web-safe.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
