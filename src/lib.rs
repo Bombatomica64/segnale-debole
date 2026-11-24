@@ -21,6 +21,7 @@ pub mod physics;
 pub mod player;
 pub mod playtest_bot;
 pub mod raytracing;
+pub mod sculpt;
 pub mod signal;
 pub mod state;
 pub mod upgrades;

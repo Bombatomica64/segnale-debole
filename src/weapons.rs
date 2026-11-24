@@ -6,15 +6,17 @@
 //! Viewmodels live on [`OVERLAY_LAYER`], drawn by a second camera (child of the
 //! `PlayerCamera`) that clears depth, so they never clip into walls.
 
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::mouse::AccumulatedMouseScroll;
+use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
 use bevy::render::view::Msaa;
 use rand::Rng;
 
 use crate::apps::{spawn_hijack_hotspot, PhoneApps};
+use crate::assets_gen::{engraved_gold_texture, gunmetal_plate_texture, hazard_stripe_texture, obsidian_tech_texture, wood_grain_texture};
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::bot_input::BotControl;
 use crate::boss::{damage_pylon, pylon_ray_hit, BossPylon, PYLON_SPHERES};
@@ -29,6 +31,7 @@ use crate::mesh_batch::{MaterialBatches, ParentedBatches};
 use crate::meta::{HandsetSkin, RunLoadout, SkinSlot};
 use crate::phone_screen::PhoneScreenTexture;
 use crate::physics::{has_line_of_sight, raycast_grid};
+use crate::sculpt;
 use crate::player::{live_eye_pose, smooth_factor, CursorCaptured, Player, PlayerCamera, AIR_SPEED_HARD_CAP};
 use crate::signal::{overclock_factor, SignalState};
 use crate::state::{GameSet, PlayerModifiers, RunStats};
@@ -158,6 +161,10 @@ pub struct WeaponState {
     /// Weapon being lowered during a swap (shown for the first half of it).
     pub previous: Weapon,
     pub cooldown: f32,
+    /// Full cooldown armed by the last shot (after fire-rate / 5G Overclock
+    /// modifiers), so reload-cycle animations normalise against the real cycle.
+    /// Zeroed when a swap (not a shot) arms the cooldown.
+    pub last_cooldown: f32,
     /// Remaining swap animation; the model switches at the halfway point.
     pub swap_timer: f32,
     pub recoil: f32,
@@ -190,8 +197,22 @@ impl WeaponState {
         } else {
             SWAP_SECS
         };
-        self.cooldown = self.cooldown.max(SWAP_SECS * 0.6);
+        let swap_cd = SWAP_SECS * 0.6;
+        if swap_cd > self.cooldown {
+            // The swap, not a shot, now owns the cooldown: no reload cycle to animate.
+            self.cooldown = swap_cd;
+            self.last_cooldown = 0.0;
+        }
         true
+    }
+
+    /// 0..1 progress through the current shot's reload cycle (1.0 = ready, or no
+    /// shot cycle in flight), normalised by the cooldown that shot actually armed.
+    pub fn cycle_progress(&self) -> f32 {
+        if self.cooldown <= 0.0 || self.last_cooldown <= 0.0 {
+            return 1.0;
+        }
+        1.0 - (self.cooldown / self.last_cooldown.max(0.05)).clamp(0.0, 1.0)
     }
 }
 
@@ -865,6 +886,15 @@ pub struct MuzzleLight;
 pub struct MuzzleStar;
 #[derive(Component)]
 pub struct PlasmaCoil(pub usize);
+/// Shotgun bolt carrier over the right-side ejection port (slides back on the pump).
+#[derive(Component)]
+pub struct ShotgunBolt;
+/// Plasma Repeater top flux slide (snaps back on every shot, exposing the capacitor).
+#[derive(Component)]
+pub struct PlasmaFluxSlide;
+/// Signal-Mortar open breech cradle + warhead (kicks back on fire, vents on reload).
+#[derive(Component)]
+pub struct RocketBreech;
 #[derive(Component)]
 pub struct PhoneViewmodel;
 #[derive(Component)]
@@ -878,6 +908,8 @@ pub struct PhoneMaterials {
     pub screen: Handle<StandardMaterial>,
     pub led: Handle<StandardMaterial>,
     pub coil: Handle<StandardMaterial>,
+    /// Signal-Mortar warhead / ammo window / heat-vent glow (flares on fire, recharges).
+    pub warhead: Handle<StandardMaterial>,
 }
 
 /// A phone chassis part styled by the run's [`HandsetSkin`] palette slot.
@@ -888,20 +920,91 @@ pub struct PhoneSkinPart(pub SkinSlot);
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhoneSkin(pub HandsetSkin);
 
-pub const WEAPON_REST: Vec3 = Vec3::new(0.24, -0.20, -0.40);
+/// Gun rest pose: nudged left/up so the sculpted receiver, walnut wrist and rear
+/// breech clear the bottom-right ammo panel while staying wide of the crosshair.
+pub const WEAPON_REST: Vec3 = Vec3::new(0.215, -0.175, -0.39);
 pub const PHONE_REST: Vec3 = Vec3::new(-0.265, -0.135, -0.37);
+/// Rest pose of the animated mechanical pivots (local to their gun model).
+pub const SHOTGUN_BOLT_REST: Vec3 = Vec3::new(0.0445, 0.014, -0.047);
+pub const PLASMA_SLIDE_REST: Vec3 = Vec3::new(0.0, 0.081, -0.15);
+pub const ROCKET_BREECH_REST: Vec3 = Vec3::new(0.0, 0.068, -0.03);
+/// Idle emissive of the plasma coils / conduit / canister: vivid #00C8FF electric cyan,
+/// never white.
+const PLASMA_GLOW: LinearRgba = LinearRgba::rgb(0.02, 0.85, 1.75);
+/// Plasma emissive at the peak of a shot (blends back to [`PLASMA_GLOW`]).
+const PLASMA_FLARE: LinearRgba = LinearRgba::rgb(0.12, 2.2, 4.2);
+/// Idle emissive of the Signal-Mortar warhead, ammo windows + heat vents: hot #FF8A1F
+/// amber (flares on a shot, dims while venting, recharges by ready).
+const ROCKET_GLOW: LinearRgba = LinearRgba::rgb(2.0, 0.62, 0.03);
+/// Camera-space depth of the world-space muzzle origin of tracers / bolts / rockets
+/// (also the eye->muzzle span `rocket_launch` checks for a blocking wall).
+pub const MUZZLE_DEPTH: f32 = 0.85;
+/// Shotgun right-side ejection port, local to the gun model.
+pub const SHOTGUN_PORT_LOCAL: Vec3 = Vec3::new(0.036, 0.014, -0.045);
+
+/// Barrel tip of each gun viewmodel, local to its [`GunModel`] (where its flash sits).
+pub fn viewmodel_muzzle_local(w: Weapon) -> Vec3 {
+    match w {
+        Weapon::Shotgun => Vec3::new(0.0, 0.030, -0.598),
+        Weapon::Plasma => Vec3::new(0.0, 0.0, -0.585),
+        Weapon::Rocket => Vec3::new(0.0, 0.012, -0.565),
+    }
+}
+
+/// Camera-space muzzle origin of world tracers / bolts / rockets: the gun's barrel tip
+/// slid along its own view ray to [`MUZZLE_DEPTH`]. The viewmodel overlay camera shares
+/// the eye's pose and FOV, so shots leave exactly where the barrel is drawn on screen.
+pub fn muzzle_offset(w: Weapon) -> Vec3 {
+    let tip = WEAPON_REST + viewmodel_muzzle_local(w);
+    tip * (MUZZLE_DEPTH / -tip.z)
+}
+
+/// Multiply a mesh's UVs (per-part texture tiling while sharing one material).
+fn uv_scaled(mut m: Mesh, s: Vec2) -> Mesh {
+    if let Some(VertexAttributeValues::Float32x2(uvs)) = m.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
+        for uv in uvs.iter_mut() {
+            uv[0] *= s.x;
+            uv[1] *= s.y;
+        }
+    }
+    m
+}
+
+/// Flat `size` decal quad facing +Z with UVs scaled by `uv`.
+fn decal(size: Vec2, uv: Vec2) -> Mesh {
+    uv_scaled(Mesh::from(Rectangle::new(size.x, size.y)), uv)
+}
 
 fn vm_part(parent: Entity, mesh: &Handle<Mesh>, mat: &Handle<StandardMaterial>, t: Vec3, s: Vec3, r: Quat) -> impl Bundle {
     (ChildOf(parent), Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::from_translation(t).with_scale(s).with_rotation(r), overlay_layer())
 }
 
+/// Viewmodel cylinder: 12 sides is plenty at viewmodel scale (Bevy's default is 32).
+fn vm_cylinder() -> Mesh {
+    Cylinder::new(1.0, 1.0).mesh().resolution(12).build()
+}
+
+/// Thin faceted ring spanning radius 0.78..1.0 in the XZ plane (192 tris; a default
+/// Bevy `Torus` of the same footprint costs 1,536).
+fn vm_thin_ring() -> Mesh {
+    sculpt::armored_ring(0.89, 0.11, 0.11, 12, true)
+}
+
+/// Tiny sight beads / LEDs: a few millimetres on screen, 8x6 is visually round.
+fn vm_bead() -> Mesh {
+    Sphere::new(1.0).mesh().uv(8, 6)
+}
+
 /// Source primitives of the viewmodel batches (same shapes as the handles).
+/// Tessellation is tuned for viewmodel scale: a default `Capsule3d` is 1,024 tris and a
+/// default `Torus` 1,536, which alone pushed each gun past 9k triangles.
 struct VmSourceMeshes {
     cube: Mesh,
     cyl: Mesh,
     cap: Mesh,
     thin_ring: Mesh,
     sphere: Mesh,
+    bead: Mesh,
     cone: Mesh,
 }
 
@@ -909,11 +1012,12 @@ impl VmSourceMeshes {
     fn new() -> Self {
         VmSourceMeshes {
             cube: Mesh::from(Cuboid::new(1.0, 1.0, 1.0)),
-            cyl: Mesh::from(Cylinder::new(1.0, 1.0)),
-            cap: Mesh::from(Capsule3d::new(0.5, 1.0)),
-            thin_ring: Mesh::from(Torus::new(0.78, 1.0)),
-            sphere: Sphere::new(1.0).mesh().uv(16, 12),
-            cone: Mesh::from(Cone::new(1.0, 1.0)),
+            cyl: vm_cylinder(),
+            cap: Capsule3d::new(0.5, 1.0).mesh().latitudes(6).longitudes(12).build(),
+            thin_ring: vm_thin_ring(),
+            sphere: Sphere::new(1.0).mesh().uv(10, 8),
+            bead: vm_bead(),
+            cone: Cone::new(1.0, 1.0).mesh().resolution(12).build(),
         }
     }
 }
@@ -925,6 +1029,7 @@ fn spawn_viewmodels(
     phone_tex: Option<Res<PhoneScreenTexture>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     loadout: Option<Res<RunLoadout>>,
     render_msaa: Option<Res<crate::perf::RenderMsaa>>,
 ) {
@@ -939,11 +1044,13 @@ fn spawn_viewmodels(
         _ => 85f32.to_radians(),
     };
     let cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-    let cyl = meshes.add(Cylinder::new(1.0, 1.0));
-    let ring = meshes.add(Torus::new(0.68, 1.0));
-    let thin_ring = meshes.add(Torus::new(0.78, 1.0));
-    let sphere = meshes.add(Sphere::new(1.0).mesh().uv(16, 12));
+    let cyl = meshes.add(vm_cylinder());
+    let thin_ring = meshes.add(vm_thin_ring());
+    let bead = meshes.add(vm_bead());
     let screen_quad = meshes.add(Rectangle::new(0.118, 0.177));
+    // Beveled faceted accelerator ring for the animated plasma coils (same unit
+    // footprint as the old 0.68..1.0 torus so the ripple scale is unchanged).
+    let coil_ring = meshes.add(sculpt::armored_ring(0.84, 0.16, 0.16, 20, true));
     // Rigid untagged parts are baked per (pivot, material) into a few meshes;
     // tagged / animated parts (skin slots, LEDs, coils, screen) stay separate.
     let src = VmSourceMeshes::new();
@@ -952,22 +1059,65 @@ fn spawn_viewmodels(
     let mat = |m: &mut Assets<StandardMaterial>, c: Color, rough: f32, metal: f32| {
         m.add(StandardMaterial { base_color: c, perceptual_roughness: rough, metallic: metal, ..default() })
     };
-    let glow = |m: &mut Assets<StandardMaterial>, c: Color, e: LinearRgba| m.add(StandardMaterial { base_color: c, emissive: e, unlit: true, ..default() });
+    // Muzzle flashes: lit but matte/non-reflective so the HDR emissive drives them
+    // (an unlit material ignores emissive and tonemaps a 1.0 base to flat beige/grey).
+    let glow = |m: &mut Assets<StandardMaterial>, c: Color, e: LinearRgba| {
+        m.add(StandardMaterial { base_color: c, emissive: e, perceptual_roughness: 1.0, metallic: 0.0, reflectance: 0.0, ..default() })
+    };
+    // Lit emissive: the (moderate) emissive carries a saturated hue that never clips
+    // to white, the base colour still catches the key light, and the emissive stays
+    // animatable (unlit materials ignore emissive entirely).
+    let lit_glow =
+        |m: &mut Assets<StandardMaterial>, c: Color, e: LinearRgba| m.add(StandardMaterial { base_color: c, emissive: e, perceptual_roughness: 0.6, metallic: 0.0, reflectance: 0.2, ..default() });
+    // Retro pixel-art surfaces (neutral-bright, tinted by base_colour).
+    let gunmetal_img = images.add(gunmetal_plate_texture().into_image());
+    let wood_img = images.add(wood_grain_texture().into_image());
+    let hazard_img = images.add(hazard_stripe_texture().into_image());
+    let obsidian_img = images.add(obsidian_tech_texture().into_image());
+    let gold_img = images.add(engraved_gold_texture().into_image());
+    let tex = |m: &mut Assets<StandardMaterial>, img: &Handle<Image>, c: Color, rough: f32, metal: f32| {
+        m.add(StandardMaterial { base_color: c, base_color_texture: Some(img.clone()), perceptual_roughness: rough, metallic: metal, ..default() })
+    };
 
     // Rich metallic / composite / tactical palette.
     let steel = mat(&mut materials, Color::srgb(0.46, 0.49, 0.54), 0.28, 0.9);
     let brushed = mat(&mut materials, Color::srgb(0.32, 0.35, 0.39), 0.38, 0.85);
     let dark_steel = mat(&mut materials, Color::srgb(0.12, 0.13, 0.15), 0.44, 0.78);
-    let heat_metal = mat(&mut materials, Color::srgb(0.24, 0.19, 0.22), 0.32, 0.88);
-    let titanium = mat(&mut materials, Color::srgb(0.22, 0.24, 0.27), 0.42, 0.82);
-    let copper = mat(&mut materials, Color::srgb(0.62, 0.34, 0.16), 0.35, 0.85);
-    let brass = mat(&mut materials, Color::srgb(0.86, 0.68, 0.22), 0.25, 0.92);
+    // Heat-blued muzzle hardware (cool violet-blue temper).
+    let heat_blued = mat(&mut materials, Color::srgb(0.20, 0.22, 0.36), 0.3, 0.88);
     let shell_red = mat(&mut materials, Color::srgb(0.72, 0.08, 0.05), 0.45, 0.1);
-    let wood = mat(&mut materials, Color::srgb(0.29, 0.14, 0.06), 0.72, 0.05);
     let grip = mat(&mut materials, Color::srgb(0.055, 0.055, 0.06), 0.92, 0.05);
     let glove = mat(&mut materials, Color::srgb(0.17, 0.20, 0.14), 0.88, 0.05);
     let glove_plate = mat(&mut materials, Color::srgb(0.26, 0.29, 0.22), 0.55, 0.45);
-    let hazard = mat(&mut materials, Color::srgb(0.88, 0.52, 0.04), 0.5, 0.2);
+    let bolt_silver = mat(&mut materials, Color::srgb(0.68, 0.72, 0.76), 0.25, 0.95);
+    // Textured gun surfaces.
+    let gm_steel = tex(&mut materials, &gunmetal_img, Color::srgb(0.62, 0.65, 0.70), 0.3, 0.82);
+    let gm_titanium = tex(&mut materials, &gunmetal_img, Color::srgb(0.43, 0.46, 0.51), 0.34, 0.78);
+    let gm_dark = tex(&mut materials, &gunmetal_img, Color::srgb(0.25, 0.27, 0.31), 0.4, 0.72);
+    let wood = tex(&mut materials, &wood_img, Color::srgb(1.0, 0.94, 0.9), 0.6, 0.0);
+    let hazard = tex(&mut materials, &hazard_img, Color::WHITE, 0.5, 0.15);
+    // Signal-Mortar shroud: warm tint + a hazard-textured #F2A20C self-glow so the amber
+    // stripes stay punchy on dark floors (the black stripes stay black).
+    let rk_hazard = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.84, 0.55),
+        base_color_texture: Some(hazard_img.clone()),
+        emissive: LinearRgba::from(Color::srgb(0.949, 0.635, 0.047)) * 0.32,
+        emissive_texture: Some(hazard_img.clone()),
+        perceptual_roughness: 0.42,
+        metallic: 0.15,
+        ..default()
+    });
+    // Mars Combat Pump: light brushed-gunmetal top planes over a black-oxide receiver
+    // side (gunmetal texture averages ~0.78, so tints are pre-compensated).
+    let sg_top = tex(&mut materials, &gunmetal_img, Color::srgb(0.49, 0.54, 0.60), 0.30, 0.85);
+    let sg_oxide = tex(&mut materials, &gunmetal_img, Color::srgb(0.14, 0.155, 0.18), 0.42, 0.78);
+    // UAC Plasma Repeater: dark industrial slate chassis + dark brushed titanium accents,
+    // so the cyan coils are the brightest thing on the gun.
+    let pl_slate = tex(&mut materials, &obsidian_img, Color::srgb(0.16, 0.18, 0.23), 0.36, 0.74);
+    let pl_titanium = tex(&mut materials, &gunmetal_img, Color::srgb(0.30, 0.34, 0.41), 0.32, 0.82);
+    let pl_edge = mat(&mut materials, Color::srgb(0.52, 0.56, 0.62), 0.22, 0.95);
+    let brass = tex(&mut materials, &gold_img, Color::srgb(1.0, 0.9, 0.72), 0.28, 0.9);
+    let copper = tex(&mut materials, &gold_img, Color::srgb(0.95, 0.56, 0.38), 0.32, 0.88);
     // Handset skin: unique materials for every skinned phone chassis slot.
     let mut skin_mat = |slot: SkinSlot| materials.add(palette.slot(slot).to_material());
     let (bezel, phone_frame, bumper, phone_ptt, phone_coil, phone_bolts) = (
@@ -978,26 +1128,35 @@ fn spawn_viewmodels(
         skin_mat(SkinSlot::Coil),
         skin_mat(SkinSlot::Bolts),
     );
-    let bolt_silver = mat(&mut materials, Color::srgb(0.68, 0.72, 0.76), 0.25, 0.95);
 
-    let sight_green = glow(&mut materials, Color::srgb(0.3, 1.0, 0.4), LinearRgba::rgb(1.0, 9.0, 1.5));
-    let sight_red = glow(&mut materials, Color::srgb(1.0, 0.25, 0.12), LinearRgba::rgb(10.0, 1.5, 0.4));
-    let vent_amber = glow(&mut materials, Color::srgb(1.0, 0.55, 0.15), LinearRgba::rgb(6.0, 2.2, 0.2));
-    let flash_core = glow(&mut materials, Color::srgb(1.0, 0.98, 0.88), LinearRgba::rgb(22.0, 18.0, 10.0));
-    let flash_fire = glow(&mut materials, Color::srgb(1.0, 0.65, 0.2), LinearRgba::rgb(16.0, 6.0, 0.8));
-    let flash_cyan = glow(&mut materials, Color::srgb(0.55, 1.0, 1.0), LinearRgba::rgb(4.0, 16.0, 20.0));
+    // Saturated glow accents (lit + emissive so the hue survives tonemapping).
+    let sight_green = lit_glow(&mut materials, Color::srgb(0.12, 0.95, 0.3), LinearRgba::rgb(0.25, 3.2, 0.55));
+    let sight_red = lit_glow(&mut materials, Color::srgb(1.0, 0.1, 0.05), LinearRgba::rgb(3.8, 0.32, 0.1));
+    let vent_amber = lit_glow(&mut materials, Color::srgb(1.0, 0.54, 0.12), ROCKET_GLOW);
+    // Incandescent yellow-white core, saturated orange-amber flame tongues.
+    let flash_core = glow(&mut materials, Color::srgb(1.0, 0.96, 0.72), LinearRgba::rgb(4.2, 3.2, 0.9));
+    let flash_fire = glow(&mut materials, Color::srgb(1.0, 0.48, 0.06), LinearRgba::rgb(1.45, 0.34, 0.006));
+    let flash_cyan = glow(&mut materials, Color::srgb(0.3, 0.9, 1.0), LinearRgba::rgb(0.5, 4.2, 7.5));
     let flash_cyan_halo = materials.add(additive_glow(Color::srgb(0.2, 0.92, 1.0), 0.65));
-    let warhead_glow = glow(&mut materials, Color::srgb(1.0, 0.62, 0.18), LinearRgba::rgb(9.0, 3.6, 0.5));
     let flash_amber_halo = materials.add(additive_glow(Color::srgb(1.0, 0.5, 0.1), 0.6));
-    let coil = materials.add(StandardMaterial { base_color: Color::srgb(0.35, 1.0, 1.0), emissive: LinearRgba::rgb(0.8, 6.0, 8.5), unlit: true, ..default() });
-    let led = materials.add(StandardMaterial { base_color: Color::WHITE, emissive: LinearRgba::rgb(6.0, 1.0, 0.8), unlit: true, ..default() });
+    // Animated (per-shot reactive) glows live in PhoneMaterials, replaced every run.
+    let coil = lit_glow(&mut materials, Color::srgb(0.05, 0.62, 0.95), PLASMA_GLOW);
+    // Static brighter inner plasma core (conduit tube / capacitor) over the deeper coils.
+    let plasma_core = lit_glow(&mut materials, Color::srgb(0.45, 0.9, 1.0), LinearRgba::rgb(0.18, 1.6, 2.6));
+    let warhead_glow = lit_glow(&mut materials, Color::srgb(1.0, 0.54, 0.12), ROCKET_GLOW);
+    // Recessed ignition ring deep in the muzzle brake (static, a touch hotter/redder).
+    let bore_glow = lit_glow(&mut materials, Color::srgb(1.0, 0.42, 0.05), LinearRgba::rgb(2.4, 0.55, 0.02));
+    // Status LED / antenna beacon: LIT (unlit ignores emissive), dark hued base +
+    // saturated emissive, both rewritten every frame by `animate_viewmodels`.
+    let (led_base, led_emissive) = phone_led_glow(5, false, false, 0.0);
+    let led = materials.add(StandardMaterial { base_color: led_base, emissive: led_emissive, perceptual_roughness: 0.7, metallic: 0.0, reflectance: 0.08, ..default() });
     let screen = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: phone_tex.as_ref().map(|t| t.image.clone()),
         unlit: true,
         ..default()
     });
-    commands.insert_resource(PhoneMaterials { screen: screen.clone(), led: led.clone(), coil: coil.clone() });
+    commands.insert_resource(PhoneMaterials { screen: screen.clone(), led: led.clone(), coil: coil.clone(), warhead: warhead_glow.clone() });
 
     let overlay = commands
         .spawn((
@@ -1008,163 +1167,328 @@ fn spawn_viewmodels(
             msaa,
             Projection::Perspective(PerspectiveProjection { fov, near: 0.01, far: 400.0, ..default() }),
             RenderLayers::layer(OVERLAY_LAYER),
+            // Per-camera ambient: lifts the shadowed left/top faces of metal so the
+            // chamfers read instead of crushing to black (the world keeps its own).
+            AmbientLight { color: Color::srgb(1.0, 0.86, 0.8), brightness: 220.0, ..default() },
             Transform::default(),
         ))
         .id();
-    // Dual key + cool rim lighting for sculpted metallic highlights on the hands.
-    commands.spawn((
-        ChildOf(overlay),
-        PointLight { color: Color::srgb(1.0, 0.82, 0.7), intensity: 11_000.0, range: 3.5, shadow_maps_enabled: false, ..default() },
-        Transform::from_xyz(0.18, 0.42, 0.12),
-        overlay_layer(),
-    ));
-    commands.spawn((
-        ChildOf(overlay),
-        PointLight { color: Color::srgb(0.82, 0.9, 1.0), intensity: 6_800.0, range: 3.2, shadow_maps_enabled: false, ..default() },
-        Transform::from_xyz(-0.35, 0.22, 0.02),
-        overlay_layer(),
-    ));
+    // Studio rig on OVERLAY_LAYER: warm key above-left of the gun (lights the faces the
+    // camera sees), cool rim from ahead-right for edge specular, low warm fill from below,
+    // and a soft key for the phone chassis. The OLED screen is unlit, so it never washes out.
+    for (color, intensity, range, pos) in [
+        (Color::srgb(1.0, 0.88, 0.76), 13_000.0, 3.5, Vec3::new(0.06, 0.36, -0.18)),
+        (Color::srgb(0.66, 0.82, 1.0), 9_500.0, 3.0, Vec3::new(0.52, 0.22, -0.95)),
+        (Color::srgb(1.0, 0.72, 0.55), 2_600.0, 2.5, Vec3::new(0.12, -0.42, -0.25)),
+        (Color::srgb(0.82, 0.9, 1.0), 5_200.0, 3.2, Vec3::new(-0.35, 0.22, 0.02)),
+    ] {
+        commands.spawn((
+            ChildOf(overlay),
+            PointLight { color, intensity, range, shadow_maps_enabled: false, ..default() },
+            Transform::from_translation(pos),
+            overlay_layer(),
+        ));
+    }
     commands.spawn((
         ChildOf(overlay),
         MuzzleLight,
         PointLight { color: Color::srgb(1.0, 0.72, 0.35), intensity: 0.0, range: 3.5, shadow_maps_enabled: false, ..default() },
-        Transform::from_xyz(0.24, -0.08, -0.88),
+        Transform::from_translation(WEAPON_REST + Vec3::new(0.0, 0.1, -0.48)),
         overlay_layer(),
     ));
 
     // =========================================================================
-    // RIGHT HAND: ELABORATE WEAPON VIEWMODELS
+    // RIGHT HAND: SCULPTED WEAPON VIEWMODELS
     // =========================================================================
     let wroot = commands.spawn((ChildOf(cam), WeaponViewmodel, Transform::from_translation(WEAPON_REST), Visibility::default())).id();
     let rx = Quat::from_rotation_x(FRAC_PI_2);
     let rz = Quat::from_rotation_z(FRAC_PI_2);
     let id = Quat::IDENTITY;
+    let one = Vec3::ONE;
+    // Prism / ring axis (+Y) pointing at the muzzle (-Z) or the rear (+Z), rotated about
+    // that axis so an n-gon has a flat face on top.
+    let fwd = Quat::from_rotation_x(-FRAC_PI_2);
+    let fwd_flat = |n: usize| fwd * Quat::from_rotation_y(PI / n as f32);
+    let aft_flat = |n: usize| rx * Quat::from_rotation_y(PI / n as f32);
+    // Shared small sculpted hardware.
+    let hex_bolt = sculpt::tapered_prism(6, 0.0048, 0.0048, 0.0045, true);
+    let trigger_blade = sculpt::curved_horn(0.0032, 0.0018, 0.022, 0.0, 0.007, 5, 6);
+    let trigger_guard = sculpt::armored_ring(0.019, 0.0025, 0.0035, 16, true);
+    let wrist_cuff = sculpt::armored_ring(0.046, 0.008, 0.017, 12, true);
+    let knuckle_plate = sculpt::beveled_box(Vec3::new(0.022, 0.048, 0.068), 0.006);
+    let guard_rot = Quat::from_rotation_z(FRAC_PI_2);
+    let guard_scale = Vec3::new(1.0, 1.0, 1.5);
+    let arm_rot = Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2);
 
     // ---- Weapon 1: Mars Combat Pump Shotgun ----
     let sg = commands.spawn((ChildOf(wroot), GunModel(Weapon::Shotgun), Transform::default(), Visibility::default())).id();
-    // Stepped sculpted receiver body + chamfered top dust cover + bottom trigger housing.
-    vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, 0.0, -0.01), Vec3::new(0.072, 0.088, 0.25), id);
-    vb.part(sg, &src.cube, &brushed, Vec3::new(0.0, 0.044, -0.01), Vec3::new(0.056, 0.016, 0.235), id);
-    vb.part(sg, &src.cube, &titanium, Vec3::new(0.0, -0.046, 0.01), Vec3::new(0.052, 0.018, 0.18), id);
-    // Side receiver detail: recessed ejection port on right showing chambered red/brass shell + rivets.
-    vb.part(sg, &src.cube, &grip, Vec3::new(0.036, 0.014, -0.05), Vec3::new(0.006, 0.028, 0.092), id);
-    vb.part(sg, &src.cyl, &shell_red, Vec3::new(0.034, 0.014, -0.06), Vec3::new(0.01, 0.048, 0.01), rx);
-    vb.part(sg, &src.cyl, &brass, Vec3::new(0.034, 0.014, -0.032), Vec3::new(0.0105, 0.016, 0.0105), rx);
-    vb.part(sg, &src.cube, &hazard, Vec3::new(-0.037, 0.008, -0.02), Vec3::new(0.004, 0.016, 0.11), id);
-    for z in [-0.09f32, -0.01, 0.06] {
+    // Chamfered heavy receiver + sloped dust-cover shroud + beveled trigger housing.
+    // Black-oxide receiver sides vs light brushed-gunmetal top planes: the value split
+    // keeps the beveled form readable against dark walls.
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.072, 0.088, 0.25), 0.009), &sg_oxide, Vec3::new(0.0, 0.0, -0.01), one, id);
+    vb.part(sg, &sculpt::wedge_plate(0.066, 0.016, 0.24, 0.62, 0.95, 0.0), &sg_top, Vec3::new(0.0, 0.052, -0.01), one, id);
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.054, 0.022, 0.17), 0.006), &gm_titanium, Vec3::new(0.0, -0.052, 0.01), one, id);
+    // Hex rivets on both receiver flanks.
+    for z in [-0.11f32, -0.01, 0.07] {
         for s in [-1.0f32, 1.0] {
-            vb.part(sg, &src.cyl, &bolt_silver, Vec3::new(0.037 * s, -0.022, z), Vec3::new(0.005, 0.004, 0.005), rz);
+            vb.part(sg, &hex_bolt, &bolt_silver, Vec3::new(0.0372 * s, -0.026, z), one, rz);
         }
     }
-    // Top Picatinny rail blocks + rear green tritium ghost-ring sight + front red fiber-optic post.
+    // Recessed left-side Mars/UAC hazard stripe (dark inlay + diagonal stripe decal).
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.003, 0.024, 0.125), 0.001), &grip, Vec3::new(-0.0362, 0.010, -0.03), one, id);
+    vb.part(sg, &decal(Vec2::new(0.115, 0.016), Vec2::new(1.8, 0.25)), &hazard, Vec3::new(-0.0379, 0.010, -0.03), one, Quat::from_rotation_y(-FRAC_PI_2));
+    // Right-side recessed ejection port with the chambered red/brass shell + bolt guide rails.
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.004, 0.030, 0.076), 0.0012), &grip, Vec3::new(0.0352, 0.014, -0.046), one, id);
+    vb.part(sg, &src.cyl, &shell_red, Vec3::new(0.0335, 0.014, -0.053), Vec3::new(0.0075, 0.046, 0.0075), rx);
+    vb.part(sg, &src.cyl, &brass, Vec3::new(0.0335, 0.014, -0.025), Vec3::new(0.0082, 0.010, 0.0082), rx);
+    for y in [0.0305f32, -0.0025] {
+        vb.part(sg, &sculpt::beveled_box(Vec3::new(0.004, 0.003, 0.16), 0.001), &sg_top, Vec3::new(0.0378, y, -0.02), one, id);
+    }
+    // Beveled Picatinny rail + slots on the dust cover.
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.026, 0.006, 0.17), 0.0015), &gm_dark, Vec3::new(0.0, 0.063, -0.02), one, id);
+    let rail_slot = sculpt::beveled_box(Vec3::new(0.029, 0.005, 0.011), 0.0015);
     for k in 0..7 {
-        vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, 0.056, -0.105 + k as f32 * 0.026), Vec3::new(0.028, 0.01, 0.015), id);
+        vb.part(sg, &rail_slot, &dark_steel, Vec3::new(0.0, 0.068, -0.095 + k as f32 * 0.025), one, id);
     }
-    vb.part(sg, &src.thin_ring, &steel, Vec3::new(0.0, 0.072, 0.055), Vec3::new(0.014, 0.008, 0.014), rx);
+    // Rear ghost-ring aperture on a sloped base, guarded by ears with green tritium dots.
+    vb.part(sg, &sculpt::wedge_plate(0.034, 0.014, 0.018, 0.6, 0.8, 0.0), &gm_dark, Vec3::new(0.0, 0.067, 0.08), one, id);
+    vb.part(sg, &sculpt::armored_ring(0.0105, 0.0028, 0.0032, 16, true), &gm_steel, Vec3::new(0.0, 0.087, 0.08), one, rx);
     for s in [-1.0f32, 1.0] {
-        vb.part(sg, &src.sphere, &sight_green, Vec3::new(0.018 * s, 0.072, 0.058), Vec3::splat(0.0038), id);
+        vb.part(sg, &sculpt::beveled_box(Vec3::new(0.006, 0.022, 0.014), 0.0015), &gm_dark, Vec3::new(0.017 * s, 0.081, 0.08), one, id);
+        vb.part(sg, &src.bead, &sight_green, Vec3::new(0.017 * s, 0.086, 0.0875), Vec3::splat(0.0032), id);
     }
-    // Heavy upper barrel + ventilated perforated heat-shield shroud + ported muzzle choke.
-    vb.part(sg, &src.cyl, &steel, Vec3::new(0.0, 0.030, -0.35), Vec3::new(0.020, 0.48, 0.020), rx);
-    vb.part(sg, &src.cyl, &grip, Vec3::new(0.0, 0.030, -0.592), Vec3::new(0.015, 0.008, 0.015), rx); // bore opening
-    vb.part(sg, &src.cyl, &heat_metal, Vec3::new(0.0, 0.030, -0.565), Vec3::new(0.024, 0.052, 0.024), rx); // muzzle brake
-    vb.part(sg, &src.cube, &brushed, Vec3::new(0.0, 0.050, -0.34), Vec3::new(0.018, 0.008, 0.39), id); // ventilated top rib
-    for k in 0..8 {
-        vb.part(
-            sg, &src.thin_ring,
-            &brushed,
-            Vec3::new(0.0, 0.030, -0.165 - k as f32 * 0.048),
-            Vec3::new(0.026, 0.014, 0.026),
-            rx,
-        );
+    // Heavy 12-facet barrel + dark bore.
+    vb.part(sg, &sculpt::tapered_prism(12, 0.019, 0.0175, 0.46, true), &gm_steel, Vec3::new(0.0, 0.030, -0.36), one, fwd_flat(12));
+    vb.part(sg, &sculpt::tapered_prism(12, 0.012, 0.012, 0.004, true), &grip, Vec3::new(0.0, 0.030, -0.5965), one, fwd_flat(12));
+    // Chamfered heat-shield: two angled vented roof plates, beveled cooling collars,
+    // raised ventilated top rib on posts.
+    let shield_plate = sculpt::beveled_box(Vec3::new(0.022, 0.0035, 0.30), 0.001);
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let vent_hole = Vec3::new(0.011, 0.0012, 0.014);
+    for s in [-1.0f32, 1.0] {
+        let q = Quat::from_rotation_z(-0.55 * s);
+        let c = Vec3::new(0.0123 * s, 0.050, -0.34);
+        vb.part(sg, &shield_plate, &gm_dark, c, one, q);
+        for k in 0..6 {
+            vb.part(sg, &src.cube, &grip, c + q * Vec3::new(0.0, 0.0019, -0.11 + k as f32 * 0.044), vent_hole, q);
+        }
     }
-    // Front sight ramp + glowing red tritium bead.
-    vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, 0.057, -0.555), Vec3::new(0.012, 0.018, 0.028), id);
-    vb.part(sg, &src.sphere, &sight_red, Vec3::new(0.0, 0.071, -0.552), Vec3::splat(0.0048), id);
-    // Underbarrel magazine tube + barrel clamp + knurled front cap.
-    vb.part(sg, &src.cyl, &dark_steel, Vec3::new(0.0, -0.012, -0.32), Vec3::new(0.016, 0.42, 0.016), rx);
-    vb.part(sg, &src.cyl, &brushed, Vec3::new(0.0, -0.012, -0.535), Vec3::new(0.0185, 0.028, 0.0185), rx);
-    vb.part(sg, &src.cube, &steel, Vec3::new(0.0, 0.008, -0.49), Vec3::new(0.032, 0.056, 0.024), id);
-    // Sculpted rear stock + grip + trigger guard + trigger.
-    vb.part(sg, &src.cube, &wood, Vec3::new(0.0, -0.048, 0.20), Vec3::new(0.054, 0.078, 0.21), Quat::from_rotation_x(0.14));
-    vb.part(sg, &src.cube, &grip, Vec3::new(0.0, -0.062, 0.305), Vec3::new(0.056, 0.088, 0.02), Quat::from_rotation_x(0.14));
+    let collar = sculpt::armored_ring(0.024, 0.0035, 0.006, 12, true);
+    for z in [-0.17f32, -0.34, -0.51] {
+        vb.part(sg, &collar, &brushed, Vec3::new(0.0, 0.030, z), one, rx);
+    }
+    let rib_post = sculpt::beveled_box(Vec3::new(0.006, 0.007, 0.008), 0.0015);
+    for k in 0..7 {
+        vb.part(sg, &rib_post, &dark_steel, Vec3::new(0.0, 0.0565, -0.175 - k as f32 * 0.06), one, id);
+    }
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.012, 0.004, 0.40), 0.0012), &sg_top, Vec3::new(0.0, 0.062, -0.355), one, id);
+    // Sloped front sight ramp + red fiber-optic bead.
+    vb.part(sg, &sculpt::wedge_plate(0.012, 0.016, 0.03, 0.5, 0.4, 0.006), &gm_dark, Vec3::new(0.0, 0.072, -0.548), one, id);
+    vb.part(sg, &src.bead, &sight_red, Vec3::new(0.0, 0.0825, -0.545), Vec3::splat(0.0045), id);
+    // Ported heat-blued compensator with dark slots.
+    vb.part(sg, &sculpt::tapered_prism(8, 0.0245, 0.0225, 0.062, true), &heat_blued, Vec3::new(0.0, 0.030, -0.564), one, fwd_flat(8));
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let port_slot = Vec3::new(0.010, 0.003, 0.007);
+    for k in 0..3 {
+        let z = -0.549 - k as f32 * 0.014;
+        vb.part(sg, &src.cube, &grip, Vec3::new(0.0, 0.0528, z), port_slot, id);
+        for s in [-1.0f32, 1.0] {
+            vb.part(sg, &src.cube, &grip, Vec3::new(0.0228 * s, 0.030, z), port_slot, rz);
+        }
+    }
+    // Under-barrel tubular magazine + heavy beveled clamp + knurled front cap.
+    vb.part(sg, &sculpt::tapered_prism(16, 0.0155, 0.0155, 0.40, false), &gm_dark, Vec3::new(0.0, -0.012, -0.33), one, fwd);
+    vb.part(sg, &sculpt::tapered_prism(12, 0.018, 0.0165, 0.026, true), &brushed, Vec3::new(0.0, -0.012, -0.535), one, fwd_flat(12));
+    let knurl = sculpt::armored_ring(0.0175, 0.0015, 0.002, 12, true);
+    for z in [-0.527f32, -0.543] {
+        vb.part(sg, &knurl, &grip, Vec3::new(0.0, -0.012, z), one, rx);
+    }
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.034, 0.066, 0.024), 0.005), &gm_steel, Vec3::new(0.0, 0.010, -0.49), one, id);
+    vb.part(sg, &hex_bolt, &bolt_silver, Vec3::new(0.0175, 0.010, -0.49), one, rz);
+    // Contoured walnut stock + raised comb + rubber buttpad.
+    let stock_rot = Quat::from_rotation_x(0.14);
+    let stock_c = Vec3::new(0.0, -0.048, 0.20);
+    vb.part(sg, &uv_scaled(sculpt::beveled_box(Vec3::new(0.052, 0.074, 0.21), 0.010), Vec2::new(2.0, 1.0)), &wood, stock_c, one, stock_rot);
+    vb.part(sg, &sculpt::wedge_plate(0.046, 0.02, 0.16, 0.72, 0.85, 0.01), &wood, stock_c + stock_rot * Vec3::new(0.0, 0.047, -0.01), one, stock_rot);
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.056, 0.084, 0.022), 0.006), &grip, Vec3::new(0.0, -0.062, 0.31), one, stock_rot);
+    // Walnut stock wrist + raised cheek-weld crest right behind the receiver (above the
+    // HUD panel, so the wood+steel palette reads up close, not only on the pump), with a
+    // black-oxide receiver tang strap + bolt over the wood.
+    let wrist_rot = Quat::from_rotation_x(0.07);
+    vb.part(sg, &uv_scaled(sculpt::beveled_box(Vec3::new(0.054, 0.066, 0.085), 0.011), Vec2::new(1.5, 1.0)), &wood, Vec3::new(0.0, 0.004, 0.132), one, wrist_rot);
+    vb.part(sg, &uv_scaled(sculpt::wedge_plate(0.046, 0.026, 0.13, 0.6, 0.78, -0.012), Vec2::new(2.0, 1.0)), &wood, Vec3::new(0.0, 0.041, 0.172), one, Quat::from_rotation_x(0.11));
+    vb.part(sg, &sculpt::beveled_box(Vec3::new(0.024, 0.005, 0.058), 0.0015), &sg_oxide, Vec3::new(0.0, 0.0385, 0.128), one, wrist_rot);
+    vb.part(sg, &hex_bolt, &bolt_silver, Vec3::new(0.0, 0.0425, 0.142), one, id);
+    // Ergonomic pistol grip + sculpted trigger guard + curved trigger.
     vb.part(sg, &src.cap, &grip, Vec3::new(0.0, -0.095, 0.075), Vec3::new(0.046, 0.07, 0.052), Quat::from_rotation_x(-0.38));
-    vb.part(sg, &src.cube, &dark_steel, Vec3::new(0.0, -0.076, -0.015), Vec3::new(0.014, 0.006, 0.075), id); // trigger guard bottom
-    vb.part(sg, &src.cube, &steel, Vec3::new(0.0, -0.060, 0.004), Vec3::new(0.006, 0.024, 0.01), Quat::from_rotation_x(0.35)); // trigger
-    // Articulated gloved marine right hand + armored wrist cuff gripping shotgun.
+    vb.part(sg, &trigger_guard, &gm_dark, Vec3::new(0.0, -0.066, -0.01), guard_scale, guard_rot);
+    vb.part(sg, &trigger_blade, &steel, Vec3::new(0.0, -0.058, -0.006), one, Quat::from_rotation_x(PI));
+    // Armored marine glove + knuckle plate + wrist cuff.
     vb.part(sg, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.082), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.35));
-    vb.part(sg, &src.cube, &glove_plate, Vec3::new(0.036, -0.096, 0.065), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.3));
-    vb.part(sg, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.20), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
-    vb.part(sg, &src.cyl, &glove_plate, Vec3::new(0.048, -0.155, 0.165), Vec3::new(0.052, 0.036, 0.052), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
+    vb.part(sg, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.065), one, Quat::from_rotation_x(-0.3));
+    vb.part(sg, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.20), Vec3::new(0.088, 0.11, 0.088), arm_rot);
+    vb.part(sg, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.165), one, arm_rot);
 
-    // Sliding pump forend (contoured wood/polymer ribs + dual steel action bars).
+    // Sliding pump forend: contoured walnut with dark rubber grip grooves + dual action bars.
     let pump = commands.spawn((ChildOf(sg), PumpForend, Transform::from_xyz(0.0, -0.012, -0.30), Visibility::default())).id();
-    vb.part(pump, &src.cyl, &wood, Vec3::ZERO, Vec3::new(0.032, 0.175, 0.030), rx);
-    vb.part(pump, &src.cube, &wood, Vec3::new(0.0, -0.014, 0.0), Vec3::new(0.058, 0.034, 0.165), id);
+    vb.part(pump, &uv_scaled(sculpt::tapered_prism(12, 0.031, 0.029, 0.17, true), Vec2::new(3.0, 1.0)), &wood, Vec3::ZERO, one, fwd_flat(12));
+    vb.part(pump, &uv_scaled(sculpt::beveled_box(Vec3::new(0.056, 0.030, 0.16), 0.009), Vec2::new(2.0, 1.0)), &wood, Vec3::new(0.0, -0.016, 0.0), one, id);
+    let groove = sculpt::armored_ring(0.0305, 0.0028, 0.0035, 12, true);
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let side_groove = Vec3::new(0.002, 0.018, 0.006);
     for k in 0..6 {
-        vb.part(pump, &src.cyl, &grip, Vec3::new(0.0, -0.002, -0.068 + k as f32 * 0.027), Vec3::new(0.0335, 0.011, 0.0335), rx);
+        let z = -0.065 + k as f32 * 0.026;
+        vb.part(pump, &groove, &grip, Vec3::new(0.0, 0.0, z), one, fwd_flat(12));
+        for s in [-1.0f32, 1.0] {
+            vb.part(pump, &src.cube, &grip, Vec3::new(0.0285 * s, -0.016, z), side_groove, id);
+        }
     }
     for s in [-1.0f32, 1.0] {
-        vb.part(pump, &src.cube, &steel, Vec3::new(0.027 * s, 0.005, 0.13), Vec3::new(0.005, 0.008, 0.18), id);
+        vb.part(pump, &sculpt::beveled_box(Vec3::new(0.005, 0.008, 0.18), 0.0015), &gm_steel, Vec3::new(0.027 * s, 0.005, 0.13), one, id);
     }
-    // Layered volumetric shotgun muzzle star-burst (compact & punchy so targets stay visible).
+    // Articulated bolt carrier over the ejection port (slides back on the pump stroke).
+    let bolt = commands.spawn((ChildOf(sg), ShotgunBolt, Transform::from_translation(SHOTGUN_BOLT_REST), Visibility::default())).id();
+    vb.part(bolt, &sculpt::beveled_box(Vec3::new(0.006, 0.028, 0.066), 0.0018), &gm_steel, Vec3::ZERO, one, id);
+    for k in 0..4 {
+        vb.part(bolt, &src.cube, &dark_steel, Vec3::new(0.0032, 0.0, 0.016 + k as f32 * 0.0055), Vec3::new(0.0015, 0.02, 0.002), id);
+    }
+    vb.part(bolt, &sculpt::beveled_box(Vec3::new(0.004, 0.008, 0.008), 0.001), &steel, Vec3::new(0.0035, 0.0, -0.026), one, id);
+    // Doom-style volumetric muzzle blast: incandescent yellow-white core, a forward
+    // muzzle cone and asymmetric jagged orange-amber flame tongues of uneven length and
+    // splay (rolled + scaled per shot, so no two flashes match).
     let star = commands
-        .spawn((ChildOf(sg), MuzzleFlash(Weapon::Shotgun), MuzzleStar, Transform::from_xyz(0.0, 0.028, -0.63), Visibility::Hidden))
+        .spawn((ChildOf(sg), MuzzleFlash(Weapon::Shotgun), MuzzleStar, Transform::from_translation(viewmodel_muzzle_local(Weapon::Shotgun) - Vec3::Z * 0.02), Visibility::Hidden))
         .id();
-    let q = std::f32::consts::FRAC_PI_4;
-    for (a, len, width) in [(0.0f32, 0.24f32, 0.018f32), (2.0 * q, 0.21, 0.016), (q, 0.14, 0.014), (3.0 * q, 0.13, 0.014)] {
-        vb.part(star, &src.cube, &flash_fire, Vec3::ZERO, Vec3::new(len, width, 0.005), Quat::from_rotation_z(a));
-        vb.part(star, &src.cube, &flash_core, Vec3::new(0.0, 0.0, 0.003), Vec3::new(len * 0.52, width * 0.55, 0.005), Quat::from_rotation_z(a));
+    // (angle about the bore, length, base width, forward tilt)
+    for (a, len, w, tilt) in [
+        (0.15f32, 0.20f32, 0.030f32, 0.32f32),
+        (0.95, 0.11, 0.021, 0.52),
+        (1.70, 0.17, 0.026, 0.28),
+        (2.55, 0.09, 0.019, 0.60),
+        (3.30, 0.19, 0.029, 0.38),
+        (4.10, 0.12, 0.022, 0.46),
+        (4.95, 0.15, 0.025, 0.30),
+        (5.70, 0.08, 0.018, 0.62),
+    ] {
+        let dir = Vec3::new(a.cos() * tilt.cos(), a.sin() * tilt.cos(), -tilt.sin());
+        let q = Quat::from_rotation_arc(Vec3::Y, dir);
+        vb.part(star, &src.cone, &flash_fire, dir * (len * 0.5), Vec3::new(w, len, w * 0.55), q);
+        if len > 0.14 {
+            vb.part(star, &src.cone, &flash_core, dir * (len * 0.28), Vec3::new(w * 0.5, len * 0.52, w * 0.3), q);
+        }
     }
-    vb.part(star, &src.cone, &flash_fire, Vec3::new(0.0, 0.0, -0.075), Vec3::new(0.025, 0.15, 0.025), Quat::from_rotation_x(-FRAC_PI_2));
-    vb.part(star, &src.sphere, &flash_core, Vec3::ZERO, Vec3::splat(0.034), id);
+    let fwd_cone = Quat::from_rotation_x(-FRAC_PI_2);
+    vb.part(star, &src.cone, &flash_fire, Vec3::new(0.0, 0.0, -0.085), Vec3::new(0.036, 0.17, 0.036), fwd_cone);
+    vb.part(star, &src.cone, &flash_core, Vec3::new(0.0, 0.0, -0.05), Vec3::new(0.02, 0.10, 0.02), fwd_cone);
+    vb.part(star, &src.sphere, &flash_core, Vec3::ZERO, Vec3::splat(0.032), id);
 
-    // ---- Weapon 2: UAC Plasma Repeater (elaborate twin-rail sci-fi rifle) ----
+    // ---- Weapon 2: UAC Plasma Repeater (twin-rail sci-fi accelerator) ----
     let pl = commands.spawn((ChildOf(wroot), GunModel(Weapon::Plasma), Transform::default(), Visibility::Hidden)).id();
-    // Layered dark titanium lower receiver + brushed upper shroud + rear stock.
-    vb.part(pl, &src.cube, &titanium, Vec3::new(0.0, -0.008, -0.10), Vec3::new(0.088, 0.092, 0.34), id);
-    vb.part(pl, &src.cube, &brushed, Vec3::new(0.0, 0.042, -0.14), Vec3::new(0.072, 0.034, 0.32), id);
-    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.0, 0.062, -0.08), Vec3::new(0.046, 0.018, 0.20), id);
-    vb.part(pl, &src.cube, &hazard, Vec3::new(0.0, 0.018, 0.04), Vec3::new(0.092, 0.014, 0.05), id);
-    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.0, -0.02, 0.14), Vec3::new(0.068, 0.084, 0.16), id);
-    // Rear holographic sight frame + glowing cyan reticle dot.
-    vb.part(pl, &src.cube, &dark_steel, Vec3::new(-0.022, 0.086, -0.01), Vec3::new(0.007, 0.036, 0.034), id);
-    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.022, 0.086, -0.01), Vec3::new(0.007, 0.036, 0.034), id);
-    vb.part(pl, &src.cube, &dark_steel, Vec3::new(0.0, 0.102, -0.01), Vec3::new(0.052, 0.007, 0.034), id);
-    vb.part(pl, &src.sphere, &coil, Vec3::new(0.0, 0.086, -0.012), Vec3::splat(0.0042), id);
-    // Twin parallel steel accelerator rails + central glowing plasma conduit + 5 pulsing coils.
-    vb.part(pl, &src.cube, &steel, Vec3::new(0.0, 0.034, -0.42), Vec3::new(0.034, 0.016, 0.30), id);
-    vb.part(pl, &src.cube, &steel, Vec3::new(0.0, -0.034, -0.42), Vec3::new(0.034, 0.016, 0.30), id);
-    vb.part(pl, &src.cyl, &coil, Vec3::new(0.0, 0.0, -0.40), Vec3::new(0.016, 0.32, 0.016), rx);
+    // Chamfered dark-slate lower receiver + swept dark-titanium upper shroud (dark chassis
+    // so the electric-cyan plasma is the hottest value on the gun), with bright machined
+    // edge strips on the receiver chamfers.
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.088, 0.090, 0.34), 0.011), &pl_slate, Vec3::new(0.0, -0.008, -0.10), one, id);
+    vb.part(pl, &sculpt::wedge_plate(0.074, 0.036, 0.30, 0.72, 0.88, -0.012), &pl_titanium, Vec3::new(0.0, 0.055, -0.13), one, id);
+    for s in [-1.0f32, 1.0] {
+        let q = Quat::from_rotation_z(-s * FRAC_PI_4);
+        vb.part(pl, &src.cube, &pl_edge, Vec3::new(0.0389 * s, 0.0319, -0.10), Vec3::new(0.0062, 0.0012, 0.316), q);
+        vb.part(pl, &src.cube, &pl_edge, Vec3::new(0.0389 * s, -0.0479, -0.10), Vec3::new(0.0062, 0.0012, 0.316), Quat::from_rotation_z(s * FRAC_PI_4));
+    }
+    // Hot capacitor core under the flux slide (exposed when it snaps back).
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.024, 0.006, 0.12), 0.002), &coil, Vec3::new(0.0, 0.076, -0.15), one, id);
+    // Hazard-striped battery bulkhead band.
+    vb.part(pl, &uv_scaled(sculpt::beveled_box(Vec3::new(0.094, 0.018, 0.05), 0.004), Vec2::new(2.0, 0.5)), &hazard, Vec3::new(0.0, 0.016, 0.045), one, id);
+    // Angular rear stock + cheek rest + rubber buttplate.
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.066, 0.084, 0.16), 0.010), &pl_slate, Vec3::new(0.0, -0.02, 0.15), one, id);
+    vb.part(pl, &sculpt::wedge_plate(0.054, 0.022, 0.13, 0.7, 0.8, 0.012), &pl_titanium, Vec3::new(0.0, 0.033, 0.15), one, id);
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.07, 0.092, 0.016), 0.004), &grip, Vec3::new(0.0, -0.02, 0.235), one, id);
+    // Holographic sight: beveled base, posts and hood, cyan reticle dot + ticks.
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.05, 0.008, 0.036), 0.002), &gm_dark, Vec3::new(0.0, 0.077, -0.002), one, id);
+    for s in [-1.0f32, 1.0] {
+        vb.part(pl, &sculpt::beveled_box(Vec3::new(0.006, 0.030, 0.028), 0.0015), &gm_dark, Vec3::new(0.023 * s, 0.096, -0.002), one, id);
+        vb.part(pl, &src.cube, &coil, Vec3::new(0.011 * s, 0.096, -0.004), Vec3::new(0.006, 0.0012, 0.0012), id);
+    }
+    vb.part(pl, &sculpt::wedge_plate(0.054, 0.008, 0.032, 0.8, 0.85, 0.0), &gm_dark, Vec3::new(0.0, 0.115, -0.002), one, id);
+    vb.part(pl, &src.bead, &coil, Vec3::new(0.0, 0.096, -0.004), Vec3::splat(0.0034), id);
+    vb.part(pl, &src.cube, &coil, Vec3::new(0.0, 0.0875, -0.004), Vec3::new(0.0012, 0.005, 0.0012), id);
+    // Twin chamfered accelerator rails (dark centre groove) + flared emitter tines.
+    let rail = sculpt::beveled_box(Vec3::new(0.034, 0.016, 0.30), 0.004);
+    let tine_plate = |s: f32| sculpt::wedge_plate(0.034, 0.045, 0.016, 1.25, 0.55, 0.010 * s);
+    for s in [-1.0f32, 1.0] {
+        vb.part(pl, &rail, &pl_titanium, Vec3::new(0.0, 0.034 * s, -0.42), one, id);
+        vb.part(pl, &src.cube, &grip, Vec3::new(0.0, 0.034 * s, -0.42), Vec3::new(0.0352, 0.003, 0.26), id);
+        vb.part(pl, &src.cube, &pl_edge, Vec3::new(0.0, 0.034 * s + 0.0082 * s, -0.42), Vec3::new(0.026, 0.0008, 0.29), id);
+        vb.part(pl, &tine_plate(s), &pl_titanium, Vec3::new(0.0, 0.034 * s, -0.5925), one, fwd);
+    }
+    // Energised plasma conduit (brighter inner core tube inside the deeper coils) + end
+    // collars + muzzle lens.
+    vb.part(pl, &sculpt::tapered_prism(10, 0.0145, 0.0145, 0.32, false), &plasma_core, Vec3::new(0.0, 0.0, -0.40), one, fwd);
+    let conduit_collar = sculpt::armored_ring(0.017, 0.003, 0.005, 12, true);
+    for z in [-0.255f32, -0.545] {
+        vb.part(pl, &conduit_collar, &gm_dark, Vec3::new(0.0, 0.0, z), one, rx);
+    }
+    vb.part(pl, &src.sphere, &coil, Vec3::new(0.0, 0.0, -0.562), Vec3::splat(0.019), id);
     for k in 0..5 {
         commands.spawn((
             PlasmaCoil(k),
-            vm_part(pl, &ring, &coil, Vec3::new(0.0, 0.0, -0.29 - k as f32 * 0.054), Vec3::new(0.044, 0.052, 0.044), rx),
+            vm_part(pl, &coil_ring, &coil, Vec3::new(0.0, 0.0, -0.29 - k as f32 * 0.054), Vec3::new(0.044, 0.052, 0.044), rx),
         ));
     }
-    // Flared triple-pronged plasma emitter crown around muzzle lens.
-    for a in [0.0f32, TAU / 3.0, 2.0 * TAU / 3.0] {
-        let off = Vec3::new(a.cos() * 0.034, a.sin() * 0.034, -0.575);
-        vb.part(pl, &src.cube, &steel, off, Vec3::new(0.012, 0.012, 0.06), Quat::from_rotation_z(a));
+    // Left pressurised plasma canister: glowing cell, beveled end caps, containment cage,
+    // mount bracket and an angled braided power feed.
+    let can = Vec3::new(-0.062, -0.008, 0.0);
+    vb.part(pl, &sculpt::tapered_prism(14, 0.0215, 0.0215, 0.15, false), &coil, can + Vec3::Z * -0.07, one, fwd);
+    let can_cap = sculpt::tapered_prism(8, 0.025, 0.019, 0.02, true);
+    vb.part(pl, &can_cap, &gm_dark, can + Vec3::Z * -0.155, one, fwd_flat(8));
+    vb.part(pl, &can_cap, &gm_dark, can + Vec3::Z * 0.015, one, aft_flat(8));
+    let cage_ring = sculpt::armored_ring(0.023, 0.0028, 0.004, 14, true);
+    for z in [-0.12f32, -0.07, -0.02] {
+        vb.part(pl, &cage_ring, &gm_dark, can + Vec3::Z * z, one, rx);
     }
-    vb.part(pl, &src.sphere, &coil, Vec3::new(0.0, 0.0, -0.555), Vec3::splat(0.022), id);
-    // Side copper cooling radiator fins with glowing heat vents.
-    for k in 0..5 {
-        let z = -0.22 + k as f32 * 0.042;
-        vb.part(pl, &src.cube, &copper, Vec3::new(0.047, 0.012, z), Vec3::new(0.012, 0.052, 0.014), id);
-        vb.part(pl, &src.cube, &vent_amber, Vec3::new(0.045, 0.012, z + 0.021), Vec3::new(0.006, 0.036, 0.008), id);
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let cage_bar = Vec3::new(0.004, 0.004, 0.15);
+    for a in [PI * 0.72, PI, PI * 1.28] {
+        vb.part(pl, &src.cube, &gm_dark, can + Vec3::new(a.cos() * 0.0235, a.sin() * 0.0235, -0.07), cage_bar, Quat::from_rotation_z(a));
     }
-    // Side-mounted pressurized glowing cyan plasma cell canister + dual steel clamp rings + conduit.
-    vb.part(pl, &src.cyl, &coil, Vec3::new(-0.062, -0.008, -0.07), Vec3::new(0.022, 0.18, 0.022), rx);
-    for z in [-0.135f32, -0.005] {
-        vb.part(pl, &src.cyl, &dark_steel, Vec3::new(-0.062, -0.008, z), Vec3::new(0.026, 0.022, 0.026), rx);
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.02, 0.012, 0.03), 0.003), &gm_dark, Vec3::new(-0.047, -0.008, -0.07), one, id);
+    let feed_rot = Quat::from_rotation_x(1.3) * Quat::from_rotation_z(-0.45);
+    let feed_c = Vec3::new(-0.052, -0.012, -0.20);
+    vb.part(pl, &src.cap, &dark_steel, feed_c, Vec3::new(0.012, 0.06, 0.012), feed_rot);
+    let braid = sculpt::armored_ring(0.0068, 0.0016, 0.0022, 10, true);
+    for t in [-0.03f32, -0.015, 0.0, 0.015, 0.03] {
+        vb.part(pl, &braid, &brushed, feed_c + feed_rot * Vec3::Y * t, one, feed_rot);
     }
-    vb.part(pl, &src.cap, &brushed, Vec3::new(-0.052, -0.012, -0.20), Vec3::new(0.012, 0.06, 0.012), Quat::from_rotation_x(1.3) * Quat::from_rotation_z(-0.45));
-    // Grip + gloved right hand.
-    vb.part(pl, &src.cap, &grip, Vec3::new(0.0, -0.095, 0.035), Vec3::new(0.046, 0.072, 0.052), Quat::from_rotation_x(-0.32));
+    // Right side: angled copper radiator fins over glowing warm-amber thermal vents.
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.004, 0.058, 0.20), 0.0015), &grip, Vec3::new(0.0435, 0.010, -0.15), one, id);
+    let fin = sculpt::wedge_plate(0.05, 0.016, 0.007, 0.7, 1.0, 0.0);
+    let fin_rot = Quat::from_rotation_y(0.35) * Quat::from_rotation_z(-FRAC_PI_2);
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let thermal_vent = Vec3::new(0.003, 0.034, 0.008);
+    for k in 0..6 {
+        let z = -0.235 + k as f32 * 0.034;
+        vb.part(pl, &fin, &copper, Vec3::new(0.052, 0.010, z), one, fin_rot);
+        if k < 5 {
+            vb.part(pl, &src.cube, &vent_amber, Vec3::new(0.0462, 0.010, z + 0.017), thermal_vent, id);
+        }
+    }
+    // Angled sci-fi grip + trigger guard/trigger + armored marine glove.
+    vb.part(pl, &sculpt::beveled_box(Vec3::new(0.040, 0.088, 0.05), 0.009), &grip, Vec3::new(0.0, -0.092, 0.032), one, Quat::from_rotation_x(-0.32));
+    vb.part(pl, &trigger_guard, &gm_dark, Vec3::new(0.0, -0.060, -0.025), guard_scale, guard_rot);
+    vb.part(pl, &trigger_blade, &steel, Vec3::new(0.0, -0.052, -0.022), one, Quat::from_rotation_x(PI));
     vb.part(pl, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
-    vb.part(pl, &src.cube, &glove_plate, Vec3::new(0.036, -0.096, 0.03), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.28));
-    vb.part(pl, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
+    vb.part(pl, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.03), one, Quat::from_rotation_x(-0.28));
+    vb.part(pl, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), arm_rot);
+    vb.part(pl, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.135), one, arm_rot);
+    // Reciprocating flux slide on the top shroud (snaps back on every shot).
+    let slide = commands.spawn((ChildOf(pl), PlasmaFluxSlide, Transform::from_translation(PLASMA_SLIDE_REST), Visibility::default())).id();
+    vb.part(slide, &sculpt::beveled_box(Vec3::new(0.046, 0.016, 0.13), 0.004), &pl_titanium, Vec3::ZERO, one, id);
+    for k in 0..4 {
+        vb.part(slide, &src.cube, &grip, Vec3::new(0.0, 0.001, 0.038 + k as f32 * 0.007), Vec3::new(0.0475, 0.010, 0.0025), id);
+    }
+    for s in [-1.0f32, 1.0] {
+        vb.part(slide, &src.cube, &coil, Vec3::new(0.0233 * s, -0.002, -0.02), Vec3::new(0.0015, 0.0035, 0.07), id);
+    }
+    vb.part(slide, &uv_scaled(sculpt::beveled_box(Vec3::new(0.022, 0.003, 0.018), 0.0008), Vec2::new(1.0, 0.4)), &hazard, Vec3::new(0.0, 0.0085, 0.04), one, id);
     // Layered plasma muzzle flash (bright core + additive outer halo).
     let pl_flash = commands
         .spawn((ChildOf(pl), MuzzleFlash(Weapon::Plasma), Transform::from_xyz(0.0, 0.0, -0.60), Visibility::Hidden))
@@ -1173,57 +1497,160 @@ fn spawn_viewmodels(
     vb.part(pl_flash, &src.sphere, &flash_cyan_halo, Vec3::ZERO, Vec3::splat(0.095), id);
     vb.part(pl_flash, &src.thin_ring, &flash_cyan, Vec3::new(0.0, 0.0, -0.01), Vec3::new(0.075, 0.015, 0.075), rx);
 
-    // ---- Weapon 3: Signal-Mortar (chunky industrial Mars rocket tube) ----
+    // ---- Weapon 3: Signal-Mortar (heavy Mars industrial launcher) ----
     let rk = commands.spawn((ChildOf(wroot), GunModel(Weapon::Rocket), Transform::default(), Visibility::Hidden)).id();
-    // Main launch tube + dark titanium barrel shroud + heavy muzzle collar & bore.
-    vb.part(rk, &src.cyl, &titanium, Vec3::new(0.0, 0.012, -0.20), Vec3::new(0.052, 0.62, 0.052), rx);
-    vb.part(rk, &src.cyl, &dark_steel, Vec3::new(0.0, 0.012, -0.43), Vec3::new(0.059, 0.20, 0.059), rx);
-    vb.part(rk, &src.cyl, &heat_metal, Vec3::new(0.0, 0.012, -0.535), Vec3::new(0.066, 0.045, 0.066), rx);
-    vb.part(rk, &src.cyl, &grip, Vec3::new(0.0, 0.012, -0.559), Vec3::new(0.044, 0.008, 0.044), rx);
+    let axis = Vec3::new(0.0, 0.012, 0.0);
+    // Faceted octagonal titanium launch tube.
+    vb.part(rk, &sculpt::tapered_prism(8, 0.052, 0.050, 0.60, true), &gm_titanium, axis + Vec3::Z * -0.20, one, fwd_flat(8));
+    // Stepped dark-steel forward jacket with 4 beveled octagonal cooling ribs.
+    vb.part(rk, &sculpt::tapered_prism(8, 0.059, 0.057, 0.16, true), &gm_dark, axis + Vec3::Z * -0.43, one, fwd_flat(8));
+    let rib = sculpt::armored_ring(0.061, 0.0045, 0.006, 8, true);
+    for z in [-0.37f32, -0.41, -0.45, -0.49] {
+        vb.part(rk, &rib, &gm_steel, axis + Vec3::Z * z, one, fwd_flat(8));
+    }
+    // Bold diagonal hazard stabilizer shroud with dark trim rings.
+    vb.part(rk, &uv_scaled(sculpt::tapered_prism(8, 0.0555, 0.0555, 0.13, true), Vec2::new(3.0, 1.0)), &rk_hazard, axis + Vec3::Z * -0.25, one, fwd_flat(8));
+    let trim = sculpt::armored_ring(0.0565, 0.003, 0.005, 8, true);
+    for z in [-0.185f32, -0.315] {
+        vb.part(rk, &trim, &gm_dark, axis + Vec3::Z * z, one, fwd_flat(8));
+    }
+    // Massive flared heat-blued muzzle brake + blast-deflector fins + deep dark bore.
+    vb.part(rk, &sculpt::flared_dish(0.05, 0.078, 0.06, 0.012, 16), &heat_blued, axis + Vec3::Z * -0.505, one, fwd);
+    vb.part(rk, &sculpt::tapered_prism(16, 0.036, 0.036, 0.004, false), &grip, axis + Vec3::Z * -0.52, one, fwd);
+    // Recessed glowing amber ignition/pilot ring deep in the brake throat.
+    vb.part(rk, &sculpt::armored_ring(0.041, 0.0035, 0.0025, 16, true), &bore_glow, axis + Vec3::Z * -0.5232, one, rx);
+    vb.part(rk, &sculpt::armored_ring(0.022, 0.002, 0.0015, 12, true), &bore_glow, axis + Vec3::Z * -0.5225, one, rx);
+    let deflector = sculpt::beveled_box(Vec3::new(0.006, 0.026, 0.045), 0.0015);
     for k in 0..4 {
-        let a = k as f32 * TAU / 4.0 + std::f32::consts::FRAC_PI_4;
-        vb.part(rk, &src.cube, &dark_steel, Vec3::new(a.cos() * 0.062, 0.012 + a.sin() * 0.062, -0.43), Vec3::new(0.012, 0.012, 0.18), Quat::from_rotation_z(a));
+        let a = FRAC_PI_4 + k as f32 * FRAC_PI_2;
+        vb.part(rk, &deflector, &heat_blued, axis + Vec3::new(a.cos() * 0.074, a.sin() * 0.074, -0.54), one, Quat::from_rotation_z(a - FRAC_PI_2));
     }
-    // Rear exhaust bell + dark venturi.
-    vb.part(rk, &src.cyl, &steel, Vec3::new(0.0, 0.012, 0.125), Vec3::new(0.06, 0.05, 0.06), rx);
-    vb.part(rk, &src.cyl, &grip, Vec3::new(0.0, 0.012, 0.151), Vec3::new(0.046, 0.006, 0.046), rx);
-    // Hazard-striped casing bands.
+    // Flared rear backblast venturi bell (opens to +Z) with dark exhaust nozzle + collar.
+    vb.part(rk, &sculpt::flared_dish(0.044, 0.062, 0.045, 0.009, 16), &gm_dark, axis + Vec3::Z * 0.095, one, rx);
+    vb.part(rk, &sculpt::tapered_prism(16, 0.031, 0.031, 0.004, false), &grip, axis + Vec3::Z * 0.1065, one, rx);
+    vb.part(rk, &sculpt::armored_ring(0.05, 0.004, 0.008, 8, true), &gm_dark, axis + Vec3::Z * 0.095, one, fwd_flat(8));
+    // Seen end-on from the eye: brushed steel bell lip, a stator hub and six slotted
+    // dark exhaust vanes inside the venturi.
+    vb.part(rk, &sculpt::armored_ring(0.0615, 0.003, 0.004, 16, true), &brushed, axis + Vec3::Z * 0.139, one, rx);
+    vb.part(rk, &sculpt::tapered_prism(8, 0.015, 0.008, 0.024, true), &gm_dark, axis + Vec3::Z * 0.112, one, aft_flat(8));
+    let stator = sculpt::beveled_box(Vec3::new(0.0035, 0.028, 0.02), 0.001);
+    for k in 0..6 {
+        let a = PI / 6.0 + k as f32 * PI / 3.0;
+        vb.part(rk, &stator, &dark_steel, axis + Vec3::new(a.cos() * 0.031, a.sin() * 0.031, 0.117), one, Quat::from_rotation_z(a - FRAC_PI_2) * Quat::from_rotation_y(0.35));
+    }
+    // Rear butt detail (the tube top carries the breech cradle, so this wraps the side
+    // and lower faces only): dark beveled vent-collar panels with slotted vents, slotted
+    // exhaust fins on the octagon corners, and a brushed steel clamping ring with bolted
+    // lugs just behind the breech, so the rear tube reads as hardware, not a blank cylinder.
+    let collar_panel = sculpt::beveled_box(Vec3::new(0.034, 0.005, 0.06), 0.0015);
     for k in 0..5 {
-        let m = if k % 2 == 0 { &hazard } else { &dark_steel };
-        vb.part(rk, &src.cyl, m, Vec3::new(0.0, 0.012, -0.30 + k as f32 * 0.04), Vec3::new(0.0545, 0.02, 0.0545), rx);
-    }
-    // Glowing amber warhead chamber: dark cradle on top with a lit window + side port.
-    vb.part(rk, &src.cube, &dark_steel, Vec3::new(0.0, 0.058, -0.05), Vec3::new(0.05, 0.03, 0.15), id);
-    vb.part(rk, &src.cyl, &warhead_glow, Vec3::new(0.0, 0.066, -0.05), Vec3::new(0.017, 0.12, 0.017), rx);
-    vb.part(rk, &src.cube, &warhead_glow, Vec3::new(0.054, 0.012, -0.06), Vec3::new(0.006, 0.026, 0.09), id);
-    vb.part(rk, &src.cube, &warhead_glow, Vec3::new(-0.054, 0.012, -0.06), Vec3::new(0.006, 0.026, 0.09), id);
-    // Rear optical sight frame + amber reticle.
-    for x in [-0.024f32, 0.024] {
-        vb.part(rk, &src.cube, &dark_steel, Vec3::new(x, 0.098, 0.03), Vec3::new(0.007, 0.05, 0.03), id);
-    }
-    vb.part(rk, &src.cube, &dark_steel, Vec3::new(0.0, 0.122, 0.03), Vec3::new(0.055, 0.007, 0.03), id);
-    vb.part(rk, &src.sphere, &warhead_glow, Vec3::new(0.0, 0.098, 0.028), Vec3::splat(0.0045), id);
-    vb.part(rk, &src.sphere, &sight_red, Vec3::new(0.0, 0.07, -0.53), Vec3::splat(0.005), id);
-    // Braced stabilizer rails under the tube + cross braces + bolts.
-    for x in [-0.052f32, 0.052] {
-        vb.part(rk, &src.cube, &steel, Vec3::new(x, -0.038, -0.25), Vec3::new(0.01, 0.014, 0.42), id);
-    }
-    for z in [-0.42f32, -0.25, -0.08] {
-        vb.part(rk, &src.cube, &brushed, Vec3::new(0.0, -0.038, z), Vec3::new(0.114, 0.01, 0.018), id);
-        for x in [-0.058f32, 0.058] {
-            vb.part(rk, &src.cyl, &bolt_silver, Vec3::new(x, -0.038, z), Vec3::new(0.005, 0.004, 0.005), rz);
+        // Right side, lower-right, bottom, lower-left, left faces.
+        let a = -(k as f32) * FRAC_PI_4;
+        let n = Vec3::new(a.cos(), a.sin(), 0.0);
+        let q = Quat::from_rotation_z(a - FRAC_PI_2);
+        vb.part(rk, &collar_panel, &gm_dark, axis + n * 0.0505 + Vec3::Z * 0.03, one, q);
+        for z in [0.012f32, 0.026, 0.040] {
+            vb.part(rk, &src.cube, &grip, axis + n * 0.0532 + Vec3::Z * z, Vec3::new(0.024, 0.0016, 0.0055), q);
         }
     }
-    // Front vertical grip + rear pistol grip + trigger guard + trigger.
-    vb.part(rk, &src.cap, &grip, Vec3::new(0.0, -0.09, -0.30), Vec3::new(0.034, 0.07, 0.04), Quat::from_rotation_x(0.12));
+    let exhaust_fin = sculpt::beveled_box(Vec3::new(0.0045, 0.013, 0.05), 0.0012);
+    for k in 0..6 {
+        let a = PI / 8.0 - k as f32 * FRAC_PI_4;
+        vb.part(rk, &exhaust_fin, &dark_steel, axis + Vec3::new(a.cos() * 0.060, a.sin() * 0.060, 0.03), one, Quat::from_rotation_z(a - FRAC_PI_2));
+    }
+    vb.part(rk, &sculpt::armored_ring(0.0535, 0.0035, 0.0075, 8, true), &steel, axis + Vec3::Z * 0.078, one, fwd_flat(8));
+    for s in [-1.0f32, 1.0] {
+        vb.part(rk, &sculpt::beveled_box(Vec3::new(0.008, 0.014, 0.016), 0.002), &steel, axis + Vec3::new(0.058 * s, 0.0, 0.078), one, id);
+        vb.part(rk, &hex_bolt, &bolt_silver, axis + Vec3::new(0.0625 * s, 0.0, 0.078), one, rz);
+    }
+    // Glowing segmented ammo-status windows on both tube flanks.
+    for s in [-1.0f32, 1.0] {
+        vb.part(rk, &sculpt::beveled_box(Vec3::new(0.005, 0.03, 0.085), 0.0015), &gm_dark, axis + Vec3::new(0.0495 * s, 0.0, -0.07), one, id);
+        vb.part(rk, &sculpt::beveled_box(Vec3::new(0.004, 0.018, 0.068), 0.001), &warhead_glow, axis + Vec3::new(0.0515 * s, 0.0, -0.07), one, id);
+        for k in 0..4 {
+            vb.part(rk, &src.cube, &grip, axis + Vec3::new(0.0537 * s, 0.0, -0.096 + k as f32 * 0.017), Vec3::new(0.001, 0.02, 0.003), id);
+        }
+    }
+    // Glowing amber heat-vent slits on the lower facets over dark recessed backing.
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let slit = Vec3::new(0.016, 0.003, 0.0045);
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let vent_back = Vec3::new(0.024, 0.0015, 0.07);
+    for s in [-1.0f32, 1.0] {
+        let q = Quat::from_rotation_z(s * FRAC_PI_4);
+        let n = Vec3::new(s * std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2, 0.0);
+        vb.part(rk, &src.cube, &grip, axis + n * 0.0482 + Vec3::Z * -0.14, vent_back, q);
+        for k in 0..5 {
+            vb.part(rk, &src.cube, &vent_amber, axis + n * 0.0492 + Vec3::Z * (-0.115 - k as f32 * 0.012), slit, q);
+        }
+    }
+    // Optical rangefinder: mount, beveled housing, flared lens hood, eyepiece with amber
+    // targeting reticle and a range readout strip.
+    let rf = Vec3::new(-0.046, 0.098, 0.0);
+    vb.part(rk, &sculpt::beveled_box(Vec3::new(0.012, 0.04, 0.05), 0.003), &gm_dark, Vec3::new(-0.040, 0.064, 0.02), one, id);
+    vb.part(rk, &sculpt::beveled_box(Vec3::new(0.032, 0.03, 0.095), 0.005), &gm_dark, rf + Vec3::Z * 0.01, one, id);
+    vb.part(rk, &sculpt::tapered_prism(8, 0.012, 0.0145, 0.026, true), &grip, rf + Vec3::Z * -0.05, one, fwd_flat(8));
+    vb.part(rk, &sculpt::tapered_prism(8, 0.011, 0.009, 0.012, true), &grip, rf + Vec3::Z * 0.064, one, aft_flat(8));
+    vb.part(rk, &src.bead, &warhead_glow, rf + Vec3::Z * 0.0705, Vec3::splat(0.0042), id);
+    for s in [-1.0f32, 1.0] {
+        vb.part(rk, &src.cube, &warhead_glow, rf + Vec3::new(0.0075 * s, 0.0, 0.0705), Vec3::new(0.0055, 0.0012, 0.0012), id);
+    }
+    vb.part(rk, &src.cube, &warhead_glow, rf + Vec3::new(-0.0165, 0.006, 0.01), Vec3::new(0.0015, 0.005, 0.03), id);
+    // Front red aiming post on the jacket.
+    vb.part(rk, &sculpt::wedge_plate(0.008, 0.018, 0.012, 0.5, 0.6, 0.0), &gm_dark, Vec3::new(0.0, 0.0755, -0.47), one, id);
+    vb.part(rk, &src.bead, &sight_red, Vec3::new(0.0, 0.087, -0.47), Vec3::splat(0.0045), id);
+    // Braced under-barrel stabilizer rails + cross braces + silver hex bolts.
+    for x in [-0.052f32, 0.052] {
+        vb.part(rk, &sculpt::beveled_box(Vec3::new(0.010, 0.014, 0.42), 0.003), &gm_steel, Vec3::new(x, -0.038, -0.25), one, id);
+    }
+    let brace = sculpt::beveled_box(Vec3::new(0.114, 0.010, 0.018), 0.003);
+    for z in [-0.42f32, -0.25, -0.08] {
+        vb.part(rk, &brace, &gm_titanium, Vec3::new(0.0, -0.038, z), one, id);
+        for x in [-0.059f32, 0.059] {
+            vb.part(rk, &hex_bolt, &bolt_silver, Vec3::new(x, -0.038, z), one, rz);
+        }
+    }
+    // Front vertical foregrip with finger grooves + rear pistol grip, guard and trigger.
+    vb.part(rk, &sculpt::beveled_box(Vec3::new(0.034, 0.012, 0.05), 0.003), &gm_dark, Vec3::new(0.0, -0.049, -0.30), one, id);
+    let fg_rot = Quat::from_rotation_x(0.12);
+    let fg_c = Vec3::new(0.0, -0.088, -0.30);
+    vb.part(rk, &sculpt::beveled_box(Vec3::new(0.03, 0.07, 0.036), 0.007), &grip, fg_c, one, fg_rot);
+    for k in 0..3 {
+        vb.part(rk, &src.cube, &gm_dark, fg_c + fg_rot * Vec3::new(0.0, -0.018 + k as f32 * 0.016, 0.0), Vec3::new(0.0315, 0.003, 0.037), fg_rot);
+    }
     vb.part(rk, &src.cap, &grip, Vec3::new(0.0, -0.095, 0.035), Vec3::new(0.046, 0.072, 0.052), Quat::from_rotation_x(-0.32));
-    vb.part(rk, &src.cube, &dark_steel, Vec3::new(0.0, -0.064, -0.03), Vec3::new(0.014, 0.006, 0.075), id);
-    vb.part(rk, &src.cube, &steel, Vec3::new(0.0, -0.05, -0.01), Vec3::new(0.006, 0.022, 0.01), Quat::from_rotation_x(0.35));
-    // Gloved right hand + armored cuff.
+    vb.part(rk, &trigger_guard, &gm_dark, Vec3::new(0.0, -0.058, -0.025), guard_scale, guard_rot);
+    vb.part(rk, &trigger_blade, &steel, Vec3::new(0.0, -0.05, -0.02), one, Quat::from_rotation_x(PI));
+    // Armored marine glove + knuckle plate + wrist cuff.
     vb.part(rk, &src.cap, &glove, Vec3::new(0.012, -0.112, 0.045), Vec3::new(0.076, 0.052, 0.078), Quat::from_rotation_x(-0.3));
-    vb.part(rk, &src.cube, &glove_plate, Vec3::new(0.036, -0.096, 0.03), Vec3::new(0.022, 0.048, 0.068), Quat::from_rotation_x(-0.28));
-    vb.part(rk, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
-    vb.part(rk, &src.cyl, &glove_plate, Vec3::new(0.048, -0.155, 0.135), Vec3::new(0.052, 0.036, 0.052), Quat::from_rotation_x(1.15) * Quat::from_rotation_z(-0.2));
+    vb.part(rk, &knuckle_plate, &glove_plate, Vec3::new(0.036, -0.096, 0.03), one, Quat::from_rotation_x(-0.28));
+    vb.part(rk, &src.cap, &glove, Vec3::new(0.042, -0.17, 0.17), Vec3::new(0.088, 0.11, 0.088), arm_rot);
+    vb.part(rk, &wrist_cuff, &glove_plate, Vec3::new(0.048, -0.155, 0.135), one, arm_rot);
+    // Open-frame breech cradle carrying the exposed finned warhead: kicks back on fire
+    // and lifts/vents through the reload cycle.
+    let breech = commands.spawn((ChildOf(rk), RocketBreech, Transform::from_translation(ROCKET_BREECH_REST), Visibility::default())).id();
+    vb.part(breech, &sculpt::beveled_box(Vec3::new(0.056, 0.008, 0.15), 0.003), &gm_dark, Vec3::new(0.0, -0.012, 0.0), one, id);
+    for s in [-1.0f32, 1.0] {
+        vb.part(breech, &sculpt::beveled_box(Vec3::new(0.008, 0.028, 0.15), 0.0025), &gm_titanium, Vec3::new(0.025 * s, 0.004, 0.0), one, id);
+        for z in [-0.05f32, 0.05] {
+            vb.part(breech, &hex_bolt, &bolt_silver, Vec3::new(0.0295 * s, 0.004, z), one, rz);
+        }
+    }
+    let strap = sculpt::beveled_box(Vec3::new(0.058, 0.006, 0.012), 0.0015);
+    for z in [-0.05f32, 0.05] {
+        vb.part(breech, &strap, &gm_steel, Vec3::new(0.0, 0.021, z), one, id);
+    }
+    vb.part(breech, &sculpt::tapered_prism(12, 0.0125, 0.0125, 0.07, false), &brass, Vec3::new(0.0, 0.004, 0.01), one, fwd);
+    vb.part(breech, &sculpt::tapered_prism(12, 0.0125, 0.0015, 0.045, false), &warhead_glow, Vec3::new(0.0, 0.004, -0.0475), one, fwd);
+    vb.part(breech, &sculpt::armored_ring(0.0128, 0.002, 0.003, 12, true), &warhead_glow, Vec3::new(0.0, 0.004, -0.012), one, rx);
+    // Sub-millimetre bevel is invisible at this size: a 12-tri cube, not a 64-tri bevel.
+    let tail_fin = Vec3::new(0.002, 0.012, 0.024);
+    for k in 0..4 {
+        let a = FRAC_PI_4 + k as f32 * FRAC_PI_2;
+        vb.part(breech, &src.cube, &gm_dark, Vec3::new(a.cos() * 0.017, 0.004 + a.sin() * 0.017, 0.04), tail_fin, Quat::from_rotation_z(a - FRAC_PI_2));
+    }
+    vb.part(breech, &sculpt::beveled_box(Vec3::new(0.05, 0.03, 0.02), 0.004), &gm_dark, Vec3::new(0.0, 0.004, 0.085), one, id);
+    vb.part(breech, &uv_scaled(sculpt::beveled_box(Vec3::new(0.04, 0.004, 0.016), 0.001), Vec2::new(1.0, 0.4)), &rk_hazard, Vec3::new(0.0, 0.021, 0.085), one, id);
     // Fiery mortar muzzle flash (cone + hot core + additive halo + ring).
     let rk_flash = commands
         .spawn((ChildOf(rk), MuzzleFlash(Weapon::Rocket), Transform::from_xyz(0.0, 0.012, -0.60), Visibility::Hidden))
@@ -1261,7 +1688,7 @@ fn spawn_viewmodels(
     // Top bulkhead: speaker grille slot + front-facing lens + blinking status LED.
     vb.part(proot, &src.cube, &dark_steel, Vec3::new(0.0, 0.097, 0.0105), Vec3::new(0.036, 0.005, 0.003), id);
     vb.part(proot, &src.cyl, &brushed, Vec3::new(-0.032, 0.097, 0.0105), Vec3::new(0.0045, 0.003, 0.0045), rx);
-    commands.spawn((PhoneLed, vm_part(proot, &sphere, &led, Vec3::new(0.034, 0.097, 0.0115), Vec3::splat(0.0038), id)));
+    commands.spawn((PhoneLed, vm_part(proot, &bead, &led, Vec3::new(0.034, 0.097, 0.0115), Vec3::splat(0.0038), id)));
     // Bottom chin tactile home bar + lanyard loop.
     vb.part(proot, &src.cube, &brushed, Vec3::new(0.0, -0.098, 0.0105), Vec3::new(0.044, 0.006, 0.003), id);
     // Side hardware controls: orange PTT button on left, volume rockers on right.
@@ -1272,7 +1699,7 @@ fn spawn_viewmodels(
     vb.part(proot, &src.cyl, &brushed, Vec3::new(0.048, 0.114, -0.001), Vec3::new(0.011, 0.018, 0.011), id);
     vb.part(proot, &src.cyl, &dark_steel, Vec3::new(0.048, 0.145, -0.001), Vec3::new(0.0048, 0.052, 0.0048), id);
     commands.spawn((PhoneSkinPart(SkinSlot::Coil), vm_part(proot, &thin_ring, &phone_coil, Vec3::new(0.048, 0.132, -0.001), Vec3::new(0.008, 0.006, 0.008), id)));
-    commands.spawn((PhoneLed, vm_part(proot, &sphere, &led, Vec3::new(0.048, 0.174, -0.001), Vec3::splat(0.0062), id)));
+    commands.spawn((PhoneLed, vm_part(proot, &bead, &led, Vec3::new(0.048, 0.174, -0.001), Vec3::splat(0.0062), id)));
     // Raised screen surround lip + LIVE 160x240 pixel-art OLED screen quad!
     vb.part(proot, &src.cube, &grip, Vec3::new(0.0, 0.0, 0.0096), Vec3::new(0.123, 0.182, 0.002), id);
     commands.spawn((
@@ -1341,6 +1768,9 @@ fn animate_viewmodels(
         Query<&mut Transform, With<PumpForend>>,
         Query<(&mut Transform, &PlasmaCoil)>,
         Query<&mut Transform, With<MuzzleStar>>,
+        Query<&mut Transform, With<ShotgunBolt>>,
+        Query<&mut Transform, With<PlasmaFluxSlide>>,
+        Query<&mut Transform, With<RocketBreech>>,
     )>,
     mut models: Query<(&GunModel, &mut Visibility), Without<MuzzleFlash>>,
     mut flashes: Query<(&MuzzleFlash, &mut Visibility), Without<GunModel>>,
@@ -1359,8 +1789,18 @@ fn animate_viewmodels(
 
     if let Ok(mut tf) = set.p0().single_mut() {
         let kick = ws.recoil;
-        tf.translation = WEAPON_REST + bob + Vec3::new(0.0, -0.3 * swap + kick * 0.022, kick * 0.095);
-        tf.rotation = Quat::from_rotation_x(kick * 0.36 - swap * 0.6) * Quat::from_rotation_z(-swap * 0.3);
+        // (back, lift, pitch, roll): the Signal-Mortar shoves deep into the shoulder with an
+        // eased (held) kick and a brief authoritative roll that settles back to level.
+        let (back, lift, pitch, roll) = match shown {
+            Weapon::Rocket => {
+                let k = (kick / 1.4).clamp(0.0, 1.0);
+                let e = k * k * (3.0 - 2.0 * k);
+                (e * 0.15, e * 0.02, e * 0.32, (k * PI).sin() * 0.07)
+            }
+            _ => (kick * 0.095, kick * 0.022, kick * 0.36, 0.0),
+        };
+        tf.translation = WEAPON_REST + bob + Vec3::new(0.0, -0.3 * swap + lift, back);
+        tf.rotation = Quat::from_rotation_x(pitch - swap * 0.6) * Quat::from_rotation_z(-swap * 0.3 - roll);
     }
     let cast = apps.cast_anim.clamp(0.0, 1.0);
     if let Ok(mut tf) = set.p1().single_mut() {
@@ -1380,6 +1820,28 @@ fn animate_viewmodels(
         tf.rotation = Quat::from_rotation_z(ws.muzzle_roll);
         tf.scale = Vec3::splat(0.55 + 0.78 * k);
     }
+    // Shotgun bolt rides back with the pump stroke, exposing the chambered shell.
+    if let Ok(mut tf) = set.p5().single_mut() {
+        let k = (ws.pump * PI).sin().max(0.0);
+        tf.translation = SHOTGUN_BOLT_REST + Vec3::Z * (k * 0.066);
+    }
+    // Plasma flux slide snaps fully back on each shot and springs home.
+    if let Ok(mut tf) = set.p6().single_mut() {
+        let k = if shown == Weapon::Plasma { (ws.recoil / 0.35).clamp(0.0, 1.0) } else { 0.0 };
+        tf.translation = PLASMA_SLIDE_REST + Vec3::Z * (k.sqrt() * 0.05);
+    }
+    // Mortar breech: hard rearward kick on fire, then a lift-and-tilt vent through the reload.
+    if let Ok(mut tf) = set.p7().single_mut() {
+        // Normalised by the cooldown the shot actually armed, so fire-rate upgrades and
+        // 5G Overclock run the full lift-and-vent cycle instead of starting it midway.
+        let (kick, cyc) = if shown == Weapon::Rocket {
+            ((ws.recoil / 1.4).clamp(0.0, 1.0), (ws.cycle_progress() * PI).sin().max(0.0))
+        } else {
+            (0.0, 0.0)
+        };
+        tf.translation = ROCKET_BREECH_REST + Vec3::new(0.0, cyc * 0.006, kick * 0.042 + cyc * 0.01);
+        tf.rotation = Quat::from_rotation_x(-cyc * 0.09);
+    }
     for (m, mut v) in &mut models {
         *v = if m.0 == shown { Visibility::Inherited } else { Visibility::Hidden };
     }
@@ -1397,23 +1859,40 @@ fn animate_viewmodels(
 
     // Animate phone status LED + antenna beacon + plasma coils.
     let Some(pm) = pm else { return };
-    let mut c = signal_color(signal.bars).to_linear();
-    let mut pulse = 4.0 + 3.0 * (t * (3.0 + signal.bars as f32 * 1.5)).sin().max(0.0);
-    if signal.in_dead_zone {
-        pulse = if (t * 8.0).sin() > 0.2 { 6.0 } else { 0.4 };
-        c = LinearRgba::rgb(1.0, 0.12, 0.08);
-    }
-    if apps.ping_active_timer > 0.0 || apps.overload_flash_timer > 0.0 {
-        c = LinearRgba::rgb(0.3, 1.0, 1.0);
-        pulse = 10.0;
-    }
+    let (base, emissive) = phone_led_glow(signal.bars, signal.in_dead_zone, apps.ping_active_timer > 0.0 || apps.overload_flash_timer > 0.0, t);
     if let Some(mut m) = materials.get_mut(&pm.led) {
-        m.emissive = LinearRgba::rgb(c.red * pulse, c.green * pulse, c.blue * pulse);
+        m.base_color = base;
+        m.emissive = emissive;
     }
+    // Saturated plasma: gentle idle shimmer, flares on each shot without clipping to white
+    // (peaks at ~PLASMA_FLARE on a fresh shot).
     if let Some(mut m) = materials.get_mut(&pm.coil) {
-        let k = if ws.displayed() == Weapon::Plasma { 1.0 + ws.recoil * 3.5 } else { 1.0 };
-        m.emissive = LinearRgba::rgb(0.8, 6.0, 8.5) * k;
+        let k = if shown == Weapon::Plasma { (0.06 * (t * 9.0).sin() + (ws.recoil / 0.35).clamp(0.0, 1.0)).clamp(0.0, 1.0) } else { 0.0 };
+        m.emissive = PLASMA_GLOW.mix(&PLASMA_FLARE, k);
     }
+    // Mortar warhead/vents: flare on fire, dim while venting, recharge to full by ready.
+    if let Some(mut m) = materials.get_mut(&pm.warhead) {
+        let k = if shown == Weapon::Rocket { 0.45 + 0.55 * ws.cycle_progress() + 1.0 * (ws.recoil / 1.4).clamp(0.0, 1.0) } else { 1.0 };
+        m.emissive = ROCKET_GLOW * k;
+    }
+}
+
+/// Phone status LED / antenna beacon colour for the current signal state:
+/// `(base_color, emissive)`. A dark-but-hued base plus a saturated emissive kept in
+/// ~1.0..3.2, so the bars hue / dead-zone red / ping cyan reads instead of clipping white.
+pub fn phone_led_glow(bars: u8, dead_zone: bool, pinging: bool, t: f32) -> (Color, LinearRgba) {
+    let (c, pulse) = if pinging {
+        (LinearRgba::rgb(0.08, 0.85, 1.0), 3.2)
+    } else if dead_zone {
+        (LinearRgba::rgb(1.0, 0.05, 0.03), if (t * 8.0).sin() > 0.2 { 3.0 } else { 0.35 })
+    } else {
+        let c = signal_color(bars).to_linear();
+        (c, 1.6 + 1.4 * (t * (3.0 + bars as f32 * 1.5)).sin().max(0.0))
+    };
+    // Normalise so the brightest channel is 1.0: pulse alone sets the intensity.
+    let peak = c.red.max(c.green).max(c.blue).max(1e-3);
+    let at = |k: f32| LinearRgba::rgb(c.red / peak * k, c.green / peak * k, c.blue / peak * k);
+    (Color::LinearRgba(at(0.35)), at(pulse))
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,11 +2087,13 @@ fn fire_weapons(
     }
     ws.force_fire = false;
     ws.cooldown = fire_cooldown(ws.current, &mods, signal.bars);
+    ws.last_cooldown = ws.cooldown;
 
     let origin = cam.translation;
     let rot = cam.rotation;
     let fwd = rot * Vec3::NEG_Z;
-    let muzzle = origin + rot * Vec3::new(0.2, -0.17, -0.85);
+    // On the drawn barrel tip's view ray (see `muzzle_offset`).
+    let muzzle = origin + rot * muzzle_offset(ws.current);
     // Doppler Overdrive: speed at the moment of the shot sets the bonus.
     let speed = Vec2::new(player.velocity.x, player.velocity.z).length();
     let dmult = doppler_damage_mult(speed, &mods);
@@ -1639,7 +2120,8 @@ fn fire_weapons(
             spawn_flash_light(&mut commands, muzzle, Color::srgb(1.0, 0.72, 0.35), 820_000.0, 13.0, 0.08);
             let right_dir = rot * Vec3::X;
             let up_dir = rot * Vec3::Y;
-            let breach = origin + rot * Vec3::new(0.29, -0.18, -0.42);
+            // Exactly at the viewmodel's right-side ejection port.
+            let breach = origin + rot * (WEAPON_REST + SHOTGUN_PORT_LOCAL);
             spawn_ejected_shell(&mut commands, &fx, breach, right_dir, up_dir, fwd);
             spawn_particles(&mut commands, &fx, muzzle, BurstColor::Smoke, 2, 1.2, 0.06);
             let mut rng = rand::rng();
@@ -2236,6 +2718,79 @@ mod tests {
             "#....#...#", //
             "##########",
         ])
+    }
+
+    fn tris(m: &Mesh) -> usize {
+        m.indices().map_or(m.count_vertices(), |i| i.len()) / 3
+    }
+
+    #[test]
+    fn rocket_cycle_spans_the_cooldown_the_shot_actually_armed() {
+        // A fire-rate-boosted shot: the cycle starts at 0, not partway through.
+        let fast = ROCKET_COOLDOWN * 0.5;
+        let mut ws = WeaponState { current: Weapon::Rocket, cooldown: fast, last_cooldown: fast, ..default() };
+        assert!(ws.cycle_progress().abs() < 1e-6, "fresh shot starts the cycle at 0");
+        ws.cooldown = fast * 0.5;
+        assert!((ws.cycle_progress() - 0.5).abs() < 1e-6, "halfway through the real cooldown");
+        ws.cooldown = 0.0;
+        assert_eq!(ws.cycle_progress(), 1.0, "ready");
+        // A swap (not a shot) arming the cooldown runs no reload cycle.
+        let mut ws = WeaponState { current: Weapon::Shotgun, last_cooldown: SHOTGUN_COOLDOWN, ..default() };
+        assert!(ws.switch_to(Weapon::Rocket));
+        assert!(ws.cooldown > 0.0);
+        assert_eq!(ws.cycle_progress(), 1.0);
+        // ...but swapping mid-cycle keeps the shot's cycle.
+        let mut ws = WeaponState { current: Weapon::Rocket, cooldown: 0.6, last_cooldown: 0.85, ..default() };
+        ws.switch_to(Weapon::Plasma);
+        assert_eq!((ws.cooldown, ws.last_cooldown), (0.6, 0.85));
+    }
+
+    #[test]
+    fn muzzle_origin_sits_on_the_drawn_barrel_tip_ray() {
+        for w in Weapon::ALL {
+            let m = muzzle_offset(w);
+            let tip = WEAPON_REST + viewmodel_muzzle_local(w);
+            assert!((m.z + MUZZLE_DEPTH).abs() < 1e-5, "{w:?} depth");
+            assert!(m.normalize().angle_between(tip.normalize()) < 1e-4, "{w:?} on the tip's view ray");
+            assert!(m.x > 0.1 && m.y < -0.08, "{w:?} lower-right of the crosshair");
+        }
+        // The ejection port is on the right flank of the shotgun receiver.
+        assert!(SHOTGUN_PORT_LOCAL.x > 0.03 && (WEAPON_REST + SHOTGUN_PORT_LOCAL).z < -0.4);
+    }
+
+    #[test]
+    fn phone_led_shows_a_saturated_signal_hue() {
+        let green = phone_led_glow(5, false, false, 0.3).1;
+        let red = phone_led_glow(5, true, false, 0.2).1;
+        let cyan = phone_led_glow(1, true, true, 0.0).1;
+        assert!(green.green > 1.0 && green.green > 1.5 * green.blue && green.green > 5.0 * green.red, "{green:?}");
+        assert_eq!(green.alpha, 1.0);
+        assert!(red.red > 1.0 && red.red > 5.0 * red.green.max(red.blue), "{red:?}");
+        assert!(cyan.blue > 1.0 && cyan.green > 1.0 && cyan.red < 0.5, "{cyan:?}");
+        for bars in 0..=5 {
+            for k in 0..40 {
+                let (base, e) = phone_led_glow(bars, k % 3 == 0, k % 7 == 0, k as f32 * 0.13);
+                let peak = e.red.max(e.green).max(e.blue);
+                assert!((0.3..=3.2 + 1e-4).contains(&peak), "emissive never clips to white: {e:?}");
+                assert!(base.to_linear().red.max(base.to_linear().green).max(base.to_linear().blue) < 0.5, "dark hued base");
+            }
+        }
+    }
+
+    #[test]
+    fn viewmodel_primitives_stay_low_poly() {
+        let src = VmSourceMeshes::new();
+        for (name, m, max) in [
+            ("cyl", &src.cyl, 48),
+            ("cap", &src.cap, 200),
+            ("thin_ring", &src.thin_ring, 192),
+            ("sphere", &src.sphere, 160),
+            ("bead", &src.bead, 96),
+            ("cone", &src.cone, 24),
+        ] {
+            assert!(tris(m) <= max, "{name}: {} tris", tris(m));
+        }
+        assert!(tris(&Mesh::from(Torus::new(0.78, 1.0))) > 5 * tris(&src.thin_ring));
     }
 
     #[test]

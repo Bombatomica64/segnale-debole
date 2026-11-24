@@ -490,6 +490,118 @@ pub fn ceiling_texture() -> Canvas {
     c
 }
 
+/// Neutral striated demonic hide / organic carapace texture (meant to be tinted
+/// via `StandardMaterial::base_color` so each demon archetype keeps its signature hue).
+pub fn demon_hide_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let fx = x as f32 / 64.0 * std::f32::consts::TAU;
+        let fy = y as f32 / 64.0 * std::f32::consts::TAU;
+        let striation = (fy * 5.0 + (fx * 2.0).sin() * 1.4).sin() * 0.5 + 0.5;
+        let scale_pat = ((fx * 4.0).sin() * (fy * 4.0).cos()) * 0.5 + 0.5;
+        let n = hash_noise(x / 2, y / 2, 71);
+        let fine = hash_noise(x, y, 72);
+        let v = (0.54 + striation * 0.22 + scale_pat * 0.14 + n * 0.14 + fine * 0.06).clamp(0.42, 1.0);
+        // Dark organic crevices along sine ridges.
+        let mut lum = (v * 245.0) as u8;
+        if striation < 0.12 {
+            lum = (lum as f32 * 0.62) as u8;
+        }
+        [lum, (lum as f32 * 0.94) as u8, (lum as f32 * 0.92) as u8]
+    });
+    c
+}
+
+/// Brushed & riveted industrial gunmetal / cyber-armor plate texture (neutral greyscale
+/// for clean `base_color` tinting on guns, Relay Sniper, Jammer Fiend, and Boss armor).
+pub fn gunmetal_plate_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        // Horizontal brushed steel grain.
+        let brush = hash_noise(x / 4, y, 81) * 0.16 + hash_noise(x, y, 82) * 0.08;
+        let mut lum = (196.0 + brush * 55.0).clamp(150.0, 250.0);
+        // Crisp machined panel seam + specular bevel lip.
+        if x % 32 == 0 || y % 32 == 0 {
+            lum = 95.0;
+        } else if x % 32 == 1 || y % 32 == 1 {
+            lum = 248.0;
+        }
+        let v = lum as u8;
+        [v, v, (v as f32 * 1.02).min(255.0) as u8]
+    });
+    // Subtle corner rivets.
+    for (rx, ry) in [(4, 4), (28, 4), (4, 28), (28, 28), (36, 4), (60, 4), (36, 28), (60, 28), (4, 36), (28, 36), (36, 36), (60, 36), (4, 60), (28, 60), (36, 60), (60, 60)] {
+        c.set(rx, ry, [245, 246, 250]);
+        c.set(rx + 1, ry + 1, [92, 94, 98]);
+    }
+    c
+}
+
+/// Rich dark walnut / tactical rifle wood grain texture for the Mars Combat Pump Shotgun.
+pub fn wood_grain_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let fx = x as f32 / 64.0 * std::f32::consts::TAU;
+        let fy = y as f32 / 64.0 * std::f32::consts::TAU;
+        let ring = (fy * 6.0 + (fx * 2.0).sin() * 1.8 + hash_noise(x / 3, y / 2, 91) * 0.7).sin() * 0.5 + 0.5;
+        let grain = hash_noise(x / 4, y, 92);
+        let t = (ring * 0.7 + grain * 0.3).clamp(0.0, 1.0);
+        mix([68, 30, 14], [148, 76, 36], t)
+    });
+    c
+}
+
+/// Crisp industrial diagonal black-and-amber hazard stripe texture for Signal-Mortar & cyber-armor.
+pub fn hazard_stripe_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let stripe = ((x + y) / 8) % 2 == 0;
+        let n = hash_noise(x, y, 101);
+        let base = if stripe { [238, 152, 18] } else { [28, 26, 28] };
+        let mut col = shade(base, 0.85 + n * 0.22);
+        if y == 0 || y == 63 {
+            col = [72, 70, 74];
+        }
+        col
+    });
+    c
+}
+
+/// Angular obsidian-tech chitin texture with subtle engraved circuit channels
+/// (neutral-bright for clean `base_color` tinting on Phase Stalker / Carrier Daemon / Pylons).
+pub fn obsidian_tech_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let n = hash_noise(x / 2, y / 2, 111);
+        let diag = ((x + y) % 16 == 0) || ((x + 64 - y) % 32 == 0);
+        let mut lum = 188.0 + n * 38.0;
+        if diag {
+            lum = 112.0;
+        } else if (x + y) % 16 == 1 {
+            lum = 242.0;
+        }
+        let v = lum.clamp(90.0, 255.0) as u8;
+        [v, (v as f32 * 0.96) as u8, v]
+    });
+    c
+}
+
+/// Fluted molten-gold / engraved bronze filigree texture for Hell Baron & Carrier Daemon trim.
+pub fn engraved_gold_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let n = hash_noise(x, y, 121);
+        let ridge = ((x % 16) as i32 - 8).abs() as f32 / 8.0;
+        let band = y % 32 < 3 || y % 32 > 29;
+        let mut col = mix([175, 118, 24], [252, 206, 78], (ridge * 0.75 + n * 0.25).clamp(0.0, 1.0));
+        if band {
+            col = shade(col, 0.65);
+        }
+        col
+    });
+    c
+}
+
 /// Multiply every pixel by an sRGB tint.
 pub fn tint_canvas(mut c: Canvas, tint: [f32; 3]) -> Canvas {
     for y in 0..c.size {
