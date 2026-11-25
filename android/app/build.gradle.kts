@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = System.getenv("ANDROID_VERSION_CODE")?.toIntOrNull() ?: 1
-        versionName = System.getenv("ANDROID_VERSION_NAME")?.takeIf { it.isNotBlank() } ?: "0.5.0"
+        versionName = System.getenv("ANDROID_VERSION_NAME")?.takeIf { it.isNotBlank() } ?: "1.0.0"
         ndk {
             // `libsegnale_debole.so` is built for arm64 only (cargo ndk -t arm64-v8a).
             abiFilters += "arm64-v8a"

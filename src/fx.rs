@@ -808,8 +808,15 @@ impl Plugin for FxPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudFeed>()
             .add_systems(PreStartup, create_fx_assets)
+            .add_systems(OnEnter(crate::state::AppState::MainMenu), clear_hud_feed)
+            .add_systems(OnEnter(crate::state::AppState::Leaderboard), clear_hud_feed)
+            .add_systems(OnEnter(crate::state::AppState::Compendium), clear_hud_feed)
             .add_systems(Update, (animate_fx, tick_feed).in_set(GameSet::World));
     }
+}
+
+fn clear_hud_feed(mut feed: ResMut<HudFeed>) {
+    *feed = HudFeed::default();
 }
 
 fn tick_feed(time: Res<Time>, mut feed: ResMut<HudFeed>) {

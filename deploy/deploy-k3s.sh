@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Build the web + API images and roll them out on the local single-node k3s.
 #
-#   deploy/deploy-k3s.sh            # TAG=v0.5.0
-#   TAG=v0.5.1 deploy/deploy-k3s.sh
+#   deploy/deploy-k3s.sh            # TAG=v1.0.0
+#   TAG=v1.0.1 deploy/deploy-k3s.sh
 #
 # Images are imported straight into k3s's containerd (imagePullPolicy: Never),
 # so no registry is involved. Run from anywhere; paths resolve to the repo root.
 # Note: deploy/k8s.yaml pins the image tags; bump them there when changing TAG.
 set -euo pipefail
 
-TAG="${TAG:-v0.5.0}"
+TAG="${TAG:-v1.0.0}"
 NAMESPACE="segnale-debole"
 SECRET="segnale-debole-secrets"
 WEB_IMAGE="docker.io/library/segnale-debole-web:${TAG}"

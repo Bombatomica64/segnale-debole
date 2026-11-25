@@ -1606,17 +1606,26 @@ pub struct SettingsRowTag(pub usize, pub Color);
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SettingsPadFocus(pub usize);
 
-fn reset_settings_pad_focus(mut focus: ResMut<SettingsPadFocus>) {
+/// Whether keyboard arrows/Enter currently own row focus in Settings.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettingsKeyFocus(pub bool);
+
+fn reset_settings_pad_focus(mut focus: ResMut<SettingsPadFocus>, mut key_focus: ResMut<SettingsKeyFocus>) {
     focus.0 = 0;
+    key_focus.0 = false;
 }
 
-/// Controller Settings: Up / Down walk [`SETTINGS_ROWS`], Left / Right / `A`
-/// edit (see [`settings_pad_edit`]), `B` goes back. Mirrors the focused stop
-/// into [`GamepadFocus`] so the BACK switch lights like any punk button.
+/// Controller + keyboard Settings navigation: Up / Down walk [`SETTINGS_ROWS`],
+/// Left / Right / `A` / `Enter` edit (see [`settings_pad_edit`]), `B` / `Esc`
+/// goes back. Mirrors the focused stop into [`GamepadFocus`] so the BACK
+/// switch lights like any punk button.
 #[allow(clippy::too_many_arguments)]
 pub fn settings_pad_nav(
     pad: Res<GamepadInput>,
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    motion: Option<Res<bevy::input::mouse::AccumulatedMouseMotion>>,
     mut idx: ResMut<SettingsPadFocus>,
+    mut key_focus: ResMut<SettingsKeyFocus>,
     mut focus: ResMut<GamepadFocus>,
     rows: Query<(Entity, &SettingsRowTag)>,
     mut store: ResMut<ProfileStore>,
@@ -1624,23 +1633,40 @@ pub fn settings_pad_nav(
     mut sfx: ResMut<SfxQueue>,
     (ret, mut next): (Res<SettingsReturn>, ResMut<NextState<AppState>>),
 ) {
-    if !pad.connected {
+    let k = keys.as_deref();
+    let k_dy = i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::ArrowDown) || k.just_pressed(KeyCode::KeyS)))
+        - i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::ArrowUp) || k.just_pressed(KeyCode::KeyW)));
+    let k_dx = i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::ArrowRight) || k.just_pressed(KeyCode::KeyD)))
+        - i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::ArrowLeft) || k.just_pressed(KeyCode::KeyA)));
+    let k_confirm = k.is_some_and(|k| k.just_pressed(KeyCode::Enter) || k.just_pressed(KeyCode::Space));
+    let k_used = k_dy != 0 || k_dx != 0 || k_confirm;
+    if k_used {
+        key_focus.0 = true;
+    } else if pad.active || motion.is_some_and(|m| m.delta != Vec2::ZERO) {
+        key_focus.0 = false;
+    }
+    if !pad.connected && !k_used && !key_focus.0 {
         return;
     }
-    let dy = pad.nav_y();
+    let dy = if pad.connected && pad.nav_y() != 0 { pad.nav_y() } else { k_dy };
+    let dx = if pad.connected && pad.nav_x() != 0 { pad.nav_x() } else { k_dx };
+    let confirm = (pad.connected && pad.confirm) || k_confirm;
     if dy != 0 {
         idx.0 = (idx.0.min(SETTINGS_ROW_COUNT - 1) as i32 + dy).rem_euclid(SETTINGS_ROW_COUNT as i32) as usize;
+        if k_dy != 0 {
+            sfx.play(SfxEvent::UiTick);
+        }
     }
     let row = SETTINGS_ROWS[idx.0.min(SETTINGS_ROW_COUNT - 1)];
     let want = rows.iter().find(|(_, t)| t.0 == idx.0).map(|(e, _)| e);
     if focus.focused != want {
         focus.focused = want;
     }
-    if pad.back {
+    if pad.connected && pad.back {
         next.set(ret.0);
         return;
     }
-    match settings_pad_edit(row, pad.nav_x(), pad.confirm, &store.profile.settings.sanitized()) {
+    match settings_pad_edit(row, dx, confirm, &store.profile.settings.sanitized()) {
         Some(SettingsPadAction::Edit(t)) => *fb = edit_feedback(commit_settings_edit(&mut store, t), &mut sfx),
         Some(SettingsPadAction::Back) => next.set(ret.0),
         None => {}
@@ -1651,6 +1677,7 @@ pub fn settings_pad_nav(
 fn add_settings_systems(app: &mut App) {
     app.init_resource::<SettingsHover>()
         .init_resource::<SettingsPadFocus>()
+        .init_resource::<SettingsKeyFocus>()
         .add_systems(OnEnter(AppState::Settings), (reset_feedback, reset_settings_pad_focus, spawn_settings_screen).chain())
         .add_systems(Update, (settings_pad_nav, settings_clicks, refresh_settings_ui).chain().run_if(in_state(AppState::Settings)));
 }
@@ -1664,10 +1691,10 @@ fn settings_clicks(
     mut fb: ResMut<MetaFeedback>,
     mut hover: ResMut<SettingsHover>,
     mut sfx: ResMut<SfxQueue>,
-    (pad, focus): (Res<GamepadInput>, Res<GamepadFocus>),
+    (pad, focus, key_focus): (Res<GamepadInput>, Res<GamepadFocus>, Res<SettingsKeyFocus>),
 ) {
-    let now = if pad.active {
-        // Controller navigation owns the highlight (RESET DEFAULTS is a control).
+    let now = if pad.active || key_focus.0 {
+        // Controller / keyboard navigation owns the highlight (RESET DEFAULTS is a control).
         focus.focused.and_then(|e| controls.get(e).ok()).map(|(_, _, _, ctl)| ctl.0)
     } else {
         let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
@@ -1678,6 +1705,7 @@ fn settings_clicks(
     }
     if let Some(t) = hover.0
         && !pad.active
+        && !key_focus.0
         && mouse.just_released(MouseButton::Left)
     {
         *fb = edit_feedback(commit_settings_edit(&mut store, t), &mut sfx);
@@ -1696,15 +1724,17 @@ fn refresh_settings_ui(
     mut labels: Query<(&SettingsLabel, &mut Text, &mut TextColor)>,
     mut preview: Query<(Entity, &mut ReticlePreview)>,
     fresh: Query<(), Added<SettingsLabel>>,
-    (pad, focus, mut rows): (
+    (pad, focus, key_focus, idx, mut rows): (
         Res<GamepadInput>,
         Res<GamepadFocus>,
+        Res<SettingsKeyFocus>,
+        Res<SettingsPadFocus>,
         Query<(Entity, &SettingsRowTag, &mut BackgroundColor, &mut BorderColor), (Without<SettingsControl>, Without<SettingsPip>, Without<MenuButton>)>,
     ),
 ) {
     let s = store.profile.settings.sanitized();
     for (e, tag, mut bg, mut border) in &mut rows {
-        let lit = focus.shows(&pad, e);
+        let lit = focus.shows(&pad, e) || (key_focus.0 && tag.0 == idx.0);
         let (want_bg, want_border) = settings_row_look(tag.1, lit);
         if bg.0 != want_bg {
             bg.0 = want_bg;

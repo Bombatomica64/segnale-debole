@@ -808,12 +808,26 @@ fn trial_tick(
     mut run: ResMut<RunStats>,
     mut ws: ResMut<WeaponState>,
     mut players: Query<(&mut Player, &mut Transform)>,
-    stale_fx: Query<Entity, Or<(With<PlayerProjectile>, With<Fx>)>>,
+    stale_fx: Query<Entity, Or<(With<PlayerProjectile>, With<Fx>, With<crate::decals::Decal>)>>,
+    (mut decal_pool, mut decal_queue, mut feed): (
+        Option<ResMut<crate::decals::DecalPool>>,
+        Option<ResMut<crate::decals::DecalQueue>>,
+        Option<ResMut<HudFeed>>,
+    ),
 ) {
     let Ok((mut p, mut tf)) = players.single_mut() else { return };
     if trial.reset_requested {
         for e in &stale_fx {
             commands.entity(e).try_despawn();
+        }
+        if let Some(pool) = decal_pool.as_deref_mut() {
+            pool.ring.clear();
+        }
+        if let Some(queue) = decal_queue.as_deref_mut() {
+            queue.pending.clear();
+        }
+        if let Some(feed) = feed.as_deref_mut() {
+            *feed = HudFeed::default();
         }
         *trial = TimeTrialState::default();
         run.time_elapsed = 0.0;
@@ -823,10 +837,7 @@ fn trial_tick(
         place_player(&grid, &mut p, &mut tf, grid.spawn, grid.spawn_yaw);
         p.dash_cooldown = 0.0;
         p.invuln_timer = 0.0;
-        ws.current = Weapon::Rocket;
-        ws.previous = Weapon::Rocket;
-        ws.cooldown = 0.0;
-        ws.swap_timer = 0.0;
+        *ws = WeaponState { current: Weapon::Rocket, previous: Weapon::Rocket, ..default() };
     } else if !trial.finished {
         trial.elapsed += time.delta_secs();
     }

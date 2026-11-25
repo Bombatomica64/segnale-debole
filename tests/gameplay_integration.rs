@@ -4065,6 +4065,75 @@ fn f9_does_nothing_without_dev_tools() {
     }
 }
 
+/// Milestone 29: keyboard-only players can navigate and edit Settings without
+/// a controller or mouse, from both Main Menu and Pause.
+#[test]
+fn keyboard_only_can_edit_settings() {
+    let mut app = App::new();
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    tap(&mut app, KeyCode::KeyO);
+    assert_eq!(app_state(&app), AppState::Settings);
+    let before = app.world().resource::<ProfileStore>().profile.settings.mouse_sensitivity;
+    // Row 0 is Mouse Sensitivity: Right arrow increases it without any gamepad.
+    tap(&mut app, KeyCode::ArrowRight);
+    let after = app.world().resource::<ProfileStore>().profile.settings.mouse_sensitivity;
+    assert!(after > before, "expected keyboard ArrowRight to bump mouse sensitivity ({before} -> {after})");
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+}
+
+/// Milestone 29: ordinary Pause preserves HudFeed; abandoning to MainMenu clears it,
+/// and instant Time Trial retry clears decals, HudFeed, and weapon animation state.
+#[test]
+fn hud_feed_and_trial_retry_cleanup() {
+    use segnale_debole::decals::{Decal, DecalKind, DecalPool, DecalQueue, DecalRequest};
+    use segnale_debole::fx::HudFeed;
+    use segnale_debole::trials::TimeTrialState;
+
+    let mut app = App::new();
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    app.world_mut().resource_mut::<HudFeed>().toast("RUN ALERT", Color::WHITE);
+    // Pause + Resume preserves HudFeed.
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert_eq!(app.world().resource::<HudFeed>().toasts.len(), 1);
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(app.world().resource::<HudFeed>().toasts.len(), 1);
+    // Returning to MainMenu clears HudFeed so old alerts never leak into the next run.
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::MainMenu);
+    app.update();
+    app.update();
+    assert!(app.world().resource::<HudFeed>().toasts.is_empty());
+
+    // Time Trial instant retry clears pooled decals, queue, HudFeed, and weapon anim timers.
+    tap(&mut app, KeyCode::KeyT);
+    assert_eq!(app_state(&app), AppState::Playing);
+    let d = app.world_mut().spawn(Decal(DecalKind::Scorch)).id();
+    app.world_mut().resource_mut::<DecalPool>().push(d);
+    app.world_mut().resource_mut::<DecalQueue>().push(DecalRequest::floor(DecalKind::Scorch, Vec3::ZERO, 1.0));
+    app.world_mut().resource_mut::<HudFeed>().toast("TRIAL TOAST", Color::WHITE);
+    {
+        let mut ws = app.world_mut().resource_mut::<WeaponState>();
+        ws.recoil = 0.8;
+        ws.muzzle = 0.2;
+        ws.inspect_timer = 0.5;
+    }
+    app.world_mut().resource_mut::<TimeTrialState>().reset_requested = true;
+    app.update();
+    app.update();
+    assert!(app.world().resource::<DecalPool>().ring.is_empty());
+    assert!(app.world().resource::<DecalQueue>().pending.is_empty());
+    assert_eq!(app.world_mut().query::<&Decal>().iter(app.world()).count(), 0);
+    assert!(app.world().resource::<HudFeed>().toasts.is_empty());
+    let ws = app.world().resource::<WeaponState>();
+    assert_eq!((ws.recoil, ws.muzzle, ws.inspect_timer), (0.0, 0.0, 0.0));
+}
+
 /// Milestone 28: an Imp visible 32 m down a clear straight corridor wakes
 /// within about a second; an Imp at the same range behind a wall stays idle.
 #[test]
