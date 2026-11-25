@@ -22,7 +22,7 @@ use bevy::window::PrimaryWindow;
 
 use crate::enemies::{EnemyAssets, EnemyKind, KIND_COUNT};
 use crate::fx::OVERLAY_LAYER;
-use crate::gamepad::GamepadInput;
+use crate::gamepad::{DualPrompt, GamepadInput};
 use crate::hud::text;
 use crate::meta::ProfileStore;
 use crate::sculpt;
@@ -932,7 +932,12 @@ fn spawn_dossier_ui(commands: &mut Commands, tex: Option<&UiKitTextures>) {
     ));
     let tabs = commands.spawn((ChildOf(card), Node { column_gap: Val::Px(10.0), ..default() })).id();
     for cat in [Category::Bestiary, Category::Armory] {
-        commands.spawn((ChildOf(tabs), comp_button(&format!("{}  [TAB]", cat.name()), CompAction::Tab(cat), 14.0, ButtonStyle::HazardAmber)));
+        let label = format!("{}  [TAB]", cat.name());
+        commands.spawn((
+            ChildOf(tabs),
+            comp_button(&label, CompAction::Tab(cat), 14.0, ButtonStyle::HazardAmber),
+            DualPrompt::new(label, format!("{}  [Y]", cat.name())),
+        ));
     }
     commands.spawn((
         ChildOf(card),
@@ -985,9 +990,14 @@ fn spawn_dossier_ui(commands: &mut Commands, tex: Option<&UiKitTextures>) {
     ));
     commands.spawn((ChildOf(card), Node { flex_grow: 1.0, ..default() }));
     let nav = commands.spawn((ChildOf(card), Node { column_gap: Val::Px(10.0), justify_content: JustifyContent::SpaceBetween, ..default() })).id();
-    commands.spawn((ChildOf(nav), comp_button("PREV  [A]", CompAction::Prev, 15.0, ButtonStyle::ScrapSteel)));
-    commands.spawn((ChildOf(nav), comp_button("NEXT  [D]", CompAction::Next, 15.0, ButtonStyle::PrimaryAcid)));
-    commands.spawn((ChildOf(nav), comp_button("BACK  [ESC]", CompAction::Back, 15.0, ButtonStyle::DangerRed)));
+    // Keycaps follow the active input mode (LB / RB also cycle exhibits).
+    for (kbm, pad, action, style) in [
+        ("PREV  [A]", "PREV  [LB]", CompAction::Prev, ButtonStyle::ScrapSteel),
+        ("NEXT  [D]", "NEXT  [RB]", CompAction::Next, ButtonStyle::PrimaryAcid),
+        ("BACK  [ESC]", "BACK  [B]", CompAction::Back, ButtonStyle::DangerRed),
+    ] {
+        commands.spawn((ChildOf(nav), comp_button(kbm, action, 15.0, style), DualPrompt::new(kbm, pad)));
+    }
 }
 
 fn despawn_compendium(mut commands: Commands, q: Query<Entity, With<CompendiumEntity>>) {

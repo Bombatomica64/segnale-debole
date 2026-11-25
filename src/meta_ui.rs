@@ -21,7 +21,7 @@ use crate::audio::{SfxEvent, SfxQueue};
 use crate::gamepad::{GamepadFocus, GamepadFocusable, GamepadInput};
 use crate::hud::{spawn_crosshair, text, MenuAction, MenuButton, CROSSHAIR_BOX, COLOR_BG, COLOR_CYAN, COLOR_DIM, COLOR_GOLD, COLOR_SIGNAL_AMBER, COLOR_SIGNAL_GREEN, COLOR_SIGNAL_RED};
 use crate::ui_kit::{
-    hard_shadow, inset_border, plate_border, plate_rect, punk_button, punk_screen_root, rivet_card, section_crate, set_strip_tape, stamped_tag,
+    hard_shadow, inset_border, plate_border, plate_rect, punk_screen_root, rivet_card, section_crate, set_strip_tape, stamped_tag,
     stencil_title, tape_image, terminal_chassis, ButtonStyle, ChassisStrip, Tape, TerminalChassis, UiKitTextures, ACID_DARK, ACID_GREEN,
     ARC_CYAN, ASH_DIM, BLOOD_DARK, BONE_TEXT, CARD_BORDER, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_MID, LOCKED_IRON, PUNK_RED,
     STEEL_BORDER,
@@ -880,10 +880,11 @@ fn screen_header(commands: &mut Commands, phone: Entity, title: &str, fb: &MetaF
     header
 }
 
-fn footer(commands: &mut Commands, phone: Entity, buttons: [(&str, MenuAction, ButtonStyle); 3]) {
+/// Footer switches of `state`; keycaps follow the active input mode.
+fn footer(commands: &mut Commands, phone: Entity, state: AppState, buttons: [(&str, MenuAction, ButtonStyle); 3]) {
     let f = commands.spawn((ChildOf(phone), Node { margin: UiRect { top: Val::Px(2.0), bottom: Val::Px(4.0), ..default() }, ..row(JustifyContent::Center, 24.0) })).id();
     for (label, action, style) in buttons {
-        commands.spawn((ChildOf(f), punk_button(label, action, 19.0, style)));
+        commands.spawn((ChildOf(f), crate::hud::prompt_button(state, label, action, 19.0, style)));
     }
 }
 
@@ -1003,6 +1004,7 @@ fn spawn_loadout_screen(
     footer(
         &mut commands,
         phone,
+        AppState::Loadout,
         [
             ("BACK  [ESC]", MenuAction::BackToMenu, ButtonStyle::ScrapSteel),
             ("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, ButtonStyle::DangerRed),
@@ -1130,6 +1132,7 @@ fn spawn_contracts_screen(
     footer(
         &mut commands,
         phone,
+        AppState::ContractsFeats,
         [
             ("BACK  [ESC]", MenuAction::BackToMenu, ButtonStyle::ScrapSteel),
             ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::HazardAmber),
@@ -2022,7 +2025,7 @@ fn spawn_settings_screen(
     let back = if mid_run { "BACK TO PAUSE  [ESC]" } else { "BACK  [ESC]" };
     commands.spawn((
         ChildOf(f),
-        punk_button(back, MenuAction::CloseSettings, 19.0, ButtonStyle::HeroAcid),
+        crate::hud::prompt_button(AppState::Settings, back, MenuAction::CloseSettings, 19.0, ButtonStyle::HeroAcid),
         SettingsRowTag(settings_row_index(SettingsRow::Back), ACID_GREEN),
     ));
 }

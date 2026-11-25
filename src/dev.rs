@@ -33,6 +33,11 @@
 //! - `SEGNALE_LEADERBOARD_SHOTS=<dir>`: Milestone 26 tour (networking off,
 //!   staged boards): main menu with the account pill, Daily / Time Trial
 //!   leaderboards, the callsign editor and the offline fallback, then exits.
+//! - `SEGNALE_LAYOUT_SHOTS=<dir>`: Milestone 27 embed-layout tour (pair it
+//!   with `SEGNALE_WINDOW_SIZE=960x540` etc.): main menu (mouse & keyboard
+//!   and controller prompts), the full 25-entry leaderboard on all 3 pages as
+//!   a native guest, the controller callsign editor, the App Store upgrade
+//!   cards and the in-run HUD with controller prompts, then exits.
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
@@ -120,6 +125,21 @@ impl Plugin for DevPlugin {
                 }
             }
             app.insert_resource(LeaderboardShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, leaderboard_shots_tour);
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_LAYOUT_SHOTS") {
+            let mut showcase = meta_showcase_profile();
+            showcase.callsign = "BOMBA64".into();
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.profile = showcase;
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(showcase));
+                }
+            }
+            app.insert_resource(LayoutShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, layout_shots_tour.after(GameSet::Ui));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_COMPENDIUM_SHOTS") {
@@ -798,7 +818,7 @@ fn leaderboard_shots_tour(
         }
         (7, AppState::Leaderboard) if t > 0.5 => {
             lb.editing = Some("BOMBA6".into());
-            lb.notice = Some("TYPE A-Z 0-9 _ -  //  ENTER SAVE  //  ESC CANCEL".into());
+            lb.notice = None;
             true
         }
         (8, AppState::Leaderboard) if t > 1.0 => {
@@ -818,6 +838,142 @@ fn leaderboard_shots_tour(
             true
         }
         (11, AppState::Leaderboard) if t > 1.5 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_LAYOUT_SHOTS (Milestone 27)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct LayoutShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+/// Main menu (M&K, then pad prompts) -> leaderboard pages 1-3 (native
+/// guest) -> pad callsign editor -> App Store -> HUD (pad prompts).
+#[allow(clippy::too_many_arguments)]
+fn layout_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<LayoutShots>,
+    state: Res<State<AppState>>,
+    mut lb: ResMut<crate::leaderboard::LeaderboardState>,
+    mut pad: ResMut<crate::gamepad::GamepadInput>,
+    (mut run, mut mods): (ResMut<RunStats>, ResMut<PlayerModifiers>),
+    mut players: Query<&mut Player>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use crate::leaderboard::{Account, Board};
+    cfg.timer += time.delta_secs();
+    for mut p in &mut players {
+        p.invuln_timer = 999.0;
+        p.hp = p.max_hp;
+    }
+    let dir = cfg.dir.clone();
+    let t = cfg.timer;
+    // No real pad is plugged in: `active` stays as staged (see `update_gamepad_input`).
+    let mut set_pad = |on: bool| {
+        if pad.active != on {
+            pad.active = on;
+        }
+    };
+    let advance = match (cfg.stage, *state.get()) {
+        (0, AppState::MainMenu) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "01_main_menu.png");
+            true
+        }
+        (1, AppState::MainMenu) if t > 0.5 => {
+            set_pad(true);
+            true
+        }
+        (2, AppState::MainMenu) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "02_main_menu_pad.png");
+            true
+        }
+        (3, AppState::MainMenu) if t > 0.5 => {
+            set_pad(false);
+            next.set(AppState::Leaderboard);
+            true
+        }
+        (4, AppState::Leaderboard) if t > 0.5 => {
+            lb.account = Account::Guest { auth_enabled: true };
+            lb.daily = Board::Loaded(showcase_daily_board());
+            lb.trial = Board::Loaded(showcase_trial_board());
+            true
+        }
+        (5, AppState::Leaderboard) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "03_leaderboard_p1.png");
+            true
+        }
+        (6, AppState::Leaderboard) if t > 0.4 => {
+            lb.turn_page(1);
+            true
+        }
+        (7, AppState::Leaderboard) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "04_leaderboard_p2.png");
+            true
+        }
+        (8, AppState::Leaderboard) if t > 0.4 => {
+            lb.turn_page(1);
+            true
+        }
+        (9, AppState::Leaderboard) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "05_leaderboard_p3.png");
+            true
+        }
+        (10, AppState::Leaderboard) if t > 0.4 => {
+            set_pad(true);
+            lb.page = 0;
+            lb.editing = Some("BOMBA6".into());
+            true
+        }
+        (11, AppState::Leaderboard) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "06_leaderboard_pad_callsign.png");
+            true
+        }
+        (12, AppState::Leaderboard) if t > 0.4 => {
+            set_pad(false);
+            lb.editing = None;
+            crate::state::start_run(&mut run, &mut mods, &mut next, 0x5EED_0027);
+            true
+        }
+        (13, AppState::Playing) if t > 2.0 => {
+            complete_floor(&mut run, &mut next);
+            true
+        }
+        (14, AppState::UpgradeSelect) if t > 1.2 => {
+            meta_shot(&mut commands, &dir, "07_upgrades.png");
+            true
+        }
+        (15, AppState::UpgradeSelect) if t > 0.4 => {
+            set_pad(true);
+            true
+        }
+        (16, AppState::UpgradeSelect) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "08_upgrades_pad.png");
+            true
+        }
+        (17, AppState::UpgradeSelect) if t > 0.3 => {
+            next.set(AppState::Playing);
+            true
+        }
+        (18, AppState::Playing) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "09_hud_pad.png");
+            true
+        }
+        (19, AppState::Playing) if t > 1.5 => {
             exit.write(AppExit::Success);
             true
         }

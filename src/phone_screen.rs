@@ -63,6 +63,9 @@ pub struct PhoneScreenSnapshot {
     pub spoof_active: bool,
     /// Standing in a Jammer Hijack hotspot: carrier label reads "HIJK".
     pub hijack_boost: bool,
+    /// Controller is the active input: tiles read `LT PNG` / `RB EMP` and the
+    /// tower prompt `PRESS [X]` instead of `RMB` / `Q` / `[E]`.
+    pub pad_prompts: bool,
 }
 
 impl Default for PhoneScreenSnapshot {
@@ -91,8 +94,14 @@ impl Default for PhoneScreenSnapshot {
             decoy_ready: false,
             spoof_active: false,
             hijack_boost: false,
+            pad_prompts: false,
         }
     }
+}
+
+/// Ping / 5G Overload tile labels per input mode.
+pub const fn app_tile_labels(pad: bool) -> (&'static str, &'static str) {
+    if pad { ("LT PNG", "RB EMP") } else { ("RMB PNG", "Q  EMP") }
 }
 
 pub struct PhoneScreenPlugin;
@@ -130,6 +139,7 @@ fn update_phone_screen(
     apps: Res<PhoneApps>,
     mods: Res<PlayerModifiers>,
     extraction: Res<ExtractionState>,
+    mode: Option<Res<crate::gamepad::InputMode>>,
     mut screen: ResMut<PhoneScreenTexture>,
     mut images: ResMut<Assets<Image>>,
     (mut frame, mut shown): (Local<Vec<u8>>, Local<Vec<u8>>),
@@ -168,6 +178,7 @@ fn update_phone_screen(
         decoy_ready: signal.bars == 0 && mods.missed_call && apps.ping_cooldown <= 0.0,
         spoof_active: apps.spoof_active(),
         hijack_boost: signal.hotspot_boosted,
+        pad_prompts: mode.is_some_and(|m| m.is_pad()),
     };
     // Render off-texture; only touch the image (which marks it for GPU
     // re-upload) when the pixels actually differ from the last upload.
@@ -533,8 +544,9 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     }
 
     // ---- 5. Chunky At-a-Glance App Tiles (y = 170..212) ----
+    let (ping_lbl, emp_lbl) = app_tile_labels(s.pad_prompts);
     if s.decoy_ready {
-        draw_special_tile(&mut g, 5, 170, 73, 42, "RMB PNG", "DECOY", [44, 26, 4], [255, 196, 48], [255, 214, 90], s.time);
+        draw_special_tile(&mut g, 5, 170, 73, 42, ping_lbl, "DECOY", [44, 26, 4], [255, 196, 48], [255, 214, 90], s.time);
     } else {
         draw_app_tile(
         &mut g,
@@ -542,7 +554,7 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         170,
         73,
         42,
-        "RMB PNG",
+        ping_lbl,
         s.bars,
         PING_MIN_BARS,
         s.ping_cd,
@@ -551,7 +563,7 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         );
     }
     if s.callback_ready {
-        draw_special_tile(&mut g, 82, 170, 73, 42, "Q  EMP", "CALL!", [40, 34, 6], [255, 222, 70], [120, 250, 255], s.time);
+        draw_special_tile(&mut g, 82, 170, 73, 42, emp_lbl, "CALL!", [40, 34, 6], [255, 222, 70], [120, 250, 255], s.time);
     } else {
         draw_app_tile(
         &mut g,
@@ -559,7 +571,7 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         170,
         73,
         42,
-        "Q  EMP",
+        emp_lbl,
         s.bars,
         OVERLOAD_MIN_BARS,
         s.overload_cd,
@@ -591,7 +603,7 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         let _ = if s.sos_jammed { write!(lbl, "JAM! {pct}%") } else { write!(lbl, "SOS {pct}%") };
         g.text(28, 219, lbl.as_str(), 2, bright);
     } else {
-        let (msg, col) = if s.near_tower { ("PRESS [E]", green) } else { ("FIND 5-BAR", amber) };
+        let (msg, col) = if s.near_tower { (if s.pad_prompts { "PRESS [X]" } else { "PRESS [E]" }, green) } else { ("FIND 5-BAR", amber) };
         g.text(22, 219, msg, 2, col);
     }
 
@@ -807,6 +819,19 @@ mod tests {
         // Spoof wins when both are active.
         let both = render(&PhoneScreenSnapshot { spoof_active: true, hijack_boost: true, ..calm(5) });
         assert_eq!(carrier_pixels(&both), carrier_pixels(&render(&PhoneScreenSnapshot { spoof_active: true, ..calm(5) })));
+    }
+
+    #[test]
+    fn app_tiles_follow_the_input_mode() {
+        assert_eq!(app_tile_labels(false), ("RMB PNG", "Q  EMP"));
+        assert_eq!(app_tile_labels(true), ("LT PNG", "RB EMP"));
+        let tiles = |b: &[u8]| (170..212).flat_map(|y| (5..155).map(move |x| px(b, x, y))).collect::<Vec<_>>();
+        let kbm = render(&calm(3));
+        let pad = render(&PhoneScreenSnapshot { pad_prompts: true, ..calm(3) });
+        assert_ne!(tiles(&kbm), tiles(&pad), "tile labels redraw for the controller");
+        // Near the tower the prompt swaps [E] -> [X].
+        let near = |pad_prompts| render(&PhoneScreenSnapshot { near_tower: true, pad_prompts, ..calm(5) });
+        assert_ne!(near(false), near(true));
     }
 
     #[test]

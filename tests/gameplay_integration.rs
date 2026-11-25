@@ -3032,8 +3032,8 @@ fn endless_overdrive_continues_past_victory_and_records_once() {
             let texts = ui_texts(&mut app);
             assert!(texts.iter().any(|t| t == "THE CARRIER DAEMON"), "boss plate header");
             assert!(texts.iter().any(|t| t == "PHASE I"), "boss phase tag");
-            assert!(texts.iter().any(|t| t == "DEFEAT THE CARRIER DAEMON TO LOCK EXTRACTION"), "hold status: {texts:?}");
-            assert!(texts.iter().any(|t| t.starts_with("UPLINK HELD 99%")));
+            assert!(texts.iter().any(|t| t == "CARRIER DAEMON ALIVE - EXTRACTION LOCKED"), "hold status: {texts:?}");
+            assert!(texts.iter().any(|t| t == "UPLINK HELD AT 99% // KILL THE CARRIER DAEMON TO EXTRACT"), "hold banner: {texts:?}");
         }
         fast_clear_floor(&mut app);
         if floor < FINAL_FLOOR {
@@ -4026,4 +4026,40 @@ fn compendium_is_a_pre_run_screen() {
     assert!(texts.iter().any(|t| t == "LIFETIME KILLS"));
     assert!(texts.iter().any(|t| t == "17"), "{texts:?}");
     assert!(texts.iter().any(|t| t == "FLANKER // FLOOR 2+"));
+}
+
+/// Milestone 27: without dev tools (a release build without `SEGNALE_DEV`)
+/// F9 does nothing: the floor, the run and its reward / leaderboard
+/// eligibility stay untouched.
+#[test]
+fn f9_does_nothing_without_dev_tools() {
+    use segnale_debole::hud::DevTools;
+    let mut app = App::new();
+    app.insert_resource(DevTools(false));
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    for _ in 0..3 {
+        tap(&mut app, KeyCode::F9);
+    }
+    assert_eq!(app_state(&app), AppState::Playing);
+    let run = app.world().resource::<RunStats>();
+    assert_eq!(run.floor, 1);
+    assert!(!run.debug_skipped, "still eligible for feats and leaderboards");
+    // Explicit DevTools(true) allows F9 floor skip; default matches build profile when SEGNALE_DEV is unset.
+    assert!(segnale_debole::hud::parse_dev_env(Some("1")));
+    assert!(!segnale_debole::hud::parse_dev_env(Some("0")));
+    assert!(!segnale_debole::hud::parse_dev_env(Some("")));
+    assert!(!segnale_debole::hud::parse_dev_env(None));
+    let mut enabled = App::new();
+    enabled.insert_resource(DevTools(true));
+    enabled.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    enabled.update();
+    tap(&mut enabled, KeyCode::Enter);
+    tap(&mut enabled, KeyCode::F9);
+    assert!(enabled.world().resource::<RunStats>().debug_skipped);
+    if std::env::var_os("SEGNALE_DEV").is_none() {
+        assert_eq!(DevTools::from_env().0, cfg!(debug_assertions));
+    }
 }

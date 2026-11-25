@@ -853,7 +853,7 @@ fn trial_pit_rescue(
     trial.rescues += 1;
     let at = if cleared == 0 { "START".to_string() } else { time_trial_gates()[cleared - 1].label.to_string() };
     feed.toast(format!("PIT RESCUE - BACK TO {at}"), HAZARD_YELLOW);
-    sfx.play(SfxEvent::Denied);
+    sfx.play(SfxEvent::PitRescue);
 }
 
 /// Toast line of a gate crossing: `CP 2  00:31.4  -0:01.2`.

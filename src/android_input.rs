@@ -700,8 +700,13 @@ mod tests {
     }
 
     /// The queue drains into real Bevy gamepad / mouse state.
+    /// Serializes the tests that drive the process-wide input bridge /
+    /// pointer-capture flag (the test harness runs tests in parallel).
+    static BRIDGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn bridge_feeds_bevy_input() {
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::input::InputPlugin, AndroidInputPlugin));
         app.world_mut().spawn((Window::default(), PrimaryWindow));
@@ -790,6 +795,7 @@ mod tests {
 
     #[test]
     fn pointer_capture_mirrors_cursor_captured() {
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut app = App::new();
         app.add_plugins(MinimalPlugins).insert_resource(CursorCaptured(true)).add_systems(Update, publish_pointer_capture);
         app.update();

@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::gamepad::{GamepadInput, PadFocusLock};
-use crate::hud::{text, MenuAction};
+use crate::gamepad::{pad_edit_text, DualPrompt, GamepadInput, InputMode, PadFocusLock, PAD_TEXT_HINT};
+use crate::hud::{pad_prompt, text, MenuAction};
 use crate::meta::{
     is_callsign_char, record_game_over, record_victory, sanitize_callsign, PlayerProfile, ProfileStore, RunLoadout, CALLSIGN_MAX, PROFILE_SCHEMA_VERSION,
 };
@@ -48,6 +48,9 @@ pub const TOKEN_ENV: &str = "SEGNALE_AUTH_TOKEN";
 pub const OFFLINE_ENV: &str = "SEGNALE_LEADERBOARD_OFFLINE";
 /// Rows of a board.
 pub const TOP_N: usize = 25;
+/// Rows per leaderboard page (the Top 25 spans 3 pages): keeps every row,
+/// the page indicator, the status lines and BACK inside a 960x540 embed.
+pub const LB_PAGE_SIZE: usize = 10;
 /// Daily score cap accepted by the server.
 pub const MAX_SCORE: u64 = 10_000_000;
 
@@ -555,6 +558,109 @@ pub struct LeaderboardState {
     pub notice: Option<String>,
     /// Leaderboard switches pressed this frame (routed from `hud::perform`).
     pub pending: Vec<MenuAction>,
+    /// 0-based page of the active board ([`LB_PAGE_SIZE`] rows each).
+    pub page: usize,
+}
+
+/// Pages a board of `rows` entries spans (at least 1).
+pub fn page_count(rows: usize) -> usize {
+    rows.min(TOP_N).div_ceil(LB_PAGE_SIZE).max(1)
+}
+
+impl LeaderboardState {
+    /// Entries on the active tab's board (0 unless loaded).
+    pub fn active_rows(&self) -> usize {
+        match self.tab {
+            LbTab::Daily => if let Board::Loaded(v) = &self.daily { v.len() } else { 0 },
+            LbTab::TimeTrial => if let Board::Loaded(v) = &self.trial { v.len() } else { 0 },
+        }
+    }
+
+    /// The shown page, clamped to the active board.
+    pub fn current_page(&self) -> usize {
+        self.page.min(page_count(self.active_rows()) - 1)
+    }
+
+    /// Step the page by `delta` (clamped; never wraps).
+    pub fn turn_page(&mut self, delta: i32) {
+        let last = page_count(self.active_rows()) as i32 - 1;
+        let want = (self.current_page() as i32 + delta).clamp(0, last) as usize;
+        if self.page != want {
+            self.page = want;
+        }
+    }
+
+    /// Switch DAILY <-> TIME TRIAL (back to page 1).
+    pub fn switch_tab(&mut self) {
+        self.tab = self.tab.other();
+        self.page = 0;
+    }
+}
+
+/// `PAGE 2/3` indicator of the active board.
+pub fn page_label(lb: &LeaderboardState) -> String {
+    format!("PAGE {}/{}", lb.current_page() + 1, page_count(lb.active_rows()))
+}
+
+/// Native / Android guests post scores anonymously (no browser sign-in):
+/// a one-line explanation for the leaderboard header (`None` elsewhere).
+pub fn guest_note(account: &Account) -> Option<&'static str> {
+    guest_note_for(cfg!(target_arch = "wasm32"), account)
+}
+
+/// [`guest_note`] for an explicit platform (testable on every target).
+pub fn guest_note_for(web: bool, account: &Account) -> Option<&'static str> {
+    (!web && matches!(account, Account::Guest { .. })).then_some(GUEST_NOTE)
+}
+
+/// See [`guest_note`].
+pub const GUEST_NOTE: &str = "GUEST MODE // SCORES POST AS GUEST (WEB SIGN-IN FOR CLOUD SYNC)";
+
+/// Short player-facing badge of a refused / failed score submission.
+pub fn submit_failure(status: u16, body: &str) -> SubmitStatus {
+    match status {
+        0 => SubmitStatus::Offline,
+        429 => SubmitStatus::NotRanked("RATE LIMITED - TRY AGAIN SOON".into()),
+        400..=499 => {
+            let why = serde_json::from_str::<ErrorResp>(body).map(|e| e.error).unwrap_or_default();
+            warn!("leaderboard: submission rejected ({status}): {why}");
+            SubmitStatus::NotRanked(rejection_reason(&why))
+        }
+        _ => SubmitStatus::NotRanked("SERVER BUSY - SAVED LOCALLY".into()),
+    }
+}
+
+/// Longest server reason shown on an end card.
+const REASON_MAX: usize = 40;
+
+/// `REJECTED: <SERVER REASON>` in uppercase ASCII, cut at a word boundary
+/// (generic when the server gave no reason).
+pub fn rejection_reason(error: &str) -> String {
+    let clean: String = error
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c.to_ascii_uppercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if clean.is_empty() {
+        return "REJECTED BY SERVER - NOT RANKED".into();
+    }
+    let mut out = String::new();
+    for word in clean.split(' ') {
+        let extra = if out.is_empty() { word.len() } else { word.len() + 1 };
+        if out.len() + extra > REASON_MAX {
+            if out.is_empty() {
+                out.push_str(&word[..REASON_MAX.min(word.len())]);
+            }
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    format!("REJECTED: {out}")
 }
 
 /// Account pill text for the menus.
@@ -618,6 +724,11 @@ pub fn adopt_cloud_profile(store: &mut ProfileStore, cloud: Option<&serde_json::
     }
 }
 
+/// Notice after a failed `POST /auth/logout` (still signed in).
+pub const SIGN_OUT_FAILED: &str = "SIGN OUT FAILED - RETRY";
+/// Notice after `PUT /profile` answered 401.
+pub const SESSION_EXPIRED: &str = "SESSION EXPIRED - SIGN IN AGAIN";
+
 /// Apply one reply to the state (and the local profile).
 pub fn apply_reply(r: NetReply, lb: &mut LeaderboardState, store: &mut ProfileStore, client: &mut LeaderboardClient) {
     let ok = (200..300).contains(&r.status);
@@ -631,7 +742,12 @@ pub fn apply_reply(r: NetReply, lb: &mut LeaderboardState, store: &mut ProfileSt
                         put_profile(client, &store.profile);
                     }
                 }
-                Some(me) => lb.account = Account::Guest { auth_enabled: me.auth_enabled },
+                Some(me) => {
+                    lb.account = Account::Guest { auth_enabled: me.auth_enabled };
+                    if client.bearer.take().is_some() {
+                        lb.notice = Some(SESSION_EXPIRED.into());
+                    }
+                }
                 None => lb.account = Account::Offline,
             }
         }
@@ -642,7 +758,13 @@ pub fn apply_reply(r: NetReply, lb: &mut LeaderboardState, store: &mut ProfileSt
                     adopt_cloud_profile(store, p.profile.as_ref(), p.callsign.as_deref());
                 }
             }
-            401 => lb.account = Account::Guest { auth_enabled: true },
+            401 => {
+                // The session expired server-side: drop the stale sign-in
+                // (and a native bearer token) and say so.
+                lb.account = Account::Guest { auth_enabled: true };
+                client.bearer = None;
+                lb.notice = Some(SESSION_EXPIRED.into());
+            }
             _ => lb.notice = Some("CLOUD SYNC FAILED - PROGRESS SAVED LOCALLY".into()),
         },
         NetKind::DailyBoard => {
@@ -668,18 +790,19 @@ pub fn apply_reply(r: NetReply, lb: &mut LeaderboardState, store: &mut ProfileSt
                     Ok(s) if s.accepted => SubmitStatus::Ranked { rank: s.rank, improved: s.improved, verified: s.verified },
                     _ => SubmitStatus::NotRanked("NOT RANKED".into()),
                 },
-                429 => SubmitStatus::NotRanked("RATE LIMITED - SAVED LOCALLY".into()),
-                400..=499 => {
-                    let why = serde_json::from_str::<ErrorResp>(&r.body).map(|e| e.error).unwrap_or_default();
-                    warn!("leaderboard: submission rejected ({}): {why}", r.status);
-                    SubmitStatus::NotRanked("REJECTED BY SERVER - NOT RANKED".into())
-                }
-                _ => SubmitStatus::Offline,
+                status => submit_failure(status, &r.body),
             };
         }
-        NetKind::Logout => {
+        // Only a confirmed sign-out clears the account: a failed request
+        // keeps the session (and says so) so the player can retry.
+        NetKind::Logout if ok => {
             lb.account = Account::Guest { auth_enabled: true };
+            client.bearer = None;
             lb.notice = Some("SIGNED OUT".into());
+        }
+        NetKind::Logout => {
+            warn!("leaderboard: sign out failed ({})", r.status);
+            lb.notice = Some(SIGN_OUT_FAILED.into());
         }
     }
 }
@@ -755,6 +878,7 @@ pub fn auto_submit(
 fn on_enter_leaderboard(mut client: ResMut<LeaderboardClient>, mut lb: ResMut<LeaderboardState>) {
     lb.editing = None;
     lb.notice = None;
+    lb.page = 0;
     request_boards(&mut client, &mut lb);
 }
 
@@ -789,18 +913,20 @@ fn toggle_callsign_edit(lb: &mut LeaderboardState, store: &mut ProfileStore, cli
         commit_callsign(lb, store, client);
     } else {
         lb.editing = Some(store.profile.callsign.clone());
-        lb.notice = Some("TYPE A-Z 0-9 _ -  //  ENTER SAVE  //  ESC CANCEL".into());
+        // The footer shows the editor controls for the active input mode.
+        lb.notice = None;
     }
 }
+
+/// Keyboard callsign editor controls (see [`PAD_TEXT_HINT`] for the pad).
+pub const CALLSIGN_KBM_HINT: &str = "TYPE A-Z 0-9 _ -  //  ENTER SAVE  //  ESC CANCEL";
 
 /// Character set cycled by the controller in the callsign editor.
 const PAD_CHARSET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
 
 /// Cycle a callsign character by `step` through [`PAD_CHARSET`].
 pub fn cycle_callsign_char(c: char, step: i32) -> char {
-    let set: Vec<char> = PAD_CHARSET.chars().collect();
-    let i = set.iter().position(|x| *x == c).unwrap_or(0) as i32;
-    set[(i + step).rem_euclid(set.len() as i32) as usize]
+    crate::gamepad::cycle_char(PAD_CHARSET, c, step)
 }
 
 /// SIGN IN (web: navigate to the Authentik login) / SIGN OUT.
@@ -838,9 +964,9 @@ fn leaderboard_input(
     let pending = std::mem::take(&mut lb.pending);
     for action in pending {
         match action {
-            MenuAction::LbTab => {
-                lb.tab = lb.tab.other();
-            }
+            MenuAction::LbTab => lb.switch_tab(),
+            MenuAction::LbPrevPage => lb.turn_page(-1),
+            MenuAction::LbNextPage => lb.turn_page(1),
             MenuAction::LbRefresh => request_boards(&mut client, &mut lb),
             MenuAction::LbCallsign => toggle_callsign_edit(&mut lb, &mut store, &mut client),
             MenuAction::LbAccount => account_action(&mut lb, &mut client),
@@ -856,7 +982,7 @@ fn leaderboard_input(
         } else if enter {
             commit_callsign(&mut lb, &mut store, &mut client);
         } else {
-            if keys.just_pressed(KeyCode::Backspace) || pad.nav_left {
+            if keys.just_pressed(KeyCode::Backspace) {
                 buf.pop();
             }
             for k in keys.get_just_pressed() {
@@ -866,16 +992,7 @@ fn leaderboard_input(
                     buf.push(c);
                 }
             }
-            if pad.nav_right && buf.chars().count() < CALLSIGN_MAX {
-                buf.push('A');
-            }
-            if pad.nav_up || pad.nav_down {
-                let step = if pad.nav_up { 1 } else { -1 };
-                match buf.pop() {
-                    Some(c) => buf.push(cycle_callsign_char(c, step)),
-                    None => buf.push('A'),
-                }
-            }
+            pad_edit_text(&mut buf, &pad, PAD_CHARSET, CALLSIGN_MAX);
             if lb.editing.as_deref() != Some(buf.as_str()) {
                 lb.editing = Some(buf);
             }
@@ -883,7 +1000,14 @@ fn leaderboard_input(
     } else if !was_editing && lb.editing.is_none() {
         let tab = keys.any_just_pressed([KeyCode::Tab, KeyCode::KeyQ, KeyCode::KeyE]) || pad.tab_prev || pad.tab_next;
         if tab {
-            lb.tab = lb.tab.other();
+            lb.switch_tab();
+        }
+        // Pages: [ / ] , Left / Right, PageUp / PageDown, or LT / RT.
+        if keys.any_just_pressed([KeyCode::BracketLeft, KeyCode::ArrowLeft, KeyCode::PageUp]) || pad.page_prev {
+            lb.turn_page(-1);
+        }
+        if keys.any_just_pressed([KeyCode::BracketRight, KeyCode::ArrowRight, KeyCode::PageDown]) || pad.page_next {
+            lb.turn_page(1);
         }
         if keys.just_pressed(KeyCode::KeyR) || pad.alt_action {
             request_boards(&mut client, &mut lb);
@@ -973,6 +1097,8 @@ enum LbLabel {
     Notice,
     Message,
     LocalSummary,
+    Page,
+    Guest,
 }
 
 /// Table column header `i`.
@@ -993,10 +1119,17 @@ struct LbTable;
 #[derive(Component)]
 struct LbMessageBox;
 
-/// Column widths (px) of the 9-column table.
-const COLS: [f32; 9] = [56.0, 210.0, 52.0, 140.0, 120.0, 120.0, 150.0, 120.0, 90.0];
-const ROW_FONT: f32 = 12.0;
-const ROW_H: f32 = 15.0;
+/// Column flex bases (px) of the 9-column table: the columns grow in
+/// proportion to fill a wide chassis and shrink together (each cell clips)
+/// down to a 960x540 embed. Sum + gaps ~ 830 px.
+const COLS: [f32; 9] = [36.0, 150.0, 40.0, 104.0, 62.0, 96.0, 104.0, 96.0, 64.0];
+const ROW_FONT: f32 = 13.0;
+const ROW_H: f32 = 18.0;
+
+/// A fluid table column (header or cell).
+fn col_node(w: f32) -> Node {
+    Node { flex_basis: Val::Px(w), flex_grow: w, flex_shrink: 1.0, min_width: Val::Px(0.0), overflow: Overflow::clip(), ..default() }
+}
 const VERIFIED_TAG: &str = "[ID]";
 
 /// Column headers of a tab.
@@ -1063,19 +1196,20 @@ pub fn local_summary(p: &PlayerProfile, today: DailyDate) -> String {
 }
 
 /// Label of the callsign plate.
-pub fn callsign_plate_label(lb: &LeaderboardState, callsign: &str) -> String {
+pub fn callsign_plate_label(lb: &LeaderboardState, callsign: &str, mode: InputMode) -> String {
     match &lb.editing {
         Some(buf) => format!("CALLSIGN: {buf}_"),
-        None => format!("CALLSIGN: {callsign}  [C]"),
+        None => format!("CALLSIGN: {callsign}{}", mode.pick("  [C]", "")),
     }
 }
 
-/// Label of the tab switch.
-pub fn tab_label(lb: &LeaderboardState) -> String {
+/// Label of the tab switch (names the board on screen).
+pub fn tab_label(lb: &LeaderboardState, mode: InputMode) -> String {
     let date = if lb.daily_date.is_empty() { DailyDate::today_utc().format_iso() } else { lb.daily_date.clone() };
+    let key = mode.pick("[TAB]", "[LB/RB]");
     match lb.tab {
-        LbTab::Daily => format!("DAILY ({date})  >  TIME TRIAL  [TAB]"),
-        LbTab::TimeTrial => format!("TIME TRIAL  >  DAILY ({date})  [TAB]"),
+        LbTab::Daily => format!("BOARD: DAILY {date}  {key}"),
+        LbTab::TimeTrial => format!("BOARD: TIME TRIAL  {key}"),
     }
 }
 
@@ -1090,14 +1224,18 @@ pub fn account_switch_label(account: &Account) -> Option<&'static str> {
     }
 }
 
-/// Key hints of the leaderboard footer.
-pub const LB_HINTS: &str = "TAB / Q / E  OR  LB / RB: SWITCH BOARD   //   C: EDIT CALLSIGN   //   R / Y: REFRESH";
+/// Key hints of the leaderboard (mouse & keyboard).
+pub const LB_HINTS: &str = "TAB: SWITCH BOARD  //  [ ] OR ARROWS: PAGE  //  C: EDIT CALLSIGN  //  R: REFRESH";
+/// Key hints of the leaderboard (controller).
+pub const LB_PAD_HINTS: &str = "LB / RB: SWITCH BOARD  //  LT / RT: PAGE  //  Y: REFRESH  //  A: SELECT  //  B: BACK";
 
-/// Footer line: the live notice, else the key hints.
-fn footer_line(lb: &LeaderboardState) -> (&str, Color) {
-    match &lb.notice {
-        Some(n) => (n.as_str(), HAZARD_YELLOW),
-        None => (LB_HINTS, ASH_DIM),
+/// Notice line: the callsign editor's controls while typing (per input
+/// mode), else the live notice, else the key hints.
+pub fn footer_line(lb: &LeaderboardState, mode: InputMode) -> (&str, Color) {
+    match (&lb.editing, &lb.notice) {
+        (Some(_), _) => (mode.pick(CALLSIGN_KBM_HINT, PAD_TEXT_HINT), HAZARD_YELLOW),
+        (None, Some(n)) => (n.as_str(), HAZARD_YELLOW),
+        (None, None) => (mode.pick(LB_HINTS, LB_PAD_HINTS), ASH_DIM),
     }
 }
 
@@ -1132,14 +1270,17 @@ pub fn spawn_account_pill(commands: &mut Commands, parent: Entity, lb: &Leaderbo
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_leaderboard_screen(
     mut commands: Commands,
     store: Res<ProfileStore>,
     lb: Res<LeaderboardState>,
+    mode: Option<Res<InputMode>>,
     tex: Option<Res<UiKitTextures>>,
     msaa: Option<Res<crate::perf::RenderMsaa>>,
 ) {
     let tex = tex.as_deref();
+    let mode = mode.map(|m| *m).unwrap_or_default();
     let msaa = msaa.map(|m| m.0).unwrap_or(bevy::render::view::Msaa::Sample2);
     commands.spawn((
         DespawnOnExit(AppState::Leaderboard),
@@ -1150,16 +1291,15 @@ fn spawn_leaderboard_screen(
     let root = punk_screen_root(&mut commands, AppState::Leaderboard, tex, INK_BLACK, 1.0);
     let body = terminal_chassis(&mut commands, root, tex, 1180.0, false);
     let p = &store.profile;
+    let full = || Node { width: Val::Percent(100.0), align_items: AlignItems::Center, column_gap: Val::Px(10.0), ..default() };
 
     // Header: title | account pill | SIGN IN / SIGN OUT.
-    let header = commands
-        .spawn((ChildOf(body), Node { width: Val::Percent(100.0), align_items: AlignItems::Center, column_gap: Val::Px(12.0), ..default() }))
-        .id();
-    stencil_title(&mut commands, header, "GLOBAL LEADERBOARD", 26.0, BONE_TEXT, PUNK_RED);
+    let header = commands.spawn((ChildOf(body), full())).id();
+    stencil_title(&mut commands, header, "GLOBAL LEADERBOARD", 24.0, BONE_TEXT, PUNK_RED);
     commands.spawn((ChildOf(header), Node { flex_grow: 1.0, ..default() }));
     commands.spawn((
         ChildOf(header),
-        Node { padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)), border: plate_rect((3.0, 1.0, 1.0, 1.0)), ..default() },
+        Node { padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)), border: plate_rect((3.0, 1.0, 1.0, 1.0)), flex_shrink: 0.0, ..default() },
         BorderColor { left: ARC_CYAN, top: STEEL_BORDER, right: STEEL_BORDER, bottom: STEEL_BORDER },
         BackgroundColor(INK_BLACK.with_alpha(0.7)),
         children![(AccountPillText, text(account_label(&lb.account, &p.callsign), 13.0, ARC_CYAN))],
@@ -1168,42 +1308,49 @@ fn spawn_leaderboard_screen(
     if account_switch_label(&lb.account).is_none() {
         commands.entity(acct).insert(Node { display: Display::None, ..default() });
     }
+    // Native / Android guests: why scores post as GUEST.
+    let note = guest_note(&lb.account);
+    commands.spawn((
+        ChildOf(body),
+        LbLabel::Guest,
+        text(note.unwrap_or_default(), 11.0, ARC_CYAN.with_alpha(0.85)),
+        Node { display: if note.is_some() { Display::Flex } else { Display::None }, ..default() },
+    ));
 
-    // Controls: callsign plate | tab switch | status | REFRESH.
-    let controls = commands
-        .spawn((ChildOf(body), Node { width: Val::Percent(100.0), align_items: AlignItems::Center, column_gap: Val::Px(12.0), ..default() }))
-        .id();
-    let plate = commands.spawn((ChildOf(controls), punk_button(&callsign_plate_label(&lb, &p.callsign), MenuAction::LbCallsign, 15.0, ButtonStyle::HazardAmber))).id();
-    // Wide enough for `CALLSIGN: <12 chars>  [C]`: typing never shifts the row.
-    commands.entity(plate).entry::<Node>().and_modify(|mut n| n.min_width = Val::Px(300.0));
-    commands.spawn((ChildOf(controls), punk_button(&tab_label(&lb), MenuAction::LbTab, 15.0, ButtonStyle::PrimaryAcid)));
+    // Controls: callsign plate | tab switch | REFRESH.
+    let controls = commands.spawn((ChildOf(body), full())).id();
+    let plate = commands.spawn((ChildOf(controls), punk_button(&callsign_plate_label(&lb, &p.callsign, mode), MenuAction::LbCallsign, 14.0, ButtonStyle::HazardAmber))).id();
+    // Roomy enough that typing a callsign barely shifts the row, narrow
+    // enough for a 960 px embed.
+    commands.entity(plate).entry::<Node>().and_modify(|mut n| n.min_width = Val::Px(220.0));
+    commands.spawn((ChildOf(controls), punk_button(&tab_label(&lb, mode), MenuAction::LbTab, 14.0, ButtonStyle::PrimaryAcid)));
     commands.spawn((ChildOf(controls), Node { flex_grow: 1.0, ..default() }));
-    let (status, color) = board_status(&lb);
-    commands.spawn((ChildOf(controls), LbLabel::Status, text(status, 13.0, color)));
-    commands.spawn((ChildOf(controls), punk_button("REFRESH  [R]", MenuAction::LbRefresh, 15.0, ButtonStyle::ScrapSteel)));
+    commands.spawn((
+        ChildOf(controls),
+        punk_button("REFRESH  [R]", MenuAction::LbRefresh, 14.0, ButtonStyle::ScrapSteel),
+        DualPrompt::new("REFRESH  [R]", "REFRESH  [Y]"),
+    ));
 
-    // Table.
+    // Table: one page of LB_PAGE_SIZE rows.
     let (table, table_head) = section_crate(&mut commands, body, "TOP 25", HAZARD_YELLOW, Node { width: Val::Percent(100.0), row_gap: Val::Px(1.0), ..default() });
     commands.entity(table).insert(hard_shadow(5.0));
+    let (status, color) = board_status(&lb);
+    commands.spawn((ChildOf(table_head), LbLabel::Status, text(status, 12.0, color)));
     commands.spawn((ChildOf(table_head), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(table_head), text("[ID] = AUTHENTIK-VERIFIED  //  YOUR CALLSIGN IS HIGHLIGHTED", 11.0, ASH_DIM)));
+    commands.spawn((ChildOf(table_head), text("[ID] = AUTHENTIK-VERIFIED  //  YOU ARE HIGHLIGHTED", 11.0, ASH_DIM)));
     let head_row = commands.spawn((ChildOf(table), Node { column_gap: Val::Px(8.0), padding: UiRect::horizontal(Val::Px(6.0)), ..default() })).id();
     for (i, w) in COLS.iter().enumerate() {
-        commands.spawn((
-            ChildOf(head_row),
-            Node { width: Val::Px(*w), flex_shrink: 0.0, ..default() },
-            children![(LbHeader(i), text(column_headers(lb.tab)[i], 11.0, HAZARD_YELLOW))],
-        ));
+        commands.spawn((ChildOf(head_row), col_node(*w), children![(LbHeader(i), text(column_headers(lb.tab)[i], 11.0, HAZARD_YELLOW), TextLayout::no_wrap())]));
     }
     // Fixed height: the chassis never jumps between loaded / empty / offline.
     let rows = commands
         .spawn((
             ChildOf(table),
             LbTable,
-            Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(1.0), min_height: Val::Px(TOP_N as f32 * (ROW_H + 1.0)), ..default() },
+            Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(1.0), min_height: Val::Px(LB_PAGE_SIZE as f32 * (ROW_H + 1.0)), ..default() },
         ))
         .id();
-    for r in 0..TOP_N {
+    for r in 0..LB_PAGE_SIZE {
         let row = commands
             .spawn((
                 ChildOf(rows),
@@ -1213,7 +1360,7 @@ fn spawn_leaderboard_screen(
             ))
             .id();
         for (c, w) in COLS.iter().enumerate() {
-            commands.spawn((ChildOf(row), Node { width: Val::Px(*w), flex_shrink: 0.0, overflow: Overflow::clip(), ..default() }, children![(LbCell(r, c), text("", ROW_FONT, BONE_TEXT))]));
+            commands.spawn((ChildOf(row), col_node(*w), children![(LbCell(r, c), text("", ROW_FONT, BONE_TEXT), TextLayout::no_wrap())]));
         }
     }
     commands.spawn((
@@ -1221,7 +1368,7 @@ fn spawn_leaderboard_screen(
         LbMessageBox,
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(110.0),
+            top: Val::Px(36.0),
             left: Val::Px(0.0),
             right: Val::Px(0.0),
             flex_direction: FlexDirection::Column,
@@ -1229,18 +1376,26 @@ fn spawn_leaderboard_screen(
             row_gap: Val::Px(10.0),
             ..default()
         },
-        children![(LbLabel::Message, text("", 22.0, PUNK_RED)), (LbLabel::LocalSummary, text("", 15.0, BONE_TEXT))],
+        children![(LbLabel::Message, text("", 20.0, PUNK_RED)), (LbLabel::LocalSummary, text("", 14.0, BONE_TEXT))],
     ));
 
-    // Footer.
-    let footer = commands
-        .spawn((ChildOf(body), Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() }))
-        .id();
-    commands.spawn((ChildOf(footer), punk_button("BACK  [ESC]", MenuAction::BackToMenu, 17.0, ButtonStyle::ScrapSteel)));
-    // Feedback (sync errors, callsign editor help) replaces the key hints.
-    let (line, color) = footer_line(&lb);
-    commands.spawn((ChildOf(footer), LbLabel::Notice, text(line, 12.0, color)));
+    // Feedback (sync errors, sign-out, callsign editor controls) or key hints.
+    let notice = commands.spawn((ChildOf(body), Node { width: Val::Percent(100.0), justify_content: JustifyContent::Center, ..default() })).id();
+    let (line, color) = footer_line(&lb, mode);
+    commands.spawn((ChildOf(notice), LbLabel::Notice, text(line, 12.0, color)));
+
+    // Footer: BACK | PREV  PAGE n/3  NEXT.
+    let footer = commands.spawn((ChildOf(body), full())).id();
+    commands.spawn((ChildOf(footer), punk_button("BACK  [ESC]", MenuAction::BackToMenu, 16.0, ButtonStyle::ScrapSteel), DualPrompt::new("BACK  [ESC]", pad_prompt(AppState::Leaderboard, "BACK  [ESC]", MenuAction::BackToMenu))));
+    commands.spawn((ChildOf(footer), Node { flex_grow: 1.0, ..default() }));
+    commands.spawn((ChildOf(footer), punk_button(PREV_PAGE_KBM, MenuAction::LbPrevPage, 14.0, ButtonStyle::ScrapSteel), DualPrompt::new(PREV_PAGE_KBM, "PREV  [LT]")));
+    commands.spawn((ChildOf(footer), Node { min_width: Val::Px(84.0), justify_content: JustifyContent::Center, ..default() }, children![(LbLabel::Page, text(page_label(&lb), 14.0, HAZARD_YELLOW))]));
+    commands.spawn((ChildOf(footer), punk_button(NEXT_PAGE_KBM, MenuAction::LbNextPage, 14.0, ButtonStyle::PrimaryAcid), DualPrompt::new(NEXT_PAGE_KBM, "NEXT  [RT]")));
 }
+
+/// Page switches (mouse & keyboard keycaps: `[` / `]` or the arrows).
+const PREV_PAGE_KBM: &str = "PREV  [ [ ]";
+const NEXT_PAGE_KBM: &str = "NEXT  [ ] ]";
 
 fn set_text(t: &mut Mut<Text>, s: &str) {
     if t.0 != s {
@@ -1267,29 +1422,34 @@ fn set_display(n: &mut Mut<Node>, show: bool) {
 fn refresh_leaderboard_ui(
     lb: Res<LeaderboardState>,
     store: Res<ProfileStore>,
-    mut rows: Query<(&LbRow, &mut Node, &mut BackgroundColor), Without<LbMessageBox>>,
-    mut msg_box: Query<&mut Node, (With<LbMessageBox>, Without<LbRow>)>,
+    mode: Option<Res<InputMode>>,
+    mut rows: Query<(&LbRow, &mut Node, &mut BackgroundColor), (Without<LbMessageBox>, Without<LbLabel>)>,
+    mut msg_box: Query<&mut Node, (With<LbMessageBox>, Without<LbRow>, Without<LbLabel>)>,
+    mut label_nodes: Query<(&LbLabel, &mut Node), (Without<LbRow>, Without<LbMessageBox>)>,
     mut cells: Query<(&LbCell, &mut Text, &mut TextColor), (Without<LbHeader>, Without<LbLabel>)>,
     mut headers: Query<(&LbHeader, &mut Text), (Without<LbCell>, Without<LbLabel>)>,
     mut labels: Query<(&LbLabel, &mut Text, &mut TextColor), (Without<LbCell>, Without<LbHeader>)>,
     buttons: Query<(&MenuAction, &Children)>,
     mut button_texts: Query<&mut Text, (Without<LbCell>, Without<LbHeader>, Without<LbLabel>)>,
 ) {
-    if !lb.is_changed() && !store.is_changed() {
+    let mode_changed = mode.as_ref().is_some_and(|m| m.is_changed());
+    let mode = mode.map(|m| *m).unwrap_or_default();
+    if !lb.is_changed() && !store.is_changed() && !mode_changed {
         return;
     }
     let me = store.profile.callsign.as_str();
+    let offset = lb.current_page() * LB_PAGE_SIZE;
     let lines: Vec<([String; 9], bool, bool)> = match (lb.tab, &lb.daily, &lb.trial) {
         (LbTab::Daily, Board::Loaded(v), _) => v.iter().map(|e| (daily_cells(e), e.callsign == me, e.verified)).collect(),
         (LbTab::TimeTrial, _, Board::Loaded(v)) => v.iter().map(|e| (trial_cells(e), e.callsign == me, e.verified)).collect(),
         _ => Vec::new(),
     };
     for (row, mut node, mut bg) in &mut rows {
-        let line = lines.get(row.0);
+        let line = lines.get(offset + row.0);
         set_display(&mut node, line.is_some());
         let want = match line {
             Some((_, true, _)) => HAZARD_YELLOW.with_alpha(0.22),
-            Some(_) if row.0 % 2 == 0 => Color::WHITE.with_alpha(0.035),
+            Some(_) if (offset + row.0).is_multiple_of(2) => Color::WHITE.with_alpha(0.035),
             _ => Color::NONE,
         };
         if bg.0 != want {
@@ -1297,10 +1457,10 @@ fn refresh_leaderboard_ui(
         }
     }
     for (cell, mut t, mut c) in &mut cells {
-        let Some((vals, mine, _)) = lines.get(cell.0) else { continue };
+        let Some((vals, mine, _)) = lines.get(offset + cell.0) else { continue };
         set_text(&mut t, &vals[cell.1]);
         let color = match cell.1 {
-            0 if cell.0 < 3 => crate::hud::COLOR_GOLD,
+            0 if offset + cell.0 < 3 => crate::hud::COLOR_GOLD,
             1 if *mine => HAZARD_YELLOW,
             2 => ARC_CYAN,
             3 if lb.tab == LbTab::Daily && vals[3] == "EXTRACTED" => ACID_GREEN,
@@ -1334,10 +1494,12 @@ fn refresh_leaderboard_ui(
                 set_color(&mut c, status_color);
             }
             LbLabel::Notice => {
-                let (line, color) = footer_line(&lb);
+                let (line, color) = footer_line(&lb, mode);
                 set_text(&mut t, line);
                 set_color(&mut c, color);
             }
+            LbLabel::Page => set_text(&mut t, &page_label(&lb)),
+            LbLabel::Guest => set_text(&mut t, guest_note(&lb.account).unwrap_or_default()),
             LbLabel::Message => {
                 set_text(&mut t, message);
                 set_color(&mut c, msg_color);
@@ -1345,10 +1507,15 @@ fn refresh_leaderboard_ui(
             LbLabel::LocalSummary => set_text(&mut t, &if message.is_empty() { String::new() } else { local_summary(&store.profile, DailyDate::today_utc()) }),
         }
     }
+    for (label, mut n) in &mut label_nodes {
+        if *label == LbLabel::Guest {
+            set_display(&mut n, guest_note(&lb.account).is_some());
+        }
+    }
     for (action, children) in &buttons {
         let want = match action {
-            MenuAction::LbCallsign => callsign_plate_label(&lb, me),
-            MenuAction::LbTab => tab_label(&lb),
+            MenuAction::LbCallsign => callsign_plate_label(&lb, me, mode),
+            MenuAction::LbTab => tab_label(&lb, mode),
             _ => continue,
         };
         for c in children {
@@ -1535,6 +1702,106 @@ mod tests {
     }
 
     #[test]
+    fn sign_out_only_clears_the_account_on_success() {
+        let reply = |kind: NetKind, status: u16, body: &str| NetReply { kind, status, body: body.into() };
+        let signed_in = || LeaderboardState { account: Account::SignedIn { username: "u".into() }, ..default() };
+        let mut store = ProfileStore::in_memory(PlayerProfile::default());
+        for status in [0, 401, 500, 503] {
+            let mut lb = signed_in();
+            let mut client = LeaderboardClient::offline();
+            client.bearer = Some("tok".into());
+            apply_reply(reply(NetKind::Logout, status, ""), &mut lb, &mut store, &mut client);
+            assert!(lb.account.signed_in(), "status {status} keeps the session");
+            assert_eq!(lb.notice.as_deref(), Some(SIGN_OUT_FAILED));
+            assert_eq!(client.bearer.as_deref(), Some("tok"));
+            assert_eq!(account_switch_label(&lb.account), Some("SIGN OUT"), "retry stays offered");
+        }
+        let mut lb = signed_in();
+        let mut client = LeaderboardClient::offline();
+        client.bearer = Some("tok".into());
+        apply_reply(reply(NetKind::Logout, 204, ""), &mut lb, &mut store, &mut client);
+        assert_eq!(lb.account, Account::Guest { auth_enabled: true });
+        assert_eq!(lb.notice.as_deref(), Some("SIGNED OUT"));
+        assert!(client.bearer.is_none());
+    }
+
+    #[test]
+    fn expired_session_on_profile_put_signs_out_visibly() {
+        let mut lb = LeaderboardState { account: Account::SignedIn { username: "u".into() }, ..default() };
+        let mut store = ProfileStore::in_memory(PlayerProfile::default());
+        let mut client = LeaderboardClient::offline();
+        client.bearer = Some("stale".into());
+        apply_reply(NetReply { kind: NetKind::PutProfile, status: 401, body: r#"{"error":"not authenticated"}"#.into() }, &mut lb, &mut store, &mut client);
+        assert!(!lb.account.signed_in());
+        assert_eq!(lb.notice.as_deref(), Some(SESSION_EXPIRED));
+        assert!(client.bearer.is_none());
+        // Other failures keep the account and say the progress is local.
+        let mut lb = LeaderboardState { account: Account::SignedIn { username: "u".into() }, ..default() };
+        apply_reply(NetReply { kind: NetKind::PutProfile, status: 500, body: String::new() }, &mut lb, &mut store, &mut client);
+        assert!(lb.account.signed_in());
+        assert!(lb.notice.as_deref().is_some_and(|n| n.contains("CLOUD SYNC FAILED")));
+    }
+
+    #[test]
+    fn submission_errors_map_to_short_player_messages() {
+        let badge = |status: u16, body: &str| submit_badge(&submit_failure(status, body)).unwrap().0;
+        assert_eq!(badge(429, r#"{"error":"too many submissions, slow down"}"#), "RATE LIMITED - TRY AGAIN SOON");
+        assert_eq!(badge(400, r#"{"error":"date must be a real YYYY-MM-DD date"}"#), "REJECTED: DATE MUST BE A REAL YYYY-MM-DD DATE");
+        assert_eq!(badge(400, "<html>"), "REJECTED BY SERVER - NOT RANKED");
+        assert_eq!(badge(0, ""), "OFFLINE - SAVED LOCALLY");
+        assert_eq!(badge(502, ""), "SERVER BUSY - SAVED LOCALLY");
+        let long = rejection_reason("time_secs is way out of the accepted range for this course and date");
+        assert!(long.starts_with("REJECTED: TIME_SECS IS WAY") && long.len() <= "REJECTED: ".len() + 40, "{long}");
+        assert_eq!(rejection_reason("bad\ncallsign \u{1F600}"), "REJECTED: BAD CALLSIGN");
+        assert_eq!(rejection_reason(&"X".repeat(90)), format!("REJECTED: {}", "X".repeat(40)));
+    }
+
+    #[test]
+    fn top_25_pages_ten_rows_at_a_time() {
+        assert_eq!((page_count(0), page_count(1), page_count(10), page_count(11), page_count(25), page_count(99)), (1, 1, 1, 2, 3, 3));
+        let mut lb = LeaderboardState { daily: Board::Loaded(vec![DailyEntry::default(); 25]), trial: Board::Loaded(vec![TrialEntry::default(); 4]), ..default() };
+        assert_eq!(page_label(&lb), "PAGE 1/3");
+        lb.turn_page(-1);
+        assert_eq!(lb.current_page(), 0, "never wraps below page 1");
+        lb.turn_page(1);
+        lb.turn_page(1);
+        lb.turn_page(1);
+        assert_eq!((lb.current_page(), page_label(&lb)), (2, "PAGE 3/3".to_string()));
+        lb.switch_tab();
+        assert_eq!((lb.tab, page_label(&lb)), (LbTab::TimeTrial, "PAGE 1/1".to_string()), "switching boards resets the page");
+        // A shorter reload clamps the shown page.
+        lb.switch_tab();
+        lb.page = 2;
+        lb.daily = Board::Loaded(vec![DailyEntry::default(); 12]);
+        assert_eq!(lb.current_page(), 1);
+        lb.daily = Board::Offline;
+        assert_eq!(page_label(&lb), "PAGE 1/1");
+    }
+
+    #[test]
+    fn guest_note_footer_and_labels_follow_platform_and_input() {
+        let guest = Account::Guest { auth_enabled: true };
+        assert_eq!(guest_note_for(false, &guest), Some(GUEST_NOTE));
+        assert_eq!(guest_note_for(false, &Account::Guest { auth_enabled: false }), Some(GUEST_NOTE));
+        assert_eq!(guest_note_for(true, &guest), None, "the web build offers SIGN IN instead");
+        assert_eq!(guest_note_for(false, &Account::SignedIn { username: "u".into() }), None);
+        assert_eq!(guest_note_for(false, &Account::Offline), None);
+        assert!(GUEST_NOTE.starts_with("GUEST MODE"));
+        let mut lb = LeaderboardState::default();
+        assert_eq!(footer_line(&lb, InputMode::KeyboardMouse).0, LB_HINTS);
+        assert_eq!(footer_line(&lb, InputMode::Gamepad).0, LB_PAD_HINTS);
+        lb.notice = Some(SIGN_OUT_FAILED.into());
+        assert_eq!(footer_line(&lb, InputMode::Gamepad).0, SIGN_OUT_FAILED);
+        lb.editing = Some("AB".into());
+        assert_eq!(footer_line(&lb, InputMode::Gamepad).0, PAD_TEXT_HINT, "controller editing controls");
+        assert_eq!(footer_line(&lb, InputMode::KeyboardMouse).0, CALLSIGN_KBM_HINT);
+        lb.editing = None;
+        assert_eq!(callsign_plate_label(&lb, "ACE", InputMode::KeyboardMouse), "CALLSIGN: ACE  [C]");
+        assert_eq!(callsign_plate_label(&lb, "ACE", InputMode::Gamepad), "CALLSIGN: ACE");
+        assert!(tab_label(&lb, InputMode::Gamepad).ends_with("[LB/RB]") && tab_label(&lb, InputMode::KeyboardMouse).ends_with("[TAB]"));
+    }
+
+    #[test]
     fn callsign_editor_keys_and_pad_cycle() {
         assert_eq!(callsign_key_char(KeyCode::KeyQ), Some('Q'));
         assert_eq!(callsign_key_char(KeyCode::Digit7), Some('7'));
@@ -1575,7 +1842,7 @@ mod tests {
         let s = local_summary(&p, DailyDate::new(2026, 11, 25));
         assert!(s.contains("NOT ATTEMPTED") && s.contains("TIME TRIAL PB"));
         let lb = LeaderboardState { editing: Some("AB".into()), ..default() };
-        assert_eq!(callsign_plate_label(&lb, "X"), "CALLSIGN: AB_");
+        assert_eq!(callsign_plate_label(&lb, "X", InputMode::KeyboardMouse), "CALLSIGN: AB_");
         assert_eq!(LbTab::Daily.other(), LbTab::TimeTrial);
     }
 }

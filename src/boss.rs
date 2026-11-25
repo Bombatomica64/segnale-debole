@@ -25,7 +25,8 @@ use crate::state::GameSet;
 use crate::weapons::{spawn_pickup, CombatDamage, PickupAssets, PickupKind};
 
 pub const BOSS_ARRIVAL_TEXT: &str = "WARNING: THE CARRIER DAEMON HAS ARRIVED!";
-pub const BOSS_HOLD_TEXT: &str = "DEFEAT THE CARRIER DAEMON TO LOCK EXTRACTION";
+/// Uplink banner / alert while the SOS upload is held at 99% for the boss.
+pub const BOSS_HOLD_TEXT: &str = "UPLINK HELD AT 99% // KILL THE CARRIER DAEMON TO EXTRACT";
 pub const BOSS_DEATH_TEXT: &str = "CARRIER DAEMON TERMINATED - UPLINK UNLOCKED";
 pub const BOSS_SHIELDED_TEXT: &str = "SHIELDED - DESTROY THE PYLONS";
 /// HP fraction ending Phase I (Signal Shield #1).

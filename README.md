@@ -40,6 +40,13 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
   - **Account:** on the web, `SIGN IN` goes through Authentik (`auth.bombatomica64.dev`). Once signed in, the profile is merged into Postgres **monotonically**: unlocks are unioned, records and lifetime stats take the max, the fastest PBs win, and settings stay per device. Play on several devices and your progress never goes backwards. Desktop and Android can pass a session token in `SEGNALE_AUTH_TOKEN`.
   - **End-card auto-submit:** Daily Victory and Game Over (exhibition runs are never sent) and Time Trial finishes are posted in the background. The end card shows `SUBMITTING...`, then `GLOBAL RANK #N (NEW PB!)` or `OFFLINE - SAVED LOCALLY`.
   - **Offline-first:** with no server the screen reads `OFFLINE - LOCAL RECORDS ONLY` and shows your local Daily and Time Trial records. Tests, bots, screenshot tours and `SEGNALE_LEADERBOARD_OFFLINE=1` never touch the network. Desktop overrides the server with `SEGNALE_LEADERBOARD_URL`.
+- **v1.0 jam polish (Milestone 27):**
+  - **Live input prompts:** every keycap, footer and HUD hint follows the device you touched last (mouse & keyboard or controller), switching instantly mid-screen: the main menu field manual, `STAMINA [SHIFT]` / `[LB]`, the tower `[E]` / `[X]` prompt, the phone's `RMB PNG` / `LT PNG` tiles, the weapon deck and every menu footer.
+  - **`L3` jump:** hold the left stick to bunny hop while the right thumb stays on the Right Stick for air-strafe aiming (`A` still works).
+  - **Leaderboard pages:** the Top 25 shows 10 rows per page (`[` / `]`, arrows or `LT` / `RT`, plus PREV / NEXT). A failed sign-out keeps you signed in (`SIGN OUT FAILED - RETRY`), an expired session says `SESSION EXPIRED - SIGN IN AGAIN`, and refused scores show a short reason (`RATE LIMITED - TRY AGAIN SOON`, `REJECTED: ...`). Desktop / Android guests see why their scores post as GUEST.
+  - **Embed-safe layout:** below 1280x720 the whole UI scales down uniformly (960x540 -> 0.75), so every screen fits itch.io embeds; upgrade cards are fluid.
+  - **Audio:** a rising chime on Time Trial pit rescues and quiet, debounced menu focus / confirm blips. On the web a small banner asks for a click or key press while the browser still holds audio suspended (controller-only players).
+  - `F9` (skip floor) is a dev tool: debug builds or `SEGNALE_DEV=1` only.
 - **90–120 FPS target:** static and demon mesh batching, a `F3` perf overlay and a `F4` VSync toggle.
 
 ## Controls
@@ -51,7 +58,7 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
 - `1` / `2` / `3` or click: draft a firmware upgrade in the App Store
 - Menus: `Enter` play / deploy / resume | `L` Loadout | `C` Contracts & Feats | `O` Settings (main menu and pause) | `E` continue into **Endless Overdrive** (Floor 5 victory screen) | `Esc` back or pause (`R` restart, `M` main menu while paused)
 - Performance: `F3` toggles the FPS / frame-time overlay | `F4` toggles VSync
-- **Controller** (no mouse click needed): Left Stick move | Right Stick look | `RT` fire | `A` jump (hold to bunny hop) | `LB` dash | `LT` Ping Scan | `RB` 5G Overload | `X` SOS uplink | `Y` / D-Pad Right next weapon, D-Pad Left previous | D-Pad Down inspect | `Start` pause | `Select` / `R3` Time Trial reset
+- **Controller** (no mouse click needed): Left Stick move | Right Stick look | `RT` fire | `A` or `L3` jump (hold to bunny hop) | `LB` dash | `LT` Ping Scan | `RB` 5G Overload | `X` SOS uplink | `Y` / D-Pad Right next weapon, D-Pad Left previous | D-Pad Down inspect | `Start` pause | `Select` / `R3` Time Trial reset
 - Controller menus: D-Pad / Left Stick move the focus, `A` select, `B` back, `Start` play / deploy; Settings: Up/Down pick a row, Left/Right adjust; Bestiary: Left/Right or `LB`/`RB` cycle, `Y` switch archive, Right Stick spins. Gamepad sensitivity and Invert Y live in Settings.
 
 ## Build & Run
@@ -101,6 +108,8 @@ Meta-progression screenshot tour (uses an in-memory showcase profile and never t
 xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_META_SHOTS=$HOME/scratch/meta-shots cargo run
 # Milestone 26: main menu account pill + staged Daily / Time Trial boards, callsign editor, offline fallback
 xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_LEADERBOARD_SHOTS=$HOME/scratch/lb-shots cargo run
+# Milestone 27: embed layouts (main menu, paginated Top 25, upgrades, HUD; M&K and controller prompts)
+xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_WINDOW_SIZE=960x540 SEGNALE_LAYOUT_SHOTS=$HOME/scratch/layout-540 cargo run
 ```
 
 Backend (`server/`, a standalone crate with its own `Cargo.lock`): an in-memory store runs the HTTP tests, so no Postgres is needed. Set `TEST_DATABASE_URL` to also run the Postgres test.

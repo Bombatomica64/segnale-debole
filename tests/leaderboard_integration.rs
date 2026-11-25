@@ -253,3 +253,83 @@ fn time_trial_finish_submits_and_offers_the_leaderboard() {
     tap(&mut app, KeyCode::KeyK);
     assert_eq!(app_state(&app), AppState::Leaderboard);
 }
+
+fn texts(app: &mut App) -> Vec<String> {
+    let mut q = app.world_mut().query::<&Text>();
+    q.iter(app.world()).map(|t| t.0.clone()).collect()
+}
+
+/// Milestone 27: the Top 25 pages 10 rows at a time with `[` / `]`, the
+/// arrows and LT / RT; switching boards starts on page 1 again.
+#[test]
+fn top_25_pages_with_keys_and_triggers() {
+    use segnale_debole::dev::{showcase_daily_board, showcase_trial_board};
+    use segnale_debole::leaderboard::page_label;
+    let mut app = menu_app();
+    let e = app.world_mut().spawn(Gamepad::default()).id();
+    step(&mut app, 1);
+    tap(&mut app, KeyCode::KeyK);
+    assert_eq!(app_state(&app), AppState::Leaderboard);
+    {
+        let mut lb = app.world_mut().resource_mut::<LeaderboardState>();
+        lb.daily = Board::Loaded(showcase_daily_board());
+        lb.trial = Board::Loaded(showcase_trial_board());
+    }
+    step(&mut app, 2);
+    let t = texts(&mut app);
+    assert!(t.iter().any(|s| s == "PAGE 1/3") && t.iter().any(|s| s == "ZERO_BARS"), "page 1 shows rank 1");
+    assert!(!t.iter().any(|s| s == "BHOP_GOD"), "rank 11 waits for page 2");
+    tap(&mut app, KeyCode::BracketRight);
+    assert_eq!(lb(&app).page, 1);
+    let t = texts(&mut app);
+    assert!(t.iter().any(|s| s == "BHOP_GOD") && t.iter().any(|s| s == "11") && !t.iter().any(|s| s == "ZERO_BARS"), "page 2 = ranks 11-20");
+    tap(&mut app, KeyCode::ArrowRight);
+    tap(&mut app, KeyCode::PageDown);
+    assert_eq!(page_label(lb(&app)), "PAGE 3/3", "never past the last page");
+    assert!(texts(&mut app).iter().any(|s| s == "LASTBAR"));
+    // Controller: LT pages back, RT forward.
+    pad_tap(&mut app, e, GamepadButton::LeftTrigger2);
+    assert_eq!(lb(&app).page, 1);
+    pad_tap(&mut app, e, GamepadButton::RightTrigger2);
+    assert_eq!(lb(&app).page, 2);
+    tap(&mut app, KeyCode::BracketLeft);
+    tap(&mut app, KeyCode::ArrowLeft);
+    tap(&mut app, KeyCode::ArrowLeft);
+    assert_eq!(lb(&app).page, 0, "never before page 1");
+    tap(&mut app, KeyCode::BracketRight);
+    tap(&mut app, KeyCode::Tab);
+    assert_eq!((lb(&app).tab, lb(&app).page), (LbTab::TimeTrial, 0));
+}
+
+/// Milestone 27: with a controller active the callsign editor shows the real
+/// pad controls and edits through them; the footer and key hints swap live.
+#[test]
+fn controller_callsign_editor_shows_pad_controls() {
+    use segnale_debole::gamepad::{InputMode, PAD_TEXT_HINT};
+    use segnale_debole::hud::MenuAction;
+    use segnale_debole::leaderboard::{LB_HINTS, LB_PAD_HINTS};
+    let mut app = menu_app();
+    let e = app.world_mut().spawn(Gamepad::default()).id();
+    step(&mut app, 1);
+    tap(&mut app, KeyCode::KeyK);
+    assert!(texts(&mut app).iter().any(|s| s == LB_HINTS));
+    pad_tap(&mut app, e, GamepadButton::DPadDown);
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::Gamepad);
+    let t = texts(&mut app);
+    assert!(t.iter().any(|s| s == LB_PAD_HINTS) && t.iter().any(|s| s == "BACK  [B]") && t.iter().any(|s| s == "NEXT  [RT]"), "{t:?}");
+    // Open the editor (as the focused CALLSIGN switch + A would).
+    app.world_mut().resource_mut::<LeaderboardState>().pending.push(MenuAction::LbCallsign);
+    step(&mut app, 2);
+    assert!(texts(&mut app).iter().any(|s| s == PAD_TEXT_HINT));
+    pad_tap(&mut app, e, GamepadButton::DPadRight);
+    pad_tap(&mut app, e, GamepadButton::DPadUp);
+    assert_eq!(lb(&app).editing.as_deref(), Some("MARINEB"));
+    pad_tap(&mut app, e, GamepadButton::DPadLeft);
+    pad_tap(&mut app, e, GamepadButton::South);
+    assert!(lb(&app).editing.is_none());
+    assert_eq!(app.world().resource::<ProfileStore>().profile.callsign, "MARINE");
+    // A key press flips every prompt back to mouse & keyboard.
+    tap(&mut app, KeyCode::ShiftLeft);
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::KeyboardMouse);
+    assert!(texts(&mut app).iter().any(|s| s == "BACK  [ESC]"));
+}

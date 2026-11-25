@@ -26,6 +26,7 @@ use bevy::input::InputSystems;
 use bevy::prelude::*;
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 
+use crate::audio::{SfxEvent, SfxQueue, UiSfxGate};
 use crate::meta::{live_settings, ProfileStore, GAMEPAD_SENS_RANGE};
 use crate::state::AppState;
 
@@ -213,11 +214,13 @@ pub struct GamepadInput {
     // Held.
     /// `RT` (button or analog travel).
     pub fire: bool,
-    /// `A` / Cross: holding it chains zero-friction bhops like holding Space.
+    /// `A` / Cross or `L3`: holding it chains zero-friction bhops like
+    /// holding Space. `L3` lets the left thumb bhop while the right thumb
+    /// keeps air-strafe aiming on the Right Stick.
     pub jump: bool,
 
     // One-shots (gameplay).
-    /// `A` rising edge (jump buffer).
+    /// `A` / `L3` rising edge (jump buffer).
     pub jump_pressed: bool,
     /// `LB`: Airplane Mode dash.
     pub dash: bool,
@@ -253,6 +256,10 @@ pub struct GamepadInput {
     pub tab_next: bool,
     /// `Y` / Triangle.
     pub alt_action: bool,
+    /// `LT` (menus: previous page).
+    pub page_prev: bool,
+    /// `RT` (menus: next page).
+    pub page_next: bool,
 
     /// Last frame's held [`bits`] (edge detection).
     held: u32,
@@ -307,8 +314,10 @@ impl GamepadInput {
         self.spin_x = apply_radial_deadzone(frame.right_stick, LOOK_DEADZONE).x;
 
         self.fire = on(bits::RT);
-        self.jump = on(bits::SOUTH) && !self.jump_wait_release;
-        self.jump_pressed = hit(bits::SOUTH) && !self.jump_wait_release;
+        // `A` honours the resume / deploy latch; `L3` is never latched (it
+        // cannot confirm a menu, so it never carries over into `Playing`).
+        self.jump = (on(bits::SOUTH) && !self.jump_wait_release) || on(bits::LTHUMB);
+        self.jump_pressed = (hit(bits::SOUTH) && !self.jump_wait_release) || hit(bits::LTHUMB);
         self.dash = hit(bits::LB);
         self.ping = hit(bits::LT);
         self.overload = hit(bits::RB);
@@ -324,6 +333,8 @@ impl GamepadInput {
         self.tab_prev = hit(bits::LB);
         self.tab_next = hit(bits::RB);
         self.alt_action = hit(bits::NORTH);
+        self.page_prev = hit(bits::LT);
+        self.page_next = hit(bits::RT);
 
         // Menu directions: fire on press, then repeat while held.
         let dir = nav_direction(held, frame.left_stick);
@@ -368,6 +379,138 @@ impl GamepadInput {
     pub fn nav_y(&self) -> i32 {
         self.nav_down as i32 - self.nav_up as i32
     }
+
+    /// The input mode these readings imply (see [`InputMode`]).
+    pub fn input_mode(&self) -> InputMode {
+        if self.active { InputMode::Gamepad } else { InputMode::KeyboardMouse }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Active input mode + dual prompts
+// ---------------------------------------------------------------------------
+
+/// The device the player used last: drives every on-screen prompt (keycaps,
+/// footers, HUD hints). Flips to [`InputMode::Gamepad`] on any stick / button
+/// input and back to [`InputMode::KeyboardMouse`] on any key, click or mouse
+/// motion (mirrors [`GamepadInput::active`]). Only written when it actually
+/// changes, so `is_changed()` means "the player switched devices".
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputMode {
+    #[default]
+    KeyboardMouse,
+    Gamepad,
+}
+
+impl InputMode {
+    pub fn is_pad(self) -> bool {
+        self == InputMode::Gamepad
+    }
+
+    /// `kbm` or `pad`, whichever matches this mode.
+    pub fn pick<'a>(self, kbm: &'a str, pad: &'a str) -> &'a str {
+        if self.is_pad() { pad } else { kbm }
+    }
+}
+
+/// Follow [`GamepadInput::active`] (runs right after [`update_gamepad_input`]).
+pub fn sync_input_mode(pad: Res<GamepadInput>, mut mode: ResMut<InputMode>) {
+    let want = pad.input_mode();
+    if *mode != want {
+        *mode = want;
+    }
+}
+
+/// A label with a mouse & keyboard and a controller variant. On a `Text`
+/// entity it rewrites that text; on a button (no `Text`) it rewrites the
+/// button's direct `Text` children. [`refresh_dual_prompts`] swaps it live
+/// whenever [`InputMode`] flips.
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
+pub struct DualPrompt {
+    pub kbm: String,
+    pub pad: String,
+}
+
+impl DualPrompt {
+    pub fn new(kbm: impl Into<String>, pad: impl Into<String>) -> Self {
+        DualPrompt { kbm: kbm.into(), pad: pad.into() }
+    }
+
+    pub fn get(&self, mode: InputMode) -> &str {
+        mode.pick(&self.kbm, &self.pad)
+    }
+}
+
+fn write_text(t: &mut Mut<Text>, s: &str) {
+    if t.0 != s {
+        t.0.clear();
+        t.0.push_str(s);
+    }
+}
+
+/// Apply [`DualPrompt`]s: freshly spawned ones always, every one when the
+/// input mode flipped.
+#[allow(clippy::type_complexity)]
+pub fn refresh_dual_prompts(
+    mode: Option<Res<InputMode>>,
+    mut direct: Query<(Ref<DualPrompt>, &mut Text)>,
+    parents: Query<(Ref<DualPrompt>, &Children), Without<Text>>,
+    mut texts: Query<&mut Text, Without<DualPrompt>>,
+) {
+    let Some(mode) = mode else { return };
+    let all = mode.is_changed();
+    for (prompt, mut t) in &mut direct {
+        if all || prompt.is_changed() {
+            write_text(&mut t, prompt.get(*mode));
+        }
+    }
+    for (prompt, children) in &parents {
+        if !(all || prompt.is_changed()) {
+            continue;
+        }
+        for c in children {
+            if let Ok(mut t) = texts.get_mut(*c) {
+                write_text(&mut t, prompt.get(*mode));
+            }
+        }
+    }
+}
+
+/// Controller text-entry controls (callsign / run seed editors).
+pub const PAD_TEXT_HINT: &str = "UP/DN: CHAR  R: ADD  L: DEL  A: SAVE  B: CANCEL";
+
+/// Cycle `c` by `step` through `charset` (unknown characters start at its head).
+pub fn cycle_char(charset: &str, c: char, step: i32) -> char {
+    let set: Vec<char> = charset.chars().collect();
+    if set.is_empty() {
+        return c;
+    }
+    let i = set.iter().position(|x| *x == c).unwrap_or(0) as i32;
+    set[(i + step).rem_euclid(set.len() as i32) as usize]
+}
+
+/// One frame of controller text entry on `buf` ([`PAD_TEXT_HINT`]): Left
+/// deletes, Right appends the charset's first character, Up / Down cycle the
+/// last character (an empty buffer starts one). `A` / `B` are the caller's.
+/// Returns whether `buf` changed.
+pub fn pad_edit_text(buf: &mut String, pad: &GamepadInput, charset: &str, max: usize) -> bool {
+    let before = buf.clone();
+    let first = charset.chars().next().unwrap_or('A');
+    if pad.nav_left {
+        buf.pop();
+    }
+    if pad.nav_right && buf.chars().count() < max {
+        buf.push(first);
+    }
+    if pad.nav_up || pad.nav_down {
+        let step = if pad.nav_up { 1 } else { -1 };
+        match buf.pop() {
+            Some(c) => buf.push(cycle_char(charset, c, step)),
+            None if max > 0 => buf.push(first),
+            None => {}
+        }
+    }
+    *buf != before
 }
 
 /// Merge every `Gamepad` entity into [`GamepadInput`] (zero allocations).
@@ -379,6 +522,7 @@ pub fn update_gamepad_input(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     motion: Option<Res<AccumulatedMouseMotion>>,
+    scroll: Option<Res<bevy::input::mouse::AccumulatedMouseScroll>>,
     mut input: ResMut<GamepadInput>,
     mut focus: ResMut<GamepadFocus>,
 ) {
@@ -389,7 +533,8 @@ pub fn update_gamepad_input(
     }
     let kbm = keys.is_some_and(|k| k.get_just_pressed().next().is_some())
         || mouse.is_some_and(|m| m.get_just_pressed().next().is_some())
-        || motion.is_some_and(|m| m.delta != Vec2::ZERO);
+        || motion.is_some_and(|m| m.delta != Vec2::ZERO)
+        || scroll.is_some_and(|s| s.delta != Vec2::ZERO);
     if !frame.connected && !input.connected {
         return;
     }
@@ -496,11 +641,13 @@ fn focus_ready(n: &ComputedNode, vis: Option<&InheritedVisibility>) -> bool {
 /// Move the menu focus with the D-Pad / Left Stick and turn `A` into an
 /// activation of the focused control. Runs on every screen except gameplay
 /// and the screens with bespoke controller logic.
+#[allow(clippy::type_complexity)]
 pub fn gamepad_menu_focus(
     pad: Res<GamepadInput>,
     mut focus: ResMut<GamepadFocus>,
     lock: Option<Res<PadFocusLock>>,
     items: Query<FocusData, With<GamepadFocusable>>,
+    (time, gate, sfx): (Option<Res<Time>>, Option<ResMut<UiSfxGate>>, Option<ResMut<SfxQueue>>),
 ) {
     if lock.is_some_and(|l| l.0) {
         return;
@@ -512,11 +659,14 @@ pub fn gamepad_menu_focus(
     let current = focus.focused.and_then(|e| items.get(e).ok()).filter(|(_, n, _, v, _)| focus_ready(n, *v));
     let ready = || items.iter().filter(|(_, n, _, v, _)| focus_ready(n, *v));
     let mut focused = current.map(|(e, ..)| e);
+    // Only a real D-Pad / stick step ticks (a fresh screen's initial pick is silent).
+    let mut moved = false;
     if let Some((_, _, tf, _, _)) = current {
         if let Some(dir) = nav_screen_dir(&pad) {
             let from = tf.translation;
             let cands = ready().filter(|(e, ..)| Some(*e) != focused).map(|(e, _, t, _, _)| (e, t.translation));
             if let Some(e) = spatial_pick(from, dir, cands) {
+                moved = focused != Some(e);
                 focused = Some(e);
             }
         }
@@ -532,10 +682,15 @@ pub fn gamepad_menu_focus(
     if focus.focused != focused {
         focus.focused = focused;
     }
+    let mut cue = moved.then_some(SfxEvent::UiTick);
     if pad.confirm
         && let Some(e) = focused
     {
         focus.activate = Some(e);
+        cue = Some(SfxEvent::UiConfirm);
+    }
+    if let (Some(cue), Some(time), Some(mut gate), Some(mut sfx)) = (cue, time, gate, sfx) {
+        gate.play(&mut sfx, cue, time.elapsed_secs());
     }
 }
 
@@ -560,8 +715,14 @@ impl Plugin for GamepadPlugin {
         app.init_resource::<GamepadInput>()
             .init_resource::<GamepadFocus>()
             .init_resource::<PadFocusLock>()
+            .init_resource::<InputMode>()
+            .init_resource::<UiSfxGate>()
             .add_systems(OnEnter(AppState::Playing), latch_jump_on_play_enter)
-            .add_systems(PreUpdate, (update_gamepad_input, gamepad_menu_focus.run_if(not(bespoke_screen))).chain().after(InputSystems))
+            .add_systems(
+                PreUpdate,
+                (update_gamepad_input, sync_input_mode, gamepad_menu_focus.run_if(not(bespoke_screen))).chain().after(InputSystems),
+            )
+            .add_systems(Update, refresh_dual_prompts)
             .add_systems(Update, gamepad_pause_toggle.run_if(in_state(AppState::Playing).or_else(in_state(AppState::Paused))));
     }
 }
@@ -713,6 +874,81 @@ mod tests {
         assert!(!g.active);
         g.update(PadFrame { connected: true, right_stick: Vec2::X, ..default() }, 0.016, 1.0, false, false);
         assert!(g.active && g.look_delta.x > 0.0 && g.spin_x > 0.9);
+    }
+
+    #[test]
+    fn l3_jumps_and_bhops_alongside_a_and_ignores_the_a_latch() {
+        let dt = 1.0 / 60.0;
+        let mut g = GamepadInput::default();
+        g.update(frame(bits::LTHUMB), dt, 1.0, false, false);
+        assert!(g.jump && g.jump_pressed, "L3 press jumps");
+        assert!(!g.confirm, "L3 never confirms a menu");
+        g.update(frame(bits::LTHUMB), dt, 1.0, false, false);
+        assert!(g.jump && !g.jump_pressed, "held L3 keeps bhopping");
+        // L3 held with the right stick deflected: jump + look together.
+        g.update(PadFrame { connected: true, buttons: bits::LTHUMB, right_stick: Vec2::X, ..default() }, dt, 1.0, false, false);
+        assert!(g.jump && g.look_delta.x > 0.0);
+        // The A latch from a menu confirm (resume / deploy) blocks A only.
+        let mut g = GamepadInput::default();
+        g.update(frame(bits::SOUTH), dt, 1.0, false, false);
+        g.held = bits::SOUTH;
+        g.jump_wait_release = true;
+        g.update(frame(bits::SOUTH), dt, 1.0, false, false);
+        assert!(!g.jump && !g.jump_pressed, "A still latched");
+        g.update(frame(bits::SOUTH | bits::LTHUMB), dt, 1.0, false, false);
+        assert!(g.jump && g.jump_pressed, "L3 jumps through the A latch");
+        g.update(frame(0), dt, 1.0, false, false);
+        g.update(frame(bits::SOUTH), dt, 1.0, false, false);
+        assert!(g.jump && g.jump_pressed, "releasing A clears the latch");
+    }
+
+    #[test]
+    fn triggers_page_menus_and_input_mode_follows_the_last_device() {
+        let dt = 1.0 / 60.0;
+        let mut g = GamepadInput::default();
+        assert_eq!(g.input_mode(), InputMode::KeyboardMouse);
+        g.update(frame(bits::LT), dt, 1.0, false, false);
+        assert!(g.page_prev && !g.page_next && g.ping);
+        g.update(frame(bits::RT), dt, 1.0, false, false);
+        assert!(g.page_next && !g.page_prev && g.fire);
+        g.update(frame(bits::RT), dt, 1.0, false, false);
+        assert!(!g.page_next, "one page per pull");
+        assert_eq!(g.input_mode(), InputMode::Gamepad);
+        g.update(frame(0), dt, 1.0, false, true);
+        assert_eq!(g.input_mode(), InputMode::KeyboardMouse, "a key / mouse move switches back");
+        g.update(PadFrame { connected: true, left_stick: Vec2::new(0.0, 0.9), ..default() }, dt, 1.0, false, false);
+        assert_eq!(g.input_mode(), InputMode::Gamepad, "the stick switches to the pad");
+        assert_eq!(InputMode::Gamepad.pick("[E]", "[X]"), "[X]");
+        assert_eq!(InputMode::KeyboardMouse.pick("[E]", "[X]"), "[E]");
+        let p = DualPrompt::new("BACK  [ESC]", "BACK  [B]");
+        assert_eq!((p.get(InputMode::KeyboardMouse), p.get(InputMode::Gamepad)), ("BACK  [ESC]", "BACK  [B]"));
+    }
+
+    #[test]
+    fn pad_text_entry_cycles_adds_and_deletes() {
+        let set = "AB-";
+        let with = |f: fn(&mut GamepadInput)| {
+            let mut p = GamepadInput::default();
+            f(&mut p);
+            p
+        };
+        let mut buf = String::new();
+        assert!(pad_edit_text(&mut buf, &with(|p| p.nav_up = true), set, 3));
+        assert_eq!(buf, "A", "up on an empty buffer starts a character");
+        pad_edit_text(&mut buf, &with(|p| p.nav_up = true), set, 3);
+        assert_eq!(buf, "B");
+        pad_edit_text(&mut buf, &with(|p| p.nav_down = true), set, 3);
+        pad_edit_text(&mut buf, &with(|p| p.nav_down = true), set, 3);
+        assert_eq!(buf, "-", "down wraps");
+        for _ in 0..5 {
+            pad_edit_text(&mut buf, &with(|p| p.nav_right = true), set, 3);
+        }
+        assert_eq!(buf, "-AA", "right adds up to the cap");
+        assert!(pad_edit_text(&mut buf, &with(|p| p.nav_left = true), set, 3));
+        assert_eq!(buf, "-A");
+        assert!(!pad_edit_text(&mut buf, &GamepadInput::default(), set, 3), "no input, no change");
+        assert_eq!(cycle_char(set, 'Z', 1), 'B', "unknown chars start at the head");
+        assert!(PAD_TEXT_HINT.contains("UP/DN: CHAR") && PAD_TEXT_HINT.contains("B: CANCEL"));
     }
 
     #[test]

@@ -167,3 +167,29 @@ pub fn build_headless_test_app() -> App {
     app.update();
     app
 }
+
+/// Parse a `<w>x<h>` window size (`SEGNALE_WINDOW_SIZE`), e.g. `960x540`.
+/// Each side must be 320..=7680 px.
+pub fn parse_window_size(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.trim().to_ascii_lowercase().split_once('x').map(|(w, h)| (w.trim().parse().ok(), h.trim().parse().ok()))?;
+    let ok = |v: u32| (320..=7680).contains(&v);
+    match (w, h) {
+        (Some(w), Some(h)) if ok(w) && ok(h) => Some((w, h)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod window_size_tests {
+    use super::parse_window_size;
+
+    #[test]
+    fn window_size_env_parses_and_rejects_junk() {
+        assert_eq!(parse_window_size("960x540"), Some((960, 540)));
+        assert_eq!(parse_window_size(" 1024X640 "), Some((1024, 640)));
+        assert_eq!(parse_window_size("1920 x 1080"), Some((1920, 1080)));
+        for bad in ["", "960", "x540", "0x0", "99999x540", "axb", "960x540x2"] {
+            assert_eq!(parse_window_size(bad), None, "{bad}");
+        }
+    }
+}

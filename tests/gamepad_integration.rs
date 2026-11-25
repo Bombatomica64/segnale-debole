@@ -394,3 +394,131 @@ fn unplugging_the_pad_releases_every_input() {
     assert!(horizontal_speed(&p) < 0.5, "stops once the pad is gone");
 }
 
+
+/// Milestone 27: `L3` jumps / holds a bhop chain with the left thumb while the
+/// right thumb keeps the Right Stick for air-strafe aiming.
+#[test]
+fn hold_l3_chains_bhops_while_the_right_stick_aims() {
+    let (mut app, e) = playing_app(2027);
+    axis(&mut app, e, GamepadAxis::LeftStickY, 1.0);
+    step(&mut app, FPS / 2);
+    hold(&mut app, e, GamepadButton::LeftThumb);
+    axis(&mut app, e, GamepadAxis::LeftStickY, 0.05);
+    axis(&mut app, e, GamepadAxis::LeftStickX, 1.0);
+    axis(&mut app, e, GamepadAxis::RightStickX, 0.95);
+    let yaw0 = player(&mut app).yaw;
+    let (mut hops, mut prev_vy) = (0, 0.0f32);
+    for _ in 0..3 * FPS {
+        step(&mut app, 1);
+        let p = player(&mut app);
+        if prev_vy <= 0.0 && p.velocity.y > 0.0 {
+            hops += 1;
+        }
+        prev_vy = p.velocity.y;
+    }
+    let p = player(&mut app);
+    assert!(hops >= 3, "only {hops} L3 hops");
+    assert!((p.yaw - yaw0).abs() > 0.5, "right stick kept turning during the chain");
+    assert!(horizontal_speed(&p) > MOVE_SPEED + 2.0, "L3 air-strafe gained speed: {}", horizontal_speed(&p));
+    release(&mut app, e, GamepadButton::LeftThumb);
+}
+
+/// Deploying with `A` latches `A` until released, but `L3` still jumps.
+#[test]
+fn deploy_latch_blocks_a_but_not_l3() {
+    let (mut app, e) = menu_app();
+    hold(&mut app, e, GamepadButton::South);
+    step(&mut app, 1);
+    // A still held while the run starts (as after confirming DEPLOY).
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Playing);
+    step(&mut app, 3);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert!(!app.world().resource::<GamepadInput>().jump, "held A from the menu is latched");
+    hold(&mut app, e, GamepadButton::LeftThumb);
+    step(&mut app, 1);
+    assert!(app.world().resource::<GamepadInput>().jump, "L3 jumps through the A latch");
+}
+
+fn ui_texts(app: &mut App) -> Vec<String> {
+    let mut q = app.world_mut().query::<&Text>();
+    q.iter(app.world()).map(|t| t.0.clone()).collect()
+}
+
+fn key_tap(app: &mut App, k: KeyCode) {
+    use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
+    use bevy::input::ButtonState;
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: k,
+            logical_key: Key::Unidentified(NativeKey::Unidentified),
+            state,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+    step(app, 1);
+}
+
+/// Milestone 27: the main menu prompts (keycaps + field manual) follow the
+/// last device used, live, without leaving the screen.
+#[test]
+fn main_menu_prompts_follow_the_active_input_mode() {
+    use segnale_debole::gamepad::InputMode;
+    use segnale_debole::hud::FieldManual;
+    let (mut app, e) = menu_app();
+    let shown = |app: &mut App| {
+        let mut q = app.world_mut().query::<(&FieldManual, &Node)>();
+        q.iter(app.world()).filter(|(_, n)| n.display != Display::None).map(|(m, _)| m.0).collect::<Vec<_>>()
+    };
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::KeyboardMouse);
+    let t = ui_texts(&mut app);
+    assert!(t.iter().any(|s| s == "PLAY  [ENTER]") && t.iter().any(|s| s == "LEADERBOARD  [K]"));
+    assert_eq!(shown(&mut app), vec![InputMode::KeyboardMouse]);
+    tap(&mut app, e, GamepadButton::DPadDown);
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::Gamepad);
+    let t = ui_texts(&mut app);
+    assert!(t.iter().any(|s| s == "PLAY  [START]") && t.iter().any(|s| s == "LEADERBOARD") && t.iter().any(|s| s == "CONTROLLER"), "{t:?}");
+    assert!(t.iter().any(|s| s == "SEED: RANDOM"));
+    assert_eq!(shown(&mut app), vec![InputMode::Gamepad]);
+    key_tap(&mut app, KeyCode::ShiftLeft);
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::KeyboardMouse);
+    assert!(ui_texts(&mut app).iter().any(|s| s == "PLAY  [ENTER]"));
+    assert_eq!(shown(&mut app), vec![InputMode::KeyboardMouse]);
+}
+
+/// Milestone 27: the main menu run-seed editor works from a controller
+/// (Up / Down cycle, Right add, Left delete, A lock, B cancel).
+#[test]
+fn controller_edits_the_run_seed() {
+    use segnale_debole::compendium::CustomSeedState;
+    use segnale_debole::gamepad::{PadFocusLock, PAD_TEXT_HINT};
+    let (mut app, e) = menu_app();
+    tap(&mut app, e, GamepadButton::DPadDown);
+    app.world_mut().resource_mut::<CustomSeedState>().toggle_edit();
+    step(&mut app, 2);
+    assert!(app.world().resource::<PadFocusLock>().0, "focus locked while editing");
+    assert!(ui_texts(&mut app).iter().any(|s| s == PAD_TEXT_HINT));
+    tap(&mut app, e, GamepadButton::DPadUp); // "A"
+    tap(&mut app, e, GamepadButton::DPadUp); // "B"
+    tap(&mut app, e, GamepadButton::DPadRight); // "BA"
+    tap(&mut app, e, GamepadButton::DPadDown); // "B-" (wraps backwards)
+    tap(&mut app, e, GamepadButton::DPadLeft); // "B"
+    tap(&mut app, e, GamepadButton::DPadRight); // "BA"
+    assert_eq!(app.world().resource::<CustomSeedState>().code, "BA");
+    tap(&mut app, e, GamepadButton::South);
+    let seed = app.world().resource::<CustomSeedState>().clone();
+    assert!(!seed.editing && seed.code == "BA" && seed.armed().is_some(), "{seed:?}");
+    assert!(!app.world().resource::<PadFocusLock>().0);
+    assert_eq!(app_state(&app), AppState::MainMenu, "A locked the seed, never launched a run");
+    // B cancels back to the code from before the edit, staying on the menu.
+    app.world_mut().resource_mut::<CustomSeedState>().toggle_edit();
+    step(&mut app, 2);
+    tap(&mut app, e, GamepadButton::DPadRight);
+    assert_eq!(app.world().resource::<CustomSeedState>().code, "BAA");
+    tap(&mut app, e, GamepadButton::East);
+    let seed = app.world().resource::<CustomSeedState>().clone();
+    assert!(!seed.editing && seed.code == "BA", "{seed:?}");
+    assert_eq!(app_state(&app), AppState::MainMenu);
+}

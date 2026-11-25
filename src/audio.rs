@@ -68,10 +68,17 @@ pub enum SfxEvent {
     RocketWhoosh,
     /// Eerie RF static hum + harmonic pulse emitted by nearby jammers.
     JammerHum,
+    /// Time Trial pit rescue: crisp upward synth recovery chime (never the
+    /// negative `Denied` buzz).
+    PitRescue,
+    /// Quiet menu focus tick (controller focus moved). Throttled by [`UiSfxGate`].
+    UiTick,
+    /// Short menu confirm blip. Throttled by [`UiSfxGate`].
+    UiConfirm,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 31] = [
+    pub const ALL: [SfxEvent; 34] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -103,6 +110,9 @@ impl SfxEvent {
         SfxEvent::ShellClink,
         SfxEvent::RocketWhoosh,
         SfxEvent::JammerHum,
+        SfxEvent::PitRescue,
+        SfxEvent::UiTick,
+        SfxEvent::UiConfirm,
     ];
 
     /// Warnings that must always be heard keep their direction but are pulled
@@ -123,7 +133,9 @@ impl SfxEvent {
             SfxEvent::StepRegolith | SfxEvent::StepMetal => 0.28,
             SfxEvent::ShellClink => 0.32,
             SfxEvent::LandThud | SfxEvent::RocketWhoosh => 0.55,
-            SfxEvent::JammerHum => 0.6,
+            SfxEvent::JammerHum | SfxEvent::PitRescue => 0.6,
+            SfxEvent::UiTick => 0.18,
+            SfxEvent::UiConfirm => 0.3,
             _ => 0.75,
         }
     }
@@ -608,6 +620,68 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
                 let whine = (o2.step(1_960.0 + 40.0 * (TAU * 3.0 * ts).sin()) * TAU).sin() * 0.08;
                 (hum * pulse + stat + whine) * env(t, 0.12, 0.9)
             })
+        }
+        SfxEvent::PitRescue => render(0.42, |ts, t, _| {
+            // Rising major arpeggio (E5 -> G#5 -> B5 -> E6) on a soft triangle
+            // with a sine octave shimmer: "recovered", not "denied".
+            let note = [659.25, 830.61, 987.77, 1318.5][((ts / 0.07) as usize).min(3)];
+            let body = tri(o.step(note)) * 0.5 + (o2.step(note * 2.0) * TAU).sin() * 0.18;
+            body * env(t, 0.03, 1.1)
+        }),
+        SfxEvent::UiTick => render(0.035, |_, t, n| {
+            // Tiny high square click with a breath of noise.
+            (square(o.step(2_400.0)) * 0.35 + n.next() * 0.06) * env(t, 0.04, 3.0)
+        }),
+        SfxEvent::UiConfirm => render(0.11, |ts, t, _| {
+            // Two-step upward blip (A5 -> E6).
+            let f = if ts < 0.045 { 880.0 } else { 1318.5 };
+            (square(o.step(f)) * 0.3 + tri(o2.step(f * 0.5)) * 0.2) * env(t, 0.03, 1.4)
+        }),
+    }
+}
+
+/// Minimum seconds between two [`SfxEvent::UiTick`]s (a held direction
+/// repeats every 0.22 s; mashing faster than this stays quiet).
+pub const UI_TICK_MIN_GAP: f32 = 0.09;
+/// Minimum seconds between two [`SfxEvent::UiConfirm`]s.
+pub const UI_CONFIRM_MIN_GAP: f32 = 0.15;
+
+/// Debounces menu UI cues so a held direction / mashed button never spams.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct UiSfxGate {
+    last_tick: f32,
+    last_confirm: f32,
+}
+
+impl Default for UiSfxGate {
+    fn default() -> Self {
+        UiSfxGate { last_tick: f32::NEG_INFINITY, last_confirm: f32::NEG_INFINITY }
+    }
+}
+
+impl UiSfxGate {
+    /// Whether `cue` may sound at `now` (seconds); records it when allowed.
+    /// A confirm also swallows a tick in the same instant.
+    pub fn allow(&mut self, cue: SfxEvent, now: f32) -> bool {
+        let (last, gap) = match cue {
+            SfxEvent::UiTick => (&mut self.last_tick, UI_TICK_MIN_GAP),
+            SfxEvent::UiConfirm => (&mut self.last_confirm, UI_CONFIRM_MIN_GAP),
+            _ => return true,
+        };
+        if now.is_finite() && now - *last < gap && now >= *last {
+            return false;
+        }
+        *last = now;
+        if cue == SfxEvent::UiConfirm {
+            self.last_tick = now;
+        }
+        true
+    }
+
+    /// Queue `cue` if the gate allows it.
+    pub fn play(&mut self, queue: &mut SfxQueue, cue: SfxEvent, now: f32) {
+        if self.allow(cue, now) {
+            queue.play(cue);
         }
     }
 }
@@ -1255,7 +1329,7 @@ mod tests {
 
     #[test]
     fn rocket_sfx_are_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 31);
+        assert_eq!(SfxEvent::ALL.len(), 34);
         let fire = synthesize_wav(SfxEvent::RocketFire);
         let boom = synthesize_wav(SfxEvent::RocketExplode);
         assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
@@ -1269,7 +1343,7 @@ mod tests {
 
     #[test]
     fn milestone13_sfx_are_valid_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 31);
+        assert_eq!(SfxEvent::ALL.len(), 34);
         let news = [SfxEvent::PhaseBlink, SfxEvent::SniperLock, SfxEvent::BossShield];
         for sfx in news {
             assert!(SfxEvent::ALL.contains(&sfx));
@@ -1281,6 +1355,49 @@ mod tests {
                 assert_ne!(w, synthesize_wav(other), "{sfx:?} vs {other:?}");
             }
         }
+    }
+
+    #[test]
+    fn milestone27_ui_and_pit_rescue_sfx_are_distinct() {
+        for sfx in [SfxEvent::PitRescue, SfxEvent::UiTick, SfxEvent::UiConfirm] {
+            assert!(SfxEvent::ALL.contains(&sfx));
+            let w = synthesize_wav(sfx);
+            assert_eq!(w, synthesize_wav(sfx), "{sfx:?} deterministic");
+            for other in SfxEvent::ALL.into_iter().filter(|o| *o != sfx) {
+                assert_ne!(w, synthesize_wav(other), "{sfx:?} vs {other:?}");
+            }
+        }
+        // The pit rescue chime rises (positive zero-crossing rate grows), unlike the flat Denied buzz.
+        let pcm: Vec<f32> = synth_samples(SfxEvent::PitRescue);
+        let crossings = |s: &[f32]| s.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        let q = pcm.len() / 4;
+        assert!(crossings(&pcm[3 * q..]) > crossings(&pcm[..q]), "upward arpeggio");
+        // UI cues are short and quiet next to gameplay sounds.
+        assert!(synth_samples(SfxEvent::UiTick).len() < synth_samples(SfxEvent::UiConfirm).len());
+        assert!(SfxEvent::UiTick.volume() < SfxEvent::UiConfirm.volume() && SfxEvent::UiConfirm.volume() < SfxEvent::Pickup.volume());
+    }
+
+    #[test]
+    fn ui_sfx_gate_debounces_ticks_and_confirms() {
+        let mut g = UiSfxGate::default();
+        assert!(g.allow(SfxEvent::UiTick, 1.0));
+        assert!(!g.allow(SfxEvent::UiTick, 1.03), "mashed tick is swallowed");
+        assert!(g.allow(SfxEvent::UiTick, 1.0 + UI_TICK_MIN_GAP + 0.01));
+        // A held direction (0.22 s repeat) ticks on every step, never faster.
+        let mut n = 0;
+        let mut g = UiSfxGate::default();
+        for i in 0..100 {
+            n += g.allow(SfxEvent::UiTick, i as f32 * 0.01) as u32;
+        }
+        assert!(n <= 1 + (1.0 / UI_TICK_MIN_GAP) as u32, "{n}");
+        assert!(g.allow(SfxEvent::UiConfirm, 5.0));
+        assert!(!g.allow(SfxEvent::UiConfirm, 5.05));
+        assert!(!g.allow(SfxEvent::UiTick, 5.0), "confirm swallows a same-instant tick");
+        assert!(g.allow(SfxEvent::Shotgun, 5.0), "gameplay sounds are never gated");
+        let mut q = SfxQueue::default();
+        g.play(&mut q, SfxEvent::UiConfirm, 9.0);
+        g.play(&mut q, SfxEvent::UiConfirm, 9.01);
+        assert_eq!(q.events().collect::<Vec<_>>(), vec![SfxEvent::UiConfirm]);
     }
 
     #[test]

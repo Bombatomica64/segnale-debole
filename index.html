@@ -4,6 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SEGNALE DEBOLE</title>
+  <meta name="description" content="Roguelike boomer shooter in a dead Mars bunker: a cracked phone hunting one bar of signal in your left hand, a pump shotgun in your right. Bhop, kill the jammers, hold the SOS uplink, get out.">
+  <meta name="theme-color" content="#080606">
+  <!-- Link previews (Discord, itch.io, socials). -->
+  <meta property="og:title" content="SEGNALE DEBOLE">
+  <meta property="og:description" content="Roguelike boomer shooter: hunt a single bar of signal through a demon-infested Mars bunker. Mouse &amp; keyboard or controller, right in the browser.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://signal.bombatomica64.dev/">
+  <meta property="og:site_name" content="SEGNALE DEBOLE">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="SEGNALE DEBOLE">
+  <meta name="twitter:description" content="Roguelike boomer shooter: hunt a single bar of signal through a demon-infested Mars bunker.">
+  <!-- Inline signal-bars favicon: no /favicon.ico request, no 404. -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='2' fill='%23080606'/%3E%3Crect x='1.5' y='11' width='2.5' height='3.5' fill='%23ff2b1a'/%3E%3Crect x='5' y='8' width='2.5' height='6.5' fill='%23ff2b1a'/%3E%3Crect x='8.5' y='5' width='2.5' height='9.5' fill='%235a4a40'/%3E%3Crect x='12' y='1.5' width='2.5' height='13' fill='%235a4a40'/%3E%3C/svg%3E">
   <!-- Features come from the CLI: `trunk build --release --features audio`. -->
   <!-- wasm-opt must accept rustc's default wasm32 features (bulk memory, ...). -->
   <link data-trunk rel="rust" data-bin="segnale_debole_web" data-target-name="segnale_debole_web" data-wasm-opt="z"
@@ -40,6 +53,15 @@
       content: ""; position: absolute; inset: 0; pointer-events: none;
       background: repeating-linear-gradient(0deg, rgba(0,0,0,.22) 0 1px, transparent 1px 3px);
     }
+    /* Audio unlock banner: only while an AudioContext is still suspended. */
+    #sound {
+      position: fixed; top: 10px; right: 10px; z-index: 3; display: none;
+      padding: 6px 10px; border-left: 3px solid var(--acid);
+      background: rgba(8, 6, 6, .88); color: var(--bone); cursor: pointer;
+      font: 600 11px/1.3 ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+      letter-spacing: 0.12em; text-transform: uppercase; user-select: none;
+    }
+    #sound.show { display: block; }
     @keyframes rf { 0%, 100% { opacity: .2; } 50% { opacity: 1; } }
     @media (prefers-reduced-motion: reduce) { #boot .bars i { animation: none; } }
   </style>
@@ -51,8 +73,9 @@
     <div class="title"><b>SEGNALE DEBOLE</b> // TUNING RF SIGNAL...</div>
     <div class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
     <div class="status">Downloading bunker uplink</div>
-    <div class="hint">Click the screen to capture the mouse. Esc pauses.</div>
+    <div class="hint">Click to capture mouse or use a controller. Esc / Start pauses.</div>
   </div>
+  <div id="sound" role="button" aria-live="polite">Click or press a key to enable sound</div>
   <script>
     (function () {
       var boot = document.getElementById("boot");
@@ -77,20 +100,54 @@
       }
 
       // Browsers start audio suspended until a user gesture: resume every
-      // AudioContext the game creates on the first click / key press.
+      // AudioContext the game creates on any click / key press. A gamepad
+      // press is not a gesture, so controller-only players (and tabs that
+      // come back suspended) get a small banner until audio is running.
       var contexts = [];
+      var sound = document.getElementById("sound");
+      var booted = false;
+      function anySuspended() {
+        return contexts.some(function (c) { return c.state === "suspended"; });
+      }
+      function syncBanner() {
+        sound.classList.toggle("show", booted && anySuspended());
+      }
       var Native = window.AudioContext || window.webkitAudioContext;
       if (Native) {
         class Tracked extends Native {
-          constructor(...args) { super(...args); contexts.push(this); }
+          constructor(...args) {
+            super(...args);
+            var ctx = this;
+            contexts.push(ctx);
+            var onState = function () {
+              if (ctx.state === "closed") {
+                ctx.removeEventListener("statechange", onState);
+                var idx = contexts.indexOf(ctx);
+                if (idx !== -1) contexts.splice(idx, 1);
+              }
+              syncBanner();
+            };
+            ctx.addEventListener("statechange", onState);
+            syncBanner();
+          }
         }
         window.AudioContext = Tracked;
         if (window.webkitAudioContext) window.webkitAudioContext = Tracked;
         var resume = function () {
-          contexts.forEach(function (c) { if (c.state === "suspended") c.resume(); });
+          contexts.forEach(function (c) {
+            if (c.state !== "suspended") return;
+            try {
+              var p = c.resume();
+              // Without a real gesture resume() rejects: keep the banner up.
+              if (p && p.then) p.then(syncBanner, syncBanner);
+            } catch (e) { syncBanner(); }
+          });
         };
         ["pointerdown", "keydown", "touchend"].forEach(function (ev) {
           window.addEventListener(ev, resume, { capture: true });
+        });
+        document.addEventListener("visibilitychange", function () {
+          if (!document.hidden) { resume(); syncBanner(); }
         });
       }
 
@@ -120,6 +177,8 @@
           if (canvas.width > 0 && canvas.height > 0 && ++frames > 6) {
             boot.classList.add("done");
             canvas.focus();
+            booted = true;
+            syncBanner();
             return;
           }
           requestAnimationFrame(tick);
