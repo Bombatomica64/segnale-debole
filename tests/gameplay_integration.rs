@@ -32,6 +32,7 @@ use segnale_debole::enemies::{damage_enemy, pick_phase_blink_target, SniperLaser
 use segnale_debole::extraction::{rush_cap, upload_duration, ExtractionState, BOSS_HOLD_PROGRESS};
 use segnale_debole::fx::{BurstColor, FxAssets, HudFeed};
 use segnale_debole::hud::{HudCrosshair, HudPlugin, ENDLESS_CTA};
+use segnale_debole::menu_scene::{MenuSceneCamera, MenuSceneEntity, MENU_SCENE_MAX_LIGHTS};
 use segnale_debole::meta_ui::{
     commit_meta_edit, commit_settings_edit, EditOutcome, MetaCard, MetaTarget, ReticlePreview, SettingKnob, SettingToggle, SettingsControl,
     SettingsTarget, NO_UNLOCKS_LINE,
@@ -1703,7 +1704,7 @@ fn menu_navigates_loadout_and_contracts_screens() {
     let mut app = build_menu_app(None);
     assert_eq!(app_state(&app), AppState::MainMenu);
     assert!(ui_texts(&mut app).iter().any(|t| t.starts_with("OS: STOCK OS")), "loadout summary bar");
-    assert_eq!(count::<Camera3d>(&mut app), 1);
+    assert_eq!(count::<Camera3d>(&mut app), 2, "menu UI camera + live 3D vista camera");
 
     tap(&mut app, KeyCode::KeyL);
     assert_eq!(app_state(&app), AppState::Loadout);
@@ -1725,7 +1726,7 @@ fn menu_navigates_loadout_and_contracts_screens() {
     tap(&mut app, KeyCode::Escape);
     assert_eq!(app_state(&app), AppState::MainMenu);
     assert_eq!(count::<MetaCard>(&mut app), 0, "meta screens despawn on exit");
-    assert_eq!(count::<Camera3d>(&mut app), 1);
+    assert_eq!(count::<Camera3d>(&mut app), 2);
 
     // Live refresh: a contract toggle updates the risk badge + card in place.
     tap(&mut app, KeyCode::KeyC);
@@ -2939,7 +2940,7 @@ fn settings_open_from_main_menu_and_mid_run_pause_and_apply_live() {
     tap(&mut app, KeyCode::Escape);
     assert_eq!(app_state(&app), AppState::MainMenu);
     assert_eq!(count::<SettingsControl>(&mut app), 0);
-    assert_eq!(count::<Camera3d>(&mut app), 1);
+    assert_eq!(count::<Camera3d>(&mut app), 2);
 
     // Deploy: the camera spawns at the user's base FOV with the chosen reticle.
     tap(&mut app, KeyCode::Enter);
@@ -3947,7 +3948,7 @@ fn count_with<F: bevy::ecs::query::QueryFilter>(app: &mut App) -> usize {
 #[test]
 fn compendium_opens_cycles_exhibits_and_tears_down_cleanly() {
     let mut app = build_menu_app(None);
-    assert_eq!(count_with::<With<Mesh3d>>(&mut app), 0, "the main menu has no 3D meshes");
+    assert_eq!(count_with::<(With<Mesh3d>, Without<MenuSceneEntity>)>(&mut app), 0, "the main menu has no 3D meshes beyond its vista");
     tap(&mut app, KeyCode::KeyB);
     assert_eq!(app_state(&app), AppState::Compendium);
     assert_eq!(count_with::<With<TurntableRoot>>(&mut app), 1);
@@ -4001,8 +4002,8 @@ fn compendium_opens_cycles_exhibits_and_tears_down_cleanly() {
     assert_eq!(count_with::<With<CompendiumEntity>>(&mut app), 0);
     assert_eq!(count_with::<With<ExhibitModel>>(&mut app), 0);
     assert_eq!(count_with::<With<TurntableRoot>>(&mut app), 0);
-    assert_eq!(count_with::<With<Mesh3d>>(&mut app), 0, "the whole stage is gone");
-    assert_eq!(count_with::<With<PointLight>>(&mut app), 0);
+    assert_eq!(count_with::<(With<Mesh3d>, Without<MenuSceneEntity>)>(&mut app), 0, "the whole stage is gone");
+    assert_eq!(count_with::<(With<PointLight>, Without<MenuSceneEntity>)>(&mut app), 0);
 
     // Re-entering rebuilds one stage (no duplicates) and remembers the exhibit.
     tap(&mut app, KeyCode::KeyB);
@@ -4097,13 +4098,16 @@ fn hud_feed_and_trial_retry_cleanup() {
     tap(&mut app, KeyCode::Enter);
     assert_eq!(app_state(&app), AppState::Playing);
     app.world_mut().resource_mut::<HudFeed>().toast("RUN ALERT", Color::WHITE);
-    // Pause + Resume preserves HudFeed.
+    // The deploy cold open's sector subtitle is already in the feed.
+    let toasts = app.world().resource::<HudFeed>().toasts.len();
+    assert!(toasts >= 1 && app.world().resource::<HudFeed>().toasts.iter().any(|t| t.text == "RUN ALERT"));
+    // Pause + Resume preserves HudFeed (and never replays the cold open).
     tap(&mut app, KeyCode::Escape);
     assert_eq!(app_state(&app), AppState::Paused);
-    assert_eq!(app.world().resource::<HudFeed>().toasts.len(), 1);
+    assert_eq!(app.world().resource::<HudFeed>().toasts.len(), toasts);
     tap(&mut app, KeyCode::Escape);
     assert_eq!(app_state(&app), AppState::Playing);
-    assert_eq!(app.world().resource::<HudFeed>().toasts.len(), 1);
+    assert_eq!(app.world().resource::<HudFeed>().toasts.len(), toasts);
     // Returning to MainMenu clears HudFeed so old alerts never leak into the next run.
     app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::MainMenu);
     app.update();
@@ -4163,4 +4167,175 @@ fn wide_lane_aggro_wakes_visible_demons_at_32_m_but_not_screened_ones() {
     let v = enemy(&app, visible).unwrap();
     assert!(v.alerted && v.sees_player, "32 m in plain sight reacts within ~1 s");
     assert!(!enemy(&app, screened).unwrap().alerted, "wall-screened demon stays idle");
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 30: the soul pass
+// ---------------------------------------------------------------------------
+
+#[test]
+fn menu_vista_lives_only_in_the_main_menu_and_never_meets_other_cameras() {
+    use segnale_debole::compendium::CompendiumEntity;
+    let mut app = build_menu_app(None);
+    step(&mut app, 3);
+    assert_eq!(count::<MenuSceneCamera>(&mut app), 1, "vista camera behind the menu");
+    {
+        let mut q = app.world_mut().query_filtered::<(&Camera, &bevy::render::view::Msaa), With<MenuSceneCamera>>();
+        let (cam, msaa) = q.single(app.world()).unwrap();
+        assert!(cam.order < 0, "vista renders behind the UI camera");
+        assert_eq!(*msaa, app.world().resource::<segnale_debole::perf::RenderMsaa>().0, "RenderMsaa from frame 1");
+    }
+    let lights = count_with::<(With<PointLight>, With<MenuSceneEntity>)>(&mut app);
+    assert!((1..=MENU_SCENE_MAX_LIGHTS).contains(&lights), "{lights} vista lights");
+    let meshes0 = app.world().resource::<Assets<Mesh>>().len();
+    let mats0 = app.world().resource::<Assets<StandardMaterial>>().len();
+    step(&mut app, 30);
+
+    // Compendium: the vista is fully gone before its viewer camera exists.
+    tap(&mut app, KeyCode::KeyB);
+    assert_eq!(app_state(&app), AppState::Compendium);
+    assert_eq!(count::<MenuSceneEntity>(&mut app), 0);
+    assert!(count_with::<With<CompendiumEntity>>(&mut app) > 0);
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    step(&mut app, 2);
+    assert_eq!(count::<MenuSceneCamera>(&mut app), 1, "vista returns with the menu");
+    assert_eq!(app.world().resource::<Assets<StandardMaterial>>().len(), mats0, "cached vista materials, no churn");
+    assert!(app.world().resource::<Assets<Mesh>>().len() <= meshes0, "cached vista meshes, no churn");
+
+    // Playing: only the PlayerCamera (+ viewmodel) remain.
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(count::<MenuSceneEntity>(&mut app), 0);
+    assert_eq!(count::<PlayerCamera>(&mut app), 1);
+}
+
+#[test]
+fn deploy_cold_open_fatalities_and_boss_call_declined() {
+    use segnale_debole::fatality::{FatalityState, KillCause};
+    use segnale_debole::fx::CameraPunch;
+    use segnale_debole::phone_screen::{NotifKind, PhoneNotifState, CALL_DECLINED_TEXT, SEARCHING_TEXT};
+
+    let mut app = build_menu_app(None);
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    // Deploy cold open: SEARCHING... flash + sector subtitle.
+    let n = app.world().resource::<PhoneNotifState>().clone();
+    assert_eq!(n.banner(), Some((NotifKind::Searching, SEARCHING_TEXT)));
+    assert!(app.world().resource::<HudFeed>().toasts.iter().any(|t| t.text == "SECTOR 01 // BASEMENT GARAGE"));
+    // Pause / resume never replays it.
+    tap(&mut app, KeyCode::Escape);
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(app.world().resource::<HudFeed>().toasts.iter().filter(|t| t.text.starts_with("SECTOR 01")).count(), 1);
+
+    godmode(&mut app);
+    despawn_all_enemies(&mut app);
+    let feet = player_pos(&mut app);
+    let fwd_before = {
+        let mut q = app.world_mut().query_filtered::<&Transform, With<PlayerCamera>>();
+        q.single(app.world()).unwrap().forward()
+    };
+    // A point-blank overkill always earns a fatality.
+    let imp = spawn_demon(&mut app, EnemyKind::Imp, feet + Vec3::new(3.0, 0.0, 0.0));
+    step(&mut app, 1);
+    {
+        let mut e = app.world_mut().get_mut::<Enemy>(imp).unwrap();
+        e.hp = 0.0;
+        e.kill_cause = KillCause::PointBlankOverkill;
+    }
+    step(&mut app, 2);
+    assert_eq!(app.world().resource::<FatalityState>().count, 1);
+    assert!(app.world().resource::<HudFeed>().toasts.iter().any(|t| t.text.starts_with("FATALITY // ")));
+    assert!(app.world().resource::<CameraPunch>().strength > 0.0, "camera punch kicks");
+    // The punch is roll-only: the aim direction never moves.
+    let fwd_after = {
+        let mut q = app.world_mut().query_filtered::<&Transform, With<PlayerCamera>>();
+        q.single(app.world()).unwrap().forward()
+    };
+    assert!(fwd_before.dot(*fwd_after) > 0.9999, "aim untouched by the punch");
+    // Rapid second kill inside the cooldown: no stutter-spam.
+    let imp2 = spawn_demon(&mut app, EnemyKind::Imp, feet + Vec3::new(-3.0, 0.0, 0.0));
+    step(&mut app, 1);
+    {
+        let mut e = app.world_mut().get_mut::<Enemy>(imp2).unwrap();
+        e.hp = 0.0;
+        e.kill_cause = KillCause::MortarDirect;
+    }
+    step(&mut app, 2);
+    assert_eq!(app.world().resource::<FatalityState>().count, 1, "1.8 s cooldown");
+    step(&mut app, 2 * FPS);
+    assert_eq!(app.world().resource::<CameraPunch>().strength, 0.0, "punch settles");
+
+    // Carrier Daemon kill: guaranteed CALL DECLINED. fatality + phone banner.
+    let boss = spawn_demon(&mut app, EnemyKind::CarrierDaemon, feet + Vec3::new(0.0, 0.0, 6.0));
+    step(&mut app, 1);
+    app.world_mut().get_mut::<Enemy>(boss).unwrap().hp = 0.0;
+    step(&mut app, 3);
+    assert_eq!(app.world().resource::<FatalityState>().count, 2);
+    let feed = app.world().resource::<HudFeed>();
+    assert!(feed.toasts.iter().any(|t| t.text.contains("CALL DECLINED.")), "{:?}", feed.toasts);
+    assert_eq!(app.world().resource::<PhoneNotifState>().banner(), Some((NotifKind::CallDeclined, CALL_DECLINED_TEXT)));
+}
+
+#[test]
+fn fatality_and_camera_punch_reset_across_new_runs_but_preserve_pause_and_floors() {
+    use segnale_debole::fatality::{FatalityKind, FatalityState};
+    use segnale_debole::fx::CameraPunch;
+    let mut app = build_menu_app(None);
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 3);
+    assert!(app.world().resource::<RunStats>().time_elapsed > 0.0);
+
+    // Seed active fatality cooldown + punch mid-run.
+    {
+        let mut f = app.world_mut().resource_mut::<FatalityState>();
+        f.cooldown = 1.5;
+        f.count = 3;
+        f.last = Some(FatalityKind::Disconnected);
+        app.world_mut().resource_mut::<CameraPunch>().kick(1.0);
+    }
+
+    // Pause -> resume keeps both fatality state and active punch.
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(app.world().resource::<FatalityState>().count, 3);
+    assert!(app.world().resource::<FatalityState>().cooldown > 0.5);
+    assert!(app.world().resource::<CameraPunch>().strength > 0.0);
+
+    // Floor transition via UpgradeSelect clears camera punch, keeps fatality run counters.
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::UpgradeSelect);
+    step(&mut app, 2);
+    assert_eq!(app.world().resource::<CameraPunch>().strength, 0.0, "upgrade screen clears punch");
+    assert_eq!(app.world().resource::<FatalityState>().count, 3, "floor transition preserves fatality counters");
+
+    // GameOver -> Loadout -> Playing clears both fatality state and camera punch.
+    app.world_mut().resource_mut::<CameraPunch>().kick(1.0);
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::GameOver);
+    step(&mut app, 2);
+    assert_eq!(app.world().resource::<CameraPunch>().strength, 0.0, "game over clears punch");
+    tap(&mut app, KeyCode::KeyL);
+    assert_eq!(app_state(&app), AppState::Loadout);
+    assert_eq!(*app.world().resource::<FatalityState>(), FatalityState::default(), "loadout resets fatality state");
+
+    // Deploy directly from Loadout, then Paused -> RestartRun [R] clears both without visiting MainMenu.
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 2);
+    {
+        let mut f = app.world_mut().resource_mut::<FatalityState>();
+        f.cooldown = 1.5;
+        f.count = 2;
+        f.last = Some(FatalityKind::NoService);
+        app.world_mut().resource_mut::<CameraPunch>().kick(1.0);
+    }
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    tap(&mut app, KeyCode::KeyR);
+    assert_eq!(app_state(&app), AppState::Playing);
+    assert_eq!(*app.world().resource::<FatalityState>(), FatalityState::default(), "restart resets fatality state");
+    assert_eq!(app.world().resource::<CameraPunch>().strength, 0.0, "restart clears camera punch");
 }

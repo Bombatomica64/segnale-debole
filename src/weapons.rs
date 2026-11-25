@@ -2415,7 +2415,12 @@ fn fire_weapons(
             for (idx, (mut e, g, marked)) in enemies.iter_mut().enumerate() {
                 if enemy_dmg[idx] > 0.0 {
                     let kb = enemy_kb[idx] * knockback_scale(e.kind);
+                    let hp_before = e.hp;
                     damage_enemy(&mut e, enemy_dmg[idx], marked.is_some(), &mods);
+                    // Milestone 30: point-blank overkill blasts always earn a fatality.
+                    if !e.is_alive() && crate::fatality::is_point_blank_overkill(enemy_dmg[idx], hp_before, g.translation().distance(origin)) {
+                        e.kill_cause = crate::fatality::KillCause::PointBlankOverkill;
+                    }
                     e.knockback += Vec3::new(kb.x, 0.0, kb.z) * 3.0;
                     e.stagger(enemy_kb[idx]);
                     // Heavy close-range blast: a subtle splatter on the floor beneath.
@@ -2727,6 +2732,9 @@ fn detonate_rocket(
         let away = Vec2::new(root.x - blast.x, root.z - blast.z).normalize_or(Vec2::new(dir.x, dir.z).normalize_or_zero());
         let kb = 14.0 * falloff * knockback_scale(en.kind);
         damage_enemy(&mut en, dmg, marked.is_some(), mods);
+        if direct == HitTarget::Enemy(i) && !en.is_alive() && en.kill_cause == crate::fatality::KillCause::Generic {
+            en.kill_cause = crate::fatality::KillCause::MortarDirect;
+        }
         en.knockback += Vec3::new(away.x * kb, kb * 0.15, away.y * kb);
         en.stagger(Vec3::new(away.x, 0.0, away.y));
         any_hit = true;

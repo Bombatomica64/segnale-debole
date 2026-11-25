@@ -1589,6 +1589,10 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, assets: &GameAss
     batches.merge(&a.trim, arch.trim);
     batches.merge(&a.accent_emissive, arch.accent);
     batches.merge(&a.ceiling, arch.plate);
+    // Milestone 30 telecom screens / LEDs join the existing tower-panel and
+    // lamp batches (no extra draw calls).
+    batches.merge(&assets.tower_panel, arch.screen);
+    batches.merge(&a.lamp, arch.lamp);
 
     spawn_signal_tower(commands, g, assets, a, &src, &mut batches);
     for (mesh, mat) in batches.finish(meshes) {

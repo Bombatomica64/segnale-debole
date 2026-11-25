@@ -64,6 +64,11 @@ pub enum ArchSlot {
     Accent,
     /// Dark themed faceplates (`ThemeMaterials::ceiling`).
     Plate,
+    /// Glowing green signal screens (`GameAssets::tower_panel`, already a
+    /// per-floor batch through the tower panels: no extra draw call).
+    Screen,
+    /// Warm amber lamp glow (`ThemeMaterials::lamp`, the ceiling lamp batch).
+    Lamp,
 }
 
 /// Architectural geometry of one floor, one batch per material slot.
@@ -72,6 +77,8 @@ pub struct ArchBatches {
     pub trim: MeshBatch,
     pub accent: MeshBatch,
     pub plate: MeshBatch,
+    pub screen: MeshBatch,
+    pub lamp: MeshBatch,
 }
 
 impl ArchBatches {
@@ -80,6 +87,8 @@ impl ArchBatches {
             ArchSlot::Trim => &mut self.trim,
             ArchSlot::Accent => &mut self.accent,
             ArchSlot::Plate => &mut self.plate,
+            ArchSlot::Screen => &mut self.screen,
+            ArchSlot::Lamp => &mut self.lamp,
         }
     }
 
@@ -269,6 +278,9 @@ struct ArchMeshes {
     monolith: Mesh,
     obsidian_core: Mesh,
     plinth_bar: Mesh,
+    crt: Mesh,
+    cabinet: Mesh,
+    dish: Mesh,
 }
 
 impl ArchMeshes {
@@ -295,6 +307,10 @@ impl ArchMeshes {
             monolith: sculpt::wedge_plate(0.5, 2.9, 0.26, 0.4, 0.5, 0.0),
             obsidian_core: sculpt::beveled_box(Vec3::new(0.42, 2.6, 0.16), 0.04),
             plinth_bar: sculpt::beveled_box(Vec3::new(1.7, 0.2, 0.28), 0.04),
+            crt: sculpt::beveled_box(Vec3::new(0.52, 0.44, 0.4), 0.05),
+            cabinet: sculpt::beveled_box(Vec3::new(0.72, 2.2, 0.46), 0.035),
+            // Shallow parabolic-ish relay dish: wide rim, small hub (axis +Y).
+            dish: sculpt::tapered_prism(16, 0.22, 1.7, 0.5, false),
         }
     }
 }
@@ -311,19 +327,32 @@ fn put_box(b: &mut ArchBatches, s: ArchSlot, m: &ArchMeshes, frame: &Transform, 
 // Builders
 // ---------------------------------------------------------------------------
 
-/// Bake every architectural part of a floor into per-slot batches.
+/// Bake every architectural part of a floor into per-slot batches: the
+/// Milestone 16 framing + wall props, then the Milestone 30 wall-flush
+/// telecom clutter and the Atrium relay dish crown.
 pub fn build_architecture(g: &LevelGrid) -> ArchBatches {
     let m = ArchMeshes::new();
+    let mut b = build_architecture_base(g, &m);
+    for p in plan_telecom_props(g) {
+        let y = face_floor(g, p.face).unwrap_or(0.0);
+        build_telecom_prop(&mut b, &m, &p.face.frame(y), p.kind, p.variant);
+    }
+    build_tower_crown(g, &m, &mut b);
+    b
+}
+
+/// Milestone 16 framing, overhead structure and flush wall props.
+fn build_architecture_base(g: &LevelGrid, m: &ArchMeshes) -> ArchBatches {
     let mut b = ArchBatches::default();
-    build_wall_trim(g, &m, &mut b);
-    build_overhead(g, &m, &mut b);
-    build_lamp_cages(g, &m, &mut b);
-    build_pillar_detail(g, &m, &mut b);
-    build_catwalk_structure(g, &m, &mut b);
-    build_atrium_conduits(g, &m, &mut b);
+    build_wall_trim(g, m, &mut b);
+    build_overhead(g, m, &mut b);
+    build_lamp_cages(g, m, &mut b);
+    build_pillar_detail(g, m, &mut b);
+    build_catwalk_structure(g, m, &mut b);
+    build_atrium_conduits(g, m, &mut b);
     for p in plan_wall_props(g) {
         let y = face_floor(g, p.face).unwrap_or(0.0);
-        build_wall_prop(&mut b, &m, &p.face.frame(y), p.kind, FloorTheme::for_floor(g.floor));
+        build_wall_prop(&mut b, m, &p.face.frame(y), p.kind, FloorTheme::for_floor(g.floor));
     }
     b
 }
@@ -690,6 +719,248 @@ fn build_wall_prop(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, kind: Wa
 }
 
 // ---------------------------------------------------------------------------
+// Milestone 30: wall-flush Mars-telecom clutter + Atrium dish crown
+// ---------------------------------------------------------------------------
+
+/// Max protrusion of any telecom prop part from its backing wall face (m):
+/// 0.55 m out of a 8 m (2-cell) corridor leaves the lanes wide open.
+pub const TELECOM_MAX_DEPTH: f32 = 0.55;
+/// Half-width (along the wall) of every telecom prop: clear of the corner
+/// pilasters on the cell edges (|x| >= 1.87).
+pub const TELECOM_HALF_WIDTH: f32 = 1.6;
+/// Max height of a telecom prop above its floor.
+pub const TELECOM_MAX_HEIGHT: f32 = 3.4;
+/// Height band of the Atrium relay dish crown on the mast.
+pub const CROWN_MIN_Y: f32 = 11.0;
+
+/// What a telecom slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelecomKind {
+    /// Wall ledge desk with a crooked, cracked CRT, keyboard slab and tower.
+    PcStation,
+    /// Tall flush UAC 19-inch server cabinet with LED status strips.
+    WallRack,
+    /// "NO SIGNAL" RF status light box + floor-edge cable duct.
+    NoSignalBox,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelecomProp {
+    pub face: WallFace,
+    pub kind: TelecomKind,
+    /// Small deterministic look variation (screen color, lean).
+    pub variant: u8,
+}
+
+/// Telecom props wanted on a floor.
+pub fn telecom_prop_target(floor: u32) -> usize {
+    8 + 2 * floor.clamp(1, 5) as usize
+}
+
+/// Whether `face` can host a wall-flush telecom prop: a flat ground-level
+/// cell of a room or a corridor at least 2 cells (8 m) wide, mid-way along an
+/// unbroken straight wall (no doorway / corner / jamb beside it), clear of
+/// ramps, pits, raised plates, the spawn bay, the tower, jammers, jump pads,
+/// barrels and room-center pickups.
+pub fn telecom_slot_ok(g: &LevelGrid, face: WallFace) -> bool {
+    let (c, side, perp) = (face.cell, face.side, face.perp());
+    if !matches!(g.cell(c), Cell::Floor { height } if height == 0.0) || !g.cell(c + side).is_wall() {
+        return false;
+    }
+    // Straight wall: open floor both ways along it, unbroken wall behind, and
+    // the lane in front stays open (never a 1-cell squeeze).
+    if g.cell(c + perp).is_wall()
+        || g.cell(c - perp).is_wall()
+        || !g.cell(c + side + perp).is_wall()
+        || !g.cell(c + side - perp).is_wall()
+        || g.cell(c - side).is_wall()
+    {
+        return false;
+    }
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            match g.cell(c + IVec2::new(dx, dz)) {
+                Cell::Ramp { .. } | Cell::HazardPit | Cell::AtriumFloor => return false,
+                Cell::Floor { height } if height > 0.1 => return false,
+                _ => {}
+            }
+        }
+    }
+    let near = |p: IVec2| (p - c).abs().max_element() <= 1;
+    (c - g.spawn).abs().element_sum() >= 3
+        && (g.tower - c).abs().max_element() >= 3
+        && !g.jammers.iter().any(|&j| near(j))
+        && !g.jump_pads.iter().any(|p| near(p.cell))
+        && !g.barrels.iter().any(|&b| near(b))
+        && !g.rooms.iter().any(|r| r.center() == c)
+}
+
+/// Deterministic telecom prop placement (rooms + corridors), spaced >= 3
+/// cells apart and >= 2 cells from the Milestone 16 wall props, cycling
+/// PC station -> server rack -> NO SIGNAL box.
+pub fn plan_telecom_props(g: &LevelGrid) -> Vec<TelecomProp> {
+    let walls: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).collect();
+    let mut cands: Vec<WallFace> = wall_faces(g)
+        .into_iter()
+        .filter(|f| telecom_slot_ok(g, *f) && walls.iter().all(|w| (*w - f.cell).abs().max_element() >= 2))
+        .collect();
+    let mut rng = StdRng::seed_from_u64(g.seed ^ 0x7E1E_C030_5161_A1ED);
+    cands.shuffle(&mut rng);
+    let want = telecom_prop_target(g.floor);
+    let kinds = [TelecomKind::PcStation, TelecomKind::WallRack, TelecomKind::NoSignalBox];
+    let mut out: Vec<TelecomProp> = Vec::new();
+    for face in cands {
+        if out.len() >= want {
+            break;
+        }
+        if out.iter().all(|p| (p.face.cell - face.cell).abs().element_sum() >= 3) {
+            let i = out.len();
+            out.push(TelecomProp { face, kind: kinds[i % 3], variant: ((face.cell.x * 7 + face.cell.y * 13).rem_euclid(3)) as u8 });
+        }
+    }
+    out
+}
+
+/// Bake one telecom prop in its face frame (origin on the wall plane at floor
+/// height, +Z out of the wall). Every vertex stays within
+/// `|x| <= TELECOM_HALF_WIDTH`, `0 <= z <= TELECOM_MAX_DEPTH`,
+/// `0 <= y <= TELECOM_MAX_HEIGHT`.
+fn build_telecom_prop(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, kind: TelecomKind, variant: u8) {
+    use ArchSlot::{Accent, Lamp, Plate, Screen, Trim};
+    let glow = if variant == 1 { Lamp } else { Screen };
+    match kind {
+        TelecomKind::PcStation => {
+            // Wall ledge desk on two braces.
+            put_box(b, Trim, m, fr, Vec3::new(1.4, 0.06, 0.5), Vec3::new(0.0, 0.78, 0.25));
+            put_box(b, Accent, m, fr, Vec3::new(1.3, 0.012, 0.012), Vec3::new(0.0, 0.76, 0.505));
+            for s in [-1.0f32, 1.0] {
+                put_box(b, Trim, m, fr, Vec3::new(0.06, 0.6, 0.04), Vec3::new(s * 0.6, 0.48, 0.02));
+                let brace = Transform::from_xyz(s * 0.6, 0.6, 0.2).with_rotation(Quat::from_rotation_x(-0.7)).with_scale(Vec3::new(0.04, 0.5, 0.04));
+                b.put(Trim, &m.cube, fr, brace);
+            }
+            // Tower case under the desk with a status LED.
+            put_box(b, Plate, m, fr, Vec3::new(0.24, 0.5, 0.42), Vec3::new(0.42, 0.26, 0.22));
+            put_box(b, Accent, m, fr, Vec3::new(0.03, 0.03, 0.01), Vec3::new(0.42, 0.44, 0.435));
+            // Slightly crooked CRT: shell, bezel, glowing screen, crack lines, stand.
+            let lean = if variant == 2 { -0.12 } else { 0.12 };
+            let crt = fr.mul_transform(Transform::from_xyz(-0.18, 0.81, 0.24).with_rotation(Quat::from_rotation_y(lean) * Quat::from_rotation_z(lean * 0.25)));
+            b.put(Trim, &m.cube, &crt, bx(Vec3::new(0.26, 0.04, 0.2), Vec3::new(0.0, 0.02, 0.0)));
+            b.put(Trim, &m.crt, &crt, Transform::from_xyz(0.0, 0.26, -0.01));
+            b.put(Plate, &m.cube, &crt, bx(Vec3::new(0.46, 0.38, 0.02), Vec3::new(0.0, 0.26, 0.19)));
+            b.put(glow, &m.cube, &crt, bx(Vec3::new(0.38, 0.3, 0.012), Vec3::new(0.0, 0.26, 0.203)));
+            for (x, a, h) in [(-0.06f32, 0.7f32, 0.26f32), (0.05, -0.45, 0.18), (0.1, 1.1, 0.12)] {
+                let crack = Transform::from_xyz(x, 0.27, 0.211).with_rotation(Quat::from_rotation_z(a)).with_scale(Vec3::new(0.008, h, 0.005));
+                b.put(Trim, &m.cube, &crt, crack);
+            }
+            // Tilted keyboard slab with a key-row glow.
+            let kb = fr.mul_transform(Transform::from_xyz(-0.12, 0.83, 0.4).with_rotation(Quat::from_rotation_y(-0.08) * Quat::from_rotation_x(0.12)));
+            b.put(Trim, &m.cube, &kb, bx(Vec3::new(0.48, 0.025, 0.15), Vec3::ZERO));
+            for k in 0..3 {
+                b.put(Plate, &m.cube, &kb, bx(Vec3::new(0.42, 0.008, 0.03), Vec3::new(0.0, 0.016, -0.045 + k as f32 * 0.045)));
+            }
+        }
+        TelecomKind::WallRack => {
+            // 19-inch cabinet on a plinth, front door, vent slats, 1U blades.
+            put_box(b, Trim, m, fr, Vec3::new(0.78, 0.08, 0.48), Vec3::new(0.0, 0.04, 0.24));
+            b.put(Trim, &m.cabinet, fr, Transform::from_xyz(0.0, 1.18, 0.23));
+            put_box(b, Plate, m, fr, Vec3::new(0.62, 2.0, 0.02), Vec3::new(0.0, 1.18, 0.47));
+            for k in 0..8 {
+                put_box(b, Trim, m, fr, Vec3::new(0.5, 0.025, 0.02), Vec3::new(0.0, 1.66 + k as f32 * 0.06, 0.49));
+            }
+            for k in 0..8 {
+                let y = 0.34 + k as f32 * 0.15;
+                put_box(b, Trim, m, fr, Vec3::new(0.58, 0.08, 0.02), Vec3::new(0.0, y, 0.49));
+                // Status LED strip: red / green / amber (theme accent, screen, lamp).
+                for (i, (slot, x)) in [(Accent, -0.22f32), (Screen, 0.17), (Lamp, 0.23)].into_iter().enumerate() {
+                    if i > 0 && (k + i).is_multiple_of(4) {
+                        continue; // a few dark LEDs read as "blinking"
+                    }
+                    put_box(b, slot, m, fr, Vec3::new(0.035, 0.025, 0.012), Vec3::new(x, y, 0.506));
+                }
+            }
+            // Cable bundle rising from the cabinet head.
+            for x in [-0.18f32, 0.18] {
+                b.put(Trim, &m.thin_pipe, fr, Transform::from_xyz(x, 2.75, 0.14).with_scale(Vec3::new(0.7, 0.9, 0.7)));
+            }
+        }
+        TelecomKind::NoSignalBox => {
+            // RF status light box with a crossed-out signal icon.
+            put_box(b, Trim, m, fr, Vec3::new(0.95, 0.42, 0.14), Vec3::new(0.0, 2.55, 0.07));
+            put_box(b, Lamp, m, fr, Vec3::new(0.85, 0.32, 0.012), Vec3::new(0.0, 2.55, 0.146));
+            for k in 0..4 {
+                let h = 0.07 + k as f32 * 0.05;
+                put_box(b, Trim, m, fr, Vec3::new(0.06, h, 0.012), Vec3::new(-0.3 + k as f32 * 0.1, 2.43 + h * 0.5, 0.158));
+            }
+            b.put(Trim, &m.cube, fr, Transform::from_xyz(-0.15, 2.55, 0.165).with_rotation(Quat::from_rotation_z(0.85)).with_scale(Vec3::new(0.03, 0.36, 0.012)));
+            put_box(b, Accent, m, fr, Vec3::new(0.24, 0.05, 0.012), Vec3::new(0.24, 2.6, 0.158));
+            put_box(b, Accent, m, fr, Vec3::new(0.24, 0.05, 0.012), Vec3::new(0.24, 2.48, 0.158));
+            // Conduit down to the floor-edge cable duct.
+            b.put(Trim, &m.thin_pipe, fr, Transform::from_xyz(0.55, 1.24, 0.06).with_scale(Vec3::new(0.6, 2.2, 0.6)));
+            put_box(b, Trim, m, fr, Vec3::new(3.2, 0.12, 0.22), Vec3::new(0.0, 0.06, 0.11));
+            put_box(b, Plate, m, fr, Vec3::new(3.2, 0.02, 0.24), Vec3::new(0.0, 0.13, 0.12));
+            put_box(b, Accent, m, fr, Vec3::new(3.0, 0.015, 0.01), Vec3::new(0.0, 0.08, 0.225));
+        }
+    }
+}
+
+/// Bold angled relay dish + twin cross antennas near the top of the open-roof
+/// Atrium tower mast (all above [`CROWN_MIN_Y`]).
+fn build_tower_crown(g: &LevelGrid, m: &ArchMeshes, b: &mut ArchBatches) {
+    if !g.is_roof_open(g.tower) {
+        return;
+    }
+    let base = g.tower_world();
+    let to_spawn = g.spawn_world() - base;
+    let out = Vec3::new(to_spawn.x, 0.0, to_spawn.z).normalize_or(Vec3::X);
+    let side = Vec3::Y.cross(out).normalize_or(Vec3::Z);
+    let yaw = Quat::from_rotation_y(out.x.atan2(out.z));
+    let id = Transform::IDENTITY;
+    // Mounting collar + boom arm, sized to the rendered mast cylinder (`TOWER_MAST_RADIUS * 0.8`).
+    let mast_r = TOWER_MAST_RADIUS * 0.8;
+    let collar_y = base.y + 12.2;
+    for k in 0..4 {
+        let a = Quat::from_rotation_y(k as f32 * FRAC_PI_2);
+        b.put(
+            ArchSlot::Trim,
+            &m.cube,
+            &id,
+            Transform::from_translation(base.with_y(collar_y) + a * Vec3::Z * (mast_r + 0.04))
+                .with_rotation(a)
+                .with_scale(Vec3::new(mast_r * 2.0 + 0.24, 0.35, 0.16)),
+        );
+    }
+    let hub = base.with_y(collar_y + 0.4) + out * (mast_r + 1.3);
+    let arm_mid = base.with_y(collar_y + 0.2) + out * (mast_r + 0.6);
+    b.put(ArchSlot::Trim, &m.cube, &id, Transform::from_translation(arm_mid).with_rotation(yaw).with_scale(Vec3::new(0.22, 0.22, 1.4)));
+    // Dish aimed out and up (35 deg), feed boom along its axis + glowing horn.
+    let axis = (out * 0.82 + Vec3::Y * 0.57).normalize();
+    let dish_rot = Quat::from_rotation_arc(Vec3::Y, axis);
+    b.put(ArchSlot::Trim, &m.dish, &id, Transform::from_translation(hub + axis * 0.25).with_rotation(dish_rot));
+    b.put(ArchSlot::Accent, &m.cube, &id, Transform::from_translation(hub + axis * 0.52).with_rotation(dish_rot).with_scale(Vec3::new(3.3, 0.02, 0.05)));
+    b.put(ArchSlot::Trim, &m.thin_pipe, &id, Transform::from_translation(hub + axis * 1.05).with_rotation(dish_rot).with_scale(Vec3::new(0.7, 1.2, 0.7)));
+    b.put(ArchSlot::Accent, &m.cube, &id, Transform::from_translation(hub + axis * 1.7).with_rotation(dish_rot).with_scale(Vec3::splat(0.2)));
+    // Twin cross antennas on either flank of the mast.
+    for s in [-1.0f32, 1.0] {
+        let foot = base.with_y(collar_y - 0.6) + side * s * (mast_r + 0.45);
+        b.put(ArchSlot::Trim, &m.thin_pipe, &id, Transform::from_translation(foot + Vec3::Y * 1.9).with_scale(Vec3::new(0.8, 3.8, 0.8)));
+        b.put(
+            ArchSlot::Trim,
+            &m.cube,
+            &id,
+            Transform::from_translation(base.with_y(collar_y - 0.4) + side * s * (mast_r + 0.22))
+                .with_rotation(yaw)
+                .with_scale(Vec3::new(0.65, 0.14, 0.22)),
+        );
+        for (k, w) in [(0, 1.4f32), (1, 1.0), (2, 0.6)] {
+            let y = 2.0 + k as f32 * 0.7;
+            b.put(ArchSlot::Trim, &m.cube, &id, Transform::from_translation(foot + Vec3::Y * y).with_rotation(yaw).with_scale(Vec3::new(w, 0.06, 0.06)));
+            b.put(ArchSlot::Trim, &m.cube, &id, Transform::from_translation(foot + Vec3::Y * y).with_rotation(yaw).with_scale(Vec3::new(0.06, 0.06, w)));
+        }
+        b.put(ArchSlot::Accent, &m.cube, &id, Transform::from_translation(foot + Vec3::Y * 3.85).with_scale(Vec3::splat(0.16)));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hazard flow / accent pulse
 // ---------------------------------------------------------------------------
 
@@ -822,7 +1093,7 @@ mod tests {
     fn every_low_part_hugs_solid_geometry_and_overhead_stays_high() {
         for (floor, seed) in floors_and_seeds() {
             let g = generate_level(floor, seed);
-            let b = build_architecture(&g);
+            let b = build_architecture_base(&g, &ArchMeshes::new());
             for batch in [b.trim, b.accent, b.plate] {
                 let mesh = batch.build().expect("non-empty batch");
                 for p in positions(&mesh) {
@@ -897,10 +1168,13 @@ mod tests {
             let b = build_architecture(&g);
             let (t, a, p) = (b.trim.triangle_count(), b.accent.triangle_count(), b.plate.triangle_count());
             assert!(t > 0 && a > 0 && p > 0, "floor {floor} seed {seed}: all slots used");
+            let (sc, l) = (b.screen.triangle_count(), b.lamp.triangle_count());
+            assert!(sc > 0 && l > 0, "floor {floor} seed {seed}: telecom screens / LEDs placed");
+            assert!(sc * 8 < MAX_EMISSIVE_TRIANGLES && l * 8 < MAX_EMISSIVE_TRIANGLES, "floor {floor}: {sc} screen / {l} lamp triangles");
             worst_accent = worst_accent.max(a);
             assert!(a * 8 < MAX_EMISSIVE_TRIANGLES, "floor {floor} seed {seed}: {a} emissive accent triangles");
             assert!(t < 250_000, "floor {floor}: {t} trim triangles");
-            for batch in [b.trim, b.accent, b.plate] {
+            for batch in [b.trim, b.accent, b.plate, b.screen, b.lamp] {
                 let mesh = batch.build().unwrap();
                 assert!(rt_mesh_convertible(&mesh));
                 assert!(matches!(mesh.indices(), Some(bevy::mesh::Indices::U32(_))));
@@ -937,6 +1211,107 @@ mod tests {
         // Ramps and pits get no pilasters / skirting.
         let g = LevelGrid::from_ascii(&["#####", "#E~.#", "#####"]);
         assert!(pilaster_slots(&g).iter().all(|(f, _)| f.cell == IVec2::new(3, 1)));
+    }
+
+    #[test]
+    fn telecom_props_are_flush_compact_and_rt_ready_in_their_face_frame() {
+        let m = ArchMeshes::new();
+        for kind in [TelecomKind::PcStation, TelecomKind::WallRack, TelecomKind::NoSignalBox] {
+            for variant in 0..3u8 {
+                let mut b = ArchBatches::default();
+                build_telecom_prop(&mut b, &m, &Transform::IDENTITY, kind, variant);
+                let mut n = 0;
+                for batch in [b.trim, b.accent, b.plate, b.screen, b.lamp] {
+                    let Some(mesh) = batch.build() else { continue };
+                    assert!(rt_mesh_convertible(&mesh), "{kind:?}");
+                    assert!(matches!(mesh.indices(), Some(bevy::mesh::Indices::U32(_))));
+                    assert!(mesh.contains_attribute(Mesh::ATTRIBUTE_UV_0));
+                    for p in positions(&mesh) {
+                        n += 1;
+                        assert!(p.z >= -1e-4 && p.z <= TELECOM_MAX_DEPTH + 1e-4, "{kind:?}: protrudes {} m", p.z);
+                        assert!(p.x.abs() <= TELECOM_HALF_WIDTH + 1e-4, "{kind:?}: width {}", p.x);
+                        assert!(p.y >= -1e-4 && p.y <= TELECOM_MAX_HEIGHT + 1e-4, "{kind:?}: height {}", p.y);
+                    }
+                }
+                assert!(n > 0, "{kind:?} builds geometry");
+            }
+        }
+    }
+
+    #[test]
+    fn telecom_props_hug_straight_walls_and_never_cramp_the_lanes() {
+        let mut total = 0;
+        let m = ArchMeshes::new();
+        for (floor, seed) in floors_and_seeds() {
+            let g = generate_level(floor, seed);
+            let props = plan_telecom_props(&g);
+            assert_eq!(props, plan_telecom_props(&generate_level(floor, seed)), "deterministic");
+            assert!(props.len() <= telecom_prop_target(floor));
+            total += props.len();
+            let walls = plan_wall_props(&g);
+            for (i, p) in props.iter().enumerate() {
+                let (c, side, perp) = (p.face.cell, p.face.side, p.face.perp());
+                assert!(telecom_slot_ok(&g, p.face));
+                // Straight solid wall behind, open lane in front, no doorway / corner.
+                assert!(g.cell(c + side).is_wall() && g.cell(c + side + perp).is_wall() && g.cell(c + side - perp).is_wall());
+                assert!(!g.cell(c + perp).is_wall() && !g.cell(c - perp).is_wall() && !g.cell(c - side).is_wall());
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        assert!(!matches!(g.cell(c + IVec2::new(dx, dz)), Cell::Ramp { .. } | Cell::HazardPit), "prop {c} beside a ramp / pit");
+                    }
+                }
+                assert!((c - g.spawn).abs().element_sum() >= 3, "spawn bay stays clear");
+                for q in g.jammers.iter().copied().chain(g.barrels.iter().copied()).chain(g.jump_pads.iter().map(|p| p.cell)) {
+                    assert!((q - c).abs().max_element() >= 2, "prop {c} crowds {q}");
+                }
+                for w in &walls {
+                    assert!((w.face.cell - c).abs().max_element() >= 2, "prop {c} stacks on a wall prop");
+                }
+                for o in &props[..i] {
+                    assert!((o.face.cell - c).abs().element_sum() >= 3, "props spaced");
+                }
+                // World-space clearance: every vertex within 0.55 m of its
+                // backing wall plane, inside its own cell, out of the lane.
+                let mut b = ArchBatches::default();
+                build_telecom_prop(&mut b, &m, &p.face.frame(0.0), p.kind, p.variant);
+                let inward = p.face.inward();
+                let plane = p.face.anchor();
+                for batch in [b.trim, b.accent, b.plate, b.screen, b.lamp] {
+                    let Some(mesh) = batch.build() else { continue };
+                    for v in positions(&mesh) {
+                        let depth = (v - plane).dot(inward);
+                        assert!((-1e-3..=TELECOM_MAX_DEPTH + 1e-3).contains(&depth), "floor {floor} seed {seed}: {v} is {depth} m off the wall");
+                        assert_eq!(g.world_to_cell(v + inward * 2e-3), c, "vertex {v} leaves its cell {c}");
+                        // A 2-cell (8 m) lane keeps >= 7.45 m of clear width.
+                        assert!(CELL_SIZE * 2.0 - depth >= 7.45);
+                    }
+                }
+            }
+        }
+        assert!(total >= floors_and_seeds().len() * 4, "telecom props are actually placed ({total})");
+    }
+
+    #[test]
+    fn atrium_tower_wears_a_relay_dish_crown_high_above_play() {
+        for (floor, seed) in [(1u32, 1234u64), (3, 99), (5, 2026)] {
+            let g = generate_level(floor, seed);
+            assert!(g.is_roof_open(g.tower));
+            let m = ArchMeshes::new();
+            let mut b = ArchBatches::default();
+            build_tower_crown(&g, &m, &mut b);
+            let base = g.tower_world();
+            let mut n = 0;
+            for batch in [b.trim, b.accent] {
+                let mesh = batch.build().expect("crown parts");
+                assert!(rt_mesh_convertible(&mesh));
+                for v in positions(&mesh) {
+                    n += 1;
+                    assert!(v.y >= base.y + CROWN_MIN_Y, "crown vertex {v} hangs into play space");
+                    assert!(Vec2::new(v.x - base.x, v.z - base.z).length() < 4.0, "crown stays on the mast");
+                }
+            }
+            assert!(n > 100);
+        }
     }
 
     #[test]

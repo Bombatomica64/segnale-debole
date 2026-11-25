@@ -75,10 +75,15 @@ pub enum SfxEvent {
     UiTick,
     /// Short menu confirm blip. Throttled by [`UiSfxGate`].
     UiConfirm,
+    /// Diegetic phone notification: crisp, restrained double-chirp (ambient
+    /// carrier texts, deploy "SEARCHING...", incoming boss call).
+    PhonePing,
+    /// Random kill Fatality: chunky sub thump + bone crunch + bright snap.
+    Fatality,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 34] = [
+    pub const ALL: [SfxEvent; 36] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -113,6 +118,8 @@ impl SfxEvent {
         SfxEvent::PitRescue,
         SfxEvent::UiTick,
         SfxEvent::UiConfirm,
+        SfxEvent::PhonePing,
+        SfxEvent::Fatality,
     ];
 
     /// Warnings that must always be heard keep their direction but are pulled
@@ -143,6 +150,11 @@ impl SfxEvent {
             SfxEvent::PitRescue => 0.6,
             SfxEvent::UiTick => 0.18,
             SfxEvent::UiConfirm => 0.3,
+            // Milestone 30: notification chirp sits politely under combat;
+            // the Fatality crunch lands with kills (often beside a mortar
+            // blast), so it stays below RocketExplode to keep -1 dBFS.
+            SfxEvent::PhonePing => 0.22,
+            SfxEvent::Fatality => 0.3,
             _ => 0.75,
         }
     }
@@ -644,6 +656,31 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
             let f = if ts < 0.045 { 880.0 } else { 1318.5 };
             (square(o.step(f)) * 0.3 + tri(o2.step(f * 0.5)) * 0.2) * env(t, 0.03, 1.4)
         }),
+        SfxEvent::PhonePing => render(0.32, |ts, t, _| {
+            // Two short sine chirps (B6 then E7), each with its own fast
+            // attack / decay, plus a soft octave-down body.
+            let (start, f) = if ts < 0.13 { (0.0, 1975.5) } else { (0.13, 2637.0) };
+            let local = ts - start;
+            let chirp = (o.step(f * (1.0 + 0.04 * decay(local, 40.0))) * TAU).sin();
+            let body = tri(o2.step(f * 0.5)) * 0.25;
+            let gate = (local / 0.006).min(1.0) * decay(local, 22.0);
+            (chirp * 0.7 + body) * gate * env(t, 0.01, 0.6)
+        }),
+        SfxEvent::Fatality => {
+            let mut hold = 0.0f32;
+            render(0.58, move |ts, t, n| {
+                // Sub thump with a falling pitch, sample-and-hold bone crunch,
+                // and a bright snap transient on top.
+                let thump = (o.step(62.0 + 120.0 * decay(ts, 18.0)) * TAU).sin() * decay(ts, 6.5);
+                if ((ts * 2400.0) as u32).is_multiple_of(7) {
+                    hold = n.next();
+                }
+                let crunch = lp.run(hold, 0.5) * decay((ts - 0.02).max(0.0), 14.0) * 0.8;
+                let snap = if ts < 0.018 { n.next() * 0.9 * (1.0 - ts / 0.018) } else { 0.0 };
+                let ring = saw(o2.step(196.0 - 60.0 * t)) * 0.12 * decay(ts, 9.0);
+                (thump * 0.95 + crunch + snap + ring) * env(t, 0.004, 1.2)
+            })
+        }
     }
 }
 
@@ -1336,7 +1373,7 @@ mod tests {
 
     #[test]
     fn rocket_sfx_are_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 34);
+        assert_eq!(SfxEvent::ALL.len(), 36);
         let fire = synthesize_wav(SfxEvent::RocketFire);
         let boom = synthesize_wav(SfxEvent::RocketExplode);
         assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
@@ -1350,7 +1387,7 @@ mod tests {
 
     #[test]
     fn milestone13_sfx_are_valid_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 34);
+        assert_eq!(SfxEvent::ALL.len(), 36);
         let news = [SfxEvent::PhaseBlink, SfxEvent::SniperLock, SfxEvent::BossShield];
         for sfx in news {
             assert!(SfxEvent::ALL.contains(&sfx));
@@ -1810,6 +1847,73 @@ mod tests {
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[36..40], b"data");
         bytes[44..].as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c) as f32 / i16::MAX as f32).collect()
+    }
+
+    /// Generalized worst-case mix: the Boss Overdrive bed at every loop phase
+    /// plus `cues` (`(event, close_spatial)`), landing together and with
+    /// 0-20 ms staggers per cue. Returns `(peak, clipped samples)`.
+    fn worst_case_mix_of(cues: &[(SfxEvent, bool)]) -> (f32, usize) {
+        let full = UserSettings { audio_master_volume: 1.0, audio_muted: false, ..default() };
+        let music = MusicCues { state: AppState::Playing, bars: 5, boss_active: true, boss_overdrive: true, ..default() };
+        let weights = target_music_weights(music);
+        let stems: Vec<(Vec<f32>, f32)> =
+            MusicLayer::ALL.iter().map(|l| (decode_wav(&synthesize_music_wav(*l)), effective_music_volume(weights[l.index()], &full))).collect();
+        let loop_len = stems[0].0.len();
+        let bed: Vec<f32> = (0..loop_len).map(|i| stems.iter().map(|(s, g)| s[i] * g).sum()).collect();
+        let bed_hi = bed.iter().copied().fold(0.0f32, f32::max);
+        let bed_lo = bed.iter().copied().fold(0.0f32, f32::min);
+        let close = spatial_distance_fade(2.0, SPATIAL_MAX_DIST) * spatial_rolloff(2.0);
+        let sfx: Vec<(Vec<f32>, f32)> =
+            cues.iter().map(|(e, near)| (decode_wav(&synthesize_wav(*e)), effective_sfx_volume(*e, &full) * if *near { close } else { 1.0 })).collect();
+        let len = sfx.iter().map(|(s, _)| s.len()).max().unwrap();
+        let (mut peak, mut clipped) = (0.0f32, 0usize);
+        // Every cue together, then each cue alone shifted by 5, 10 and 20 ms.
+        let mut staggers: Vec<Vec<usize>> = vec![vec![0; cues.len()]];
+        for k in 0..cues.len() {
+            for d in [220usize, 441, 882] {
+                let mut st = vec![0; cues.len()];
+                st[k] = d;
+                staggers.push(st);
+            }
+        }
+        for st in &staggers {
+            for i in 0..len + 882 {
+                let fx: f32 = sfx.iter().zip(st).map(|((s, g), d)| i.checked_sub(*d).and_then(|j| s.get(j)).map_or(0.0, |x| x * g)).sum();
+                let v = (fx + bed_hi).abs().max((fx + bed_lo).abs());
+                peak = peak.max(v);
+                clipped += (v >= 1.0) as usize;
+            }
+        }
+        (peak, clipped)
+    }
+
+    #[test]
+    fn milestone30_phone_ping_and_fatality_are_distinct_and_keep_headroom() {
+        for sfx in [SfxEvent::PhonePing, SfxEvent::Fatality] {
+            assert!(SfxEvent::ALL.contains(&sfx));
+            let w = synthesize_wav(sfx);
+            assert_eq!(w, synthesize_wav(sfx), "{sfx:?} deterministic");
+            for other in SfxEvent::ALL.into_iter().filter(|o| *o != sfx) {
+                assert_ne!(w, synthesize_wav(other), "{sfx:?} vs {other:?}");
+            }
+        }
+        // The ping is a restrained short chirp; the fatality a short heavy hit.
+        let secs = |e| (synthesize_wav(e).len() - 44) as f32 / 2.0 / SAMPLE_RATE as f32;
+        assert!(secs(SfxEvent::PhonePing) < 0.4 && secs(SfxEvent::Fatality) < 0.7);
+        assert!(SfxEvent::PhonePing.volume() < SfxEvent::Pickup.volume());
+        assert!(SfxEvent::Fatality.volume() <= SfxEvent::RocketExplode.volume());
+        // Worst case: a mortar kill fatality right beside a jammer while a
+        // notification lands, over the full Boss Overdrive bed.
+        let (peak, clipped) = worst_case_mix_of(&[
+            (SfxEvent::JammerHum, true),
+            (SfxEvent::RocketExplode, false),
+            (SfxEvent::Fatality, false),
+            (SfxEvent::PhonePing, false),
+        ]);
+        let dbfs = 20.0 * peak.log10();
+        println!("milestone 30 worst-case mix peak {peak:.4} ({dbfs:.2} dBFS), clipped samples {clipped}");
+        assert_eq!(clipped, 0);
+        assert!(peak <= 0.89, "peak {peak:.4} ({dbfs:.2} dBFS) must stay <= -1 dBFS");
     }
 
     /// Worst-case simultaneous combat mix at full master volume: the four

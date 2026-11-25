@@ -283,6 +283,8 @@ pub struct Enemy {
     pub stagger_timer: f32,
     /// Walk-cycle phase (radians), advanced proportionally to ground speed.
     pub stride_phase: f32,
+    /// How the killing blow landed (Milestone 30 fatalities; set by weapons).
+    pub kill_cause: crate::fatality::KillCause,
 }
 
 impl Enemy {
@@ -322,6 +324,7 @@ impl Enemy {
             stagger_dir: Vec2::ZERO,
             stagger_timer: 0.0,
             stride_phase: rng.random_range(0.0..TAU),
+            kill_cause: crate::fatality::KillCause::Generic,
         }
     }
 
@@ -2865,8 +2868,11 @@ fn enemy_deaths(
     enemies: Query<(Entity, &Enemy, &Transform, Option<&PingMarked>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut decals: ResMut<DecalQueue>,
+    (mut fatal, mut punch, grid): (ResMut<crate::fatality::FatalityState>, ResMut<crate::fx::CameraPunch>, Option<Res<LevelGrid>>),
 ) {
     let mut rng = rand::rng();
+    // Player motion for style callouts (airborne / dashing / speed).
+    let (airborne, speed) = players.single().map_or((false, 0.0), |p| (!p.grounded || p.dash_timer > 0.0, Vec2::new(p.velocity.x, p.velocity.z).length()));
     for (entity, e, tf, marked) in &enemies {
         if e.is_alive() {
             continue;
@@ -2909,6 +2915,28 @@ fn enemy_deaths(
             continue;
         }
         feed.hit(true);
+        // Milestone 30: random fatality (guaranteed on point-blank overkills,
+        // direct mortar hits and the Carrier Daemon), else a style callout.
+        let boss = e.kind == EnemyKind::CarrierDaemon;
+        match fatal.roll(e.kill_cause, boss, rng.random(), rng.random()) {
+            Some(kind) => {
+                let dir = Vec3::new(e.stagger_dir.x, 0.0, e.stagger_dir.y);
+                let wall = grid
+                    .as_deref()
+                    .filter(|_| kind == crate::fatality::FatalityKind::NoService && dir != Vec3::ZERO)
+                    .and_then(|g| raycast_grid(g, center, dir.normalize(), 9.0))
+                    .map(|h| (h.point, h.normal));
+                crate::fatality::spawn_fatality_fx(&mut commands, &fx, &mut materials, &mut decals, kind, center, feet, dir, wall);
+                sfx.play_at(SfxEvent::Fatality, center);
+                feed.toast(kind.callout(), kind.color());
+                punch.kick(if boss { 1.0 } else { 0.7 });
+            }
+            None => {
+                if let Some(style) = fatal.style(airborne, speed, signal.bars) {
+                    feed.toast(format!("STYLE // {}", style.text()), Color::srgb(0.35, 0.95, 1.0));
+                }
+            }
+        }
         if e.kind == EnemyKind::CarrierDaemon {
             feed.toast(crate::boss::BOSS_DEATH_TEXT, Color::srgb(1.0, 0.8, 0.3));
             feed.alert(crate::boss::BOSS_DEATH_TEXT, Color::srgb(1.0, 0.8, 0.3), 3.5);
@@ -3066,6 +3094,15 @@ impl Plugin for EnemiesPlugin {
                     .in_set(GameSet::Combat)
                     .run_if(resource_exists::<LevelGrid>),
             )
+            .init_resource::<crate::fatality::FatalityState>()
+            .add_systems(Startup, crate::fatality::prewarm_fatality_fades)
+            .add_systems(OnEnter(crate::state::AppState::MainMenu), crate::fatality::reset_fatality_state)
+            .add_systems(OnEnter(crate::state::AppState::Loadout), crate::fatality::reset_fatality_state)
+            .add_systems(OnEnter(crate::state::AppState::ContractsFeats), crate::fatality::reset_fatality_state)
+            .add_systems(OnEnter(crate::state::AppState::Leaderboard), crate::fatality::reset_fatality_state)
+            .add_systems(OnEnter(crate::state::AppState::Compendium), crate::fatality::reset_fatality_state)
+            .add_systems(OnEnter(crate::state::AppState::Playing), crate::fatality::reset_fatality_on_fresh_run)
+            .add_systems(Update, crate::fatality::tick_fatality_state.in_set(GameSet::World))
             .add_systems(Update, enemy_deaths.in_set(GameSet::Combat).after(enemy_visuals).after(crate::weapons::CombatDamage));
     }
 }

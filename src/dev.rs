@@ -1,7 +1,9 @@
 //! Developer hooks driven by environment variables (no effect when unset):
 //! - `SEGNALE_AUTOSTART=1`: skip the main menu and start a run immediately.
 //! - `SEGNALE_SHOTS=<dir>`: (implies autostart) capture `spawn.png`, then
-//!   teleport near the Signal Tower and capture `tower.png`, then a jammer
+//!   teleport near the Signal Tower and capture `tower.png`, the Milestone 30
+//!   wall-flush telecom props (`props.png`) and the Atrium relay dish crown
+//!   (`atrium_dish.png`), then a jammer
 //!   (`jammer.png`), the SOS uplink HUD (`uplink.png`), a staged firefight with
 //!   all four demons and the dual-wield viewmodels (`combat.png`), and finally
 //!   the App Store upgrade screen (`upgrades.png`), then jumps to the Floor 5
@@ -218,9 +220,8 @@ fn screenshot_tour(
         info!("dev: screenshot -> {path}");
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     };
-    let mut place = |cell: IVec2, look_at: Vec3| {
+    let mut place_at = |pos: Vec3, look_at: Vec3| {
         if let Ok((mut p, mut tf)) = player.single_mut() {
-            let pos = grid.cell_center(cell);
             tf.translation = pos;
             let d = look_at - pos;
             p.yaw = yaw_facing(Vec2::new(d.x, d.z));
@@ -241,12 +242,41 @@ fn screenshot_tour(
             cfg.stage = 1;
         }
         (1, t) if t > 5.0 => {
-            place(tower_view_cell, grid.tower_world() + Vec3::Y * 4.0);
+            place_at(grid.cell_center(tower_view_cell), grid.tower_world() + Vec3::Y * 4.0);
             cfg.stage = 2;
         }
         (2, t) if t > 8.0 => {
             shot(&mut commands, "tower.png");
+            cfg.stage = 100;
+        }
+        // Milestone 30: wall-flush telecom props down a wide lane, then the
+        // Atrium relay dish crown (the tour clock rewinds afterwards so the
+        // original stages keep their timing).
+        (100, t) if t > 8.6 => {
+            let props = crate::architecture::plan_telecom_props(&grid);
+            let pick = props.iter().find(|p| p.kind == crate::architecture::TelecomKind::PcStation).or(props.first());
+            if let Some(p) = pick {
+                // ~3.5 m out from the prop, angled down the lane.
+                let along = Vec3::new(p.face.perp().x as f32, 0.0, p.face.perp().y as f32);
+                let at = p.face.anchor() + p.face.inward() * 0.3 + Vec3::Y * 1.0;
+                let stand = p.face.anchor() + p.face.inward() * 3.0 - along * 2.2;
+                let floor = sample_floor_height(&grid, stand.x, stand.z).unwrap_or(0.0);
+                place_at(stand.with_y(floor), at);
+            }
+            cfg.stage = 101;
+        }
+        (101, t) if t > 10.6 => {
+            shot(&mut commands, "props.png");
+            cfg.stage = 102;
+        }
+        (102, t) if t > 11.2 => {
+            place_at(grid.cell_center(tower_view_cell), grid.tower_world() + Vec3::Y * 13.0);
+            cfg.stage = 103;
+        }
+        (103, t) if t > 13.2 => {
+            shot(&mut commands, "atrium_dish.png");
             cfg.stage = 3;
+            cfg.timer = 8.1;
         }
         (3, t) if t > 9.0 => {
             let j = grid.jammers[0];
@@ -255,7 +285,7 @@ fn screenshot_tour(
                 .flat_map(|o| [j + o * 2, j + o])
                 .find(|c| matches!(grid.cell(*c), crate::level::Cell::Floor { .. }) && grid.is_reachable(*c, j))
                 .unwrap_or(j);
-            place(near, grid.cell_center(j) + Vec3::Y * 1.5);
+            place_at(grid.cell_center(near), grid.cell_center(j) + Vec3::Y * 1.5);
             cfg.stage = 4;
         }
         (4, t) if t > 12.0 => {
@@ -268,7 +298,7 @@ fn screenshot_tour(
                 .map(|o| grid.tower + o)
                 .find(|c| !grid.cell(*c).is_wall())
                 .unwrap_or(tower_view_cell);
-            place(ring_cell, grid.tower_world() + Vec3::Y * 3.0);
+            place_at(grid.cell_center(ring_cell), grid.tower_world() + Vec3::Y * 3.0);
             *ext = ExtractionState::Uploading {
                 progress: 0.42,
                 duration: 28.0,
@@ -310,7 +340,7 @@ fn screenshot_tour(
                 let to = start - pos;
                 commands.entity(e).insert(Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_facing(Vec2::new(to.x, to.z)))));
             }
-            place(from, start + fwd * 12.0 + side * 1.2 + Vec3::Y * 1.4);
+            place_at(grid.cell_center(from), start + fwd * 12.0 + side * 1.2 + Vec3::Y * 1.4);
             ws.current = Weapon::Shotgun;
             cfg.stage = 8;
         }
@@ -345,7 +375,7 @@ fn screenshot_tour(
                 commands.entity(e).insert(Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw_facing(Vec2::new(to.x, to.z)))));
             }
             commands.insert_resource(DevFreezeAi);
-            place(grid.world_to_cell(start), boss_arena_point(&grid, 14.0, 1.0).with_y(3.2));
+            place_at(grid.cell_center(grid.world_to_cell(start)), boss_arena_point(&grid, 14.0, 1.0).with_y(3.2));
             if let Ok((mut p, _)) = player.single_mut() {
                 p.ammo_rockets = p.max_rockets;
             }

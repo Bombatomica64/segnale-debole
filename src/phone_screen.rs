@@ -16,8 +16,10 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::apps::{app_block_reason, overload_cooldown, ping_cooldown, PhoneApps, OVERLOAD_MIN_BARS, PING_MIN_BARS};
 use crate::extraction::ExtractionState;
+use crate::audio::{SfxEvent, SfxQueue};
+use crate::fx::HudFeed;
 use crate::signal::SignalState;
-use crate::state::{GameSet, PlayerModifiers};
+use crate::state::{AppState, GameSet, PlayerModifiers, RunMode, RunStats};
 
 pub const SCREEN_W: u32 = 160;
 pub const SCREEN_H: u32 = 240;
@@ -66,6 +68,8 @@ pub struct PhoneScreenSnapshot {
     /// Controller is the active input: tiles read `LT PNG` / `RB EMP` and the
     /// tower prompt `PRESS [X]` instead of `RMB` / `Q` / `[E]`.
     pub pad_prompts: bool,
+    /// Active diegetic notification banner (drawn over the radar panel).
+    pub notif: Option<(NotifKind, &'static str)>,
 }
 
 impl Default for PhoneScreenSnapshot {
@@ -95,6 +99,7 @@ impl Default for PhoneScreenSnapshot {
             spoof_active: false,
             hijack_boost: false,
             pad_prompts: false,
+            notif: None,
         }
     }
 }
@@ -108,8 +113,21 @@ pub struct PhoneScreenPlugin;
 
 impl Plugin for PhoneScreenPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PreStartup, init_phone_screen_texture)
-            .add_systems(Update, update_phone_screen.in_set(GameSet::Ui));
+        app.init_resource::<PhoneNotifState>()
+            .add_systems(PreStartup, init_phone_screen_texture)
+            .add_systems(OnEnter(AppState::Playing), deploy_cold_open)
+            .add_systems(Update, (drive_phone_notifs, update_phone_screen).chain().in_set(GameSet::Ui));
+        for s in [
+            AppState::MainMenu,
+            AppState::Loadout,
+            AppState::ContractsFeats,
+            AppState::Leaderboard,
+            AppState::Compendium,
+            AppState::GameOver,
+            AppState::Victory,
+        ] {
+            app.add_systems(OnEnter(s), reset_phone_notifs);
+        }
     }
 }
 
@@ -140,6 +158,7 @@ fn update_phone_screen(
     mods: Res<PlayerModifiers>,
     extraction: Res<ExtractionState>,
     mode: Option<Res<crate::gamepad::InputMode>>,
+    notifs: Res<PhoneNotifState>,
     mut screen: ResMut<PhoneScreenTexture>,
     mut images: ResMut<Assets<Image>>,
     (mut frame, mut shown): (Local<Vec<u8>>, Local<Vec<u8>>),
@@ -179,6 +198,7 @@ fn update_phone_screen(
         spoof_active: apps.spoof_active(),
         hijack_boost: signal.hotspot_boosted,
         pad_prompts: mode.is_some_and(|m| m.is_pad()),
+        notif: notifs.banner(),
     };
     // Render off-texture; only touch the image (which marks it for GPU
     // re-upload) when the pixels actually differ from the last upload.
@@ -193,6 +213,342 @@ fn update_phone_screen(
     if let Some(data) = img.data.as_mut() {
         data.copy_from_slice(&frame);
         shown.clone_from(&frame);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 30: diegetic phone notifications
+// ---------------------------------------------------------------------------
+
+/// Ambient carrier texts: one per climb back to 2+ bars, never repeated in a run.
+pub const AMBIENT_NOTIFS: [&str; 8] = [
+    "ROAMING: HELL IS OUTSIDE EU ZONE (19.99 EUR/MB)",
+    "MOM (14 MISSED): HAI MANGIATO?",
+    "TIM-MARS: 80% OF YOUR 5G DATA USED",
+    "UAC-HR: Q3 FIRE SAFETY TRAINING OVERDUE",
+    "2% BATTERY // LOW POWER? [SHOOTING DEMONS]",
+    "WIFI: HELL_GUEST_5G (NO INTERNET)",
+    "CARRIER UPDATE: RESTART PHONE NOW",
+    "DELIVEROO MARS: RIDER LOST IN SECTOR 7",
+];
+/// Carrier Daemon arrival: the phone rings.
+pub const INCOMING_CALL_TEXT: &str = "INCOMING CALL // SPAM LIKELY";
+/// Carrier Daemon killed.
+pub const CALL_DECLINED_TEXT: &str = "CALL DECLINED.";
+/// Deploy cold open flash.
+pub const SEARCHING_TEXT: &str = "SEARCHING...";
+/// Minimum seconds between two ambient carrier texts.
+pub const AMBIENT_COOLDOWN: f32 = 14.0;
+/// Quiet period after a deploy before the first ambient text may land.
+pub const DEPLOY_QUIET_SECS: f32 = 6.0;
+/// Bars a climb must reach (from below) to trigger an ambient text.
+pub const NOTIF_MIN_BARS: u8 = 2;
+/// On-screen seconds per banner kind.
+pub const AMBIENT_SECS: f32 = 4.5;
+pub const CALL_SECS: f32 = 6.0;
+pub const DECLINED_SECS: f32 = 3.5;
+pub const SEARCHING_SECS: f32 = 1.6;
+/// Characters per line of the 1x banner body (140 px / 6 px glyphs).
+pub const BANNER_LINE_CHARS: usize = 23;
+/// HUD toast colors for phone texts (cyan ambient, amber call, acid-green decline).
+pub const NOTIF_CYAN: Color = Color::srgb(0.35, 0.95, 1.0);
+pub const NOTIF_AMBER: Color = Color::srgb(1.0, 0.72, 0.18);
+pub const NOTIF_ACID: Color = Color::srgb(0.55, 1.0, 0.25);
+
+/// Floor sector subtitles for the deploy cold open (Floors 1-5).
+pub const SECTOR_SUBTITLES: [&str; 5] = [
+    "SECTOR 01 // BASEMENT GARAGE",
+    "SECTOR 02 // SERVER ANNEX",
+    "SECTOR 03 // COOLING CORE",
+    "SECTOR 04 // BLACKOUT VAULT",
+    "SECTOR 05 // ROOFTOP RELAY",
+];
+
+/// Deploy subtitle of `floor` (Endless floors get an Overdrive sector tag).
+pub fn sector_subtitle(floor: u32) -> String {
+    match floor {
+        1..=5 => SECTOR_SUBTITLES[floor as usize - 1].to_string(),
+        f => format!("SECTOR {f:02} // OVERDRIVE DEPTHS"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifKind {
+    /// Cyan carrier / family / HR text.
+    Ambient,
+    /// Pulsing red / amber Carrier Daemon call.
+    IncomingCall,
+    /// Acid-green boss kill.
+    CallDeclined,
+    /// Deploy cold open "SEARCHING..." flash.
+    Searching,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhoneNotif {
+    pub kind: NotifKind,
+    pub text: &'static str,
+    pub timer: f32,
+}
+
+/// Non-blocking diegetic notification state (one banner at a time, ambient
+/// texts rate limited and never repeated within a run). Reset on every run
+/// start / teardown.
+#[derive(Resource, Debug, Clone, PartialEq)]
+pub struct PhoneNotifState {
+    pub active: Option<PhoneNotif>,
+    /// Seconds until the next ambient text may land.
+    pub cooldown: f32,
+    /// Shuffled ambient order for this run, consumed front to back.
+    order: [u8; 8],
+    next: usize,
+    prev_bars: u8,
+    boss_active: bool,
+    boss_kills: u32,
+    /// `(run seed, floor)` of the last deploy cold open.
+    pub deployed: Option<(u64, u32)>,
+    /// Ambient texts already shown this run (in order).
+    pub sent: Vec<&'static str>,
+}
+
+impl Default for PhoneNotifState {
+    fn default() -> Self {
+        PhoneNotifState::for_seed(0)
+    }
+}
+
+impl PhoneNotifState {
+    /// Fresh state with the ambient order shuffled deterministically by `seed`.
+    pub fn for_seed(seed: u64) -> Self {
+        let mut order = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        let mut x = seed ^ 0x9E37_79B9_7F4A_7C15;
+        for i in (1..order.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            order.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        PhoneNotifState {
+            active: None,
+            cooldown: 0.0,
+            order,
+            next: 0,
+            prev_bars: 0,
+            boss_active: false,
+            boss_kills: 0,
+            deployed: None,
+            sent: Vec::new(),
+        }
+    }
+
+    /// Banner currently shown on the phone.
+    pub fn banner(&self) -> Option<(NotifKind, &'static str)> {
+        self.active.map(|n| (n.kind, n.text))
+    }
+
+    fn show(&mut self, kind: NotifKind, text: &'static str, secs: f32) {
+        self.active = Some(PhoneNotif { kind, text, timer: secs });
+    }
+
+    /// Advance timers by `dt` seconds.
+    pub fn tick(&mut self, dt: f32) {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        self.cooldown = (self.cooldown - dt).max(0.0);
+        if let Some(n) = &mut self.active {
+            n.timer -= dt;
+            if n.timer <= 0.0 {
+                self.active = None;
+            }
+        }
+    }
+
+    /// Feed this frame's bars; returns the ambient text that just landed (if
+    /// any): a climb from `< 2` to `>= 2` bars, off cooldown, with an unused
+    /// text left and no boss call on screen.
+    pub fn on_bars(&mut self, bars: u8) -> Option<&'static str> {
+        let climbed = self.prev_bars < NOTIF_MIN_BARS && bars >= NOTIF_MIN_BARS;
+        self.prev_bars = bars;
+        let call_up = matches!(self.active, Some(PhoneNotif { kind: NotifKind::IncomingCall | NotifKind::CallDeclined, .. }));
+        if !climbed || self.cooldown > 0.0 || call_up || self.next >= self.order.len() {
+            return None;
+        }
+        let text = AMBIENT_NOTIFS[self.order[self.next] as usize];
+        self.next += 1;
+        self.cooldown = AMBIENT_COOLDOWN;
+        self.sent.push(text);
+        self.show(NotifKind::Ambient, text, AMBIENT_SECS);
+        Some(text)
+    }
+
+    /// Carrier Daemon spawned: the banner switches to the incoming call.
+    pub fn incoming_call(&mut self) -> &'static str {
+        self.show(NotifKind::IncomingCall, INCOMING_CALL_TEXT, CALL_SECS);
+        INCOMING_CALL_TEXT
+    }
+
+    /// Carrier Daemon killed.
+    pub fn call_declined(&mut self) -> &'static str {
+        self.show(NotifKind::CallDeclined, CALL_DECLINED_TEXT, DECLINED_SECS);
+        CALL_DECLINED_TEXT
+    }
+
+    /// Deploy cold open: brief "SEARCHING..." flash and a quiet period.
+    pub fn searching(&mut self) {
+        self.show(NotifKind::Searching, SEARCHING_TEXT, SEARCHING_SECS);
+        self.cooldown = self.cooldown.max(DEPLOY_QUIET_SECS);
+        self.prev_bars = 0;
+    }
+
+    /// Feed the boss HUD flag + Carrier Daemon kill count; returns the boss
+    /// banner that just switched on (call on spawn, decline on a kill).
+    pub fn on_boss(&mut self, active: bool, daemon_kills: u32) -> Option<NotifKind> {
+        let mut out = None;
+        if active && !self.boss_active {
+            self.incoming_call();
+            out = Some(NotifKind::IncomingCall);
+        }
+        if daemon_kills > self.boss_kills {
+            self.call_declined();
+            out = Some(NotifKind::CallDeclined);
+        }
+        self.boss_active = active;
+        self.boss_kills = daemon_kills;
+        out
+    }
+}
+
+/// Greedy word wrap of a banner body into lines of at most `width` chars
+/// (over-long words are hard-split at UTF-8 character boundaries).
+pub fn wrap_banner(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_chars = 0usize;
+    for mut word in text.split_whitespace() {
+        let mut word_chars = word.chars().count();
+        while word_chars > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                cur_chars = 0;
+            }
+            let split_byte = word.char_indices().nth(width).map_or(word.len(), |(i, _)| i);
+            let (a, b) = word.split_at(split_byte);
+            lines.push(a.to_string());
+            word = b;
+            word_chars -= width;
+        }
+        if cur.is_empty() {
+            cur.push_str(word);
+            cur_chars = word_chars;
+        } else if cur_chars + 1 + word_chars <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_chars += 1 + word_chars;
+        } else {
+            lines.push(std::mem::replace(&mut cur, word.to_string()));
+            cur_chars = word_chars;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+fn reset_phone_notifs(mut notifs: ResMut<PhoneNotifState>) {
+    *notifs = PhoneNotifState::default();
+}
+
+/// Deploy cold open on a fresh floor (not Time Trial, not a resume): tactile
+/// deploy cue, "SEARCHING..." phone flash and the witty sector subtitle.
+fn deploy_cold_open(run: Res<RunStats>, mut notifs: ResMut<PhoneNotifState>, mut sfx: ResMut<SfxQueue>, mut feed: ResMut<HudFeed>) {
+    let key = (run.run_seed, run.floor);
+    if notifs.deployed == Some(key) {
+        return;
+    }
+    if notifs.deployed.is_none_or(|(seed, _)| seed != run.run_seed) {
+        *notifs = PhoneNotifState::for_seed(run.run_seed);
+    }
+    notifs.deployed = Some(key);
+    if run.mode == RunMode::TimeTrial {
+        return;
+    }
+    notifs.searching();
+    sfx.play(SfxEvent::WeaponSwap);
+    sfx.play(SfxEvent::PhonePing);
+    feed.toast(sector_subtitle(run.floor), NOTIF_AMBER);
+}
+
+/// Per-frame notification driver: timers, ambient texts on a signal climb,
+/// Carrier Daemon call / decline.
+fn drive_phone_notifs(
+    time: Res<Time>,
+    signal: Res<SignalState>,
+    run: Res<RunStats>,
+    boss: Option<Res<crate::boss::BossHud>>,
+    mut notifs: ResMut<PhoneNotifState>,
+    mut sfx: ResMut<SfxQueue>,
+    mut feed: ResMut<HudFeed>,
+) {
+    notifs.tick(time.delta_secs());
+    let daemon = run.enemy_kills[crate::enemies::EnemyKind::CarrierDaemon.index()];
+    match notifs.on_boss(boss.is_some_and(|b| b.active), daemon) {
+        Some(NotifKind::IncomingCall) => {
+            sfx.play(SfxEvent::PhonePing);
+            feed.toast(format!("PHONE // {INCOMING_CALL_TEXT}"), NOTIF_AMBER);
+        }
+        Some(NotifKind::CallDeclined) => {
+            feed.toast(format!("PHONE // {CALL_DECLINED_TEXT}"), NOTIF_ACID);
+        }
+        _ => {}
+    }
+    // Time Trial runs stay clean: no carrier texts over the speedrun HUD.
+    let bars = if run.mode == RunMode::TimeTrial { 0 } else { signal.bars };
+    if let Some(text) = notifs.on_bars(bars) {
+        sfx.play(SfxEvent::PhonePing);
+        feed.toast(format!("SMS // {text}"), NOTIF_CYAN);
+    }
+}
+
+/// Phone banner card over the radar panel (y = 116..166).
+fn draw_notif_banner(g: &mut ScreenBuf<'_>, kind: NotifKind, text: &str, time: f32) {
+    let (x, y, w, h) = (5, 116, 150, 50);
+    let bright = [242, 250, 248];
+    match kind {
+        NotifKind::Ambient => {
+            g.rect(x, y, w, h, [6, 28, 36]);
+            g.rect_thick_outline(x, y, w, h, [65, 242, 255]);
+            g.rect(x + 2, y + 2, w - 4, 10, [20, 92, 108]);
+            g.text(x + 6, y + 4, "NEW MESSAGE", 1, bright);
+            for (i, line) in wrap_banner(text, BANNER_LINE_CHARS).iter().take(3).enumerate() {
+                g.text(x + 5, y + 16 + i as i32 * 10, line, 1, [190, 248, 255]);
+            }
+        }
+        NotifKind::IncomingCall => {
+            let red = (time * 6.0).sin() > 0.0;
+            let (bg, edge) = if red { ([96, 10, 8], [255, 70, 50]) } else { ([88, 58, 4], [255, 196, 48]) };
+            g.rect(x, y, w, h, bg);
+            g.rect_thick_outline(x, y, w, h, edge);
+            let (head, body) = text.split_once(" // ").unwrap_or((text, ""));
+            g.text(x + 6, y + 6, head, 1, bright);
+            g.text(x + 8, y + 22, body, 2, edge);
+        }
+        NotifKind::CallDeclined => {
+            g.rect(x, y, w, h, [16, 60, 8]);
+            g.rect_thick_outline(x, y, w, h, [150, 255, 70]);
+            let (a, b) = text.split_once(' ').unwrap_or((text, ""));
+            g.text(x + 8, y + 6, a, 2, [190, 255, 110]);
+            g.text(x + 8, y + 26, b, 2, bright);
+        }
+        NotifKind::Searching => {
+            g.rect(x, y, w, h, [8, 16, 20]);
+            g.rect_thick_outline(x, y, w, h, [255, 192, 42]);
+            let dots = ((time * 4.0) as usize % 3) + 1;
+            let shown = &text[..text.len() - 3 + dots.min(3)];
+            g.text(x + 4, y + 18, shown, 2, [255, 214, 90]);
+        }
     }
 }
 
@@ -543,6 +899,11 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         }
     }
 
+    // Milestone 30: an active notification banner covers the radar panel.
+    if let Some((kind, text)) = s.notif {
+        draw_notif_banner(&mut g, kind, text, s.time);
+    }
+
     // ---- 5. Chunky At-a-Glance App Tiles (y = 170..212) ----
     let (ping_lbl, emp_lbl) = app_tile_labels(s.pad_prompts);
     if s.decoy_ready {
@@ -739,6 +1100,13 @@ fn glyph(c: char) -> [u8; 7] {
         ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
         '<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
         '>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
+        '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        ',' => [0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b00100, 0b01000],
+        '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
+        '\'' => [0b00100, 0b00100, 0b01000, 0b00000, 0b00000, 0b00000, 0b00000],
+        '&' => [0b01100, 0b10010, 0b10100, 0b01000, 0b10101, 0b10010, 0b01101],
+        '#' => [0b01010, 0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0b01010],
         _ => [0; 7],
     }
 }
@@ -846,5 +1214,100 @@ mod tests {
         let decoy = render(&PhoneScreenSnapshot { decoy_ready: true, ..calm(0) });
         assert_eq!(px(&decoy, 70, 200), [44, 26, 4], "DECOY tile is amber");
         assert_ne!(px(&zero, 70, 200), [44, 26, 4]);
+    }
+
+    #[test]
+    fn ambient_texts_fire_on_a_climb_to_two_bars_with_cooldown_and_never_repeat() {
+        let mut n = PhoneNotifState::for_seed(1234);
+        assert_eq!(n.on_bars(0), None);
+        assert_eq!(n.on_bars(1), None, "1 bar is not enough");
+        let first = n.on_bars(2).expect("climb to 2 bars texts");
+        assert_eq!(n.banner(), Some((NotifKind::Ambient, first)));
+        assert_eq!(n.on_bars(3), None, "staying up is not a climb");
+        assert_eq!(n.on_bars(0), None);
+        assert_eq!(n.on_bars(4), None, "cooldown blocks a quick second text");
+        n.tick(AMBIENT_COOLDOWN);
+        assert_eq!(n.banner(), None, "banner expires back to telemetry");
+        assert_eq!(n.on_bars(1), None);
+        let second = n.on_bars(2).expect("off cooldown");
+        assert_ne!(first, second);
+        // Exhaust the run's pool: all 8 texts exactly once, then silence.
+        for _ in 0..20 {
+            n.tick(AMBIENT_COOLDOWN);
+            n.on_bars(0);
+            n.on_bars(5);
+        }
+        let mut sent = n.sent.clone();
+        assert_eq!(sent.len(), AMBIENT_NOTIFS.len());
+        sent.sort();
+        sent.dedup();
+        assert_eq!(sent.len(), AMBIENT_NOTIFS.len(), "never repeats within a run");
+        // Seeded order: deterministic per run, varies across runs.
+        let order = |seed| {
+            let mut s = PhoneNotifState::for_seed(seed);
+            s.on_bars(2)
+        };
+        assert_eq!(order(7), order(7));
+        assert!((0..16u64).map(order).collect::<std::collections::HashSet<_>>().len() > 1);
+    }
+
+    #[test]
+    fn boss_call_rings_then_declines_and_blocks_ambient_spam() {
+        let mut n = PhoneNotifState::for_seed(3);
+        assert_eq!(n.on_boss(false, 0), None);
+        assert_eq!(n.on_boss(true, 0), Some(NotifKind::IncomingCall));
+        assert_eq!(n.banner(), Some((NotifKind::IncomingCall, INCOMING_CALL_TEXT)));
+        assert_eq!(n.on_boss(true, 0), None, "rings once per arrival");
+        assert_eq!(n.on_bars(0), None);
+        assert_eq!(n.on_bars(5), None, "an incoming call is never overwritten by a text");
+        assert_eq!(n.on_boss(false, 1), Some(NotifKind::CallDeclined));
+        assert_eq!(n.banner(), Some((NotifKind::CallDeclined, CALL_DECLINED_TEXT)));
+        n.tick(DECLINED_SECS + 0.01);
+        assert_eq!(n.banner(), None);
+        // Deploy flash: brief, quiet period after it.
+        n.searching();
+        assert_eq!(n.banner(), Some((NotifKind::Searching, SEARCHING_TEXT)));
+        assert_eq!(n.on_bars(5), None, "quiet right after a deploy");
+        assert_eq!(sector_subtitle(1), "SECTOR 01 // BASEMENT GARAGE");
+        assert_eq!(sector_subtitle(5), "SECTOR 05 // ROOFTOP RELAY");
+        assert!(sector_subtitle(7).starts_with("SECTOR 07"));
+    }
+
+    #[test]
+    fn notification_banners_render_over_the_radar_and_fit_the_lcd() {
+        for t in AMBIENT_NOTIFS {
+            let lines = wrap_banner(t, BANNER_LINE_CHARS);
+            assert!(!lines.is_empty() && lines.len() <= 3, "{t}: {lines:?}");
+            assert!(lines.iter().all(|l| l.len() <= BANNER_LINE_CHARS));
+            assert!(t.chars().all(|c| c == ' ' || glyph(c.to_ascii_uppercase()) != [0; 7]), "{t}: every glyph drawable");
+        }
+        for t in [INCOMING_CALL_TEXT, CALL_DECLINED_TEXT, SEARCHING_TEXT] {
+            assert!(t.chars().all(|c| c == ' ' || glyph(c) != [0; 7]), "{t}");
+        }
+        let radar = |b: &[u8]| (116..166).flat_map(|y| (5..155).map(move |x| px(b, x, y))).collect::<Vec<_>>();
+        let tiles = |b: &[u8]| (170..236).flat_map(|y| (5..155).map(move |x| px(b, x, y))).collect::<Vec<_>>();
+        let base = render(&calm(3));
+        let mut prev = radar(&base);
+        for kind in [NotifKind::Ambient, NotifKind::IncomingCall, NotifKind::CallDeclined, NotifKind::Searching] {
+            let text = match kind {
+                NotifKind::Ambient => AMBIENT_NOTIFS[0],
+                NotifKind::IncomingCall => INCOMING_CALL_TEXT,
+                NotifKind::CallDeclined => CALL_DECLINED_TEXT,
+                NotifKind::Searching => SEARCHING_TEXT,
+            };
+            let b = render(&PhoneScreenSnapshot { notif: Some((kind, text)), ..calm(3) });
+            assert_ne!(radar(&b), radar(&base), "{kind:?} banner drawn");
+            assert_ne!(radar(&b), prev, "{kind:?} looks distinct");
+            assert_eq!(tiles(&b), tiles(&base), "{kind:?} keeps the app tiles + SOS bar");
+            prev = radar(&b);
+        }
+    }
+
+    #[test]
+    fn wrap_banner_handles_multibyte_utf8_and_zero_width() {
+        assert!(wrap_banner("hello world", 0).is_empty());
+        assert_eq!(wrap_banner("éé", 3), vec!["éé"]);
+        assert_eq!(wrap_banner("éééé", 3), vec!["ééé", "é"]);
+        assert_eq!(wrap_banner("caffè è pronto", 6), vec!["caffè", "è", "pronto"]);
     }
 }

@@ -45,6 +45,10 @@ use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeCh
 use crate::weapons::{doppler_active, Weapon, WeaponState};
 
 pub const COLOR_BG: Color = INK_BLACK;
+/// Main menu root scrim alpha over the live 3D vista (Milestone 30).
+pub const MENU_ROOT_SCRIM: f32 = 0.74;
+/// Grunge backdrop strength on the main menu (kept faint over the vista).
+pub const MENU_BACKDROP_ALPHA: f32 = 0.22;
 pub const COLOR_TITLE: Color = PUNK_RED;
 pub const COLOR_TEXT: Color = BONE_TEXT;
 pub const COLOR_DIM: Color = ASH_DIM;
@@ -297,6 +301,9 @@ impl Plugin for HudPlugin {
             app.insert_resource(DevTools::from_env());
         }
         app.add_plugins((UiKitPlugin, MetaUiPlugin, crate::perf::PerfOverlayPlugin, LeaderboardUiPlugin))
+            // Live 3D Mars Signal Tower vista behind the main menu (render
+            // cameras stay out of headless CoreGameplayPlugin tests).
+            .add_plugins(crate::menu_scene::MenuScenePlugin)
             .init_resource::<UiSfxGate>()
             .init_resource::<InputMode>()
             .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
@@ -426,14 +433,18 @@ fn spawn_main_menu(
 ) {
     let tex = tex.as_deref();
     let msaa = msaa.map(|m| m.0).unwrap_or(bevy::render::view::Msaa::Sample2);
-    // Menu needs its own camera: the player camera only exists in a run.
+    // Menu needs its own camera: the player camera only exists in a run. It
+    // draws the UI over the live 3D vista (`menu_scene`, camera order -1), so
+    // it never clears and renders no 3D layer of its own.
     commands.spawn((
         DespawnOnExit(AppState::MainMenu),
         Camera3d::default(),
-        Camera { clear_color: ClearColorConfig::Custom(COLOR_BG), ..default() },
+        Camera { clear_color: ClearColorConfig::None, ..default() },
         msaa,
     ));
-    let root = punk_screen_root(&mut commands, AppState::MainMenu, tex, INK_BLACK, 1.0);
+    // Translucent dark scrim: the vista shines through behind every block
+    // while text, keycaps and buttons keep full contrast.
+    let root = punk_screen_root(&mut commands, AppState::MainMenu, tex, INK_BLACK.with_alpha(MENU_ROOT_SCRIM), MENU_BACKDROP_ALPHA);
     screen_rails(&mut commands, root, tex, 12.0, false);
 
     // One poster column, exactly as wide as the wordmark: every block below

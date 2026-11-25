@@ -802,15 +802,70 @@ impl HudFeed {
     }
 }
 
+/// Purely visual camera punch (Milestone 30 fatalities): a decaying roll
+/// shake around the view axis plus a brief FOV kick. Neither changes the aim
+/// direction, and it decays on the frame clock (no hit-stop / time scaling).
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq)]
+pub struct CameraPunch {
+    /// Remaining punch strength (0..1).
+    pub strength: f32,
+    /// Seconds since the last kick (drives the roll oscillation).
+    pub t: f32,
+}
+
+/// Peak roll (radians) of a full-strength punch.
+pub const PUNCH_ROLL: f32 = 0.045;
+/// Peak FOV widening (degrees) of a full-strength punch.
+pub const PUNCH_FOV_DEG: f32 = 4.0;
+
+impl CameraPunch {
+    pub fn kick(&mut self, strength: f32) {
+        self.strength = self.strength.max(strength.clamp(0.0, 1.0));
+        self.t = 0.0;
+    }
+
+    pub fn tick(&mut self, dt: f32) {
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
+        self.t += dt;
+        self.strength *= (-7.0 * dt).exp();
+        if self.strength < 1e-3 {
+            self.strength = 0.0;
+        }
+    }
+
+    /// Roll offset (radians) to add to the camera roll this frame.
+    pub fn roll(&self) -> f32 {
+        if self.strength <= 0.0 { 0.0 } else { PUNCH_ROLL * self.strength * (self.t * 38.0).sin() }
+    }
+
+    /// FOV widening (degrees) this frame.
+    pub fn fov_deg(&self) -> f32 {
+        PUNCH_FOV_DEG * self.strength
+    }
+}
+
 pub struct FxPlugin;
 
 impl Plugin for FxPlugin {
     fn build(&self, app: &mut App) {
+        use crate::state::AppState;
         app.init_resource::<HudFeed>()
+            .init_resource::<CameraPunch>()
+            .add_systems(OnEnter(AppState::MainMenu), clear_camera_punch)
+            .add_systems(OnEnter(AppState::Loadout), clear_camera_punch)
+            .add_systems(OnEnter(AppState::ContractsFeats), clear_camera_punch)
+            .add_systems(OnEnter(AppState::Leaderboard), clear_camera_punch)
+            .add_systems(OnEnter(AppState::Compendium), clear_camera_punch)
+            .add_systems(OnEnter(AppState::GameOver), clear_camera_punch)
+            .add_systems(OnEnter(AppState::Victory), clear_camera_punch)
+            .add_systems(OnEnter(AppState::UpgradeSelect), clear_camera_punch)
+            .add_systems(OnEnter(AppState::Playing), clear_camera_punch_on_fresh_run)
             .add_systems(PreStartup, create_fx_assets)
-            .add_systems(OnEnter(crate::state::AppState::MainMenu), clear_hud_feed)
-            .add_systems(OnEnter(crate::state::AppState::Leaderboard), clear_hud_feed)
-            .add_systems(OnEnter(crate::state::AppState::Compendium), clear_hud_feed)
+            .add_systems(OnEnter(AppState::MainMenu), clear_hud_feed)
+            .add_systems(OnEnter(AppState::Leaderboard), clear_hud_feed)
+            .add_systems(OnEnter(AppState::Compendium), clear_hud_feed)
             .add_systems(Update, (animate_fx, tick_feed).in_set(GameSet::World));
     }
 }
@@ -819,8 +874,19 @@ fn clear_hud_feed(mut feed: ResMut<HudFeed>) {
     *feed = HudFeed::default();
 }
 
-fn tick_feed(time: Res<Time>, mut feed: ResMut<HudFeed>) {
+fn clear_camera_punch(mut punch: ResMut<CameraPunch>) {
+    *punch = CameraPunch::default();
+}
+
+fn clear_camera_punch_on_fresh_run(run: Res<crate::state::RunStats>, mut punch: ResMut<CameraPunch>) {
+    if run.floor == 1 && run.time_elapsed == 0.0 {
+        *punch = CameraPunch::default();
+    }
+}
+
+fn tick_feed(time: Res<Time>, mut feed: ResMut<HudFeed>, mut punch: ResMut<CameraPunch>) {
     feed.tick(time.delta_secs());
+    punch.tick(time.delta_secs());
 }
 
 #[allow(clippy::type_complexity)]

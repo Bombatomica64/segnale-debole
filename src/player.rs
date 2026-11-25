@@ -1046,6 +1046,7 @@ fn move_player(
 fn view_bob(
     time: Res<Time>,
     store: Option<Res<ProfileStore>>,
+    punch: Option<Res<crate::fx::CameraPunch>>,
     mut players: Query<&mut Player>,
     mut cams: Query<(&mut Transform, &mut Projection), With<PlayerCamera>>,
 ) {
@@ -1064,11 +1065,16 @@ fn view_bob(
     );
     cam.translation = cam.translation.lerp(target, smooth_factor(14.0, time.delta_secs()));
     // Pitch from mouse look + damped strafe roll, composed in one place.
-    cam.rotation = camera_rotation(p.pitch, p.strafe_tilt);
-    // FOV widens with speed, kicks while dashing.
+    // Fatality punch: roll only (the view axis, so the aim never moves),
+    // honoring the Strafe Roll / Speed FOV comfort toggles.
+    let settings = live_settings(store.as_deref());
+    let punch = punch.as_deref().copied().unwrap_or_default();
+    let punch_roll = if settings.strafe_roll_enabled { punch.roll() } else { 0.0 };
+    let punch_fov = if settings.speed_fov_enabled { punch.fov_deg() } else { 0.0 };
+    cam.rotation = camera_rotation(p.pitch, p.strafe_tilt + punch_roll);
+    // FOV widens with speed, kicks while dashing (and on a fatality punch).
     if let Projection::Perspective(pp) = proj.as_mut() {
-        let settings = live_settings(store.as_deref());
-        let want = base_fov_rad(&settings) + effective_fov_bonus_deg(speed, p.dash_timer > 0.0, &settings).to_radians();
+        let want = base_fov_rad(&settings) + (effective_fov_bonus_deg(speed, p.dash_timer > 0.0, &settings) + punch_fov).to_radians();
         pp.fov += (want - pp.fov) * smooth_factor(10.0, time.delta_secs());
     }
 }
