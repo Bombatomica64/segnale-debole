@@ -95,13 +95,12 @@ xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_META_SHOTS=$HOME/scratch/meta
 ```
 
 ## CI & Releases
-- **`.github/workflows/ci.yml`:** runs on pushes to `main` and on pull requests. It runs `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo check --all-targets --features audio` (with warnings denied) on Ubuntu. A parallel job runs `cargo clippy --target wasm32-unknown-unknown --features audio -- -D warnings`.
-- **`.github/workflows/release.yml`:** runs on `v*` tags and manual dispatch. It builds `--release --features audio` binaries and packages each binary with this README:
+- **`.github/workflows/ci.yml`:** runs on pushes to `main` and on pull requests. It runs `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy --all-targets --features audio,gamepad -- -D warnings` and `cargo clippy --all-targets --features raytracing -- -D warnings` on Ubuntu. Parallel jobs run `cargo clippy --target wasm32-unknown-unknown --features audio -- -D warnings` and `cargo ndk -t arm64-v8a -P 26 clippy --lib -- -D warnings` (Android).
+- **`.github/workflows/release.yml`:** runs on `v*` tags and manual dispatch. It builds Linux `--release --features audio,gamepad` binaries (plain and `raytracing`) and packages each with this README:
   - `segnale-debole-linux-x86_64.tar.gz`
-  - `segnale-debole-windows-x86_64.zip`
-  - `segnale-debole-macos-aarch64.tar.gz`
-
+  - `segnale-debole-raytracing-linux-x86_64.tar.gz`
   - `segnale-debole-web-itch.zip`: the WebGL2 build (`trunk build --release --features audio --cargo-profile wasm-release`), with `index.html` at the zip root so it can be uploaded to itch.io as-is.
+  - `segnale-debole-android-arm64.apk`: the Android build (`android/build-apk.sh --release`), signed with the Gradle debug key for sideloading.
 
   Every run uploads the archives as workflow artifacts. A `v*` tag also publishes them to a GitHub Release.
 
@@ -140,3 +139,26 @@ Differences from the native build:
 - The `raytracing` feature and the `SEGNALE_*` environment switches are native-only.
 
 See [DESIGN.md](DESIGN.md) for the full game design and architecture notes.
+
+## Android
+
+Native arm64 Android build (GameActivity, Vulkan / GLES 3.2, landscape,
+immersive fullscreen). **A controller (Bluetooth / USB) or a mouse & keyboard
+is required: there are no touch controls.** Controllers and the mouse reach
+Bevy through a small JNI bridge (`src/android_input.rs` +
+`android/app/src/main/java/.../MainActivity.kt`), because Bevy 0.20.1 has no
+Android gamepad backend and winit reports mice as touches. In a run the mouse
+uses Android pointer capture. Backgrounding the app pauses the run and
+suspends audio. The profile is stored in the app's internal storage.
+
+```bash
+# Needs JDK 17, the Android SDK (platform 35) + NDK, and:
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+
+# libsegnale_debole.so (cargo ndk) + debug APK (Gradle wrapper)
+ANDROID_HOME=~/Android/Sdk android/build-apk.sh          # release Rust lib, assembleDebug
+android/build-apk.sh --debug                             # debug Rust lib
+android/build-apk.sh --release                           # assembleRelease (debug-key signed)
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+```

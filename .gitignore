@@ -4,3 +4,10 @@
 *.log
 .DS_Store
 /dist/
+# Android (Gradle + cargo-ndk outputs)
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/app/src/main/jniLibs/
+android/local.properties

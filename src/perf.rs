@@ -1,7 +1,9 @@
 //! Performance controls and telemetry:
 //! - `F4` toggles VSync live (`AutoNoVsync` <-> `AutoVsync`) on the primary
 //!   window, with a HUD toast while playing. In the browser the compositor
-//!   owns frame pacing, so `F4` only shows "VSYNC MANAGED BY BROWSER".
+//!   owns frame pacing, so `F4` only shows "VSYNC MANAGED BY BROWSER"; on
+//!   Android the display compositor does, so it shows "VSYNC MANAGED BY
+//!   ANDROID".
 //! - `F3` toggles a compact telemetry overlay (off by default): smoothed FPS,
 //!   avg / 1%-worst / max frame time, entity count, visible / total point
 //!   lights, material and mesh asset counts, VSync mode. Its text refreshes at
@@ -34,16 +36,23 @@ pub struct RenderMsaa(pub Msaa);
 
 impl Default for RenderMsaa {
     fn default() -> Self {
-        RenderMsaa(if IS_WEB { Msaa::Off } else { Msaa::Sample2 })
+        RenderMsaa(if IS_MOBILE_OR_WEB { Msaa::Off } else { Msaa::Sample2 })
     }
 }
 
 /// True for the WebGL2 browser build.
 pub const IS_WEB: bool = cfg!(target_arch = "wasm32");
+/// True for the native Android build (GameActivity, Vulkan / GLES).
+pub const IS_ANDROID: bool = cfg!(target_os = "android");
+/// Constrained platforms: single-sample rendering, platform-owned vsync and
+/// the [`crate::level::MAX_CONSTRAINED_LIGHTS`] point-light budget.
+pub const IS_MOBILE_OR_WEB: bool = IS_WEB || IS_ANDROID;
 
-/// Startup MSAA policy: ray tracing (Solari's single-sample G-buffer) and the
+/// Startup MSAA policy: ray tracing (Solari's single-sample G-buffer), the
 /// WebGL2 build (multi-camera MSAA resolve hazards, fill-rate on integrated
-/// GPUs) force [`Msaa::Off`]; native otherwise uses [`select_msaa`].
+/// GPUs) and Android (tiled mobile GPUs, battery / thermals) force
+/// [`Msaa::Off`]: callers pass [`IS_MOBILE_OR_WEB`] as `is_web`. Desktop
+/// otherwise uses [`select_msaa`].
 pub fn platform_msaa(is_web: bool, raytracing: bool, supports_2x: bool, env_override: Option<&str>) -> Msaa {
     if is_web || raytracing { Msaa::Off } else { select_msaa(supports_2x, env_override) }
 }
@@ -51,6 +60,9 @@ pub fn platform_msaa(is_web: bool, raytracing: bool, supports_2x: bool, env_over
 /// Toast shown when `F4` is pressed in the browser, where the compositor owns
 /// frame pacing (`requestAnimationFrame`) and `AutoNoVsync` is meaningless.
 pub const WEB_VSYNC_TOAST: &str = "VSYNC MANAGED BY BROWSER";
+/// Toast shown when `F4` is pressed on Android, where SurfaceFlinger paces
+/// frames and the build always presents `AutoVsync` (battery, thermals).
+pub const ANDROID_VSYNC_TOAST: &str = "VSYNC MANAGED BY ANDROID";
 
 /// `F4` outcome: the new VSync flag and the toast to show while playing.
 pub fn f4_vsync_toggle(is_web: bool, vsync: bool) -> (bool, &'static str) {
@@ -61,6 +73,12 @@ pub fn f4_vsync_toggle(is_web: bool, vsync: bool) -> (bool, &'static str) {
     } else {
         (true, "VSYNC: ON")
     }
+}
+
+/// `F4` outcome for a platform: Android keeps vsync and shows
+/// [`ANDROID_VSYNC_TOAST`]; otherwise [`f4_vsync_toggle`].
+pub fn platform_f4_vsync_toggle(is_web: bool, is_android: bool, vsync: bool) -> (bool, &'static str) {
+    if is_android { (vsync, ANDROID_VSYNC_TOAST) } else { f4_vsync_toggle(is_web, vsync) }
 }
 
 /// Pure selection helper for unit testing and startup probing.
@@ -98,9 +116,10 @@ pub struct PerfSettings {
 }
 
 impl Default for PerfSettings {
-    /// Native starts uncapped; the browser always presents vsynced (`AutoVsync`).
+    /// Desktop starts uncapped; the browser and Android always present
+    /// vsynced (`AutoVsync`).
     fn default() -> Self {
-        PerfSettings { overlay: false, vsync: IS_WEB }
+        PerfSettings { overlay: false, vsync: IS_MOBILE_OR_WEB }
     }
 }
 
@@ -204,8 +223,9 @@ impl Plugin for PerfPlugin {
             .unwrap_or(true);
         let rt = app.world().get_resource::<crate::raytracing::RaytracingActive>().is_some_and(|r| r.0);
         // Solari's deferred G-buffer needs single-sample targets on every
-        // camera; WebGL2 always runs single-sample (see `platform_msaa`).
-        let chosen = platform_msaa(IS_WEB, rt, supports_2x, env_override.as_deref());
+        // camera; WebGL2 and Android always run single-sample (see
+        // `platform_msaa`).
+        let chosen = platform_msaa(IS_MOBILE_OR_WEB, rt, supports_2x, env_override.as_deref());
         if app.world().contains_resource::<RenderAdapter>() {
             info!("perf: MSAA selected {:?} (adapter 2x support: {})", chosen, supports_2x);
         }
@@ -219,7 +239,7 @@ fn perf_hotkeys(keys: Res<ButtonInput<KeyCode>>, state: Option<Res<State<AppStat
         stats.clear();
     }
     if keys.just_pressed(KeyCode::F4) {
-        let (vsync, toast) = f4_vsync_toggle(IS_WEB, settings.vsync);
+        let (vsync, toast) = platform_f4_vsync_toggle(IS_WEB, IS_ANDROID, settings.vsync);
         settings.vsync = vsync;
         if state.is_some_and(|s| *s.get() == AppState::Playing) {
             feed.toast(toast, Color::srgb(0.3, 1.0, 0.85));
@@ -357,7 +377,8 @@ mod tests {
 
     #[test]
     fn vsync_modes() {
-        assert_eq!(PerfSettings::default().present_mode(), PresentMode::AutoNoVsync);
+        let want = if IS_MOBILE_OR_WEB { PresentMode::AutoVsync } else { PresentMode::AutoNoVsync };
+        assert_eq!(PerfSettings::default().present_mode(), want);
         assert_eq!(present_mode_for(true), PresentMode::AutoVsync);
         assert_eq!(vsync_label(false), "NO-VSYNC");
         // F4: native flips VSync; the browser keeps it and explains why.
@@ -380,6 +401,24 @@ mod tests {
         assert_eq!(platform_msaa(false, true, true, None), Msaa::Off);
         assert_eq!(platform_msaa(false, false, true, None), Msaa::Sample2);
         assert_eq!(platform_msaa(false, false, true, Some("4")), Msaa::Sample4);
-        assert_eq!(RenderMsaa::default().0, if IS_WEB { Msaa::Off } else { Msaa::Sample2 });
+        assert_eq!(RenderMsaa::default().0, if IS_MOBILE_OR_WEB { Msaa::Off } else { Msaa::Sample2 });
+    }
+
+    #[test]
+    fn android_platform_policies() {
+        assert_eq!(IS_MOBILE_OR_WEB, IS_WEB || IS_ANDROID);
+        // Android: single-sample regardless of adapter support or env override.
+        assert_eq!(platform_msaa(true, false, true, Some("4")), Msaa::Off);
+        // F4 on Android never leaves AutoVsync and names the platform.
+        assert_eq!(platform_f4_vsync_toggle(false, true, true), (true, ANDROID_VSYNC_TOAST));
+        assert_eq!(platform_f4_vsync_toggle(true, true, true), (true, ANDROID_VSYNC_TOAST));
+        // Non-Android keeps the existing desktop / browser behavior.
+        assert_eq!(platform_f4_vsync_toggle(false, false, false), (true, "VSYNC: ON"));
+        assert_eq!(platform_f4_vsync_toggle(true, false, true), (true, WEB_VSYNC_TOAST));
+        // The constrained light budget covers Android as well as the web.
+        assert_eq!(crate::level::point_light_cap(true), Some(crate::level::MAX_CONSTRAINED_LIGHTS));
+        assert_eq!(crate::level::MAX_CONSTRAINED_LIGHTS, 12);
+        assert_eq!(crate::level::point_light_cap(IS_MOBILE_OR_WEB).is_some(), IS_MOBILE_OR_WEB);
+        assert_eq!(PerfSettings::default().vsync, IS_MOBILE_OR_WEB);
     }
 }

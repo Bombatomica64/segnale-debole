@@ -14,7 +14,7 @@ env:
 
 jobs:
   test:
-    name: Test, clippy & audio check (Linux)
+    name: Test, clippy & audio/gamepad check (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev pkg-config libx11-dev libwayland-dev libxkbcommon-dev
+            libasound2-dev libudev-dev pkg-config libx11-dev libwayland-dev libxkbcommon-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,10 +37,8 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Check full audio feature (0 warnings)
-        env:
-          RUSTFLAGS: -D warnings
-        run: cargo check --all-targets --features audio
+      - name: Clippy (audio + gamepad features, ALSA + gilrs/libudev)
+        run: cargo clippy --all-targets --features audio,gamepad -- -D warnings
 
       - name: Clippy (raytracing feature)
         run: cargo clippy --all-targets --features raytracing -- -D warnings
@@ -64,3 +62,29 @@ jobs:
       # `getrandom_backend="wasm_js"` cfg from `.cargo/config.toml`.
       - name: Clippy (wasm32-unknown-unknown, audio)
         run: cargo clippy --target wasm32-unknown-unknown --features audio -- -D warnings
+
+  android:
+    name: Android build clippy (aarch64-linux-android / cargo-ndk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # ubuntu-latest ships the Android SDK and NDK (`ANDROID_NDK_HOME`).
+      - name: Clippy (arm64-v8a, GameActivity + audio, 0 warnings)
+        run: cargo ndk -t arm64-v8a -P 26 clippy --lib -- -D warnings
+
+      - name: Build libsegnale_debole.so (arm64-v8a)
+        run: cargo ndk -t arm64-v8a -P 26 build --lib

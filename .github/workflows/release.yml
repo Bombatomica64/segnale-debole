@@ -22,12 +22,13 @@ jobs:
             suffix: linux-x86_64.tar.gz
             exe: ""
         # Standard raster build + GPU ray-traced lighting build (Bevy Solari;
-        # falls back to raster at runtime on GPUs without ray queries).
+        # falls back to raster at runtime on GPUs without ray queries). Both
+        # ship native controller support (gilrs; links libudev).
         variant:
           - prefix: segnale-debole
-            features: audio
+            features: audio,gamepad
           - prefix: segnale-debole-raytracing
-            features: audio,raytracing
+            features: audio,gamepad,raytracing
     env:
       ARCHIVE: ${{ matrix.variant.prefix }}-${{ matrix.target.suffix }}
     steps:
@@ -38,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev pkg-config libx11-dev libwayland-dev libxkbcommon-dev
+            libasound2-dev libudev-dev pkg-config libx11-dev libwayland-dev libxkbcommon-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -120,9 +121,68 @@ jobs:
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
+  build-android:
+    name: Build Android (arm64-v8a APK)
+    runs-on: ubuntu-latest
+    env:
+      ARCHIVE: segnale-debole-android-arm64.apk
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android-arm64
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # ubuntu-latest ships the Android SDK (platform 35, build-tools) and NDK
+      # (`ANDROID_HOME`, `ANDROID_NDK_HOME`). Configure optional release signing
+      # secrets (`ANDROID_KEYSTORE_B64`, `ANDROID_KEYSTORE_PASSWORD`,
+      # `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) for stable in-place updates;
+      # otherwise falls back to debug signing so artifacts stay sideloadable.
+      - name: Decode optional Android release keystore
+        if: env.KEYSTORE_B64 != ''
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK (cargo ndk + gradlew assembleRelease)
+        env:
+          ANDROID_VERSION_CODE: ${{ github.run_number }}
+          ANDROID_VERSION_NAME: ${{ github.ref_type == 'tag' && github.ref_name || '0.4.0' }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: OUT="$ARCHIVE" android/build-apk.sh --release
+
+      - name: Inspect APK
+        run: |
+          unzip -l "$ARCHIVE" | grep -E 'lib/arm64-v8a/libsegnale_debole\.so$'
+          aapt2="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)/aapt2"
+          "$aapt2" dump badging "$ARCHIVE" | grep -E "^(package|sdkVersion|targetSdkVersion|native-code)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub Release
-    needs: [build, build-web]
+    needs: [build, build-web, build-android]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

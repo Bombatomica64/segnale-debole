@@ -477,8 +477,12 @@ fn despawn_player(mut commands: Commands, q: Query<Entity, With<Player>>) {
 }
 
 fn set_cursor(cursor: &mut CursorOptions, captured: bool) {
-    cursor.grab_mode = if captured { CursorGrabMode::Locked } else { CursorGrabMode::None };
-    cursor.visible = !captured;
+    // Android has no winit cursor grab (it would only log errors): the JNI
+    // bridge mirrors `CursorCaptured` as Android pointer capture instead.
+    if !crate::perf::IS_ANDROID {
+        cursor.grab_mode = if captured { CursorGrabMode::Locked } else { CursorGrabMode::None };
+        cursor.visible = !captured;
+    }
 }
 
 fn capture_cursor(mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>, mut captured: ResMut<CursorCaptured>) {

@@ -3,7 +3,8 @@
 //! [`synthesize_wav`] is pure Rust and always compiled (and unit-tested): it
 //! renders every [`SfxEvent`] into a 16-bit mono PCM RIFF/WAVE buffer from
 //! oscillators, noise and envelopes. Actual playback is compiled only with
-//! `--features audio` (needs ALSA on Linux): the WAV buffers become cached
+//! `--features audio` (needs ALSA on Linux) and always on Android (AAudio via
+//! cpal, see `Cargo.toml`): the WAV buffers become cached
 //! `AudioSource` assets and draining [`SfxQueue`] spawns `AudioPlayer`s.
 //! Gameplay code only ever pushes into [`SfxQueue`], so it compiles identically
 //! with or without the feature.
@@ -998,30 +999,45 @@ pub fn update_music_mix(
     mix.weights = step_music_mix(mix.weights, target_music_weights(cues), time.delta_secs());
 }
 
+/// Game audio is suspended because the OS backgrounded the app (see
+/// `lifecycle::handle_app_lifecycle`): every sink is paused, new SFX are
+/// dropped and music volumes are forced to 0 until the app runs again.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioSuspended(pub bool);
+
+/// Music stem volume under the suspension flag.
+pub fn suspended_music_volume(volume: f32, suspended: AudioSuspended) -> f32 {
+    if suspended.0 { 0.0 } else { volume }
+}
+
 pub struct GameAudioPlugin;
 
 impl Plugin for GameAudioPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SfxQueue>()
             .init_resource::<MusicMixState>()
+            .init_resource::<AudioSuspended>()
             .add_systems(Update, jammer_hum.run_if(in_state(AppState::Playing)))
             .add_systems(Last, (drain_sfx, update_music_mix));
-        #[cfg(feature = "audio")]
+        #[cfg(any(feature = "audio", target_os = "android"))]
         app.add_systems(Startup, (backend::cache_sounds, backend::spawn_music_stems))
-            .add_systems(Last, (backend::attach_spatial_listener.before(drain_sfx), backend::apply_music_volumes.after(update_music_mix)));
+            .add_systems(Last, (backend::attach_spatial_listener.before(drain_sfx), backend::apply_music_volumes.after(update_music_mix)))
+            .add_systems(Last, backend::apply_audio_suspension);
     }
 }
 
-#[cfg(feature = "audio")]
+#[cfg(any(feature = "audio", target_os = "android"))]
 mod backend {
     use std::collections::HashMap;
 
-    use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, SpatialListener, SpatialScale, Volume};
+    use bevy::audio::{
+        AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, SpatialAudioSink, SpatialListener, SpatialScale, Volume,
+    };
     use bevy::prelude::*;
 
     use super::{
-        effective_music_volume, spatial_scale_factor, synthesize_music_wav, synthesize_wav, MusicLayer, MusicMixState, SfxEvent,
-        SPATIAL_LISTENER_GAP,
+        effective_music_volume, spatial_scale_factor, suspended_music_volume, synthesize_music_wav, synthesize_wav, AudioSuspended, MusicLayer,
+        MusicMixState, SfxEvent, SPATIAL_LISTENER_GAP,
     };
     use crate::player::PlayerCamera;
 
@@ -1041,11 +1057,43 @@ mod backend {
     pub fn apply_music_volumes(
         mix: Res<MusicMixState>,
         store: Option<Res<crate::meta::ProfileStore>>,
+        suspended: Res<AudioSuspended>,
         mut sinks: Query<(&MusicStem, &mut AudioSink)>,
     ) {
         let settings = crate::meta::live_settings(store.as_deref());
         for (stem, mut sink) in &mut sinks {
-            sink.set_volume(Volume::Linear(effective_music_volume(mix.weights[stem.0.index()], &settings)));
+            let v = effective_music_volume(mix.weights[stem.0.index()], &settings);
+            sink.set_volume(Volume::Linear(suspended_music_volume(v, *suspended)));
+        }
+    }
+
+    /// Pause every sink — both stereo (`AudioSink`, incl. phase-locked music
+    /// stems) and positional (`SpatialAudioSink`) — while the app is suspended,
+    /// including any sink created after suspension began. Resume all when it
+    /// runs again.
+    pub fn apply_audio_suspension(
+        suspended: Res<AudioSuspended>,
+        sinks: Query<&AudioSink>,
+        spatial_sinks: Query<&SpatialAudioSink>,
+    ) {
+        if suspended.0 {
+            for sink in &sinks {
+                if !sink.is_paused() {
+                    sink.pause();
+                }
+            }
+            for sink in &spatial_sinks {
+                if !sink.is_paused() {
+                    sink.pause();
+                }
+            }
+        } else if suspended.is_changed() {
+            for sink in &sinks {
+                sink.play();
+            }
+            for sink in &spatial_sinks {
+                sink.play();
+            }
         }
     }
 
@@ -1101,15 +1149,20 @@ pub fn effective_sfx_volume(sfx: SfxEvent, settings: &UserSettings) -> f32 {
     sfx.volume() * master
 }
 
-#[cfg(feature = "audio")]
+#[cfg(any(feature = "audio", target_os = "android"))]
 fn drain_sfx(
     mut commands: Commands,
     mut queue: ResMut<SfxQueue>,
     handles: Option<Res<backend::SfxHandles>>,
     store: Option<Res<crate::meta::ProfileStore>>,
     listeners: Query<&GlobalTransform, With<bevy::audio::SpatialListener>>,
+    suspended: Res<AudioSuspended>,
     mut picked: Local<Vec<SfxRequest>>,
 ) {
+    if suspended.0 {
+        queue.0.clear();
+        return;
+    }
     let settings = crate::meta::live_settings(store.as_deref());
     let listener = listeners.iter().next().map(|g| g.translation());
     dedup_sfx_requests(&queue.0, listener, &mut picked);
@@ -1137,7 +1190,7 @@ fn drain_sfx(
     }
 }
 
-#[cfg(not(feature = "audio"))]
+#[cfg(not(any(feature = "audio", target_os = "android")))]
 fn drain_sfx(mut queue: ResMut<SfxQueue>) {
     queue.0.clear();
 }

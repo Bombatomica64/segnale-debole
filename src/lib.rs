@@ -1,5 +1,6 @@
 //! SEGNALE DEBOLE — Doom-style retro boomer shooter roguelike (Bevy 0.20).
 
+pub mod android_input;
 pub mod apps;
 pub mod architecture;
 pub mod assets_gen;
@@ -16,6 +17,7 @@ pub mod gamepad;
 pub mod hud;
 pub mod ui_kit;
 pub mod level;
+pub mod lifecycle;
 pub mod mesh_batch;
 pub mod perf;
 pub mod meta;
@@ -72,7 +74,9 @@ impl Plugin for CoreGameplayPlugin {
             .add_plugins(decals::DecalsPlugin)
             .add_plugins(trials::TrialsPlugin)
             .add_plugins(compendium::CompendiumPlugin)
-            .add_plugins(gamepad::GamepadPlugin);
+            .add_plugins(gamepad::GamepadPlugin)
+            // Separate call: the tuple above is at Bevy's 15-plugin limit.
+            .add_plugins(lifecycle::LifecyclePlugin);
     }
 }
 
@@ -84,14 +88,45 @@ pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        // Web build: browser `localStorage`; native: `profile.json` on disk.
+        // Web build: browser `localStorage`; Android: `profile.json` in the
+        // app's internal storage; desktop: `profile.json` on disk.
         #[cfg(target_arch = "wasm32")]
         let store = meta::ProfileStore::open_web();
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_os = "android")]
+        let store = meta::ProfileStore::open(meta::resolve_android_profile_path());
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         let store = meta::ProfileStore::open(meta::resolve_profile_path(true));
-        app.insert_resource(store)
-            .add_plugins((CoreGameplayPlugin, hud::HudPlugin, dev::DevPlugin));
+        app.insert_resource(store).add_plugins((CoreGameplayPlugin, hud::HudPlugin));
+        // Env-driven dev hooks (PNG screenshot tours, playtest bot) are
+        // desktop tooling; Android has no env and builds without `png`.
+        #[cfg(not(target_os = "android"))]
+        app.add_plugins(dev::DevPlugin);
+        // Controllers and the mouse reach Bevy through the JNI bridge.
+        #[cfg(target_os = "android")]
+        app.add_plugins(android_input::AndroidInputPlugin);
     }
+}
+
+/// Android entry point (`android_main`, called by GameActivity through
+/// `android-activity`): borderless fullscreen landscape, always vsynced.
+/// Input is a controller or mouse & keyboard; there are no touch controls.
+#[cfg(target_os = "android")]
+#[bevy::prelude::bevy_main]
+fn main() {
+    use bevy::window::{MonitorSelection, PresentMode, WindowMode};
+    App::new()
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "SEGNALE DEBOLE".into(),
+                present_mode: PresentMode::AutoVsync,
+                resizable: false,
+                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+                ..default()
+            }),
+            ..default()
+        }))
+        .add_plugins(GamePlugin)
+        .run();
 }
 
 /// Fixed simulation step used by the headless test app.

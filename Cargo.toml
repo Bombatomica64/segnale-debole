@@ -3,6 +3,12 @@ name = "segnale_debole"
 version = "0.4.0"
 edition = "2024"
 
+# `cdylib` is the Android `libsegnale_debole.so` that GameActivity loads (built
+# by `cargo ndk`, see `android/build-apk.sh`); `rlib` keeps the native binary,
+# integration tests and benches linking against the library as before.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 # Minimal Bevy 0.20 feature set: omit unused asset/FX crates (bevy_gltf,
 # bevy_animation, morph, bevy_gizmos, bevy_anti_alias/smaa_luts, hdr,
@@ -37,14 +43,23 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Native-only Bevy features: multithreaded task pools, OS cursors, and PNG
-# screenshot encoding (for dev/bot tours; never needed on wasm32).
+# Native-only Bevy features (desktop and Android): multithreaded task pools.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-bevy = { version = "0.20.1", default-features = false, features = [
-    "multi_threaded",
-    "custom_cursor",
-    "png",
-] }
+bevy = { version = "0.20.1", default-features = false, features = ["multi_threaded"] }
+
+# Desktop-only Bevy features: OS cursors and PNG screenshot encoding (for
+# dev/bot tours; never needed on wasm32 or Android).
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))'.dependencies]
+bevy = { version = "0.20.1", default-features = false, features = ["custom_cursor", "png"] }
+
+# Android (`cargo ndk -t arm64-v8a build`, see `android/`): GameActivity
+# backend + audio. cpal 0.17 drives AAudio through the NDK (no Oboe, so no
+# `libc++_shared.so`; android-activity links `c++_static`). No `bevy_gilrs`:
+# gilrs 0.11 has no Android backend (it compiles to a dummy that never sees a
+# device) and winit 0.30 drops joystick motion events, so controllers and the
+# mouse reach Bevy through the JNI bridge in `src/android_input.rs`.
+[target.'cfg(target_os = "android")'.dependencies]
+bevy = { version = "0.20.1", default-features = false, features = ["android-game-activity", "bevy_audio", "wav"] }
 
 # Linux windowing backends (native only; never compiled into the web build).
 [target.'cfg(target_os = "linux")'.dependencies]

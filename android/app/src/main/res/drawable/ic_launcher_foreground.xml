@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Weak signal: one lit bar (punk red) and four dead bars (ash) inside the
+     72dp adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#E8372B" android:pathData="M31,66h7v8h-7z" />
+    <path android:fillColor="#5A504A" android:pathData="M41,58h7v16h-7z" />
+    <path android:fillColor="#5A504A" android:pathData="M51,50h7v24h-7z" />
+    <path android:fillColor="#5A504A" android:pathData="M61,42h7v32h-7z" />
+    <path android:fillColor="#5A504A" android:pathData="M71,34h7v40h-7z" />
+    <path android:fillColor="#F2E6CF" android:pathData="M31,78h47v3h-47z" />
+</vector>

@@ -995,11 +995,16 @@ impl CullableLight {
 /// Concurrent world point-light budget. WebGL2 has no storage buffers, so
 /// Bevy's clustered forward path packs lights into small uniform buffers and
 /// every lit fragment loops the cluster's lights: the web build keeps only the
-/// nearest lit [`CullableLight`]s. Native stays uncapped.
+/// nearest lit [`CullableLight`]s. Android shares the same budget (tiled
+/// mobile GPUs pay per light per fragment and thermally throttle). Desktop
+/// stays uncapped.
 pub const WEB_POINT_LIGHT_CAP: usize = 12;
+/// Light budget of the constrained platforms (web and Android).
+pub const MAX_CONSTRAINED_LIGHTS: usize = WEB_POINT_LIGHT_CAP;
 
-pub const fn point_light_cap(is_web: bool) -> Option<usize> {
-    if is_web { Some(WEB_POINT_LIGHT_CAP) } else { None }
+/// `constrained` = [`crate::perf::IS_MOBILE_OR_WEB`] at runtime.
+pub const fn point_light_cap(constrained: bool) -> Option<usize> {
+    if constrained { Some(MAX_CONSTRAINED_LIGHTS) } else { None }
 }
 
 /// Override for the concurrent world-light budget (tests / tuning). Absent:
@@ -1045,7 +1050,7 @@ pub fn cull_world_lights(
 ) {
     let Ok(ptf) = players.single() else { return };
     let eye = ptf.translation + Vec3::Y * crate::player::PLAYER_EYE_HEIGHT;
-    let cap = budget.map_or(point_light_cap(crate::perf::IS_WEB), |b| b.0);
+    let cap = budget.map_or(point_light_cap(crate::perf::IS_MOBILE_OR_WEB), |b| b.0);
     let cutoff = match cap {
         None => None,
         cap => {

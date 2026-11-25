@@ -397,6 +397,7 @@ fn spawn_main_menu(
         ));
     }
     commands.spawn((ChildOf(modes), punk_button("BESTIARY & ARMORY  [B]", MenuAction::OpenCompendium, 16.0, ButtonStyle::DangerRed)));
+    spawn_input_hint(&mut commands, column);
 
     // Run seed: compact selector strip (armed code or RANDOM) + RND / CLR.
     let seed_row = commands
@@ -1241,6 +1242,33 @@ fn spawn_pause_menu(mut commands: Commands, run: Res<RunStats>, loadout: Res<Run
     if shareable_code(&run).is_some() {
         commands.spawn((ChildOf(btns), punk_button(&share_button_label(&run, &seed), MenuAction::ShareSeed, 15.0, ButtonStyle::ScrapSteel)));
     }
+    spawn_input_hint(&mut commands, card);
+}
+
+/// Android input requirement shown under the Main Menu and Pause actions.
+/// There are no touch controls: a controller or mouse & keyboard is required.
+pub const ANDROID_INPUT_HINT: &str = "CONTROLLER OR MOUSE & KEYBOARD REQUIRED // NO TOUCH CONTROLS";
+
+/// The platform's menu input hint (Android only; desktop and web menus stay
+/// uncluttered).
+pub const fn platform_input_hint(is_android: bool) -> Option<&'static str> {
+    if is_android { Some(ANDROID_INPUT_HINT) } else { None }
+}
+
+/// Marker for the [`ANDROID_INPUT_HINT`] line.
+#[derive(Component)]
+pub struct InputHint;
+
+/// Append the platform input hint (if any) as a small centered line at the
+/// end of `parent`'s column.
+fn spawn_input_hint(commands: &mut Commands, parent: Entity) {
+    let Some(hint) = platform_input_hint(crate::perf::IS_ANDROID) else { return };
+    commands.spawn((
+        ChildOf(parent),
+        InputHint,
+        Node { margin: UiRect::top(Val::Px(4.0)), justify_content: JustifyContent::Center, ..default() },
+        children![text(hint, 11.0, ASH_DIM.with_alpha(0.85))],
+    ));
 }
 
 /// Menu action. "START" snapshots the profile's equipped loadout (chip, skin,
@@ -3166,6 +3194,15 @@ fn debug_skip_floor(keys: Res<ButtonInput<KeyCode>>, mut run: ResMut<RunStats>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn android_input_hint_only_on_android() {
+        assert_eq!(platform_input_hint(false), None);
+        assert_eq!(platform_input_hint(true), Some(ANDROID_INPUT_HINT));
+        assert!(ANDROID_INPUT_HINT.contains("NO TOUCH CONTROLS"));
+        assert!(ANDROID_INPUT_HINT.is_ascii(), "default font glyphs only");
+        assert_eq!(platform_input_hint(crate::perf::IS_ANDROID).is_some(), crate::perf::IS_ANDROID);
+    }
 
     #[test]
     fn pad_menu_shortcuts_per_screen() {

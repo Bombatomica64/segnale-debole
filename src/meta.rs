@@ -1164,6 +1164,24 @@ pub fn resolve_profile_path(windowed: bool) -> Option<PathBuf> {
     profile_path_policy(var("SEGNALE_PROFILE").as_deref(), windowed, bot_or_shots, var("XDG_DATA_HOME").as_deref(), var("HOME").as_deref())
 }
 
+/// Android profile location: `profile.json` in the app's internal data
+/// directory (`Context.getFilesDir()`, private to the app, no permissions,
+/// removed on uninstall). `None` (no directory) = unwritable in-memory store.
+pub fn android_profile_path(internal_data_dir: Option<&Path>) -> Option<PathBuf> {
+    internal_data_dir.filter(|d| !d.as_os_str().is_empty()).map(|d| d.join("profile.json"))
+}
+
+/// [`android_profile_path`] under the running activity's internal data path.
+#[cfg(target_os = "android")]
+pub fn resolve_android_profile_path() -> Option<PathBuf> {
+    let dir = bevy::android::ANDROID_APP.get().and_then(|app| app.internal_data_path());
+    let path = android_profile_path(dir.as_deref());
+    if path.is_none() {
+        warn!("android: no internal data path - profile stays in memory");
+    }
+    path
+}
+
 // ---------------------------------------------------------------------------
 // Browser persistence (web build): `localStorage` key/value store
 // ---------------------------------------------------------------------------
@@ -2013,6 +2031,31 @@ mod tests {
         assert_eq!(store.profile.stats.total_kills, 65);
         // Jammer Hunter (8 lifetime jammers) was already earned at Floor 5.
         assert!(store.profile.has_feat(FeatId::JammerHunter));
+    }
+
+    #[test]
+    fn android_profile_lives_in_internal_storage() {
+        let dir = Path::new("/data/user/0/dev.bombatomica64.segnaledebole/files");
+        assert_eq!(android_profile_path(Some(dir)), Some(dir.join("profile.json")));
+        assert_eq!(android_profile_path(None), None);
+        assert_eq!(android_profile_path(Some(Path::new(""))), None);
+        // No directory: an in-memory store that never touches the disk.
+        let store = ProfileStore::open(android_profile_path(None));
+        assert!(store.path.is_none());
+        assert!(store.save().is_ok());
+    }
+
+    #[test]
+    fn android_profile_round_trips_on_disk() {
+        let dir = std::env::temp_dir().join(format!("segnale-android-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = android_profile_path(Some(&dir));
+        let mut store = ProfileStore::open(path.clone());
+        store.profile.stats.total_jammers = 42;
+        store.save().unwrap();
+        let reopened = ProfileStore::open(path);
+        assert_eq!(reopened.profile.stats.total_jammers, 42);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
