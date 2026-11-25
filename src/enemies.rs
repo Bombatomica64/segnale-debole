@@ -1848,6 +1848,20 @@ fn sculpt_carrier(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     }
 }
 
+/// Farthest the player can be seen (line of sight still required).
+pub const SIGHT_MAX_DIST: f32 = 45.0;
+/// An unalerted demon that sees the player within this range wakes up
+/// (Milestone 28: 36 m covers the 32 m straight corridors, so nobody idles
+/// in plain sight down a long lane; wall-screened demons stay asleep).
+pub const SIGHT_AGGRO_DIST: f32 = 36.0;
+/// Close enough to hear the player through walls.
+pub const PROXIMITY_AGGRO_DIST: f32 = 8.0;
+
+/// Whether an unalerted demon wakes this sense tick.
+pub fn wakes_on_senses(sees_player: bool, dist: f32) -> bool {
+    (sees_player && dist < SIGHT_AGGRO_DIST) || dist < PROXIMITY_AGGRO_DIST
+}
+
 /// Spawn one demon. `pos` is the feet position (hover center for Cacodemons).
 /// Allocates no materials or meshes: the model and its state materials are
 /// pre-baked in [`EnemyAssets`].
@@ -2234,8 +2248,8 @@ fn enemy_ai(
         e.los_timer -= dt;
         if e.los_timer <= 0.0 {
             e.los_timer = 0.25;
-            e.sees_player = dist < 45.0 && has_line_of_sight(&grid, eye, p_eye);
-            if !e.alerted && ((e.sees_player && dist < 26.0) || dist < 8.0) {
+            e.sees_player = dist < SIGHT_MAX_DIST && has_line_of_sight(&grid, eye, p_eye);
+            if !e.alerted && wakes_on_senses(e.sees_player, dist) {
                 e.alerted = true;
             }
         }
@@ -3619,5 +3633,15 @@ mod tests {
         assert_eq!(death_decals(EnemyKind::JammerFiend, false)[0].unwrap().0, crate::decals::DecalKind::IchorGreen);
         assert_eq!(death_decals(EnemyKind::PhaseStalker, false)[0].unwrap().0, crate::decals::DecalKind::IchorViolet);
         assert!(death_decals(EnemyKind::HellBaron, false)[1].is_some() && death_decals(EnemyKind::CarrierDaemon, false)[1].is_some());
+    }
+
+    #[test]
+    fn wide_lane_sight_aggro_reaches_36_m_but_needs_line_of_sight() {
+        const { assert!(SIGHT_AGGRO_DIST < SIGHT_MAX_DIST) };
+        assert!(wakes_on_senses(true, 32.0), "visible down a 32 m corridor");
+        assert!(wakes_on_senses(true, 35.9));
+        assert!(!wakes_on_senses(true, 36.5), "past the aggro range");
+        assert!(!wakes_on_senses(false, 20.0), "wall-screened stays idle");
+        assert!(wakes_on_senses(false, 7.0), "close enough to hear");
     }
 }

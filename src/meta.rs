@@ -608,6 +608,12 @@ fn default_gamepad_sensitivity() -> f32 {
     1.0
 }
 
+/// Serde default of [`UserSettings::gamepad_aim_friction`] (on; profiles
+/// written before Milestone 28 lack the field).
+fn default_aim_friction() -> bool {
+    true
+}
+
 /// Player-facing options persisted inside the profile (never gameplay power).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -635,6 +641,9 @@ pub struct UserSettings {
     /// Stick up looks down.
     #[serde(default)]
     pub gamepad_invert_y: bool,
+    /// Gentle Right Stick slowdown over visible targets (never the mouse).
+    #[serde(default = "default_aim_friction")]
+    pub gamepad_aim_friction: bool,
 }
 
 impl Default for UserSettings {
@@ -653,6 +662,7 @@ impl Default for UserSettings {
             speedrun_splits: false,
             gamepad_sensitivity: default_gamepad_sensitivity(),
             gamepad_invert_y: false,
+            gamepad_aim_friction: default_aim_friction(),
         }
     }
 }
@@ -1609,6 +1619,9 @@ mod tests {
         let p = parse_profile(old).expect("old profile parses");
         assert_eq!(p.settings.gamepad_sensitivity, 1.0, "missing field = 1.0, not f32::default()");
         assert!(!p.settings.gamepad_invert_y);
+        assert!(p.settings.gamepad_aim_friction, "pre-Milestone 28 profiles get aim friction on");
+        let off: UserSettings = serde_json::from_str(r#"{"gamepad_aim_friction":false}"#).unwrap();
+        assert!(!off.gamepad_aim_friction, "an explicit OFF survives a load");
         assert_eq!((p.settings.mouse_sensitivity, p.settings.base_fov_deg, p.settings.speedrun_splits), (1.5, 95.0, true));
         // An empty settings block and a bare profile both fall back to defaults.
         assert_eq!(parse_profile(r#"{"settings":{}}"#).unwrap().settings, UserSettings::default());

@@ -1,7 +1,9 @@
 //! Unified gamepad / controller input (Milestone 23).
 //!
-//! Every connected [`Gamepad`] entity is folded into one [`GamepadInput`]
-//! resource in `PreUpdate`, right after Bevy's own input systems. Gameplay and
+//! Exactly one connected [`Gamepad`] (the active pad, see
+//! [`choose_active_pad`]) is folded into one [`GamepadInput`] resource in
+//! `PreUpdate`, right after Bevy's own input systems; other pads are ignored
+//! until they press a button (Milestone 28). Gameplay and
 //! menu systems read that resource next to keyboard / mouse, so a controller
 //! drives exactly the same physics, weapons, apps and state machine.
 //!
@@ -50,6 +52,8 @@ pub const NAV_REPEAT_DELAY: f32 = 0.35;
 pub const NAV_REPEAT_RATE: f32 = 0.22;
 /// Longest frame the look curve integrates (a hitch never spins the view).
 const MAX_LOOK_DT: f32 = 0.1;
+/// Stick deflection that lets an unowned pad claim input (stick drift never does).
+pub const CLAIM_STICK_THRESHOLD: f32 = 0.5;
 /// Movement components below this share of the stick magnitude snap to zero,
 /// so a near-pure sideways push reads as a pure strafe (CPMA air-strafe) and a
 /// near-pure forward push as W-only air control.
@@ -192,6 +196,49 @@ impl PadFrame {
 }
 
 // ---------------------------------------------------------------------------
+// Single active controller ownership (Milestone 28)
+// ---------------------------------------------------------------------------
+
+/// What one connected pad did this frame, for [`choose_active_pad`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PadClaim {
+    /// A digital button `just_pressed` this frame (deliberate edge).
+    pub edge: bool,
+    /// Any button held (or analog trigger past [`TRIGGER_THRESHOLD`]).
+    pub held: bool,
+    /// Strongest raw stick deflection (either stick).
+    pub stick: f32,
+}
+
+impl PadClaim {
+    /// Classify one pad's snapshot; `prev_buttons` = its held [`bits`] last frame.
+    pub fn of(frame: &PadFrame, prev_buttons: u32) -> Self {
+        PadClaim {
+            edge: (frame.buttons & !prev_buttons) | frame.tapped != 0,
+            held: frame.buttons != 0,
+            stick: frame.left_stick.length().max(frame.right_stick.length()),
+        }
+    }
+
+    /// Deliberate enough to claim an unowned seat.
+    fn claims_free_seat(&self) -> bool {
+        self.edge || self.held || self.stick >= CLAIM_STICK_THRESHOLD
+    }
+}
+
+/// The pad that owns input this frame. The current owner keeps it while
+/// connected unless another pad sends a deliberate button edge (never stick
+/// drift). With no (connected) owner, the first pad pressing a button or
+/// pushing a stick past [`CLAIM_STICK_THRESHOLD`] claims it.
+pub fn choose_active_pad(current: Option<Entity>, pads: &[(Entity, PadClaim)]) -> Option<Entity> {
+    let owner = current.filter(|o| pads.iter().any(|(e, _)| e == o));
+    if let Some(o) = owner {
+        return pads.iter().find(|(e, c)| *e != o && c.edge).map(|(e, _)| *e).or(Some(o));
+    }
+    pads.iter().find(|(_, c)| c.claims_free_seat()).map(|(e, _)| *e)
+}
+
+// ---------------------------------------------------------------------------
 // GamepadInput
 // ---------------------------------------------------------------------------
 
@@ -201,6 +248,9 @@ impl PadFrame {
 pub struct GamepadInput {
     /// Any `Gamepad` entity exists.
     pub connected: bool,
+    /// The one pad that drives everything (see [`choose_active_pad`]); other
+    /// connected pads are ignored entirely.
+    pub active_pad: Option<Entity>,
     /// The player is navigating with a controller: set on any gamepad input,
     /// cleared on mouse / keyboard activity (gates the menu focus highlight).
     pub active: bool,
@@ -210,10 +260,14 @@ pub struct GamepadInput {
     pub look_delta: Vec2,
     /// Raw Right Stick X past the look deadzone (Compendium turntable).
     pub spin_x: f32,
+    /// Deadzoned Right Stick magnitude `[0, 1]` (aim friction fades with it).
+    pub look_mag: f32,
 
     // Held.
     /// `RT` (button or analog travel).
     pub fire: bool,
+    /// `RT` rising edge (a fresh trigger squeeze: empty-gun dry click).
+    pub fire_just_pressed: bool,
     /// `A` / Cross or `L3`: holding it chains zero-friction bhops like
     /// holding Space. `L3` lets the left thumb bhop while the right thumb
     /// keeps air-strafe aiming on the Right Stick.
@@ -300,8 +354,12 @@ impl GamepadInput {
             *self = GamepadInput::default();
             return;
         }
+
         let held = frame.buttons;
-        let edge = (held & !self.held) | frame.tapped;
+        // Accept a same-frame press+release tap only when the button was
+        // previously up, so a slow analog RT squeeze crossing 0.35 and later
+        // firing digital `just_pressed` never double-triggers a dry click.
+        let edge = (held | frame.tapped) & !self.held;
         let on = |b: u32| held & b != 0;
         let hit = |b: u32| edge & b != 0;
         if !on(bits::SOUTH) {
@@ -311,9 +369,12 @@ impl GamepadInput {
         self.connected = true;
         self.move_axes = stick_move_axes(frame.left_stick);
         self.look_delta = apply_look_curve(frame.right_stick, sensitivity, invert_y, dt);
-        self.spin_x = apply_radial_deadzone(frame.right_stick, LOOK_DEADZONE).x;
+        let look_stick = apply_radial_deadzone(frame.right_stick, LOOK_DEADZONE);
+        self.spin_x = look_stick.x;
+        self.look_mag = look_stick.length();
 
         self.fire = on(bits::RT);
+        self.fire_just_pressed = hit(bits::RT);
         // `A` honours the resume / deploy latch; `L3` is never latched (it
         // cannot confirm a menu, so it never carries over into `Playing`).
         self.jump = (on(bits::SOUTH) && !self.jump_wait_release) || on(bits::LTHUMB);
@@ -513,11 +574,15 @@ pub fn pad_edit_text(buf: &mut String, pad: &GamepadInput, charset: &str, max: u
     *buf != before
 }
 
-/// Merge every `Gamepad` entity into [`GamepadInput`] (zero allocations).
+/// Pads tracked for ownership (more are ignored).
+const MAX_PADS: usize = 8;
+
+/// Fold the active pad (see [`choose_active_pad`]) into [`GamepadInput`]
+/// (zero allocations). Every other connected pad is ignored.
 #[allow(clippy::too_many_arguments)]
 pub fn update_gamepad_input(
     time: Res<Time>,
-    pads: Query<&Gamepad>,
+    pads: Query<(Entity, &Gamepad)>,
     store: Option<Res<ProfileStore>>,
     keys: Option<Res<ButtonInput<KeyCode>>>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
@@ -525,11 +590,44 @@ pub fn update_gamepad_input(
     scroll: Option<Res<bevy::input::mouse::AccumulatedMouseScroll>>,
     mut input: ResMut<GamepadInput>,
     mut focus: ResMut<GamepadFocus>,
+    mut prev_held: Local<[(Option<Entity>, u32); MAX_PADS]>,
 ) {
     focus.activate = None;
-    let mut frame = PadFrame::default();
-    for pad in &pads {
+    // Up to 8 pads tracked without allocating; extra pads are ignored.
+    let mut claims = [(Entity::PLACEHOLDER, PadClaim::default()); MAX_PADS];
+    let mut held_now = [(None, 0u32); MAX_PADS];
+    let mut n = 0;
+    for (e, pad) in &pads {
+        if n < MAX_PADS {
+            let mut f = PadFrame::default();
+            f.merge(pad);
+            let prev = prev_held.iter().find(|(p, _)| *p == Some(e)).map_or(0, |(_, b)| *b);
+            claims[n] = (e, PadClaim::of(&f, prev));
+            held_now[n] = (Some(e), f.buttons);
+            n += 1;
+        }
+    }
+    let prev_snapshot = *prev_held;
+    *prev_held = held_now;
+    let prev = input.active_pad;
+    let owner = choose_active_pad(prev, &claims[..n]);
+    if prev.is_some() && !claims[..n].iter().any(|(e, _)| Some(*e) == prev) {
+        // The owner was unplugged: release every held action this frame.
+        *input = GamepadInput { connected: n > 0, ..default() };
+    }
+    let mut frame = PadFrame { connected: n > 0, ..default() };
+    if let Some(pad) = owner.and_then(|o| pads.get(o).ok().map(|(_, p)| p)) {
         frame.merge(pad);
+    }
+    if owner != input.active_pad {
+        // Seed `input.held` from the incoming owner's *previous-frame* button
+        // mask (both on active handover and post-unplug takeover) so already-
+        // held buttons don't invent phantom edges while fresh analog/digital
+        // presses on this frame keep their edge.
+        input.held = owner
+            .and_then(|o| prev_snapshot.iter().find(|(p, _)| *p == Some(o)).map(|(_, b)| *b))
+            .unwrap_or(0);
+        input.active_pad = owner;
     }
     let kbm = keys.is_some_and(|k| k.get_just_pressed().next().is_some())
         || mouse.is_some_and(|m| m.get_just_pressed().next().is_some())
@@ -967,5 +1065,45 @@ mod tests {
         let others5 = grid.iter().copied().filter(|(x, _)| *x != e(5));
         assert_eq!(spatial_pick(Vec2::new(0.0, 120.0), Vec2::Y, others5), Some(e(1)));
         assert_eq!(spatial_pick(Vec2::ZERO, Vec2::Y, std::iter::empty()), None);
+    }
+
+    #[test]
+    fn active_pad_ownership_claims_keeps_and_transfers_on_button_edges_only() {
+        let a = Entity::from_raw_u32(1).unwrap();
+        let b = Entity::from_raw_u32(2).unwrap();
+        let idle = PadClaim::default();
+        let drift = PadClaim { stick: 0.3, ..default() };
+        let full_stick = PadClaim { stick: 1.0, ..default() };
+        let press = PadClaim { edge: true, held: true, ..default() };
+        let held = PadClaim { held: true, ..default() };
+        // Nobody owns: drift never claims, a deliberate stick or button does.
+        assert_eq!(choose_active_pad(None, &[(a, idle), (b, drift)]), None);
+        assert_eq!(choose_active_pad(None, &[(a, idle), (b, full_stick)]), Some(b));
+        assert_eq!(choose_active_pad(None, &[(a, held), (b, idle)]), Some(a));
+        // A owns: B's full stick or a merely held button never steals it.
+        assert_eq!(choose_active_pad(Some(a), &[(a, idle), (b, full_stick)]), Some(a));
+        assert_eq!(choose_active_pad(Some(a), &[(a, idle), (b, held)]), Some(a));
+        // A fresh button edge on B transfers ownership.
+        assert_eq!(choose_active_pad(Some(a), &[(a, full_stick), (b, press)]), Some(b));
+        // The owner unplugged: the seat frees (and only a deliberate pad reclaims it).
+        assert_eq!(choose_active_pad(Some(a), &[(b, drift)]), None);
+        assert_eq!(choose_active_pad(Some(a), &[]), None);
+    }
+
+    #[test]
+    fn fire_just_pressed_is_a_single_rising_edge() {
+        let dt = 1.0 / 60.0;
+        let mut g = GamepadInput::default();
+        g.update(frame(bits::RT), dt, 1.0, false, false);
+        assert!(g.fire && g.fire_just_pressed);
+        g.update(frame(bits::RT), dt, 1.0, false, false);
+        assert!(g.fire && !g.fire_just_pressed, "held trigger is not a new squeeze");
+        // Slow squeeze: analog crossed 0.35 on frame 1, then digital just_pressed fires on frame 2.
+        let delayed_digital = PadFrame { connected: true, buttons: bits::RT, tapped: bits::RT, ..default() };
+        g.update(delayed_digital, dt, 1.0, false, false);
+        assert!(g.fire && !g.fire_just_pressed, "delayed digital tap while already held must not double-trigger");
+        g.update(frame(0), dt, 1.0, false, false);
+        g.update(frame(bits::RT), dt, 1.0, false, false);
+        assert!(g.fire_just_pressed);
     }
 }

@@ -522,3 +522,100 @@ fn controller_edits_the_run_seed() {
     assert!(!seed.editing && seed.code == "BA", "{seed:?}");
     assert_eq!(app_state(&app), AppState::MainMenu);
 }
+
+/// Milestone 28: exactly one controller owns input. A second pad held at full
+/// deflection does nothing (no movement, no look, no input-mode flip) until it
+/// sends a deliberate button edge; unplugging the owner releases everything
+/// on that very frame.
+#[test]
+fn only_the_active_pad_drives_input_and_ownership_moves_on_button_edges() {
+    use segnale_debole::gamepad::InputMode;
+    let (mut app, a) = playing_app(21);
+    // A claims the seat with a harmless D-Pad Up press.
+    tap(&mut app, a, GamepadButton::DPadUp);
+    assert_eq!(app.world().resource::<GamepadInput>().active_pad, Some(a));
+    // The player goes back to the keyboard.
+    key_tap(&mut app, KeyCode::F9);
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::KeyboardMouse);
+
+    let b = plug_pad(&mut app);
+    let start = player_feet(&mut app);
+    let yaw0 = player(&mut app).yaw;
+    axis(&mut app, b, GamepadAxis::LeftStickY, 1.0);
+    axis(&mut app, b, GamepadAxis::RightStickX, 1.0);
+    step(&mut app, FPS / 2);
+    {
+        let g = app.world().resource::<GamepadInput>();
+        assert_eq!(g.active_pad, Some(a), "stick deflection never steals the seat");
+        assert_eq!(g.move_axes, Vec2::ZERO);
+        assert_eq!(g.look_delta, Vec2::ZERO);
+    }
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::KeyboardMouse, "pad B never flips the prompts");
+    let p = player(&mut app);
+    assert!((p.yaw - yaw0).abs() < 1e-6, "pad B never turns the camera");
+    assert!(horizontal_speed(&p) < 0.1 && (player_feet(&mut app) - start).length() < 0.05, "pad B never walks");
+
+    // A deliberate button edge on B transfers ownership; B's sticks now drive.
+    tap(&mut app, b, GamepadButton::DPadUp);
+    assert_eq!(app.world().resource::<GamepadInput>().active_pad, Some(b));
+    step(&mut app, FPS / 4);
+    let p = player(&mut app);
+    assert!((p.yaw - yaw0).abs() > 0.2, "B turns the camera now");
+    assert!(horizontal_speed(&p) > 1.0, "B walks the player now");
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::Gamepad);
+    // A's stick no longer counts.
+    axis(&mut app, a, GamepadAxis::RightStickX, -1.0);
+    step(&mut app, 2);
+    assert!(app.world().resource::<GamepadInput>().look_delta.x > 0.0, "still B's rightward look");
+
+    // Unplug the owner mid-action: every held action clears on that frame.
+    hold(&mut app, b, GamepadButton::RightTrigger2);
+    step(&mut app, 1);
+    assert!(app.world().resource::<GamepadInput>().fire);
+    app.world_mut().entity_mut(b).despawn();
+    step(&mut app, 1);
+    {
+        let g = app.world().resource::<GamepadInput>();
+        assert!(g.connected, "pad A is still plugged in");
+        assert!(!g.fire && !g.jump && g.move_axes == Vec2::ZERO, "held actions cleared on the unplug frame");
+        // A still holds its stick, which reclaims the free seat on the same frame.
+        assert_eq!(g.active_pad, Some(a));
+    }
+}
+
+#[derive(Resource, Default)]
+struct DeniedCount(usize);
+
+fn count_denied(sfx: Res<segnale_debole::audio::SfxQueue>, mut n: ResMut<DeniedCount>) {
+    n.0 += sfx.events().filter(|e| *e == segnale_debole::audio::SfxEvent::Denied).count();
+}
+
+/// Milestone 28: an empty trigger squeeze dry-clicks once, like a fresh
+/// mouse click: never repeating while held, once more on the next squeeze.
+#[test]
+fn empty_trigger_squeeze_dry_clicks_once_per_pull() {
+    let (mut app, e) = playing_app(22);
+    app.init_resource::<DeniedCount>().add_systems(PostUpdate, count_denied);
+    {
+        let mut q = app.world_mut().query::<&mut Player>();
+        let mut p = q.single_mut(app.world_mut()).unwrap();
+        p.ammo_shells = 0;
+        p.ammo_plasma = 0;
+        p.ammo_rockets = 0;
+    }
+    step(&mut app, 1);
+    let denied = |app: &App| app.world().resource::<DeniedCount>().0;
+    assert_eq!(denied(&app), 0);
+    hold(&mut app, e, GamepadButton::RightTrigger2);
+    step(&mut app, 1);
+    assert_eq!(denied(&app), 1, "one dry click on the squeeze");
+    step(&mut app, FPS);
+    assert_eq!(denied(&app), 1, "holding the trigger never repeats");
+    release(&mut app, e, GamepadButton::RightTrigger2);
+    step(&mut app, 2);
+    hold(&mut app, e, GamepadButton::RightTrigger2);
+    step(&mut app, 1);
+    assert_eq!(denied(&app), 2, "a second squeeze clicks once more");
+    step(&mut app, FPS / 2);
+    assert_eq!(denied(&app), 2);
+}

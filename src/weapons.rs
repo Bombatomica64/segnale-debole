@@ -2284,12 +2284,20 @@ fn fire_weapons(
     let bot_fire = bot.as_ref().is_some_and(|b| b.fire);
     // `RT` fires without cursor capture (controllers need no mouse click).
     let pad_fire = pad.as_ref().is_some_and(|g| g.fire);
+    let pad_fire_edge = pad.as_ref().is_some_and(|g| g.fire_just_pressed);
+    let fresh_trigger = (captured.0 && mouse.just_pressed(MouseButton::Left)) || pad_fire_edge;
     let trigger = (captured.0 && mouse.pressed(MouseButton::Left)) || ws.force_fire || bot_fire || pad_fire;
     // `F` / D-Pad Down inspect flourish (purely visual): pulling the trigger cancels it at once.
-    if trigger {
+    if trigger || fresh_trigger {
         ws.inspect_timer = 0.0;
     } else if (keys.just_pressed(KeyCode::KeyF) || pad.as_ref().is_some_and(|g| g.inspect)) && ws.swap_timer <= 0.0 {
         ws.inspect_timer = INSPECT_SECS;
+    }
+    // Empty-inventory dry click: honour a fresh click / quick trigger tap even
+    // during cooldown or a single-frame press+release when no loaded gun exists.
+    if fresh_trigger && !ws.current.has_ammo(&player) && ws.current.auto_swap_target(&player).is_none() {
+        sfx.play(SfxEvent::Denied);
+        return;
     }
     if !trigger || ws.cooldown > 0.0 || ws.swap_timer > SWAP_SECS * 0.4 {
         return;
@@ -2299,8 +2307,6 @@ fn fire_weapons(
             && ws.switch_to(other)
         {
             sfx.play(SfxEvent::WeaponSwap);
-        } else if mouse.just_pressed(MouseButton::Left) {
-            sfx.play(SfxEvent::Denied);
         }
         return;
     }

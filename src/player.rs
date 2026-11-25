@@ -516,6 +516,69 @@ fn cursor_capture_input(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Controller aim friction (Milestone 28)
+// ---------------------------------------------------------------------------
+
+/// Half-angle of the aim-friction cone around the view ray (~6 degrees).
+pub const AIM_FRICTION_CONE_RAD: f32 = 0.105;
+/// Targets farther than this never slow the stick (effective combat range).
+pub const AIM_FRICTION_RANGE: f32 = 36.0;
+/// Largest slowdown, right on a silhouette with a moderate stick (20%).
+pub const AIM_FRICTION_MAX_SLOW: f32 = 0.20;
+/// Stick magnitude up to which the full slowdown applies (fine tracking).
+pub const AIM_FRICTION_FINE_STICK: f32 = 0.5;
+/// Stick magnitude at and past which friction is gone (turning away is instant).
+pub const AIM_FRICTION_FULL_STICK: f32 = 0.85;
+
+fn smoothstep01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Right-stick look multiplier in `[1 - AIM_FRICTION_MAX_SLOW, 1]` for a
+/// target `angle_rad` off the view ray (0 = on its silhouette) and the
+/// deadzoned stick magnitude. Fades smoothly to `1.0` toward the cone edge
+/// and toward full deflection. It only ever scales a delta the stick already
+/// produced: a centered stick never moves, nothing snaps or pulls.
+pub fn aim_friction_scale(angle_rad: f32, stick_mag: f32) -> f32 {
+    if !angle_rad.is_finite() || !stick_mag.is_finite() || stick_mag <= 0.0 || angle_rad >= AIM_FRICTION_CONE_RAD {
+        return 1.0;
+    }
+    let near = 1.0 - smoothstep01(angle_rad.max(0.0) / AIM_FRICTION_CONE_RAD);
+    let fine = 1.0 - smoothstep01((stick_mag - AIM_FRICTION_FINE_STICK) / (AIM_FRICTION_FULL_STICK - AIM_FRICTION_FINE_STICK));
+    1.0 - AIM_FRICTION_MAX_SLOW * near * fine
+}
+
+/// Angle (radians) between the view ray and the nearest edge of a sphere
+/// (`0` when the ray already crosses it).
+pub fn silhouette_angle(eye: Vec3, fwd: Vec3, center: Vec3, radius: f32) -> f32 {
+    let to = center - eye;
+    let dist = to.length();
+    if dist <= radius.max(1e-4) {
+        return 0.0;
+    }
+    let center_angle = fwd.normalize_or_zero().angle_between(to / dist);
+    let half = (radius / dist).clamp(0.0, 1.0).asin();
+    (center_angle - half).max(0.0)
+}
+
+/// Smallest silhouette angle among `targets` (`(center, radius)` spheres)
+/// inside [`AIM_FRICTION_RANGE`] and the friction cone with a clear line of
+/// sight from `eye` (wall-screened targets never count).
+pub fn aim_friction_target_angle(grid: Option<&LevelGrid>, eye: Vec3, fwd: Vec3, targets: impl Iterator<Item = (Vec3, f32)>) -> Option<f32> {
+    targets
+        .filter(|(c, _)| c.distance_squared(eye) <= AIM_FRICTION_RANGE * AIM_FRICTION_RANGE)
+        .map(|(c, r)| (c, silhouette_angle(eye, fwd, c, r)))
+        .filter(|(_, a)| *a < AIM_FRICTION_CONE_RAD)
+        .filter(|(c, _)| grid.is_none_or(|g| crate::physics::has_line_of_sight(g, eye, *c)))
+        .map(|(_, a)| a)
+        .reduce(f32::min)
+}
+
+type FrictionEnemies<'w, 's> = Query<'w, 's, (&'static Transform, &'static Enemy), (Without<Player>, Without<PlayerCamera>)>;
+type FrictionJammers<'w, 's> = Query<'w, 's, (&'static Transform, &'static DemonJammer), (Without<Player>, Without<PlayerCamera>, Without<Enemy>)>;
+
 #[allow(clippy::too_many_arguments)]
 fn mouse_look(
     motion: Res<AccumulatedMouseMotion>,
@@ -526,6 +589,7 @@ fn mouse_look(
     pad: Option<Res<GamepadInput>>,
     mut players: Query<(&mut Player, &mut Transform), Without<PlayerCamera>>,
     mut cams: Query<&mut Transform, With<PlayerCamera>>,
+    (grid, enemies, jammers): (Option<Res<LevelGrid>>, FrictionEnemies, FrictionJammers),
 ) {
     let Ok((mut p, mut tf)) = players.single_mut() else { return };
     if mouse_look_active(*captured, browser.as_deref()) && motion.delta != Vec2::ZERO {
@@ -535,9 +599,28 @@ fn mouse_look(
     }
     // Right Stick: already curved, sensitivity- and dt-scaled radians; needs
     // no cursor capture (Steam Deck / Android / web work without a click).
-    if let Some(look) = pad.map(|g| g.look_delta)
-        && look != Vec2::ZERO
+    // Aim friction gently slows this stick delta (never the mouse) while the
+    // crosshair crosses a visible demon / jammer.
+    if let Some(g) = pad.as_deref()
+        && g.look_delta != Vec2::ZERO
     {
+        let mut look = g.look_delta;
+        if live_settings(store.as_deref()).gamepad_aim_friction {
+            let cam_local = cams.single().copied().unwrap_or_default();
+            let eye_tf = live_eye_pose(&tf, &cam_local);
+            let (eye, fwd) = (eye_tf.translation, eye_tf.rotation * Vec3::NEG_Z);
+            let demons = enemies
+                .iter()
+                .filter(|(_, e)| e.is_alive())
+                .flat_map(|(t, e)| e.stats.hit_spheres.iter().map(move |&(h, r)| (t.translation + Vec3::Y * h, r)));
+            let towers = jammers
+                .iter()
+                .filter(|(_, j)| j.hp > 0.0)
+                .flat_map(|(t, _)| crate::weapons::JAMMER_SPHERES.iter().map(move |&(h, r)| (t.translation + Vec3::Y * h, r)));
+            if let Some(angle) = aim_friction_target_angle(grid.as_deref(), eye, fwd, demons.chain(towers)) {
+                look *= aim_friction_scale(angle, g.look_mag);
+            }
+        }
         p.yaw -= look.x;
         p.pitch = (p.pitch + look.y).clamp(-1.5, 1.5);
     }
@@ -1827,5 +1910,60 @@ mod tests {
         }
         assert_ne!(theme_fog(1).color, theme_fog(2).color);
         assert_eq!(theme_fog(1).color, theme_fog(6).color);
+    }
+
+    #[test]
+    fn aim_friction_scale_is_gentle_and_fades_with_angle_and_stick() {
+        let moderate = 0.4;
+        // On the silhouette with a moderate stick: the full (gentle) 20%.
+        assert!((aim_friction_scale(0.0, moderate) - 0.80).abs() < 1e-6);
+        assert!(aim_friction_scale(0.0, moderate) >= 1.0 - AIM_FRICTION_MAX_SLOW - 1e-6);
+        // A centered stick has nothing to scale (and never moves the view).
+        assert_eq!(aim_friction_scale(0.0, 0.0), 1.0);
+        // Full deflection turns away at full speed.
+        assert_eq!(aim_friction_scale(0.0, AIM_FRICTION_FULL_STICK), 1.0);
+        assert_eq!(aim_friction_scale(0.0, 1.0), 1.0);
+        // Cone edge and beyond: nothing.
+        assert_eq!(aim_friction_scale(AIM_FRICTION_CONE_RAD, moderate), 1.0);
+        assert_eq!(aim_friction_scale(0.5, moderate), 1.0);
+        // Smooth and monotonic in both inputs, always within [0.8, 1].
+        let mut last = 0.0;
+        for i in 0..=100 {
+            let v = aim_friction_scale(AIM_FRICTION_CONE_RAD * i as f32 / 100.0, moderate);
+            assert!((0.8 - 1e-6..=1.0).contains(&v) && v >= last - 1e-6);
+            last = v;
+        }
+        let mut last = 0.0;
+        for i in 1..=100 {
+            let v = aim_friction_scale(0.0, i as f32 / 100.0);
+            assert!(v >= last - 1e-6);
+            last = v;
+        }
+        assert_eq!(aim_friction_scale(f32::NAN, 0.4), 1.0);
+        assert_eq!(aim_friction_scale(0.0, f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn aim_friction_targets_need_the_cone_range_and_line_of_sight() {
+        // 4 m cells: open rows z 4..8 and 12..16, a pillar at x 12..16 in row z 8..12.
+        let grid = LevelGrid::from_ascii(&["#######", "#.....#", "#..#..#", "#.....#", "#######"]);
+        let east = Vec3::X;
+        let eye = Vec3::new(6.0, 1.6, 6.0);
+        // A demon straight ahead in the open.
+        let ahead = (Vec3::new(20.0, 1.6, 6.0), 0.5);
+        assert_eq!(aim_friction_target_angle(Some(&grid), eye, east, std::iter::once(ahead)), Some(0.0));
+        // Well outside the cone, or past the combat range: none.
+        assert_eq!(aim_friction_target_angle(None, eye, east, std::iter::once((Vec3::new(13.0, 1.6, 13.0), 0.5))), None);
+        let far = (Vec3::new(6.0 + AIM_FRICTION_RANGE + 2.0, 1.6, 6.0), 0.5);
+        assert_eq!(aim_friction_target_angle(None, eye, east, std::iter::once(far)), None);
+        // Behind the pillar: occluded, so no friction at all.
+        let eye2 = Vec3::new(6.0, 1.6, 10.0);
+        let behind = (Vec3::new(20.0, 1.6, 10.0), 0.5);
+        assert!(!crate::physics::has_line_of_sight(&grid, eye2, behind.0), "pillar blocks");
+        assert_eq!(aim_friction_target_angle(Some(&grid), eye2, east, std::iter::once(behind)), None);
+        // Slightly off the silhouette: a small positive angle inside the cone.
+        let a = aim_friction_target_angle(Some(&grid), eye, east, std::iter::once((Vec3::new(20.0, 1.6, 6.8), 0.5))).unwrap();
+        assert!(a > 0.0 && a < AIM_FRICTION_CONE_RAD, "{a}");
+        assert!(aim_friction_scale(a, 0.4) > 0.8 && aim_friction_scale(a, 0.4) < 1.0);
     }
 }

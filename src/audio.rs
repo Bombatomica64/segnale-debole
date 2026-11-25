@@ -128,12 +128,19 @@ impl SfxEvent {
     /// Playback volume (0..1).
     pub fn volume(self) -> f32 {
         match self {
-            SfxEvent::Hit | SfxEvent::EnemyFire | SfxEvent::Pickup | SfxEvent::WeaponSwap => 0.45,
+            SfxEvent::Hit | SfxEvent::Pickup | SfxEvent::WeaponSwap => 0.45,
             SfxEvent::Plasma | SfxEvent::Jump | SfxEvent::Bhop => 0.5,
             SfxEvent::StepRegolith | SfxEvent::StepMetal => 0.28,
             SfxEvent::ShellClink => 0.32,
             SfxEvent::LandThud | SfxEvent::RocketWhoosh => 0.55,
-            SfxEvent::JammerHum | SfxEvent::PitRescue => 0.6,
+            // Milestone 28 headroom: keep RocketExplode punchier than RocketFire
+            // while reserving headroom so Overdrive stems + close hum + blast +
+            // enemy fire stay cleanly <= -1 dBFS with zero clipping.
+            SfxEvent::JammerHum => 0.24,
+            SfxEvent::RocketFire => 0.40,
+            SfxEvent::RocketExplode => 0.44,
+            SfxEvent::EnemyFire => 0.36,
+            SfxEvent::PitRescue => 0.6,
             SfxEvent::UiTick => 0.18,
             SfxEvent::UiConfirm => 0.3,
             _ => 0.75,
@@ -745,7 +752,7 @@ const MUSIC_SEAM_SAMPLES: usize = SAMPLE_RATE as usize / 50;
 /// Peak level every stem is normalized to.
 pub const MUSIC_PEAK: f32 = 0.85;
 /// Base mix level of a fully weighted stem (before the master volume).
-pub const MUSIC_BASE_VOLUME: f32 = 0.32;
+pub const MUSIC_BASE_VOLUME: f32 = 0.20;
 /// Exponential crossfade rate of [`step_music_mix`] (1/s).
 pub const MUSIC_MIX_RATE: f32 = 3.0;
 
@@ -1013,8 +1020,8 @@ pub fn target_music_weights(c: MusicCues) -> [f32; MUSIC_LAYERS] {
         AppState::Paused => [0.25, 0.0, 0.0, 0.0],
         AppState::UpgradeSelect | AppState::Victory => [0.15, 0.55, 0.0, 0.0],
         AppState::GameOver => [0.50, 0.0, 0.0, 0.0],
-        AppState::Playing if c.boss_active && c.boss_overdrive => [0.05, 0.20, 1.0, 1.0],
-        AppState::Playing if c.boss_active => [0.15, 0.30, 1.0, 0.75],
+        AppState::Playing if c.boss_active && c.boss_overdrive => [0.04, 0.14, 0.62, 0.68],
+        AppState::Playing if c.boss_active => [0.10, 0.22, 0.72, 0.60],
         AppState::Playing if c.uploading => [0.15, 0.35, 1.0, 0.0],
         AppState::Playing if c.time_trial => [0.0, 0.85, 0.70, 0.0],
         AppState::Playing if c.bars <= 1 => [0.95, 0.05, 0.0, 0.0],
@@ -1525,12 +1532,13 @@ mod tests {
         for bars in 0..=5 {
             let sos = MusicCues { uploading: true, ..cues(Playing, bars) };
             assert_eq!(target_music_weights(sos), [0.15, 0.35, 1.0, 0.0], "SOS at {bars}");
-            // Carrier Daemon: the Overdrive stem joins at 0.75, full in Overdrive.
+            // Carrier Daemon: the Overdrive stem joins at 0.60, peaks at 0.68 in Overdrive
+            // (keeping 4-stem stacked headroom clean under -1 dBFS at full master).
             let boss = MusicCues { boss_active: true, ..cues(Playing, bars) };
-            assert_eq!(target_music_weights(boss), [0.15, 0.30, 1.0, 0.75], "boss at {bars}");
+            assert_eq!(target_music_weights(boss), [0.10, 0.22, 0.72, 0.60], "boss at {bars}");
             let od = MusicCues { boss_overdrive: true, ..boss };
-            assert_eq!(target_music_weights(od), [0.05, 0.20, 1.0, 1.0], "overdrive at {bars}");
-            assert_eq!(target_music_weights(MusicCues { uploading: true, ..od }), [0.05, 0.20, 1.0, 1.0], "boss wins over SOS");
+            assert_eq!(target_music_weights(od), [0.04, 0.14, 0.62, 0.68], "overdrive at {bars}");
+            assert_eq!(target_music_weights(MusicCues { uploading: true, ..od }), [0.04, 0.14, 0.62, 0.68], "boss wins over SOS");
             // A stale overdrive flag without a live boss is ignored.
             assert_eq!(target_music_weights(MusicCues { boss_overdrive: true, ..cues(Playing, bars) })[3], 0.0);
             // Time trial: energetic pulse + rush instead of the dead-zone drone.
@@ -1795,5 +1803,71 @@ mod tests {
         assert!(is_clink_bounce(-3.0, 1.2));
         assert!(!is_clink_bounce(-0.8, 0.2), "resting jitter is silent");
         assert!(!is_clink_bounce(-3.0, -3.2), "still falling");
+    }
+
+    /// Decode a 16-bit mono PCM WAV written by [`encode_wav`] back to `-1..1`.
+    fn decode_wav(bytes: &[u8]) -> Vec<f32> {
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[36..40], b"data");
+        bytes[44..].as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c) as f32 / i16::MAX as f32).collect()
+    }
+
+    /// Worst-case simultaneous combat mix at full master volume: the four
+    /// Boss Overdrive stems at their mix weights, a close Jammer hum, a
+    /// Signal-Mortar detonation (`RocketExplode`) and an enemy shot, all
+    /// decoded back from their WAV bytes. The SFX land together and with a few
+    /// staggered offsets; the music bed is checked at EVERY loop phase (each
+    /// SFX sample is paired with the bed's hottest same-sign sample, which
+    /// upper-bounds any phase alignment). Every source is mono, duplicated /
+    /// panned to both ears with gain <= 1, so the hottest ear sees at most
+    /// this sum. Returns `(peak, clipped samples)`.
+    fn worst_case_combat_mix() -> (f32, usize) {
+        let full = UserSettings { audio_master_volume: 1.0, audio_muted: false, ..default() };
+        let cues = MusicCues { state: AppState::Playing, bars: 5, boss_active: true, boss_overdrive: true, ..default() };
+        let weights = target_music_weights(cues);
+        let stems: Vec<(Vec<f32>, f32)> =
+            MusicLayer::ALL.iter().map(|l| (decode_wav(&synthesize_music_wav(*l)), effective_music_volume(weights[l.index()], &full))).collect();
+        let loop_len = stems[0].0.len();
+        assert!(stems.iter().all(|(s, _)| s.len() == loop_len), "phase-locked stems");
+        let bed: Vec<f32> = (0..loop_len).map(|i| stems.iter().map(|(s, g)| s[i] * g).sum()).collect();
+        let bed_hi = bed.iter().copied().fold(0.0f32, f32::max);
+        let bed_lo = bed.iter().copied().fold(0.0f32, f32::min);
+        let close = spatial_distance_fade(2.0, SPATIAL_MAX_DIST) * spatial_rolloff(2.0);
+        let sfx: Vec<(Vec<f32>, f32)> = [(SfxEvent::JammerHum, close), (SfxEvent::RocketExplode, 1.0), (SfxEvent::EnemyFire, 1.0)]
+            .iter()
+            .map(|(e, g)| (decode_wav(&synthesize_wav(*e)), effective_sfx_volume(*e, &full) * g))
+            .collect();
+        let len = sfx.iter().map(|(s, _)| s.len()).max().unwrap();
+        let (mut peak, mut clipped) = (0.0f32, 0usize);
+        // SFX offsets in samples: together, then each shifted by 5-20 ms.
+        let staggers: [[usize; 3]; 6] = [[0, 0, 0], [0, 220, 0], [0, 0, 220], [0, 0, 330], [441, 0, 110], [0, 110, 0]];
+        for st in &staggers {
+            for i in 0..len + 441 {
+                let fx: f32 = sfx.iter().zip(st).map(|((s, g), d)| i.checked_sub(*d).and_then(|j| s.get(j)).map_or(0.0, |x| x * g)).sum();
+                let v = (fx + bed_hi).abs().max((fx + bed_lo).abs());
+                peak = peak.max(v);
+                clipped += (v >= 1.0) as usize;
+            }
+        }
+        (peak, clipped)
+    }
+
+    #[test]
+    fn worst_case_combat_mix_keeps_one_db_of_headroom() {
+        let (peak, clipped) = worst_case_combat_mix();
+        let dbfs = 20.0 * peak.log10();
+        println!("worst-case combat mix peak {peak:.4} ({dbfs:.2} dBFS), clipped samples {clipped}");
+        assert_eq!(clipped, 0, "no sample reaches full scale");
+        assert!(peak <= 0.89, "peak {peak:.4} ({dbfs:.2} dBFS) must stay <= 0.89 (-1 dBFS)");
+        // Every cue keeps a clear level of its own, and telegraphs / shots stay
+        // distinct relative to the explosion, the hum and the music bed.
+        let full = UserSettings::default();
+        let v = |e: SfxEvent| effective_sfx_volume(e, &full);
+        for e in [SfxEvent::EnemyFire, SfxEvent::SniperLock, SfxEvent::BaronAlert, SfxEvent::Shotgun, SfxEvent::Plasma, SfxEvent::RocketExplode] {
+            assert!(v(e) >= 0.3, "{e:?} stays punchy: {}", v(e));
+        }
+        assert!(v(SfxEvent::EnemyFire) >= v(SfxEvent::JammerHum), "enemy shots cut through the hum");
+        assert!(v(SfxEvent::Shotgun) >= v(SfxEvent::RocketExplode) * 0.8, "player shots stay distinct from explosions");
+        assert!(v(SfxEvent::EnemyFire) > MUSIC_BASE_VOLUME, "shots sit above the music bed");
     }
 }

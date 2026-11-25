@@ -2914,8 +2914,9 @@ fn settings_open_from_main_menu_and_mid_run_pause_and_apply_live() {
     tap(&mut app, KeyCode::KeyO);
     assert_eq!(app_state(&app), AppState::Settings);
     assert_eq!(app.world().resource::<SettingsReturn>().0, AppState::MainMenu);
-    // 6 knobs x (-/+), 5 toggles (incl. SPEEDRUN SPLITS, GAMEPAD INVERT Y), the style pills, the color swatches, RESET.
-    assert_eq!(count::<SettingsControl>(&mut app), 6 * 2 + 5 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
+    // 6 knobs x (-/+), 6 toggles (incl. SPEEDRUN SPLITS, GAMEPAD INVERT Y, AIM FRICTION), the style pills, the color swatches, RESET.
+    assert_eq!(count::<SettingsControl>(&mut app), 6 * 2 + 6 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
+    assert!(ui_texts(&mut app).iter().any(|t| t == "AIM FRICTION"), "aim friction toggle row");
     assert!(ui_texts(&mut app).iter().any(|t| t == "SPEEDRUN SPLITS"), "speedrun splits toggle row");
     let texts = ui_texts(&mut app);
     assert!(texts.iter().any(|t| t == "GAMEPAD SENSITIVITY") && texts.iter().any(|t| t == "GAMEPAD INVERT Y"), "gamepad rows");
@@ -3511,20 +3512,20 @@ fn adaptive_music_mix_goes_rush_during_boss_fight() {
     app.world_mut().run_system_once(segnale_debole::audio::update_music_mix).unwrap();
     let after = music_weights(&app);
     let dt = app.world().resource::<Time>().delta_secs();
-    let expect = step_music_mix(before, [0.15, 0.30, 1.0, 0.75], dt);
+    let expect = step_music_mix(before, [0.10, 0.22, 0.72, 0.60], dt);
     for i in 0..4 {
         assert!((after[i] - expect[i]).abs() < 1e-5, "{after:?} vs {expect:?}");
     }
     assert!(after[2] > before[2], "rush rises under the boss");
     assert!(after[3] > before[3], "the Boss Overdrive stem rises too");
 
-    // Overdrive: the boss stem heads for full weight.
+    // Overdrive: the boss stem rises toward its Overdrive headroom target.
     app.world_mut().insert_resource(BossHud { active: true, phase: BossPhase::Overdrive, hp_frac: 0.2, pylons: 0 });
     let before = music_weights(&app);
     app.world_mut().run_system_once(segnale_debole::audio::update_music_mix).unwrap();
     let after = music_weights(&app);
     let dt = app.world().resource::<Time>().delta_secs();
-    let expect = step_music_mix(before, [0.05, 0.20, 1.0, 1.0], dt);
+    let expect = step_music_mix(before, [0.04, 0.14, 0.62, 0.68], dt);
     for i in 0..4 {
         assert!((after[i] - expect[i]).abs() < 1e-5, "{after:?} vs {expect:?}");
     }
@@ -4062,4 +4063,35 @@ fn f9_does_nothing_without_dev_tools() {
     if std::env::var_os("SEGNALE_DEV").is_none() {
         assert_eq!(DevTools::from_env().0, cfg!(debug_assertions));
     }
+}
+
+/// Milestone 28: an Imp visible 32 m down a clear straight corridor wakes
+/// within about a second; an Imp at the same range behind a wall stays idle.
+#[test]
+fn wide_lane_aggro_wakes_visible_demons_at_32_m_but_not_screened_ones() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 4242);
+    godmode(&mut app);
+    // Two 60 m lanes (z 4..8 and z 12..16) split by a solid wall row.
+    let wall = "#".repeat(17);
+    let lane = format!("#{}#", ".".repeat(15));
+    app.world_mut().insert_resource(LevelGrid::from_ascii(&[wall.as_str(), lane.as_str(), wall.as_str(), lane.as_str(), wall.as_str()]));
+    step(&mut app, 2);
+    despawn_all_enemies(&mut app);
+    let feet = Vec3::new(6.0, 0.0, 6.0);
+    teleport(&mut app, feet, feet + Vec3::new(1.0, PLAYER_EYE_HEIGHT, 0.0));
+    step(&mut app, 5);
+    let visible = spawn_demon(&mut app, EnemyKind::Imp, Vec3::new(38.0, 0.0, 6.0));
+    let screened = spawn_demon(&mut app, EnemyKind::Imp, Vec3::new(36.0, 0.0, 14.0));
+    step(&mut app, 1);
+    let g = grid(&app);
+    assert!(has_line_of_sight(&g, feet + Vec3::Y * PLAYER_EYE_HEIGHT, Vec3::new(38.0, 1.5, 6.0)));
+    assert!(!has_line_of_sight(&g, feet + Vec3::Y * PLAYER_EYE_HEIGHT, Vec3::new(36.0, 1.5, 14.0)));
+    for e in [visible, screened] {
+        assert!(!enemy(&app, e).unwrap().alerted, "both start idle");
+    }
+    step(&mut app, FPS);
+    let v = enemy(&app, visible).unwrap();
+    assert!(v.alerted && v.sees_player, "32 m in plain sight reacts within ~1 s");
+    assert!(!enemy(&app, screened).unwrap().alerted, "wall-screened demon stays idle");
 }

@@ -37,6 +37,41 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
         /** Pointer-capture poll period (ms). */
         private const val CAPTURE_POLL_MS = 100L
+
+        /**
+         * Right-stick axis pair from which candidate axes are centered sticks
+         * (`[-1, 1]`-style range). Pure; mirrored and unit-tested in Rust as
+         * `android_input::select_right_stick_pair`. Prefers `Z / RZ` (the
+         * Android standard mapping), then `RX / RY` (many HID / Xbox-style
+         * pads), else `null` (zero look) so uncentered trigger axes on `Z / RZ`
+         * can never rotate the camera.
+         */
+        @JvmStatic
+        fun selectRightStickPair(zRz: Boolean, rxRy: Boolean): Pair<Int, Int>? = when {
+            zRz -> Pair(MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ)
+            rxRy -> Pair(MotionEvent.AXIS_RX, MotionEvent.AXIS_RY)
+            else -> null
+        }
+
+        /** Whether `axis` reports a centered stick range on `device`'s joystick source. */
+        @JvmStatic
+        fun isCenteredStick(device: InputDevice, axis: Int): Boolean {
+            val range = device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK)
+            return range != null && range.min < -0.5f && range.max > 0.5f
+        }
+    }
+
+    /** Per-device right-stick axis pair (resolved once a real device is seen). */
+    private val rightStickAxes = HashMap<Int, Pair<Int, Int>?>()
+
+    private fun rightStickPair(deviceId: Int, device: InputDevice?): Pair<Int, Int>? {
+        if (device == null) return rightStickAxes[deviceId]
+        return rightStickAxes.getOrPut(deviceId) {
+            selectRightStickPair(
+                zRz = isCenteredStick(device, MotionEvent.AXIS_Z) && isCenteredStick(device, MotionEvent.AXIS_RZ),
+                rxRy = isCenteredStick(device, MotionEvent.AXIS_RX) && isCenteredStick(device, MotionEvent.AXIS_RY),
+            )
+        }
     }
 
     private external fun nativeGamepadConnected(deviceId: Int, vendorId: Int, productId: Int)
@@ -161,9 +196,15 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
         }
     }
 
-    override fun onInputDeviceRemoved(deviceId: Int) = nativeGamepadDisconnected(deviceId)
+    override fun onInputDeviceRemoved(deviceId: Int) {
+        rightStickAxes.remove(deviceId)
+        nativeGamepadDisconnected(deviceId)
+    }
 
-    override fun onInputDeviceChanged(deviceId: Int) = Unit
+    // A remapped / reconfigured device re-resolves its right-stick axes.
+    override fun onInputDeviceChanged(deviceId: Int) {
+        rightStickAxes.remove(deviceId)
+    }
 
     // ---------------------------------------------------------------- gamepad
 
@@ -201,10 +242,13 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
     private fun sendAxes(event: MotionEvent) {
         fun axis(a: Int) = event.getAxisValue(a)
+        val pair = rightStickPair(event.deviceId, event.device)
+        val rx = if (pair != null) axis(pair.first) else 0f
+        val ry = if (pair != null) axis(pair.second) else 0f
         nativeGamepadAxes(
             event.deviceId,
             axis(MotionEvent.AXIS_X), axis(MotionEvent.AXIS_Y),
-            axis(MotionEvent.AXIS_Z), axis(MotionEvent.AXIS_RZ),
+            rx, ry,
             maxOf(axis(MotionEvent.AXIS_LTRIGGER), axis(MotionEvent.AXIS_BRAKE)),
             maxOf(axis(MotionEvent.AXIS_RTRIGGER), axis(MotionEvent.AXIS_GAS)),
             axis(MotionEvent.AXIS_HAT_X), axis(MotionEvent.AXIS_HAT_Y),

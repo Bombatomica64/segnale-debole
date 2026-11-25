@@ -112,6 +112,38 @@ pub const MOUSE_BUTTONS: [(i32, MouseButton); 5] = [
     (mouse_bits::FORWARD, MouseButton::Forward),
 ];
 
+/// Android `MotionEvent` axis ids used for right-stick pair selection.
+pub mod motion_axis {
+    pub const Z: i32 = 11;
+    pub const RX: i32 = 12;
+    pub const RY: i32 = 13;
+    pub const RZ: i32 = 14;
+    pub const LTRIGGER: i32 = 17;
+    pub const RTRIGGER: i32 = 18;
+    pub const GAS: i32 = 22;
+    pub const BRAKE: i32 = 23;
+}
+
+/// Mirror of `MainActivity.selectRightStickPair` (Milestone 28): the
+/// right-stick look axes given which candidate pairs report centered stick
+/// ranges (`min < -0.5 && max > 0.5`). `Z / RZ` first, then `RX / RY`, else
+/// `None` (zero look) so uncentered trigger axes on `Z / RZ` never rotate the
+/// camera.
+pub fn select_right_stick_pair(z_rz_centered: bool, rx_ry_centered: bool) -> Option<(i32, i32)> {
+    if z_rz_centered {
+        Some((motion_axis::Z, motion_axis::RZ))
+    } else if rx_ry_centered {
+        Some((motion_axis::RX, motion_axis::RY))
+    } else {
+        None
+    }
+}
+
+/// Mirror of `MainActivity.isCenteredStick` on a `(min, max)` motion range.
+pub fn is_centered_stick(range: Option<(f32, f32)>) -> bool {
+    range.is_some_and(|(min, max)| min < -0.5 && max > 0.5)
+}
+
 /// Hat (`AXIS_HAT_X/Y`) travel that counts as a pressed D-Pad direction.
 pub const HAT_THRESHOLD: f32 = 0.5;
 
@@ -803,5 +835,34 @@ mod tests {
         app.insert_resource(CursorCaptured(false));
         app.update();
         assert!(!wants_pointer_capture());
+    }
+
+    #[test]
+    fn right_stick_pair_prefers_z_rz_then_rx_ry_and_never_triggers() {
+        use super::motion_axis as a;
+        let stick = Some((-1.0, 1.0));
+        let trigger = Some((0.0, 1.0));
+        assert!(is_centered_stick(stick));
+        assert!(!is_centered_stick(trigger), "0..1 trigger ranges are not sticks");
+        assert!(!is_centered_stick(None));
+        assert!(!is_centered_stick(Some((-0.4, 0.4))));
+        // Standard mapping (Z / RZ sticks).
+        assert_eq!(select_right_stick_pair(true, true), Some((a::Z, a::RZ)));
+        assert_eq!(select_right_stick_pair(true, false), Some((a::Z, a::RZ)));
+        // Z / RZ are triggers (0..1) on this pad: the RX / RY sticks look.
+        let z_rz = is_centered_stick(trigger) && is_centered_stick(trigger);
+        let rx_ry = is_centered_stick(stick) && is_centered_stick(stick);
+        assert_eq!(select_right_stick_pair(z_rz, rx_ry), Some((a::RX, a::RY)));
+        // A half-centered or trigger-only pad resolves to None (zero look) so
+        // triggers on Z/RZ can never rotate the camera.
+        let half = is_centered_stick(stick) && is_centered_stick(None);
+        assert_eq!(select_right_stick_pair(half, false), None);
+        assert_eq!(select_right_stick_pair(false, false), None);
+        for pair in [select_right_stick_pair(false, true), select_right_stick_pair(true, false), select_right_stick_pair(true, true)] {
+            let (x, y) = pair.unwrap();
+            for t in [a::LTRIGGER, a::RTRIGGER, a::GAS, a::BRAKE] {
+                assert!(x != t && y != t, "never a trigger axis");
+            }
+        }
     }
 }

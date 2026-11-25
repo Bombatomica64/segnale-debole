@@ -1325,6 +1325,8 @@ pub enum SettingToggle {
     SpeedrunSplits,
     /// Right Stick up looks down.
     GamepadInvertY,
+    /// Gentle Right Stick slowdown over visible targets (controller only).
+    AimFriction,
 }
 
 impl SettingToggle {
@@ -1335,6 +1337,7 @@ impl SettingToggle {
             SettingToggle::Mute => "MUTE ALL AUDIO",
             SettingToggle::SpeedrunSplits => "SPEEDRUN SPLITS",
             SettingToggle::GamepadInvertY => "GAMEPAD INVERT Y",
+            SettingToggle::AimFriction => "AIM FRICTION",
         }
     }
 
@@ -1345,6 +1348,7 @@ impl SettingToggle {
             SettingToggle::Mute => &mut s.audio_muted,
             SettingToggle::SpeedrunSplits => &mut s.speedrun_splits,
             SettingToggle::GamepadInvertY => &mut s.gamepad_invert_y,
+            SettingToggle::AimFriction => &mut s.gamepad_aim_friction,
         }
     }
 
@@ -1355,6 +1359,7 @@ impl SettingToggle {
             SettingToggle::Mute => s.audio_muted,
             SettingToggle::SpeedrunSplits => s.speedrun_splits,
             SettingToggle::GamepadInvertY => s.gamepad_invert_y,
+            SettingToggle::AimFriction => s.gamepad_aim_friction,
         }
     }
 
@@ -1533,7 +1538,7 @@ pub enum SettingsRow {
 
 /// Controller order: the left column top to bottom, then the right column,
 /// the reticle pickers and the footer.
-pub const SETTINGS_ROWS: [SettingsRow; 15] = [
+pub const SETTINGS_ROWS: [SettingsRow; 16] = [
     SettingsRow::Knob(SettingKnob::Sensitivity),
     SettingsRow::Knob(SettingKnob::BaseFov),
     SettingsRow::Toggle(SettingToggle::SpeedFov),
@@ -1542,6 +1547,7 @@ pub const SETTINGS_ROWS: [SettingsRow; 15] = [
     SettingsRow::Knob(SettingKnob::StrafeRoll),
     SettingsRow::Knob(SettingKnob::GamepadSensitivity),
     SettingsRow::Toggle(SettingToggle::GamepadInvertY),
+    SettingsRow::Toggle(SettingToggle::AimFriction),
     SettingsRow::Knob(SettingKnob::Volume),
     SettingsRow::Toggle(SettingToggle::Mute),
     SettingsRow::Toggle(SettingToggle::SpeedrunSplits),
@@ -1923,6 +1929,7 @@ fn spawn_settings_screen(
     knob_row(&mut commands, input, SettingKnob::StrafeRoll, &s);
     knob_row(&mut commands, input, SettingKnob::GamepadSensitivity, &s);
     toggle_row(&mut commands, input, SettingToggle::GamepadInvertY, "right stick up looks down", &s);
+    toggle_row(&mut commands, input, SettingToggle::AimFriction, "stick slows gently over visible targets", &s);
 
     // Right: audio & reticle.
     let (audio, audio_head) =
@@ -2061,7 +2068,15 @@ mod tests {
         for k in SettingKnob::ALL {
             assert_eq!(SETTINGS_ROWS.iter().filter(|r| **r == SettingsRow::Knob(k)).count(), 1, "{k:?}");
         }
-        assert_eq!(SETTINGS_ROWS.iter().filter(|r| matches!(r, SettingsRow::Toggle(_))).count(), 5);
+        assert_eq!(SETTINGS_ROWS.iter().filter(|r| matches!(r, SettingsRow::Toggle(_))).count(), 6);
+        // Milestone 28: AIM FRICTION toggles like any switch, right after INVERT Y.
+        let af = SettingToggle::AimFriction;
+        assert_eq!(settings_pad_edit(SettingsRow::Toggle(af), 0, true, &s), Some(Edit(SettingsTarget::Toggle(af))));
+        assert_eq!(settings_row_index(SettingsRow::Toggle(af)), settings_row_index(SettingsRow::Toggle(g)) + 1);
+        let mut on = UserSettings::default();
+        assert!(on.gamepad_aim_friction && af.state_text(&on) == "ON" && af.label() == "AIM FRICTION");
+        apply_settings_edit(&mut on, SettingsTarget::Toggle(af));
+        assert!(!on.gamepad_aim_friction && af.state_text(&on) == "OFF");
         // Gamepad sensitivity steps on its 0.1 grid inside 0.3..=3.0.
         let mut s = UserSettings { gamepad_sensitivity: 2.95, ..default() };
         apply_settings_edit(&mut s, SettingsTarget::Up(k));

@@ -20,6 +20,10 @@ use crate::state::{AppState, GameSet, RunStats};
 pub const CELL_SIZE: f32 = 4.0;
 /// Ceiling height of covered cells (generous bhop / jump-pad headroom).
 pub const CEILING_HEIGHT: f32 = 7.2;
+/// Corridor ceiling lamp intensity (lumens) at `CEILING_HEIGHT - 0.6`.
+pub const CORRIDOR_LAMP_INTENSITY: f32 = 620_000.0;
+/// Corridor ceiling lamp range (m): reaches the floor from 6.6 m with margin.
+pub const CORRIDOR_LAMP_RANGE: f32 = 19.0;
 /// Height of walls bordering the open-roof atrium.
 pub const ATRIUM_WALL_HEIGHT: f32 = 12.0;
 /// Raised catwalks / tower pedestal.
@@ -1555,17 +1559,20 @@ fn spawn_level_geometry(commands: &mut Commands, g: &LevelGrid, assets: &GameAss
         batches.batch(&a.wall).append_filtered(&src.pillar, &tf, |n| n.y > -0.5);
     }
 
-    // Industrial bunker lights (amber, flicker-free baseline).
+    // Industrial bunker lights (amber, flicker-free baseline). Milestone 28:
+    // the 7.2 m ceiling hangs lamps at 6.6 m (was 5.4 m), so intensity and
+    // range follow the inverse-square geometry ((6.6 / 5.4)^2 ~ 1.49x) to keep
+    // under-lamp floors, doorways and pit lips as bright as before.
     for (i, l) in g.lights.iter().enumerate() {
         let pos = Vec3::new((l.x as f32 + 0.5) * CELL_SIZE, CEILING_HEIGHT - 0.6, (l.y as f32 + 0.5) * CELL_SIZE);
         let warm = i % 3 != 0;
         commands.spawn((
             LevelEntity,
-            CullableLight::for_range(16.0),
+            CullableLight::for_range(CORRIDOR_LAMP_RANGE),
             PointLight {
                 color: if warm { theme.lamp_warm } else { theme.lamp_accent },
-                intensity: 420_000.0,
-                range: 16.0,
+                intensity: CORRIDOR_LAMP_INTENSITY,
+                range: CORRIDOR_LAMP_RANGE,
                 shadow_maps_enabled: false,
                 ..default()
             },
@@ -2333,5 +2340,16 @@ mod tests {
         let kept = entries.iter().filter(|e| cmp_light_key(e, &cutoff).is_le()).count();
         assert_eq!(kept, WEB_POINT_LIGHT_CAP, "strictly {WEB_POINT_LIGHT_CAP} of 13 equidistant lights survive");
     }
-}
 
+    #[test]
+    fn corridor_lamps_compensate_the_raised_ceiling() {
+        // Floor illuminance under a lamp ~ I / h^2: at the 6.6 m hang height it
+        // must match the old 420k lamp at 5.4 m (within 2%), and the range must
+        // still reach the floor with margin.
+        let hang = CEILING_HEIGHT - 0.6;
+        let old = 420_000.0 / (5.4f32 * 5.4);
+        let new = CORRIDOR_LAMP_INTENSITY / (hang * hang);
+        assert!((new / old - 1.0).abs() < 0.02, "floor brightness ratio {}", new / old);
+        assert!(CORRIDOR_LAMP_RANGE > hang * 2.5);
+    }
+}
