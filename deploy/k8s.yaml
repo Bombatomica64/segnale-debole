@@ -90,6 +90,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: segnale-debole-api
+        postgres-client: "true"
     spec:
       automountServiceAccountToken: false
       securityContext:

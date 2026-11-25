@@ -6,7 +6,7 @@
   <title>SEGNALE DEBOLE</title>
   <!-- Features come from the CLI: `trunk build --release --features audio`. -->
   <!-- wasm-opt must accept rustc's default wasm32 features (bulk memory, ...). -->
-  <link data-trunk rel="rust" data-bin="segnale_debole" data-wasm-opt="z"
+  <link data-trunk rel="rust" data-bin="segnale_debole_web" data-target-name="segnale_debole_web" data-wasm-opt="z"
         data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue" />
   <style>
     :root { --ink: #080606; --bone: #ebdec7; --ash: #8f7d70; --red: #ff2b1a; --acid: #40ff73; }

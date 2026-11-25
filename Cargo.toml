@@ -2,12 +2,24 @@
 name = "segnale_debole"
 version = "0.4.0"
 edition = "2024"
+default-run = "segnale_debole"
 
 # `cdylib` is the Android `libsegnale_debole.so` that GameActivity loads (built
 # by `cargo ndk`, see `android/build-apk.sh`); `rlib` keeps the native binary,
 # integration tests and benches linking against the library as before.
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "segnale_debole"
+path = "src/main.rs"
+
+# Distinct binary target name for Trunk (`data-bin="segnale_debole_web"
+# data-target-name="segnale_debole_web"` in `index.html`) so Trunk does not
+# collide with the `[lib]` `cdylib` artifact of the same name.
+[[bin]]
+name = "segnale_debole_web"
+path = "src/bin/segnale_debole_web.rs"
 
 [dependencies]
 # Minimal Bevy 0.20 feature set: omit unused asset/FX crates (bevy_gltf,
