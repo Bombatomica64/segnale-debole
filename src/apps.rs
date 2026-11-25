@@ -355,15 +355,16 @@ fn phone_apps(
         Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
         Query<(&mut crate::boss::BossPylon, &GlobalTransform)>,
     ),
-    mut bot: Option<ResMut<BotControl>>,
+    (mut bot, pad): (Option<ResMut<BotControl>>, Option<Res<crate::gamepad::GamepadInput>>),
 ) {
     apps.tick(time.delta_secs());
+    let (pad_ping, pad_overload) = pad.map_or((false, false), |g| (g.ping, g.overload));
     let Ok(ptf) = players.single() else { return };
     let center = ptf.translation + Vec3::Y * 1.0;
 
     // ---- PING SCAN ----
     let bot_ping = take_flag(&mut bot, |b| &mut b.ping);
-    let ping_pressed = (captured.0 && mouse.just_pressed(MouseButton::Right)) || std::mem::take(&mut apps.force_ping) || bot_ping;
+    let ping_pressed = (captured.0 && mouse.just_pressed(MouseButton::Right)) || std::mem::take(&mut apps.force_ping) || bot_ping || pad_ping;
     if ping_pressed && signal.bars == 0 && mods.missed_call {
         // ---- MISSED CALL decoy (0 bars) ----
         if apps.ping_cooldown > 0.0 {
@@ -440,7 +441,7 @@ fn phone_apps(
     }
 
     // ---- 5G OVERLOAD ----
-    if keys.just_pressed(KeyCode::KeyQ) || take_flag(&mut bot, |b| &mut b.overload) {
+    if keys.just_pressed(KeyCode::KeyQ) || pad_overload || take_flag(&mut bot, |b| &mut b.overload) {
         match app_block_reason(overload_gate_bars(signal.bars, apps.callback_timer), OVERLOAD_MIN_BARS, apps.overload_cooldown) {
             Some(why) => {
                 sfx.play(SfxEvent::Denied);

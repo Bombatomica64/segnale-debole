@@ -590,6 +590,7 @@ pub fn punk_button(label: &str, action: MenuAction, font: f32, style: ButtonStyl
     let hero = style == ButtonStyle::HeroAcid;
     (
         MenuButton,
+        crate::gamepad::GamepadFocusable,
         action,
         colors,
         Node {
@@ -999,6 +1000,7 @@ pub fn rivet_card(commands: &mut Commands, parent: Entity, target: MetaTarget, p
         .spawn((
             ChildOf(parent),
             MetaCard(target),
+            crate::gamepad::GamepadFocusable,
             Node { flex_direction: FlexDirection::Column, padding: pad, row_gap: Val::Px(gap), border: plate_rect(CARD_BORDER), ..default() },
             plate_border(STEEL_BORDER, STEEL_BORDER.with_alpha(0.6)),
             BackgroundColor(IRON_MID),

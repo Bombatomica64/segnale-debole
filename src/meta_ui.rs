@@ -18,7 +18,8 @@ use bevy::ui::UiGlobalTransform;
 use bevy::window::PrimaryWindow;
 
 use crate::audio::{SfxEvent, SfxQueue};
-use crate::hud::{spawn_crosshair, text, MenuAction, CROSSHAIR_BOX, COLOR_BG, COLOR_CYAN, COLOR_DIM, COLOR_GOLD, COLOR_SIGNAL_AMBER, COLOR_SIGNAL_GREEN, COLOR_SIGNAL_RED};
+use crate::gamepad::{GamepadFocus, GamepadFocusable, GamepadInput};
+use crate::hud::{spawn_crosshair, text, MenuAction, MenuButton, CROSSHAIR_BOX, COLOR_BG, COLOR_CYAN, COLOR_DIM, COLOR_GOLD, COLOR_SIGNAL_AMBER, COLOR_SIGNAL_GREEN, COLOR_SIGNAL_RED};
 use crate::ui_kit::{
     hard_shadow, inset_border, plate_border, plate_rect, punk_button, punk_screen_root, rivet_card, section_crate, set_strip_tape, stamped_tag,
     stencil_title, tape_image, terminal_chassis, ButtonStyle, ChassisStrip, Tape, TerminalChassis, UiKitTextures, ACID_DARK, ACID_GREEN,
@@ -27,7 +28,7 @@ use crate::ui_kit::{
 };
 use crate::meta::{
     default_catalog, CarrierContract, CrosshairColor, CrosshairStyle, FeatId, HandsetSkin, LifetimeStats, PlayerProfile, ProfileStore,
-    RunLoadout, RunUnlockSummary, StarterChip, UserSettings, ACTIVE_CATALOG_SIZE, BASE_FOV_RANGE, EFFECT_SCALE_RANGE, MOUSE_SENS_RANGE,
+    RunLoadout, RunUnlockSummary, StarterChip, UserSettings, ACTIVE_CATALOG_SIZE, BASE_FOV_RANGE, EFFECT_SCALE_RANGE, GAMEPAD_SENS_RANGE, MOUSE_SENS_RANGE,
     VOLUME_RANGE,
 };
 use crate::player::PlayerCamera;
@@ -587,33 +588,46 @@ fn reset_feedback(store: Res<ProfileStore>, mut fb: ResMut<MetaFeedback>, mut ho
     hover.0 = None;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn meta_card_clicks(
     window: Query<&Window, With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
-    cards: Query<(&ComputedNode, &UiGlobalTransform, &MetaCard)>,
+    cards: Query<(Entity, &ComputedNode, &UiGlobalTransform, &MetaCard)>,
     mut store: ResMut<ProfileStore>,
     mut fb: ResMut<MetaFeedback>,
     mut hover: ResMut<MetaHover>,
     mut sfx: ResMut<SfxQueue>,
+    (pad, focus): (Res<GamepadInput>, Res<GamepadFocus>),
 ) {
+    let card_of = |e: Option<Entity>| e.and_then(|e| cards.get(e).ok()).map(|(_, _, _, card)| card.0);
     let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
-    hover.0 = cursor.and_then(|c| cards.iter().find(|(n, tf, _)| n.contains_point(**tf, c)).map(|(_, _, card)| card.0));
-    if let Some(t) = hover.0
-        && mouse.just_released(MouseButton::Left)
-    {
-        let (text, color) = match commit_meta_edit(&mut store, t) {
-            EditOutcome::Changed(s) => {
-                sfx.play(SfxEvent::UpgradeSelect);
-                (s, COLOR_SIGNAL_GREEN)
-            }
-            EditOutcome::Denied(s) => {
-                sfx.play(SfxEvent::Denied);
-                (s, COLOR_SIGNAL_RED)
-            }
-            EditOutcome::Unchanged(s) => (s, COLOR_CYAN),
-        };
-        *fb = MetaFeedback { text, color };
+    let pointer_card = cursor.and_then(|c| cards.iter().find(|(_, n, tf, _)| n.contains_point(**tf, c)).map(|(_, _, _, card)| card.0));
+    hover.0 = if pad.active {
+        // Controller navigation owns the highlight until the mouse moves.
+        card_of(focus.focused)
+    } else {
+        pointer_card
+    };
+    let clicked = pointer_card.filter(|_| mouse.just_released(MouseButton::Left)).or_else(|| card_of(focus.activate));
+    if let Some(t) = clicked {
+        *fb = edit_feedback(commit_meta_edit(&mut store, t), &mut sfx);
     }
+}
+
+/// Feedback line (and click sound) of a committed edit.
+fn edit_feedback(out: EditOutcome, sfx: &mut SfxQueue) -> MetaFeedback {
+    let (text, color) = match out {
+        EditOutcome::Changed(s) => {
+            sfx.play(SfxEvent::UpgradeSelect);
+            (s, COLOR_SIGNAL_GREEN)
+        }
+        EditOutcome::Denied(s) => {
+            sfx.play(SfxEvent::Denied);
+            (s, COLOR_SIGNAL_RED)
+        }
+        EditOutcome::Unchanged(s) => (s, COLOR_CYAN),
+    };
+    MetaFeedback { text, color }
 }
 
 /// Change-guarded text write (no `DerefMut`, hence no relayout, when equal).
@@ -845,6 +859,7 @@ fn toggle_button(commands: &mut Commands, parent: Entity, t: MetaTarget, p: &Pla
     commands.spawn((
         ChildOf(parent),
         MetaCard(t),
+        GamepadFocusable,
         Node { border: plate_rect((4.0, 1.0, 1.0, 3.0)), flex_shrink: 0.0, ..tape_node(11.0, 4.0) },
         plate_border(STEEL_BORDER, STEEL_BORDER),
         BackgroundColor(IRON_MID),
@@ -1201,10 +1216,19 @@ pub enum SettingKnob {
     SpeedFov,
     StrafeRoll,
     Volume,
+    /// Right Stick look multiplier.
+    GamepadSensitivity,
 }
 
 impl SettingKnob {
-    pub const ALL: [SettingKnob; 5] = [SettingKnob::Sensitivity, SettingKnob::BaseFov, SettingKnob::SpeedFov, SettingKnob::StrafeRoll, SettingKnob::Volume];
+    pub const ALL: [SettingKnob; 6] = [
+        SettingKnob::Sensitivity,
+        SettingKnob::BaseFov,
+        SettingKnob::SpeedFov,
+        SettingKnob::StrafeRoll,
+        SettingKnob::Volume,
+        SettingKnob::GamepadSensitivity,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -1213,6 +1237,7 @@ impl SettingKnob {
             SettingKnob::SpeedFov => "SPEED FOV INTENSITY",
             SettingKnob::StrafeRoll => "STRAFE ROLL INTENSITY",
             SettingKnob::Volume => "MASTER VOLUME",
+            SettingKnob::GamepadSensitivity => "GAMEPAD SENSITIVITY",
         }
     }
 
@@ -1223,6 +1248,7 @@ impl SettingKnob {
             SettingKnob::SpeedFov => "view widening at speed / dash",
             SettingKnob::StrafeRoll => "camera lean into strafes",
             SettingKnob::Volume => "every sound effect",
+            SettingKnob::GamepadSensitivity => "right-stick look speed",
         }
     }
 
@@ -1233,6 +1259,7 @@ impl SettingKnob {
             SettingKnob::BaseFov => (BASE_FOV_RANGE.0, BASE_FOV_RANGE.1, 5.0),
             SettingKnob::SpeedFov | SettingKnob::StrafeRoll => (EFFECT_SCALE_RANGE.0, EFFECT_SCALE_RANGE.1, 0.25),
             SettingKnob::Volume => (VOLUME_RANGE.0, VOLUME_RANGE.1, 0.1),
+            SettingKnob::GamepadSensitivity => (GAMEPAD_SENS_RANGE.0, GAMEPAD_SENS_RANGE.1, 0.1),
         }
     }
 
@@ -1243,6 +1270,7 @@ impl SettingKnob {
             SettingKnob::SpeedFov => s.speed_fov_scale,
             SettingKnob::StrafeRoll => s.strafe_roll_scale,
             SettingKnob::Volume => s.audio_master_volume,
+            SettingKnob::GamepadSensitivity => s.gamepad_sensitivity,
         }
     }
 
@@ -1253,6 +1281,7 @@ impl SettingKnob {
             SettingKnob::SpeedFov => &mut s.speed_fov_scale,
             SettingKnob::StrafeRoll => &mut s.strafe_roll_scale,
             SettingKnob::Volume => &mut s.audio_master_volume,
+            SettingKnob::GamepadSensitivity => &mut s.gamepad_sensitivity,
         }
     }
 
@@ -1262,7 +1291,7 @@ impl SettingKnob {
             SettingKnob::SpeedFov => Some(SettingToggle::SpeedFov),
             SettingKnob::StrafeRoll => Some(SettingToggle::StrafeRoll),
             SettingKnob::Volume => Some(SettingToggle::Mute),
-            SettingKnob::Sensitivity | SettingKnob::BaseFov => None,
+            SettingKnob::Sensitivity | SettingKnob::BaseFov | SettingKnob::GamepadSensitivity => None,
         }
     }
 
@@ -1270,7 +1299,7 @@ impl SettingKnob {
     pub fn value_text(self, s: &UserSettings) -> String {
         let v = self.get(s);
         match self {
-            SettingKnob::Sensitivity => format!("{v:.2}x"),
+            SettingKnob::Sensitivity | SettingKnob::GamepadSensitivity => format!("{v:.2}x"),
             SettingKnob::BaseFov => format!("{v:.0} DEG"),
             SettingKnob::SpeedFov | SettingKnob::StrafeRoll | SettingKnob::Volume => format!("{:.0}%", v * 100.0),
         }
@@ -1291,6 +1320,8 @@ pub enum SettingToggle {
     Mute,
     /// Speedrun split timer plate on Standard runs.
     SpeedrunSplits,
+    /// Right Stick up looks down.
+    GamepadInvertY,
 }
 
 impl SettingToggle {
@@ -1300,6 +1331,7 @@ impl SettingToggle {
             SettingToggle::StrafeRoll => "STRAFE ROLL",
             SettingToggle::Mute => "MUTE ALL AUDIO",
             SettingToggle::SpeedrunSplits => "SPEEDRUN SPLITS",
+            SettingToggle::GamepadInvertY => "GAMEPAD INVERT Y",
         }
     }
 
@@ -1309,6 +1341,7 @@ impl SettingToggle {
             SettingToggle::StrafeRoll => &mut s.strafe_roll_enabled,
             SettingToggle::Mute => &mut s.audio_muted,
             SettingToggle::SpeedrunSplits => &mut s.speedrun_splits,
+            SettingToggle::GamepadInvertY => &mut s.gamepad_invert_y,
         }
     }
 
@@ -1318,6 +1351,7 @@ impl SettingToggle {
             SettingToggle::StrafeRoll => s.strafe_roll_enabled,
             SettingToggle::Mute => s.audio_muted,
             SettingToggle::SpeedrunSplits => s.speedrun_splits,
+            SettingToggle::GamepadInvertY => s.gamepad_invert_y,
         }
     }
 
@@ -1483,42 +1517,161 @@ fn control_look(t: SettingsTarget, active: bool, hovered: bool) -> (Color, Color
     }
 }
 
+/// One controller stop on the Settings screen (Up / Down walk this list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    Knob(SettingKnob),
+    Toggle(SettingToggle),
+    Style,
+    Color,
+    Reset,
+    Back,
+}
+
+/// Controller order: the left column top to bottom, then the right column,
+/// the reticle pickers and the footer.
+pub const SETTINGS_ROWS: [SettingsRow; 15] = [
+    SettingsRow::Knob(SettingKnob::Sensitivity),
+    SettingsRow::Knob(SettingKnob::BaseFov),
+    SettingsRow::Toggle(SettingToggle::SpeedFov),
+    SettingsRow::Knob(SettingKnob::SpeedFov),
+    SettingsRow::Toggle(SettingToggle::StrafeRoll),
+    SettingsRow::Knob(SettingKnob::StrafeRoll),
+    SettingsRow::Knob(SettingKnob::GamepadSensitivity),
+    SettingsRow::Toggle(SettingToggle::GamepadInvertY),
+    SettingsRow::Knob(SettingKnob::Volume),
+    SettingsRow::Toggle(SettingToggle::Mute),
+    SettingsRow::Toggle(SettingToggle::SpeedrunSplits),
+    SettingsRow::Style,
+    SettingsRow::Color,
+    SettingsRow::Reset,
+    SettingsRow::Back,
+];
+
+/// Number of controller stops.
+pub const SETTINGS_ROW_COUNT: usize = SETTINGS_ROWS.len();
+
+/// Index of `row` in [`SETTINGS_ROWS`].
+pub fn settings_row_index(row: SettingsRow) -> usize {
+    SETTINGS_ROWS.iter().position(|r| *r == row).unwrap_or(0)
+}
+
+/// What a controller input does on a Settings row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPadAction {
+    Edit(SettingsTarget),
+    Back,
+}
+
+/// `items[i + dx]`, wrapping.
+fn cycle<T: Copy + PartialEq>(items: &[T], cur: T, dx: i32) -> T {
+    let i = items.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+    items[(i + dx).rem_euclid(items.len() as i32) as usize]
+}
+
+/// Controller edit of `row`: Left / Right (`dx`) step sliders, flip toggles
+/// and cycle the reticle style / color; `A` flips toggles, advances the
+/// pickers and presses RESET / BACK.
+pub fn settings_pad_edit(row: SettingsRow, dx: i32, confirm: bool, s: &UserSettings) -> Option<SettingsPadAction> {
+    use SettingsPadAction::*;
+    let step = if dx != 0 { dx.signum() } else if confirm { 1 } else { return None };
+    Some(match row {
+        SettingsRow::Knob(k) if dx > 0 => Edit(SettingsTarget::Up(k)),
+        SettingsRow::Knob(k) if dx < 0 => Edit(SettingsTarget::Down(k)),
+        SettingsRow::Knob(_) => return None,
+        SettingsRow::Toggle(g) => Edit(SettingsTarget::Toggle(g)),
+        SettingsRow::Style => Edit(SettingsTarget::Style(cycle(&CrosshairStyle::ALL, s.crosshair_style, step))),
+        SettingsRow::Color => Edit(SettingsTarget::Color(cycle(&CrosshairColor::ALL, s.crosshair_color, step))),
+        SettingsRow::Reset if confirm => Edit(SettingsTarget::ResetDefaults),
+        SettingsRow::Back if confirm => Back,
+        SettingsRow::Reset | SettingsRow::Back => return None,
+    })
+}
+
+/// A controller stop on the Settings screen: index into [`SETTINGS_ROWS`]
+/// and the rail color it rests with.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct SettingsRowTag(pub usize, pub Color);
+
+/// The focused [`SETTINGS_ROWS`] index.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettingsPadFocus(pub usize);
+
+fn reset_settings_pad_focus(mut focus: ResMut<SettingsPadFocus>) {
+    focus.0 = 0;
+}
+
+/// Controller Settings: Up / Down walk [`SETTINGS_ROWS`], Left / Right / `A`
+/// edit (see [`settings_pad_edit`]), `B` goes back. Mirrors the focused stop
+/// into [`GamepadFocus`] so the BACK switch lights like any punk button.
+#[allow(clippy::too_many_arguments)]
+pub fn settings_pad_nav(
+    pad: Res<GamepadInput>,
+    mut idx: ResMut<SettingsPadFocus>,
+    mut focus: ResMut<GamepadFocus>,
+    rows: Query<(Entity, &SettingsRowTag)>,
+    mut store: ResMut<ProfileStore>,
+    mut fb: ResMut<MetaFeedback>,
+    mut sfx: ResMut<SfxQueue>,
+    (ret, mut next): (Res<SettingsReturn>, ResMut<NextState<AppState>>),
+) {
+    if !pad.connected {
+        return;
+    }
+    let dy = pad.nav_y();
+    if dy != 0 {
+        idx.0 = (idx.0.min(SETTINGS_ROW_COUNT - 1) as i32 + dy).rem_euclid(SETTINGS_ROW_COUNT as i32) as usize;
+    }
+    let row = SETTINGS_ROWS[idx.0.min(SETTINGS_ROW_COUNT - 1)];
+    let want = rows.iter().find(|(_, t)| t.0 == idx.0).map(|(e, _)| e);
+    if focus.focused != want {
+        focus.focused = want;
+    }
+    if pad.back {
+        next.set(ret.0);
+        return;
+    }
+    match settings_pad_edit(row, pad.nav_x(), pad.confirm, &store.profile.settings.sanitized()) {
+        Some(SettingsPadAction::Edit(t)) => *fb = edit_feedback(commit_settings_edit(&mut store, t), &mut sfx),
+        Some(SettingsPadAction::Back) => next.set(ret.0),
+        None => {}
+    }
+}
+
 /// Settings screen plugin pieces (registered by [`MetaUiPlugin`]).
 fn add_settings_systems(app: &mut App) {
     app.init_resource::<SettingsHover>()
-        .add_systems(OnEnter(AppState::Settings), (reset_feedback, spawn_settings_screen).chain())
-        .add_systems(Update, (settings_clicks, refresh_settings_ui).chain().run_if(in_state(AppState::Settings)));
+        .init_resource::<SettingsPadFocus>()
+        .add_systems(OnEnter(AppState::Settings), (reset_feedback, reset_settings_pad_focus, spawn_settings_screen).chain())
+        .add_systems(Update, (settings_pad_nav, settings_clicks, refresh_settings_ui).chain().run_if(in_state(AppState::Settings)));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settings_clicks(
     window: Query<&Window, With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
-    controls: Query<(&ComputedNode, &UiGlobalTransform, &SettingsControl)>,
+    controls: Query<(Entity, &ComputedNode, &UiGlobalTransform, &SettingsControl)>,
     mut store: ResMut<ProfileStore>,
     mut fb: ResMut<MetaFeedback>,
     mut hover: ResMut<SettingsHover>,
     mut sfx: ResMut<SfxQueue>,
+    (pad, focus): (Res<GamepadInput>, Res<GamepadFocus>),
 ) {
-    let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
-    let now = cursor.and_then(|c| controls.iter().find(|(n, tf, _)| n.contains_point(**tf, c)).map(|(_, _, ctl)| ctl.0));
+    let now = if pad.active {
+        // Controller navigation owns the highlight (RESET DEFAULTS is a control).
+        focus.focused.and_then(|e| controls.get(e).ok()).map(|(_, _, _, ctl)| ctl.0)
+    } else {
+        let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
+        cursor.and_then(|c| controls.iter().find(|(_, n, tf, _)| n.contains_point(**tf, c)).map(|(_, _, _, ctl)| ctl.0))
+    };
     if hover.0 != now {
         hover.0 = now;
     }
     if let Some(t) = hover.0
+        && !pad.active
         && mouse.just_released(MouseButton::Left)
     {
-        let (text, color) = match commit_settings_edit(&mut store, t) {
-            EditOutcome::Changed(s) => {
-                sfx.play(SfxEvent::UpgradeSelect);
-                (s, COLOR_SIGNAL_GREEN)
-            }
-            EditOutcome::Denied(s) => {
-                sfx.play(SfxEvent::Denied);
-                (s, COLOR_SIGNAL_RED)
-            }
-            EditOutcome::Unchanged(s) => (s, COLOR_CYAN),
-        };
-        *fb = MetaFeedback { text, color };
+        *fb = edit_feedback(commit_settings_edit(&mut store, t), &mut sfx);
     }
 }
 
@@ -1534,8 +1687,23 @@ fn refresh_settings_ui(
     mut labels: Query<(&SettingsLabel, &mut Text, &mut TextColor)>,
     mut preview: Query<(Entity, &mut ReticlePreview)>,
     fresh: Query<(), Added<SettingsLabel>>,
+    (pad, focus, mut rows): (
+        Res<GamepadInput>,
+        Res<GamepadFocus>,
+        Query<(Entity, &SettingsRowTag, &mut BackgroundColor, &mut BorderColor), (Without<SettingsControl>, Without<SettingsPip>, Without<MenuButton>)>,
+    ),
 ) {
     let s = store.profile.settings.sanitized();
+    for (e, tag, mut bg, mut border) in &mut rows {
+        let lit = focus.shows(&pad, e);
+        let (want_bg, want_border) = settings_row_look(tag.1, lit);
+        if bg.0 != want_bg {
+            bg.0 = want_bg;
+        }
+        if *border != want_border {
+            *border = want_border;
+        }
+    }
     for (ctl, mut bg, mut border) in &mut controls {
         let (fill, rail, edge, _) = control_look(ctl.0, control_active(&s, ctl.0), hover.0 == Some(ctl.0));
         if bg.0 != fill {
@@ -1630,11 +1798,23 @@ fn setting_name(commands: &mut Commands, row_e: Entity, name: &str, hint: &str) 
     ));
 }
 
-/// Recessed settings row (rail on the left).
-fn setting_row(commands: &mut Commands, parent: Entity, rail: Color) -> Entity {
+/// `(fill, frame)` of a settings row: recessed, or lit while the controller
+/// focuses it (rail-tinted fill, bone frame).
+fn settings_row_look(rail: Color, focused: bool) -> (Color, BorderColor) {
+    if focused {
+        (rail.with_alpha(0.2), BorderColor { left: BONE_TEXT, ..BorderColor::all(rail.with_alpha(0.9)) })
+    } else {
+        (INK_BLACK.with_alpha(0.5), BorderColor { left: rail, ..inset_border() })
+    }
+}
+
+/// Recessed settings row (rail on the left), a controller stop for `row`.
+fn setting_row(commands: &mut Commands, parent: Entity, rail: Color, row: SettingsRow) -> Entity {
+    let (bg, border) = settings_row_look(rail, false);
     commands
         .spawn((
             ChildOf(parent),
+            SettingsRowTag(settings_row_index(row), rail),
             Node {
                 width: Val::Percent(100.0),
                 align_items: AlignItems::Center,
@@ -1643,15 +1823,15 @@ fn setting_row(commands: &mut Commands, parent: Entity, rail: Color) -> Entity {
                 border: plate_rect((3.0, 1.0, 1.0, 1.0)),
                 ..default()
             },
-            BorderColor { left: rail, ..inset_border() },
-            BackgroundColor(INK_BLACK.with_alpha(0.5)),
+            border,
+            BackgroundColor(bg),
         ))
         .id()
 }
 
 /// `[-] [pip meter + value] [+]` row of a knob.
 fn knob_row(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSettings) {
-    let r = setting_row(commands, parent, HAZARD_YELLOW.with_alpha(0.8));
+    let r = setting_row(commands, parent, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Knob(k));
     setting_name(commands, r, k.label(), k.hint());
     settings_button(commands, r, SettingsTarget::Down(k), "-", 18.0, (11.0, 0.0));
     let meter = commands
@@ -1684,7 +1864,7 @@ fn knob_row(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSet
 
 /// Toggle row: name | live state | switch.
 fn toggle_row(commands: &mut Commands, parent: Entity, g: SettingToggle, hint: &str, s: &UserSettings) {
-    let r = setting_row(commands, parent, ACID_GREEN.with_alpha(0.8));
+    let r = setting_row(commands, parent, ACID_GREEN.with_alpha(0.8), SettingsRow::Toggle(g));
     setting_name(commands, r, g.label(), hint);
     commands.spawn((
         ChildOf(r),
@@ -1738,6 +1918,8 @@ fn spawn_settings_screen(
     knob_row(&mut commands, input, SettingKnob::SpeedFov, &s);
     toggle_row(&mut commands, input, SettingToggle::StrafeRoll, "lean the camera into strafes", &s);
     knob_row(&mut commands, input, SettingKnob::StrafeRoll, &s);
+    knob_row(&mut commands, input, SettingKnob::GamepadSensitivity, &s);
+    toggle_row(&mut commands, input, SettingToggle::GamepadInvertY, "right stick up looks down", &s);
 
     // Right: audio & reticle.
     let (audio, audio_head) =
@@ -1759,7 +1941,7 @@ fn spawn_settings_screen(
     let pickers = commands
         .spawn((ChildOf(reticle), Node { flex_direction: FlexDirection::Column, flex_grow: 1.0, flex_basis: Val::Px(0.0), row_gap: Val::Px(6.0), ..default() }))
         .id();
-    let style_row = setting_row(&mut commands, pickers, ARC_CYAN.with_alpha(0.8));
+    let style_row = setting_row(&mut commands, pickers, ARC_CYAN.with_alpha(0.8), SettingsRow::Style);
     commands.entity(style_row).insert(Node {
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Column,
@@ -1776,7 +1958,7 @@ fn spawn_settings_screen(
     for st in CrosshairStyle::ALL {
         settings_button(&mut commands, pills, SettingsTarget::Style(st), st.name(), 12.0, (8.0, 3.0));
     }
-    let color_row = setting_row(&mut commands, pickers, HAZARD_YELLOW.with_alpha(0.8));
+    let color_row = setting_row(&mut commands, pickers, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Color);
     commands.entity(color_row).insert(Node {
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Column,
@@ -1835,9 +2017,14 @@ fn spawn_settings_screen(
     let f = commands
         .spawn((ChildOf(phone), Node { margin: UiRect { top: Val::Px(2.0), bottom: Val::Px(4.0), ..default() }, ..row(JustifyContent::Center, 24.0) }))
         .id();
-    settings_button(&mut commands, f, SettingsTarget::ResetDefaults, "RESET DEFAULTS", 17.0, (16.0, 7.0));
+    let reset = settings_button(&mut commands, f, SettingsTarget::ResetDefaults, "RESET DEFAULTS", 17.0, (16.0, 7.0));
+    commands.entity(reset).insert(SettingsRowTag(settings_row_index(SettingsRow::Reset), PUNK_RED));
     let back = if mid_run { "BACK TO PAUSE  [ESC]" } else { "BACK  [ESC]" };
-    commands.spawn((ChildOf(f), punk_button(back, MenuAction::CloseSettings, 19.0, ButtonStyle::HeroAcid)));
+    commands.spawn((
+        ChildOf(f),
+        punk_button(back, MenuAction::CloseSettings, 19.0, ButtonStyle::HeroAcid),
+        SettingsRowTag(settings_row_index(SettingsRow::Back), ACID_GREEN),
+    ));
 }
 
 #[cfg(test)]
@@ -1845,6 +2032,40 @@ mod tests {
     use super::*;
     use crate::meta::RunUnlockSummary;
     use std::path::Path;
+
+    #[test]
+    fn settings_pad_edit_maps_rows_to_targets() {
+        use SettingsPadAction::*;
+        let s = UserSettings::default();
+        let k = SettingKnob::GamepadSensitivity;
+        assert_eq!(settings_pad_edit(SettingsRow::Knob(k), 1, false, &s), Some(Edit(SettingsTarget::Up(k))));
+        assert_eq!(settings_pad_edit(SettingsRow::Knob(k), -1, false, &s), Some(Edit(SettingsTarget::Down(k))));
+        assert_eq!(settings_pad_edit(SettingsRow::Knob(k), 0, true, &s), None, "A on a slider does nothing");
+        let g = SettingToggle::GamepadInvertY;
+        for (dx, a) in [(1, false), (-1, false), (0, true)] {
+            assert_eq!(settings_pad_edit(SettingsRow::Toggle(g), dx, a, &s), Some(Edit(SettingsTarget::Toggle(g))));
+        }
+        let next_style = CrosshairStyle::ALL[1];
+        let last_style = *CrosshairStyle::ALL.last().unwrap();
+        assert_eq!(settings_pad_edit(SettingsRow::Style, 1, false, &s), Some(Edit(SettingsTarget::Style(next_style))));
+        assert_eq!(settings_pad_edit(SettingsRow::Style, -1, false, &s), Some(Edit(SettingsTarget::Style(last_style))), "wraps");
+        assert_eq!(settings_pad_edit(SettingsRow::Color, 0, true, &s), Some(Edit(SettingsTarget::Color(CrosshairColor::ALL[1]))));
+        assert_eq!(settings_pad_edit(SettingsRow::Reset, 1, false, &s), None);
+        assert_eq!(settings_pad_edit(SettingsRow::Reset, 0, true, &s), Some(Edit(SettingsTarget::ResetDefaults)));
+        assert_eq!(settings_pad_edit(SettingsRow::Back, 0, true, &s), Some(Back));
+        assert_eq!(settings_pad_edit(SettingsRow::Back, 0, false, &s), None);
+        // Every knob and toggle on the screen is a controller stop, exactly once.
+        for k in SettingKnob::ALL {
+            assert_eq!(SETTINGS_ROWS.iter().filter(|r| **r == SettingsRow::Knob(k)).count(), 1, "{k:?}");
+        }
+        assert_eq!(SETTINGS_ROWS.iter().filter(|r| matches!(r, SettingsRow::Toggle(_))).count(), 5);
+        // Gamepad sensitivity steps on its 0.1 grid inside 0.3..=3.0.
+        let mut s = UserSettings { gamepad_sensitivity: 2.95, ..default() };
+        apply_settings_edit(&mut s, SettingsTarget::Up(k));
+        assert_eq!(s.gamepad_sensitivity, GAMEPAD_SENS_RANGE.1);
+        assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::Up(k)), EditOutcome::Unchanged(_)));
+        assert_eq!(k.value_text(&s), "3.00x");
+    }
 
     #[test]
     fn risk_badge_scales_with_contracts() {

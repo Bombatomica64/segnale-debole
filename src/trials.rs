@@ -791,9 +791,9 @@ fn update_gate_visuals(trial: Res<TimeTrialState>, assets: Option<Res<TrialAsset
     }
 }
 
-/// `R` while playing the Time Trial: instant reset.
-fn trial_restart_key(keys: Res<ButtonInput<KeyCode>>, mut trial: ResMut<TimeTrialState>) {
-    if keys.just_pressed(KeyCode::KeyR) {
+/// `R` (or `Select` / `R3` on a controller) while playing the Time Trial: instant reset.
+fn trial_restart_key(keys: Res<ButtonInput<KeyCode>>, pad: Option<Res<crate::gamepad::GamepadInput>>, mut trial: ResMut<TimeTrialState>) {
+    if keys.just_pressed(KeyCode::KeyR) || pad.is_some_and(|g| g.trial_reset) {
         trial.reset_requested = true;
     }
 }

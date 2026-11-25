@@ -12,6 +12,7 @@ pub mod dev;
 pub mod enemies;
 pub mod extraction;
 pub mod fx;
+pub mod gamepad;
 pub mod hud;
 pub mod ui_kit;
 pub mod level;
@@ -70,7 +71,8 @@ impl Plugin for CoreGameplayPlugin {
             .add_plugins(boss::BossPlugin)
             .add_plugins(decals::DecalsPlugin)
             .add_plugins(trials::TrialsPlugin)
-            .add_plugins(compendium::CompendiumPlugin);
+            .add_plugins(compendium::CompendiumPlugin)
+            .add_plugins(gamepad::GamepadPlugin);
     }
 }
 

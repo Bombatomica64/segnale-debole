@@ -599,6 +599,14 @@ pub const MOUSE_SENS_RANGE: (f32, f32) = (0.25, 3.0);
 pub const BASE_FOV_RANGE: (f32, f32) = (70.0, 110.0);
 pub const EFFECT_SCALE_RANGE: (f32, f32) = (0.0, 1.5);
 pub const VOLUME_RANGE: (f32, f32) = (0.0, 1.0);
+/// Gamepad look sensitivity multiplier (see `gamepad::apply_look_curve`).
+pub const GAMEPAD_SENS_RANGE: (f32, f32) = (0.3, 3.0);
+
+/// Serde default of [`UserSettings::gamepad_sensitivity`] (profiles written
+/// before Milestone 23 lack the field; a plain `f32` default would read 0.0).
+fn default_gamepad_sensitivity() -> f32 {
+    1.0
+}
 
 /// Player-facing options persisted inside the profile (never gameplay power).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -621,6 +629,12 @@ pub struct UserSettings {
     /// Speedrun split timer plate on Standard runs (always on in Daily / Time Trial).
     #[serde(default)]
     pub speedrun_splits: bool,
+    /// Right Stick look multiplier (`GAMEPAD_SENS_RANGE`).
+    #[serde(default = "default_gamepad_sensitivity")]
+    pub gamepad_sensitivity: f32,
+    /// Stick up looks down.
+    #[serde(default)]
+    pub gamepad_invert_y: bool,
 }
 
 impl Default for UserSettings {
@@ -637,6 +651,8 @@ impl Default for UserSettings {
             crosshair_style: CrosshairStyle::Cross,
             crosshair_color: CrosshairColor::White,
             speedrun_splits: false,
+            gamepad_sensitivity: default_gamepad_sensitivity(),
+            gamepad_invert_y: false,
         }
     }
 }
@@ -655,6 +671,7 @@ impl UserSettings {
         self.speed_fov_scale = sane(self.speed_fov_scale, EFFECT_SCALE_RANGE, d.speed_fov_scale);
         self.strafe_roll_scale = sane(self.strafe_roll_scale, EFFECT_SCALE_RANGE, d.strafe_roll_scale);
         self.audio_master_volume = sane(self.audio_master_volume, VOLUME_RANGE, d.audio_master_volume);
+        self.gamepad_sensitivity = sane(self.gamepad_sensitivity, GAMEPAD_SENS_RANGE, d.gamepad_sensitivity);
     }
 
     /// Sanitized copy.
@@ -1454,6 +1471,31 @@ mod tests {
 
     fn run_with(floor: u32) -> RunStats {
         RunStats { floor, ..default() }
+    }
+
+    #[test]
+    fn pre_gamepad_profiles_load_with_gamepad_defaults() {
+        // A Milestone 22 profile: full settings block, no gamepad fields.
+        let old = r#"{"schema_version":1,"settings":{"mouse_sensitivity":1.5,"base_fov_deg":95.0,"speed_fov_enabled":false,
+            "speed_fov_scale":1.0,"strafe_roll_enabled":true,"strafe_roll_scale":0.5,"audio_master_volume":0.4,"audio_muted":false,
+            "crosshair_style":"Cross","crosshair_color":"White","speedrun_splits":true}}"#;
+        let p = parse_profile(old).expect("old profile parses");
+        assert_eq!(p.settings.gamepad_sensitivity, 1.0, "missing field = 1.0, not f32::default()");
+        assert!(!p.settings.gamepad_invert_y);
+        assert_eq!((p.settings.mouse_sensitivity, p.settings.base_fov_deg, p.settings.speedrun_splits), (1.5, 95.0, true));
+        // An empty settings block and a bare profile both fall back to defaults.
+        assert_eq!(parse_profile(r#"{"settings":{}}"#).unwrap().settings, UserSettings::default());
+        assert_eq!(parse_profile("{}").unwrap().settings.gamepad_sensitivity, 1.0);
+        // Round trip keeps the new fields; out-of-range values clamp on load.
+        let mut s = UserSettings { gamepad_sensitivity: 2.4, gamepad_invert_y: true, ..default() };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<UserSettings>(&json).unwrap(), s);
+        s.gamepad_sensitivity = 9.0;
+        assert_eq!(s.sanitized().gamepad_sensitivity, GAMEPAD_SENS_RANGE.1);
+        s.gamepad_sensitivity = f32::NAN;
+        assert_eq!(s.sanitized().gamepad_sensitivity, 1.0);
+        s.gamepad_sensitivity = 0.0;
+        assert_eq!(s.sanitized().gamepad_sensitivity, GAMEPAD_SENS_RANGE.0);
     }
 
     #[test]

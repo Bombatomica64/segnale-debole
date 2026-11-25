@@ -23,6 +23,7 @@ use crate::boss::BossHud;
 use crate::compendium::{apply_custom_label, pick_run_seed, seed_key_char, shareable_code, CustomSeedState};
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
 use crate::fx::HudFeed;
+use crate::gamepad::{DefaultFocus, GamepadFocus, GamepadInput};
 use crate::meta::{live_settings, record_game_over, record_victory, start_run_with_loadout, CrosshairColor, CrosshairStyle, ProfileStore, RunLoadout};
 use crate::meta_ui::{
     end_loadout_line, loadout_summary_line, loadout_tag_parts, unlock_reward_lines, MetaBox, MetaUiPlugin, NO_UNLOCKS_LINE,
@@ -39,7 +40,7 @@ use crate::ui_kit::{
     punk_screen_root_tinted, recessed_bezel, screen_rails, section_crate, signal_bars, stamped_tag, stencil_title, stencil_title_layers,
     terminal_chassis, tiled_image, ButtonStyle, PunkButtonColors, Tape, UiKitPlugin, UiKitTextures, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_DARK, IRON_MID, PUNK_RED, STEEL_BORDER, STEEL_LIGHT,
 };
-use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeChoices};
+use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeChoices, UpgradeFocus};
 use crate::weapons::{doppler_active, Weapon, WeaponState};
 
 pub const COLOR_BG: Color = INK_BLACK;
@@ -162,6 +163,21 @@ pub fn seed_hotkey_action(state: AppState, mode: RunMode, b: bool, s: bool) -> O
     match state {
         AppState::MainMenu if b => Some(MenuAction::OpenCompendium),
         AppState::Paused | AppState::GameOver | AppState::Victory if s && mode != RunMode::TimeTrial => Some(MenuAction::ShareSeed),
+        _ => None,
+    }
+}
+
+/// Controller shortcuts (focus + `A` covers every button; these are extras):
+/// - `Start`: PLAY from `MainMenu`, DEPLOY from `Loadout` / `ContractsFeats`
+///   (`Start` in `Paused` resumes via `gamepad::gamepad_pause_toggle`)
+/// - `B`: resume from `Paused`, back to the main menu from `Loadout`,
+///   `ContractsFeats`, `GameOver` and `Victory` (Settings handles its own `B`)
+pub fn pad_menu_action(state: AppState, start: bool, back: bool) -> Option<MenuAction> {
+    use MenuAction::*;
+    match state {
+        AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats if start => Some(StartRun),
+        AppState::Paused if back => Some(Continue),
+        AppState::Loadout | AppState::ContractsFeats | AppState::GameOver | AppState::Victory if back => Some(BackToMenu),
         _ => None,
     }
 }
@@ -359,7 +375,7 @@ fn spawn_main_menu(
     commands.spawn((
         ChildOf(actions),
         Node { flex_grow: 1.0, flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, ..default() },
-        children![punk_button("PLAY  [ENTER]", MenuAction::StartRun, 30.0, ButtonStyle::HeroAcid)],
+        children![(punk_button("PLAY  [ENTER]", MenuAction::StartRun, 30.0, ButtonStyle::HeroAcid), DefaultFocus)],
     ));
     commands.spawn((ChildOf(actions), punk_button("LOADOUT  [L]", MenuAction::OpenLoadout, 19.0, ButtonStyle::HazardAmber)));
     commands.spawn((ChildOf(actions), punk_button("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, 19.0, ButtonStyle::DangerRed)));
@@ -739,7 +755,7 @@ pub fn spawn_app_store(
     let foot = centered(&mut commands, phone);
     commands.spawn((ChildOf(foot), text(installed_list(&run), 14.0, ASH_DIM)));
     let hint = centered(&mut commands, phone);
-    spaced_tag(&mut commands, hint, "CLICK A CARD OR PRESS 1 / 2 / 3", (HAZARD_YELLOW, INK_BLACK), 13.0, 0.0);
+    spaced_tag(&mut commands, hint, "CLICK A CARD OR PRESS 1 / 2 / 3  //  PAD: LEFT / RIGHT + A", (HAZARD_YELLOW, INK_BLACK), 13.0, 0.0);
 }
 
 fn installed_list(run: &RunStats) -> String {
@@ -763,17 +779,21 @@ fn upgrade_cards(
     mut players: Query<&mut Player>,
     mut sfx: ResMut<SfxQueue>,
     mut next: ResMut<NextState<AppState>>,
+    (pad, pad_card): (Res<GamepadInput>, Res<UpgradeFocus>),
 ) {
     let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
     let mut chosen = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3].iter().position(|k| keys.just_pressed(*k));
     for (node, tf, card, mut bg, mut border) in &mut cards {
-        let hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
-        bg.0 = if hovered { COLOR_CARD_HOVER } else { COLOR_CARD };
-        let want = upgrade_card_border(hovered);
+        let pointer_hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
+        // Controller navigation owns the highlight until the mouse moves, but
+        // mouse releases always activate the card under the actual pointer.
+        let lit = if pad.active { card.0 == pad_card.0 } else { pointer_hovered };
+        bg.0 = if lit { COLOR_CARD_HOVER } else { COLOR_CARD };
+        let want = upgrade_card_border(lit);
         if *border != want {
             *border = want;
         }
-        if hovered && mouse.just_released(MouseButton::Left) {
+        if pointer_hovered && mouse.just_released(MouseButton::Left) {
             chosen = Some(card.0);
         }
     }
@@ -1359,9 +1379,10 @@ fn menu_buttons(
     window: Query<&Window, With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut buttons: Query<
-        (&ComputedNode, &UiGlobalTransform, &MenuAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>),
+        (Entity, &ComputedNode, &UiGlobalTransform, &MenuAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>),
         With<MenuButton>,
     >,
+    (pad, focus): (Res<GamepadInput>, Res<GamepadFocus>),
     mut labels: Query<&mut TextColor>,
     mut run: ResMut<RunStats>,
     mut mods: ResMut<PlayerModifiers>,
@@ -1371,8 +1392,10 @@ fn menu_buttons(
     mut next: ResMut<NextState<AppState>>,
 ) {
     let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
-    for (node, tf, action, colors, mut bg, mut border, children) in &mut buttons {
-        let hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
+    for (e, node, tf, action, colors, mut bg, mut border, children) in &mut buttons {
+        // Controller navigation owns the highlight until the mouse moves.
+        let pointer_hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
+        let hovered = if pad.active { focus.shows(&pad, e) } else { pointer_hovered };
         // Punk hover snap: solid accent fill, inverted label, bright frame.
         let want = colors.bg(hovered);
         if bg.0 != want {
@@ -1390,7 +1413,7 @@ fn menu_buttons(
                 }
             }
         }
-        if hovered && mouse.just_released(MouseButton::Left) {
+        if (pointer_hovered && mouse.just_released(MouseButton::Left)) || focus.activate == Some(e) {
             perform(
                 &mut commands,
                 &players,
@@ -1419,7 +1442,23 @@ fn menu_keys(
     time: Res<Time>,
     mut ret: ResMut<SettingsReturn>,
     mut next: ResMut<NextState<AppState>>,
+    pad: Res<GamepadInput>,
 ) {
+    // Controller shortcuts (never typed text, so the seed editor allows them).
+    if let Some(action) = pad_menu_action(*state.get(), pad.pause, pad.back) {
+        perform(
+            &mut commands,
+            &players,
+            action,
+            &mut run,
+            &mut mods,
+            (&mut store, &mut loadout, &mut trial, &mut seed),
+            &time,
+            (*state.get(), &mut ret),
+            &mut next,
+        );
+        return;
+    }
     // Typing a seed (`DOOM`, `BOSS`...) never fires main menu hotkeys.
     if *state.get() == AppState::MainMenu && seed.editing {
         return;
@@ -3127,6 +3166,22 @@ fn debug_skip_floor(keys: Res<ButtonInput<KeyCode>>, mut run: ResMut<RunStats>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pad_menu_shortcuts_per_screen() {
+        use MenuAction::*;
+        assert_eq!(pad_menu_action(AppState::MainMenu, true, false), Some(StartRun));
+        assert_eq!(pad_menu_action(AppState::MainMenu, false, true), None, "B on the main menu does nothing");
+        assert_eq!(pad_menu_action(AppState::Loadout, true, false), Some(StartRun));
+        assert_eq!(pad_menu_action(AppState::ContractsFeats, false, true), Some(BackToMenu));
+        assert_eq!(pad_menu_action(AppState::Paused, false, true), Some(Continue));
+        assert_eq!(pad_menu_action(AppState::Paused, true, false), None, "Start resumes via the core toggle");
+        assert_eq!(pad_menu_action(AppState::GameOver, false, true), Some(BackToMenu));
+        assert_eq!(pad_menu_action(AppState::Victory, false, true), Some(BackToMenu));
+        assert_eq!(pad_menu_action(AppState::Settings, false, true), None, "Settings owns its B");
+        assert_eq!(pad_menu_action(AppState::UpgradeSelect, true, true), None);
+        assert_eq!(pad_menu_action(AppState::Playing, true, true), None);
+    }
 
     #[test]
     fn endless_floor_plate_and_movement_line() {

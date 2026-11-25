@@ -2914,9 +2914,11 @@ fn settings_open_from_main_menu_and_mid_run_pause_and_apply_live() {
     tap(&mut app, KeyCode::KeyO);
     assert_eq!(app_state(&app), AppState::Settings);
     assert_eq!(app.world().resource::<SettingsReturn>().0, AppState::MainMenu);
-    // 5 knobs x (-/+), 4 toggles (incl. SPEEDRUN SPLITS), the style pills, the color swatches, RESET.
-    assert_eq!(count::<SettingsControl>(&mut app), 5 * 2 + 4 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
+    // 6 knobs x (-/+), 5 toggles (incl. SPEEDRUN SPLITS, GAMEPAD INVERT Y), the style pills, the color swatches, RESET.
+    assert_eq!(count::<SettingsControl>(&mut app), 6 * 2 + 5 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
     assert!(ui_texts(&mut app).iter().any(|t| t == "SPEEDRUN SPLITS"), "speedrun splits toggle row");
+    let texts = ui_texts(&mut app);
+    assert!(texts.iter().any(|t| t == "GAMEPAD SENSITIVITY") && texts.iter().any(|t| t == "GAMEPAD INVERT Y"), "gamepad rows");
     assert_eq!(count::<ReticlePreview>(&mut app), 1);
     assert_eq!(count::<Camera3d>(&mut app), 1, "settings brings its own camera from the menu");
     let texts = ui_texts(&mut app);

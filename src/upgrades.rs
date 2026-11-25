@@ -291,19 +291,72 @@ pub fn bot_pick_upgrade(
     pick_upgrade(i, &choices, &mut mods, player.as_deref_mut(), &mut run, &mut next);
 }
 
+/// Controller focus on the App Store (card index; the HUD draws its highlight).
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpgradeFocus(pub usize);
+
+/// Step a card focus by `delta`, wrapping over `count` cards.
+pub fn step_card_focus(cur: usize, delta: i32, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (cur.min(count - 1) as i32 + delta).rem_euclid(count as i32) as usize
+}
+
+fn reset_upgrade_focus(mut focus: ResMut<UpgradeFocus>) {
+    focus.0 = 0;
+}
+
+/// Controller App Store: Left / Right or `LB` / `RB` move the focus across
+/// the offers, `A` installs the focused card.
+pub fn pad_pick_upgrade(
+    pad: Res<crate::gamepad::GamepadInput>,
+    mut focus: ResMut<UpgradeFocus>,
+    choices: Res<UpgradeChoices>,
+    mut mods: ResMut<PlayerModifiers>,
+    mut run: ResMut<RunStats>,
+    mut players: Query<&mut Player>,
+    (mut sfx, mut next): (ResMut<crate::audio::SfxQueue>, ResMut<NextState<AppState>>),
+) {
+    let delta = pad.nav_x() + pad.tab_next as i32 - pad.tab_prev as i32;
+    if delta != 0 {
+        let want = step_card_focus(focus.0, delta.signum(), choices.0.len());
+        if focus.0 != want {
+            focus.0 = want;
+        }
+    }
+    if pad.confirm {
+        let mut player = players.single_mut().ok();
+        if pick_upgrade(focus.0, &choices, &mut mods, player.as_deref_mut(), &mut run, &mut next).is_some() {
+            sfx.play(crate::audio::SfxEvent::UpgradeSelect);
+        }
+    }
+}
+
 pub struct UpgradesPlugin;
 
 impl Plugin for UpgradesPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UpgradeChoices>()
             .add_systems(OnEnter(AppState::UpgradeSelect), draft_upgrades)
-            .add_systems(Update, bot_pick_upgrade.run_if(in_state(AppState::UpgradeSelect)));
+            .init_resource::<UpgradeFocus>()
+            .add_systems(OnEnter(AppState::UpgradeSelect), reset_upgrade_focus)
+            .add_systems(Update, (bot_pick_upgrade, pad_pick_upgrade).chain().run_if(in_state(AppState::UpgradeSelect)));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_focus_steps_and_wraps() {
+        assert_eq!(step_card_focus(0, 1, 3), 1);
+        assert_eq!(step_card_focus(2, 1, 3), 0);
+        assert_eq!(step_card_focus(0, -1, 3), 2);
+        assert_eq!(step_card_focus(7, 0, 3), 2, "stale focus clamps");
+        assert_eq!(step_card_focus(1, 1, 0), 0);
+    }
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 

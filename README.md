@@ -44,6 +44,8 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
 - `1` / `2` / `3` or click: draft a firmware upgrade in the App Store
 - Menus: `Enter` play / deploy / resume | `L` Loadout | `C` Contracts & Feats | `O` Settings (main menu and pause) | `E` continue into **Endless Overdrive** (Floor 5 victory screen) | `Esc` back or pause (`R` restart, `M` main menu while paused)
 - Performance: `F3` toggles the FPS / frame-time overlay | `F4` toggles VSync
+- **Controller** (no mouse click needed): Left Stick move | Right Stick look | `RT` fire | `A` jump (hold to bunny hop) | `LB` dash | `LT` Ping Scan | `RB` 5G Overload | `X` SOS uplink | `Y` / D-Pad Right next weapon, D-Pad Left previous | D-Pad Down inspect | `Start` pause | `Select` / `R3` Time Trial reset
+- Controller menus: D-Pad / Left Stick move the focus, `A` select, `B` back, `Start` play / deploy; Settings: Up/Down pick a row, Left/Right adjust; Bestiary: Left/Right or `LB`/`RB` cycle, `Y` switch archive, Right Stick spins. Gamepad sensitivity and Invert Y live in Settings.
 
 ## Build & Run
 ```bash
@@ -56,6 +58,10 @@ cargo run --features audio
 
 # Optimized build
 cargo build --release --features audio
+
+# Native controllers (gilrs; Linux needs libudev-dev pkg-config). The web
+# build always has controller support through the browser Gamepad API.
+cargo run --features audio,gamepad
 
 # GPU ray-traced lighting (Bevy Solari): hardware ray queries, ReSTIR GI,
 # emissive lamps / lava / plasma as real area lights with ray-traced shadows

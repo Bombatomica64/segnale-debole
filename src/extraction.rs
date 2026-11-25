@@ -347,7 +347,7 @@ fn rush_cells(grid: &LevelGrid) -> Vec<IVec2> {
 fn update_extraction(
     mut commands: Commands,
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    (keys, pad): (Res<ButtonInput<KeyCode>>, Option<Res<crate::gamepad::GamepadInput>>),
     grid: Res<LevelGrid>,
     signal: Res<SignalState>,
     mods: Res<PlayerModifiers>,
@@ -389,7 +389,7 @@ fn update_extraction(
             let flat = Vec2::new(ppos.x - tower.x, ppos.z - tower.z).length();
             let by_mast = flat <= UPLINK_HOLD_RADIUS && (ppos.y - tower.y).abs() < 2.0;
             *hold = if by_mast { *hold + dt } else { 0.0 };
-            let pressed = (keys.just_pressed(KeyCode::KeyE) || take_flag(&mut bot, |b| &mut b.interact)) && signal.near_tower;
+            let pressed = (keys.just_pressed(KeyCode::KeyE) || pad.as_ref().is_some_and(|g| g.interact) || take_flag(&mut bot, |b| &mut b.interact)) && signal.near_tower;
             if pressed || *hold >= UPLINK_HOLD_SECS {
                 *state = ExtractionState::start_upload_scaled(run.floor, mods.upload_duration_mult);
                 rush.0 = rush_cells(&grid);

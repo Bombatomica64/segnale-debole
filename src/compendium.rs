@@ -22,6 +22,7 @@ use bevy::window::PrimaryWindow;
 
 use crate::enemies::{EnemyAssets, EnemyKind, KIND_COUNT};
 use crate::fx::OVERLAY_LAYER;
+use crate::gamepad::GamepadInput;
 use crate::hud::text;
 use crate::meta::ProfileStore;
 use crate::sculpt;
@@ -1022,8 +1023,30 @@ fn apply_action(action: CompAction, state: &mut CompendiumState, next: &mut Next
     }
 }
 
-fn compendium_input(keys: Res<ButtonInput<KeyCode>>, mut state: ResMut<CompendiumState>, mut next: ResMut<NextState<AppState>>) {
-    if let Some(a) = compendium_key_action(&keys, state.category) {
+/// Controller: Left / Right or `LB` / `RB` cycle exhibits, `Y` switches
+/// Bestiary <-> Armory, `B` returns (Right Stick X spins, in [`spin_turntable`]).
+pub fn compendium_pad_action(pad: &GamepadInput, category: Category) -> Option<CompAction> {
+    if pad.back {
+        Some(CompAction::Back)
+    } else if pad.nav_left || pad.tab_prev {
+        Some(CompAction::Prev)
+    } else if pad.nav_right || pad.tab_next {
+        Some(CompAction::Next)
+    } else if pad.alt_action {
+        Some(CompAction::Tab(category.other()))
+    } else {
+        None
+    }
+}
+
+fn compendium_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    pad: Option<Res<GamepadInput>>,
+    mut state: ResMut<CompendiumState>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    let action = compendium_key_action(&keys, state.category).or_else(|| pad.and_then(|g| compendium_pad_action(&g, state.category)));
+    if let Some(a) = action {
         apply_action(a, &mut state, &mut next);
     }
 }
@@ -1072,7 +1095,7 @@ fn compendium_clicks(
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn spin_turntable(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -1081,6 +1104,7 @@ fn spin_turntable(
     mut state: ResMut<CompendiumState>,
     mut table: Query<&mut Transform, (With<TurntableRoot>, Without<CompendiumCamera>)>,
     mut cam: Query<&mut Transform, (With<CompendiumCamera>, Without<TurntableRoot>)>,
+    pad: Option<Res<GamepadInput>>,
 ) {
     if let (Ok(w), Ok(mut ctf)) = (window.single(), cam.single_mut())
         && w.height() > 0.0
@@ -1099,6 +1123,13 @@ fn spin_turntable(
     }
     if keys.pressed(KeyCode::KeyE) {
         spin += MANUAL_SPIN * dt;
+        manual = true;
+    }
+    // Right Stick X: analog spin (deadzoned; full tilt = the Q / E rate).
+    if let Some(x) = pad.map(|g| g.spin_x)
+        && x != 0.0
+    {
+        spin += x * MANUAL_SPIN * dt;
         manual = true;
     }
     let cursor = window.single().ok().and_then(|w| w.cursor_position().map(|c| (c, w.width())));
@@ -1185,6 +1216,28 @@ fn refresh_compendium(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_cycles_switches_and_backs_out_of_the_compendium() {
+        let mut pad = GamepadInput::default();
+        assert_eq!(compendium_pad_action(&pad, Category::Bestiary), None);
+        pad.nav_left = true;
+        assert_eq!(compendium_pad_action(&pad, Category::Bestiary), Some(CompAction::Prev));
+        let with = |f: fn(&mut GamepadInput)| {
+            let mut p = GamepadInput::default();
+            f(&mut p);
+            p
+        };
+        pad = with(|p| p.tab_next = true);
+        assert_eq!(compendium_pad_action(&pad, Category::Bestiary), Some(CompAction::Next));
+        pad = with(|p| p.alt_action = true);
+        assert_eq!(compendium_pad_action(&pad, Category::Bestiary), Some(CompAction::Tab(Category::Bestiary.other())));
+        pad = with(|p| {
+            p.back = true;
+            p.nav_right = true;
+        });
+        assert_eq!(compendium_pad_action(&pad, Category::Armory), Some(CompAction::Back), "B wins");
+    }
 
     #[test]
     fn normalize_trims_uppercases_and_caps() {

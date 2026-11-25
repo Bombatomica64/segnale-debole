@@ -2228,7 +2228,7 @@ fn fire_weapons(
         Query<(&mut BossPylon, &GlobalTransform)>,
     ),
     mut bot: Option<ResMut<BotControl>>,
-    mut scratch: Local<FireScratch>,
+    (mut scratch, pad): (Local<FireScratch>, Option<Res<crate::gamepad::GamepadInput>>),
 ) {
     let dt = time.delta_secs();
     let Ok((mut player, body)) = players.single_mut() else { return };
@@ -2268,6 +2268,10 @@ fn fire_weapons(
         want = Some(ws.current.next());
     } else if scroll.delta.y > 0.0 {
         want = Some(ws.current.prev());
+    } else if pad.as_ref().is_some_and(|g| g.weapon_next) {
+        want = Some(ws.current.next());
+    } else if pad.as_ref().is_some_and(|g| g.weapon_prev) {
+        want = Some(ws.current.prev());
     } else if let Some(w) = bot.as_mut().and_then(|b| b.switch_weapon.take()) {
         want = Some(w);
     }
@@ -2278,11 +2282,13 @@ fn fire_weapons(
     }
 
     let bot_fire = bot.as_ref().is_some_and(|b| b.fire);
-    let trigger = (captured.0 && mouse.pressed(MouseButton::Left)) || ws.force_fire || bot_fire;
-    // `F` inspect flourish (purely visual): pulling the trigger cancels it at once.
+    // `RT` fires without cursor capture (controllers need no mouse click).
+    let pad_fire = pad.as_ref().is_some_and(|g| g.fire);
+    let trigger = (captured.0 && mouse.pressed(MouseButton::Left)) || ws.force_fire || bot_fire || pad_fire;
+    // `F` / D-Pad Down inspect flourish (purely visual): pulling the trigger cancels it at once.
     if trigger {
         ws.inspect_timer = 0.0;
-    } else if keys.just_pressed(KeyCode::KeyF) && ws.swap_timer <= 0.0 {
+    } else if (keys.just_pressed(KeyCode::KeyF) || pad.as_ref().is_some_and(|g| g.inspect)) && ws.swap_timer <= 0.0 {
         ws.inspect_timer = INSPECT_SECS;
     }
     if !trigger || ws.cooldown > 0.0 || ws.swap_timer > SWAP_SECS * 0.4 {

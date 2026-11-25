@@ -20,6 +20,7 @@ use crate::assets_gen::{FloorTheme, GameAssets};
 use crate::audio::{advance_stride, footstep_sfx, SfxEvent, SfxQueue, LAND_THUD_SPEED, STEP_STRIDE};
 use crate::bot_input::{take_flag, BotControl};
 use crate::enemies::{fiend_jammer_fields_iter, Enemy};
+use crate::gamepad::GamepadInput;
 use crate::fx::{spawn_burst, spawn_flash_light, spawn_particles, spawn_shockwave, BurstColor, FxAssets, HudFeed};
 use crate::level::{DemonJammer, JumpPad, JumpPadGlow, JumpPadLight, LevelGrid, SignalTower, PAD_DORMANT_LIGHT, PAD_POWERED_LIGHT};
 use crate::meta::{live_settings, ProfileStore, RunLoadout, StarterChip, UserSettings, BASE_FOV_RANGE, EFFECT_SCALE_RANGE, MOUSE_SENS_RANGE};
@@ -510,12 +511,14 @@ fn cursor_capture_input(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mouse_look(
     motion: Res<AccumulatedMouseMotion>,
     captured: Res<CursorCaptured>,
     browser: Option<Res<BrowserPointerLock>>,
     store: Option<Res<ProfileStore>>,
     bot: Option<Res<BotControl>>,
+    pad: Option<Res<GamepadInput>>,
     mut players: Query<(&mut Player, &mut Transform), Without<PlayerCamera>>,
     mut cams: Query<&mut Transform, With<PlayerCamera>>,
 ) {
@@ -524,6 +527,14 @@ fn mouse_look(
         let sens = effective_mouse_sensitivity(&live_settings(store.as_deref()));
         p.yaw -= motion.delta.x * sens;
         p.pitch = (p.pitch - motion.delta.y * sens).clamp(-1.5, 1.5);
+    }
+    // Right Stick: already curved, sensitivity- and dt-scaled radians; needs
+    // no cursor capture (Steam Deck / Android / web work without a click).
+    if let Some(look) = pad.map(|g| g.look_delta)
+        && look != Vec2::ZERO
+    {
+        p.yaw -= look.x;
+        p.pitch = (p.pitch + look.y).clamp(-1.5, 1.5);
     }
     if let Some(bot) = bot {
         if let Some(yaw) = bot.look_yaw {
@@ -689,6 +700,16 @@ pub struct MoveInput {
     pub right: f32,
 }
 
+/// Keyboard intent plus the Left Stick (`x` = right, `y` = forward), each
+/// axis clamped to -1..1. Exact zeros survive (a pure-strafe stick keeps the
+/// CPMA air-strafe / air-control modes, see `gamepad::stick_move_axes`).
+pub fn pad_blend_move(keys: MoveInput, stick: Vec2) -> MoveInput {
+    if !stick.is_finite() {
+        return keys;
+    }
+    MoveInput { forward: (keys.forward + stick.y).clamp(-1.0, 1.0), right: (keys.right + stick.x).clamp(-1.0, 1.0) }
+}
+
 impl MoveInput {
     /// Holding only A or D: CPMA air-strafe.
     pub fn pure_strafe(self) -> bool {
@@ -754,7 +775,7 @@ pub fn effective_strafe_tilt_target(input_right: f32, side_speed_frac: f32, grou
     strafe_tilt_target(input_right, side_speed_frac, grounded) * scale
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn move_player(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -763,7 +784,7 @@ fn move_player(
     signal: Res<SignalState>,
     mut sfx: ResMut<SfxQueue>,
     mut bot: Option<ResMut<BotControl>>,
-    (store, run): (Option<Res<ProfileStore>>, Option<ResMut<RunStats>>),
+    (store, run, pad): (Option<Res<ProfileStore>>, Option<ResMut<RunStats>>, Option<Res<GamepadInput>>),
     mut q: Query<(&mut Player, &mut Transform)>,
 ) {
     let Some(grid) = grid else { return };
@@ -775,6 +796,9 @@ fn move_player(
         forward: (axis(KeyCode::KeyW, KeyCode::KeyS) + axis(KeyCode::ArrowUp, KeyCode::ArrowDown)).clamp(-1.0, 1.0),
         right: axis(KeyCode::KeyD, KeyCode::KeyA),
     };
+    // Left Stick blends with WASD (clamped, so both together never exceed a key).
+    let pad = pad.as_deref().cloned().unwrap_or_default();
+    input = pad_blend_move(input, pad.move_axes);
     if let Some(b) = &bot
         && b.strafe_axes != Vec2::ZERO
     {
@@ -793,9 +817,9 @@ fn move_player(
     p.invuln_timer = (p.invuln_timer - dt).max(0.0);
     p.since_damage += dt;
     // Edge inputs fire on the first substep only; held keys act on every one.
-    let space_tap = keys.just_pressed(KeyCode::Space);
-    let shift = keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight) || take_flag(&mut bot, |b| &mut b.dash);
-    let space_held = keys.pressed(KeyCode::Space) || bot_jump;
+    let space_tap = keys.just_pressed(KeyCode::Space) || pad.jump_pressed;
+    let shift = keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight) || pad.dash || take_flag(&mut bot, |b| &mut b.dash);
+    let space_held = keys.pressed(KeyCode::Space) || bot_jump || pad.jump;
     p.dash_started = false;
     p.prev_pos = Some(tf.translation);
 
