@@ -428,12 +428,12 @@ pub const PIT_RESCUE_Y: f32 = -0.3;
 ///    strafe gap (13) with a recovery ramp (12) -> CP 2 (x = 8).
 /// 3. Ramp descent (2-3,8) into the open-roof pit hall: jump / dash /
 ///    rocket-jump the lava trench (10-11), launch over it from the pad (9,4),
-///    or take the slow north lane -> CP 3 (x = 15).
+///    or take the slower 2-cell (8 m) wide north lane (rows 1-2) -> CP 3 (x = 15).
 /// 4. Signal Atrium: ramp (20,4) or atrium pad (22,6) onto the tower pedestal = FINISH.
 pub const TRIAL_MAP: [&str; 17] = [
     "###########################",
     "########......#####AAAAAAA#",
-    "#........####......AAAAAAA#",
+    "#..................AAAAAAA#",
     "#.........~~.......AAAAAAA#",
     "#.........~~.......AEAAAAA#",
     "#.........~~.......AAAAAAA#",
@@ -1190,6 +1190,17 @@ mod tests {
         assert_eq!((p.stats.runs_played, p.stats.victories), (0, 0));
         assert_eq!(trial_splits_line(&[8.0, 19.0], &[8.5, 18.0]), "CP 1 00:08.0 (-0:00.5)  |  CP 2 00:19.0 (+0:01.0)");
         assert_eq!(floor_splits_line(&[61.0, 125.5]), "SPLITS  F1 01:01.0  |  F2 02:05.5");
+    }
+
+    #[test]
+    fn time_trial_course_has_no_cramped_one_cell_stretches() {
+        let g = build_time_trial_grid();
+        let cramped = crate::level::cramped_cells(&g);
+        assert!(cramped.is_empty(), "1-cell (4 m) stretches on the course: {cramped:?}");
+        // The slow north lane around the lava trench is 2 cells (8 m) wide.
+        for x in 8..=13 {
+            assert!(crate::level::cross_width(&g, IVec2::new(x, 1), IVec2::X) >= 2, "north lane at x = {x}");
+        }
     }
 
     #[test]

@@ -18,10 +18,10 @@ use crate::mesh_batch::{MaterialBatches, MeshBatch};
 use crate::state::{AppState, GameSet, RunStats};
 
 pub const CELL_SIZE: f32 = 4.0;
-/// Ceiling height of covered cells.
-pub const CEILING_HEIGHT: f32 = 6.0;
+/// Ceiling height of covered cells (generous bhop / jump-pad headroom).
+pub const CEILING_HEIGHT: f32 = 7.2;
 /// Height of walls bordering the open-roof atrium.
-pub const ATRIUM_WALL_HEIGHT: f32 = 11.0;
+pub const ATRIUM_WALL_HEIGHT: f32 = 12.0;
 /// Raised catwalks / tower pedestal.
 pub const CATWALK_HEIGHT: f32 = 2.4;
 /// Floor of lava / plasma pits.
@@ -378,9 +378,135 @@ impl LevelGrid {
 // Generation
 // ---------------------------------------------------------------------------
 
-/// Grid side length for a floor (21 on floor 1, +2 per floor, capped at 29).
+/// Macro-grid pitch: a 2-cell (8 m) wide node / passage + a 1-cell wall line.
+pub const MACRO_STEP: i32 = 3;
+/// Macro nodes the spawn launch lane runs straight through (incl. the airlock).
+pub const SPAWN_LANE_NODES: i32 = 3;
+/// Chance a macro node stays solid rock (never carved by the maze).
+const SOLID_NODE_CHANCE: f64 = 0.2;
+
+/// Macro nodes per floor side: 8, 8, 9, 9, 10 (capped at Floor 5).
+fn macro_nodes_for_floor(floor: u32) -> i32 {
+    7 + (floor.clamp(1, 5) as i32 + 1) / 2
+}
+
+/// Grid side length for a floor: `MACRO_STEP * nodes + 1` (25, 25, 28, 28, 31).
 pub fn grid_size_for_floor(floor: u32) -> i32 {
-    21 + 2 * (floor.clamp(1, 5) as i32 - 1)
+    MACRO_STEP * macro_nodes_for_floor(floor) + 1
+}
+
+/// Macro nodes along a grid side of `n` cells.
+fn macro_nodes(n: i32) -> i32 {
+    (n - 1) / MACRO_STEP
+}
+
+/// Macro nodes a room side of `size` cells spans (5 -> 2, 7 -> 3, 8 -> 3).
+fn rect_nodes(size: i32) -> i32 {
+    (size + MACRO_STEP) / MACRO_STEP
+}
+
+/// Open the 2x2 block of macro node `p`.
+fn carve_macro_node(g: &mut LevelGrid, p: IVec2) {
+    let base = p * MACRO_STEP + IVec2::ONE;
+    for z in 0..2 {
+        for x in 0..2 {
+            g.set(base + IVec2::new(x, z), Cell::Floor { height: 0.0 });
+        }
+    }
+}
+
+/// Open the 2-cell wide passage from macro node `a` toward `a + o`.
+fn carve_macro_link(g: &mut LevelGrid, a: IVec2, o: IVec2) {
+    let base = a * MACRO_STEP + IVec2::ONE;
+    // Wall line between the nodes, both lanes of the passage.
+    let wall = if o.x + o.y > 0 { base + o * 2 } else { base - o.abs() };
+    let along = o.perp().abs();
+    for k in 0..2 {
+        g.set(wall + along * k, Cell::Floor { height: 0.0 });
+    }
+}
+
+/// A rect side ending mid-node (`size % MACRO_STEP == 1`, e.g. 7) leaves the
+/// last node's far half as a 1-cell strip: wall it off, keeping only the
+/// cells in front of an open passage (2-cell doorways; the chamfer pass
+/// splays their inner corners).
+fn seal_rect_strips(g: &mut LevelGrid, min: IVec2, size: IVec2) {
+    let max = min + size;
+    let (east, south) = (size.x % MACRO_STEP == 1, size.y % MACRO_STEP == 1);
+    let mut strip: Vec<(IVec2, bool)> = Vec::new();
+    let open = |g: &LevelGrid, c: IVec2| g.in_bounds(c) && !g.cell(c).is_wall();
+    if east {
+        for z in min.y..max.y + i32::from(south) {
+            let c = IVec2::new(max.x, z);
+            strip.push((c, open(g, c + IVec2::X) || (south && z == max.y && open(g, c + IVec2::Y))));
+        }
+    }
+    if south {
+        for x in min.x..max.x {
+            let c = IVec2::new(x, max.y);
+            strip.push((c, open(g, c + IVec2::Y)));
+        }
+    }
+    for (c, keep) in strip {
+        g.set(c, if keep { Cell::Floor { height: 0.0 } } else { Cell::Wall });
+    }
+}
+
+/// Flat ground-level floor (corridors, rooms, atrium) a chamfer may extend.
+fn is_flat_ground(cell: Cell) -> bool {
+    matches!(cell, Cell::Floor { height } if height == 0.0) || matches!(cell, Cell::AtriumFloor)
+}
+
+/// One pass (on a snapshot, so it never cascades along a wall) that opens
+/// every interior wall cell completing a 2x2 block of flat ground: the
+/// inner-corner post of each bend, T-junction and doorway. Players arc
+/// diagonally through 3x3 hubs instead of pixel-perfect 90 degree turns.
+fn chamfer_inner_corners(g: &mut LevelGrid, posts_only: bool) {
+    let snapshot = g.cells.clone();
+    let flat = |c: IVec2| is_flat_ground(snapshot[(c.y * g.width + c.x) as usize]);
+    let mut open = Vec::new();
+    for z in 1..g.depth - 1 {
+        for x in 1..g.width - 1 {
+            let c = IVec2::new(x, z);
+            let post = x % MACRO_STEP == 0 && z % MACRO_STEP == 0;
+            if !g.cell(c).is_wall() || (posts_only && !post) {
+                continue;
+            }
+            let corner = [(IVec2::X, IVec2::Y), (IVec2::Y, IVec2::NEG_X), (IVec2::NEG_X, IVec2::NEG_Y), (IVec2::NEG_Y, IVec2::X)]
+                .into_iter()
+                .any(|(a, b)| flat(c + a) && flat(c + b) && flat(c + a + b));
+            if corner {
+                open.push(c);
+            }
+        }
+    }
+    for c in open {
+        g.set(c, Cell::Floor { height: 0.0 });
+    }
+}
+
+/// Open cells (any non-wall) that are not part of a fully open 2x2 block:
+/// 1-cell (4 m) tunnels, pockets and nubs. The wide macro layout has none.
+pub fn cramped_cells(g: &LevelGrid) -> Vec<IVec2> {
+    let open = |c: IVec2| g.in_bounds(c) && !g.cell(c).is_wall();
+    (0..g.width * g.depth)
+        .map(|i| IVec2::new(i % g.width, i / g.width))
+        .filter(|&c| open(c))
+        .filter(|&c| {
+            ![IVec2::ZERO, IVec2::NEG_X, IVec2::NEG_Y, IVec2::NEG_ONE].into_iter().any(|o| {
+                let b = c + o;
+                open(b) && open(b + IVec2::X) && open(b + IVec2::Y) && open(b + IVec2::ONE)
+            })
+        })
+        .collect()
+}
+
+/// Lateral clearance (cells) of the open run through `c` across `axis`:
+/// the length of the contiguous non-wall line through `c` perpendicular to it.
+pub fn cross_width(g: &LevelGrid, c: IVec2, axis: IVec2) -> i32 {
+    let side = axis.perp();
+    let run = |dir: IVec2| (1..).take_while(|&k| { let p = c + dir * k; g.in_bounds(p) && !g.cell(p).is_wall() }).count() as i32;
+    if g.cell(c).is_wall() { 0 } else { 1 + run(side) + run(-side) }
 }
 
 /// Demon Jammers on a floor: 3 on Floor 1, +1 per floor, capped at
@@ -393,22 +519,44 @@ pub fn jammer_count_for_floor(floor: u32) -> usize {
 /// Jammer cap for Endless Overdrive floors.
 pub const MAX_JAMMERS: usize = 10;
 
+/// Preferred floor-loot cell inside a non-atrium room: its center when
+/// standable, or a guaranteed flat perimeter cell when the center holds lava.
+pub fn room_pickup_cell(grid: &LevelGrid, room: &Room) -> Option<IVec2> {
+    let center = room.center();
+    if matches!(grid.cell(center), Cell::Floor { .. }) && center != grid.spawn && center != grid.tower {
+        return Some(center);
+    }
+    let side = room.min + IVec2::new(0, room.size.y / 2);
+    if matches!(grid.cell(side), Cell::Floor { .. }) && side != grid.spawn && side != grid.tower {
+        return Some(side);
+    }
+    for z in 0..room.size.y {
+        for x in 0..room.size.x {
+            let c = room.min + IVec2::new(x, z);
+            if matches!(grid.cell(c), Cell::Floor { .. }) && c != grid.spawn && c != grid.tower {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
 /// Generate a fully validated labyrinth. Deterministic for a given `(floor, seed)`.
 pub fn generate_level(floor: u32, seed: u64) -> LevelGrid {
     for attempt in 0..48u64 {
         let s = seed.wrapping_add(attempt.wrapping_mul(0x2545_F491_4F6C_DD1D));
         // Later attempts drop vertical room features to guarantee success.
         let features = attempt < 40;
-        if let Some(g) = try_generate(floor, s, features)
+        if let Some(g) = try_generate(floor, s, features, false)
             && g.validate() {
                 return g;
             }
     }
-    // Plain maze + atrium is always connected.
-    try_generate(floor, seed, false).expect("featureless generation cannot fail")
+    // Deterministic all-connected fallback (no solid-node gaps, relaxed jammer spacing).
+    try_generate(floor, seed, false, true).expect("guaranteed connected fallback cannot fail")
 }
 
-fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
+fn try_generate(floor: u32, seed: u64, features: bool, guaranteed: bool) -> Option<LevelGrid> {
     let mut rng = StdRng::seed_from_u64(seed);
     let n = grid_size_for_floor(floor);
     let mut g = LevelGrid::from_cells(n, n, vec![Cell::Wall; (n * n) as usize]);
@@ -416,22 +564,52 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
     g.seed = seed;
     let ground = Cell::Floor { height: 0.0 };
 
-    // 1. Perfect maze over odd cells (iterative backtracker).
-    let start = IVec2::ONE;
-    g.set(start, ground);
-    let mut stack = vec![start];
+    // 1. Perfect maze over a macro grid (iterative backtracker): every macro
+    //    node is a 2x2 open block, every link a 2-cell (8 m) wide passage, and
+    //    walls stay 1 cell thick on the `x % MACRO_STEP == 0` lines.
+    let m = macro_nodes(n);
+    let node_idx = |p: IVec2| (p.y * m + p.x) as usize;
+    let mut links: Vec<[bool; 4]> = vec![[false; 4]; (m * m) as usize];
+    let dir_idx = |o: IVec2| RampDir::ALL.iter().position(|d| d.offset() == o).expect("unit offset");
+    let in_macro = |p: IVec2| p.x >= 0 && p.y >= 0 && p.x < m && p.y < m;
+    let link = |g: &mut LevelGrid, links: &mut Vec<[bool; 4]>, a: IVec2, o: IVec2| {
+        links[node_idx(a)][dir_idx(o)] = true;
+        links[node_idx(a + o)][dir_idx(-o)] = true;
+        carve_macro_link(g, a, o);
+    };
+    // Atrium nodes (quadrant opposite the spawn) and the spawn launch lane are
+    // picked first; ~1 in 5 other nodes stay solid rock, so the wide
+    // corridors wind around chunky wall masses instead of a flat open field.
+    let start_node = IVec2::ZERO;
+    let lane = if rng.random_bool(0.5) { IVec2::X } else { IVec2::Y };
+    let atrium_nodes = rect_nodes(ATRIUM_SIZE);
+    let lo = m / 2;
+    let hi = (m - atrium_nodes).max(lo);
+    let atrium_node = IVec2::new(rng.random_range(lo..=hi), rng.random_range(lo..=hi));
+    let mut visited = vec![false; (m * m) as usize];
+    for z in 0..m {
+        for x in 0..m {
+            let p = IVec2::new(x, z);
+            let in_atrium = (p - atrium_node).cmpge(IVec2::ZERO).all() && (p - atrium_node).cmplt(IVec2::splat(atrium_nodes)).all();
+            let on_lane = (0..SPAWN_LANE_NODES).any(|k| start_node + lane * k == p) || p == start_node + lane.perp().abs();
+            // Solid nodes count as visited: the backtracker never enters them.
+            // The guaranteed fallback skips solid nodes so the whole macro grid stays connected.
+            visited[node_idx(p)] = !guaranteed && !in_atrium && !on_lane && rng.random_bool(SOLID_NODE_CHANCE);
+        }
+    }
+    carve_macro_node(&mut g, start_node);
+    visited[node_idx(start_node)] = true;
+    let mut stack = vec![start_node];
     while let Some(&c) = stack.last() {
         let mut dirs = RampDir::ALL.map(RampDir::offset);
         dirs.shuffle(&mut rng);
-        let next = dirs.into_iter().find(|&o| {
-            let t = c + o * 2;
-            t.x > 0 && t.y > 0 && t.x < n - 1 && t.y < n - 1 && g.cell(t).is_wall()
-        });
+        let next = dirs.into_iter().find(|&o| in_macro(c + o) && !visited[node_idx(c + o)]);
         match next {
             Some(o) => {
-                g.set(c + o, ground);
-                g.set(c + o * 2, ground);
-                stack.push(c + o * 2);
+                visited[node_idx(c + o)] = true;
+                carve_macro_node(&mut g, c + o);
+                link(&mut g, &mut links, c, o);
+                stack.push(c + o);
             }
             None => {
                 stack.pop();
@@ -439,32 +617,53 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
         }
     }
 
-    // 2. Braid: knock out some separating walls to create loops (less dead ends).
-    // High-speed flow: generous loops so bhop routes circle back instead of
-    // dead-ending (capped so deep Endless floors never overflow random_bool).
-    let loop_chance = (0.16 + 0.015 * floor as f64).min(0.45);
-    for z in 1..n - 1 {
-        for x in 1..n - 1 {
-            let c = IVec2::new(x, z);
-            if !g.cell(c).is_wall() || (x + z) % 2 == 0 {
+    // 2. Braid: generous extra links so high-speed circuits loop around the
+    //    facility (capped so deep Endless floors never overflow random_bool),
+    //    then most remaining dead ends get a second exit.
+    let carved: Vec<bool> = links.iter().map(|l| l.iter().any(|&b| b)).collect();
+    let loop_chance = (0.1 + 0.01 * floor as f64).min(0.3);
+    for z in 0..m {
+        for x in 0..m {
+            let a = IVec2::new(x, z);
+            for o in [IVec2::X, IVec2::Y] {
+                if in_macro(a + o) && carved[node_idx(a)] && carved[node_idx(a + o)] && !links[node_idx(a)][dir_idx(o)] && rng.random_bool(loop_chance) {
+                    link(&mut g, &mut links, a, o);
+                }
+            }
+        }
+    }
+    for z in 0..m {
+        for x in 0..m {
+            let a = IVec2::new(x, z);
+            if links[node_idx(a)].iter().filter(|&&l| l).count() != 1 || !rng.random_bool(0.5) {
                 continue;
             }
-            let horiz = !g.cell(c + IVec2::X).is_wall() && !g.cell(c - IVec2::X).is_wall();
-            let vert = !g.cell(c + IVec2::Y).is_wall() && !g.cell(c - IVec2::Y).is_wall();
-            if (horiz ^ vert) && rng.random_bool(loop_chance) {
-                g.set(c, ground);
+            let mut dirs = RampDir::ALL.map(RampDir::offset);
+            dirs.shuffle(&mut rng);
+            if let Some(o) = dirs.into_iter().find(|&o| in_macro(a + o) && carved[node_idx(a + o)] && !links[node_idx(a)][dir_idx(o)]) {
+                link(&mut g, &mut links, a, o);
             }
         }
     }
 
-    // 3. Atrium in the quadrant opposite the spawn (odd-aligned so it touches maze cells).
-    let max_a = n - 1 - ATRIUM_SIZE; // last valid odd min coordinate
-    let lo = (n / 2) | 1;
-    let pick = |rng: &mut StdRng| {
-        let v = rng.random_range(lo..=max_a.max(lo));
-        if v % 2 == 0 { v - 1 } else { v }
-    };
-    let amin = IVec2::new(pick(&mut rng), pick(&mut rng));
+    // Spawn launch bay: the airlock node opens east and south (the chamfer
+    // pass below knocks out the inner corner post => 3x3 bay), and a
+    // straight 2-wide lane runs >= 3 nodes (32 m) toward the facility so
+    // momentum starts building from frame 1.
+    for o in [IVec2::X, IVec2::Y] {
+        if !links[node_idx(start_node)][dir_idx(o)] {
+            link(&mut g, &mut links, start_node, o);
+        }
+    }
+    for k in 1..SPAWN_LANE_NODES - 1 {
+        let a = start_node + lane * k;
+        if !links[node_idx(a)][dir_idx(lane)] {
+            link(&mut g, &mut links, a, lane);
+        }
+    }
+
+    // 3. Atrium in the quadrant opposite the spawn (macro-node aligned).
+    let amin = atrium_node * MACRO_STEP + IVec2::ONE;
     let atrium = Room { min: amin, size: IVec2::splat(ATRIUM_SIZE), feature: RoomFeature::None };
     for z in 0..ATRIUM_SIZE {
         for x in 0..ATRIUM_SIZE {
@@ -473,6 +672,7 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
             g.set_roof_open(c, true);
         }
     }
+    seal_rect_strips(&mut g, amin, atrium.size);
     let tower = atrium.center();
     g.tower = tower;
     for z in -1..=1 {
@@ -495,7 +695,8 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
     }
     g.pillars.push(tower_world_xz(tower));
     g.pillar_radii.push(TOWER_MAST_RADIUS);
-    for (dx, dz) in [(1, 1), (5, 1), (1, 5), (5, 5)] {
+    let far = ATRIUM_SIZE - 2;
+    for (dx, dz) in [(1, 1), (far, 1), (1, far), (far, far)] {
         let c = amin + IVec2::new(dx, dz);
         if matches!(g.cell(c), Cell::AtriumFloor) {
             g.pillars.push(tower_world_xz(c));
@@ -504,47 +705,53 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
     }
     g.rooms.push(atrium);
 
-    // 4. Rooms (odd-aligned, non-overlapping with a 1-cell margin, away from spawn).
-    let room_target = 3 + floor as usize;
+    // 4. Rooms: 5x5 / 5x7 / 7x5 / 7x7, macro-node aligned (so every exit is a
+    //    full 2-cell passage), non-overlapping with a 1-cell wall between
+    //    footprints, clear of the spawn launch bay.
+    let room_target = 3 + floor.clamp(1, 5) as usize / 2;
     let mut tries = 0;
     while g.rooms.len() < room_target + 1 && tries < 200 {
         tries += 1;
         let size = IVec2::new(
-            if rng.random_bool(0.6) { 5 } else { 3 },
-            if rng.random_bool(0.6) { 5 } else { 3 },
+            if rng.random_bool(0.5) { 7 } else { 5 },
+            if rng.random_bool(0.5) { 7 } else { 5 },
         );
-        let rx = rng.random_range(0..=(n - 1 - size.x) / 2) * 2 + 1;
-        let rz = rng.random_range(0..=(n - 1 - size.y) / 2) * 2 + 1;
-        let min = IVec2::new(rx, rz);
-        if min.x + size.x > n - 1 || min.y + size.y > n - 1 {
+        let span = IVec2::new(rect_nodes(size.x), rect_nodes(size.y));
+        if span.x > m || span.y > m {
             continue;
         }
-        // Keep the spawn airlock area clear.
-        if min.x <= 3 && min.y <= 3 {
+        let node = IVec2::new(rng.random_range(0..=m - span.x), rng.random_range(0..=m - span.y));
+        // Keep the spawn airlock / launch bay clear.
+        if node.x <= 1 && node.y <= 1 {
             continue;
         }
+        let lane_hit = (0..SPAWN_LANE_NODES).any(|k| {
+            let p = start_node + lane * k;
+            p.x >= node.x && p.y >= node.y && p.x < node.x + span.x && p.y < node.y + span.y
+        });
+        // Only over nodes the maze carved: every room is wired into the flow.
+        let all_carved = (0..span.y).all(|z| (0..span.x).all(|x| carved[node_idx(node + IVec2::new(x, z))]));
+        if lane_hit || !all_carved {
+            continue;
+        }
+        let min = node * MACRO_STEP + IVec2::ONE;
+        let foot = span * MACRO_STEP - IVec2::ONE;
         let overlaps = g.rooms.iter().any(|r| {
-            min.x - 1 < r.min.x + r.size.x
-                && r.min.x - 1 < min.x + size.x
-                && min.y - 1 < r.min.y + r.size.y
-                && r.min.y - 1 < min.y + size.y
+            let rf = IVec2::new(rect_nodes(r.size.x), rect_nodes(r.size.y)) * MACRO_STEP - IVec2::ONE;
+            min.x - 1 < r.min.x + rf.x && r.min.x - 1 < min.x + foot.x && min.y - 1 < r.min.y + rf.y && r.min.y - 1 < min.y + foot.y
         });
         if overlaps {
             continue;
         }
         let feature = if !features {
             RoomFeature::None
-        } else if size.x == 5 && size.y == 5 {
+        } else {
             match rng.random_range(0..4) {
                 0 => RoomFeature::None,
                 1 => RoomFeature::LavaPit,
                 2 => RoomFeature::Pillars,
                 _ => RoomFeature::Catwalk,
             }
-        } else if rng.random_bool(0.3) {
-            RoomFeature::LavaPit
-        } else {
-            RoomFeature::None
         };
         let room = Room { min, size, feature };
         for z in 0..size.y {
@@ -552,50 +759,78 @@ fn try_generate(floor: u32, seed: u64, features: bool) -> Option<LevelGrid> {
                 g.set(min + IVec2::new(x, z), ground);
             }
         }
+        seal_rect_strips(&mut g, min, size);
         apply_room_feature(&mut g, &room, &mut rng);
         g.rooms.push(room);
     }
 
-    // 5. Spawn airlock, facing an open neighbour.
+    // Chamfer: knock out every inner-corner wall nub at bends, T-junctions
+    // and room / atrium mouths so turns open into 3x3 hubs.
+    // A second, posts-only pass catches wall-line posts whose lanes the first
+    // pass splayed (it only touches lattice posts, so it cannot cascade).
+    chamfer_inner_corners(&mut g, false);
+    chamfer_inner_corners(&mut g, true);
+
+    // 5. Spawn airlock: launch bay corner, facing down the straight lane.
+    let start = IVec2::ONE;
     g.spawn = start;
     g.set(start, ground);
-    g.spawn_yaw = [IVec2::X, IVec2::Y, IVec2::NEG_X, IVec2::NEG_Y]
-        .into_iter()
-        .find(|&o| !g.cell(start + o).is_wall())
-        .map(|o| yaw_facing(o.as_vec2()))
-        .unwrap_or(0.0);
+    g.spawn_yaw = yaw_facing(lane.as_vec2());
 
     let dist = g.walk_distances(g.spawn);
     dist[g.idx(g.tower)]?;
 
-    // 6. Demon jammers: prefer room centers / catwalk tops, then far corridor cells.
+    // 6. Demon jammers: reserve up to 2 reachable room pickup cells first so
+    //    guaranteed floor loot is never overwritten by a room OR corridor jammer.
     let want = jammer_count_for_floor(floor);
+    let mut pickup_rooms: Vec<IVec2> = g
+        .rooms
+        .iter()
+        .skip(1)
+        .filter_map(|r| room_pickup_cell(&g, r))
+        .filter(|&c| dist[g.idx(c)].is_some())
+        .collect();
+    pickup_rooms.shuffle(&mut rng);
+    let reserved_pickups: Vec<IVec2> = pickup_rooms.into_iter().take(2).collect();
+
     let mut candidates: Vec<IVec2> = Vec::new();
     for room in g.rooms.iter().skip(1) {
-        candidates.push(match room.feature {
-            RoomFeature::Catwalk => room.min + IVec2::new(3, 2),
+        let spot = match room.feature {
+            RoomFeature::Catwalk => catwalk_origin(room) + IVec2::new(2, 0),
             RoomFeature::LavaPit => room.min + IVec2::new(0, room.size.y / 2),
             RoomFeature::Pillars | RoomFeature::None => room.center(),
-        });
+        };
+        if !reserved_pickups.contains(&spot) {
+            candidates.push(spot);
+        }
     }
     candidates.shuffle(&mut rng);
     let mut corridor: Vec<IVec2> = (0..n * n)
         .map(|i| IVec2::new(i % n, i / n))
-        .filter(|&c| matches!(g.cell(c), Cell::Floor { height } if height == 0.0))
+        .filter(|&c| matches!(g.cell(c), Cell::Floor { height } if height == 0.0) && !reserved_pickups.contains(&c))
         .collect();
     corridor.shuffle(&mut rng);
     candidates.extend(corridor);
     let min_spawn_dist = 6;
-    for c in candidates {
+    let spacings: &[i32] = if guaranteed { &[5, 3, 2, 1] } else { &[5] };
+    for &min_gap in spacings {
+        for &c in &candidates {
+            if g.jammers.len() >= want {
+                break;
+            }
+            if g.jammers.contains(&c) || reserved_pickups.contains(&c) {
+                continue;
+            }
+            let Some(d) = dist[g.idx(c)] else { continue };
+            let standable = matches!(g.cell(c), Cell::Floor { .. });
+            let far_from_others = g.jammers.iter().all(|j| (*j - c).abs().element_sum() >= min_gap);
+            let far_from_tower = (g.tower - c).abs().element_sum() >= min_gap.min(5);
+            if standable && d >= min_spawn_dist.min((min_gap + 1) as u32) && far_from_others && far_from_tower && !atrium.contains(c) {
+                g.jammers.push(c);
+            }
+        }
         if g.jammers.len() >= want {
             break;
-        }
-        let Some(d) = dist[g.idx(c)] else { continue };
-        let standable = matches!(g.cell(c), Cell::Floor { .. });
-        let far_from_others = g.jammers.iter().all(|j| (*j - c).abs().element_sum() >= 5);
-        let far_from_tower = (g.tower - c).abs().element_sum() >= 5;
-        if standable && d >= min_spawn_dist && far_from_others && far_from_tower && !atrium.contains(c) {
-            g.jammers.push(c);
         }
     }
     if g.jammers.len() < want {
@@ -667,7 +902,7 @@ fn place_jump_pads(g: &mut LevelGrid, rng: &mut StdRng) {
         let spec = match room.feature {
             RoomFeature::Catwalk => {
                 // In front of the raised plates, launching north onto them.
-                let c = m + IVec2::new(2, 3);
+                let c = catwalk_origin(&room) + IVec2::new(1, 1);
                 (matches!(g.cell(c + IVec2::NEG_Y), Cell::Floor { height } if height > 0.1))
                     .then_some(JumpPadSpec { cell: c, launch_vel: Vec3::new(0.0, 11.0, -5.0) })
             }
@@ -729,7 +964,9 @@ fn place_barrels(g: &mut LevelGrid, rng: &mut StdRng) {
         if g.barrels.len() >= want {
             break;
         }
-        if prop_cell_free(g, c) && !g.barrels.contains(&c) && !is_chokepoint(g, c) && !near_blocked(g, c) {
+        // Tucked: barrels hug a wall (nudged toward it), never mid-lane.
+        let against_wall = RampDir::ALL.map(RampDir::offset).into_iter().any(|o| g.cell(c + o).is_wall());
+        if prop_cell_free(g, c) && against_wall && !g.barrels.contains(&c) && !is_chokepoint(g, c) && !near_blocked(g, c) {
             g.barrels.push(c);
         }
     }
@@ -740,26 +977,39 @@ fn apply_room_feature(g: &mut LevelGrid, room: &Room, rng: &mut StdRng) {
     match room.feature {
         RoomFeature::None => {}
         RoomFeature::Catwalk => {
-            // Interior row: ramp (rising east) + two raised catwalk plates.
-            g.set(m + IVec2::new(1, 2), Cell::Ramp { low_height: 0.0, high_height: CATWALK_HEIGHT, dir: RampDir::East });
-            g.set(m + IVec2::new(2, 2), Cell::Floor { height: CATWALK_HEIGHT });
-            g.set(m + IVec2::new(3, 2), Cell::Floor { height: CATWALK_HEIGHT });
+            // Middle row: ramp (rising east) + two raised catwalk plates, with
+            // at least one free floor cell on every side (entries stay open).
+            let o = catwalk_origin(room);
+            g.set(o, Cell::Ramp { low_height: 0.0, high_height: CATWALK_HEIGHT, dir: RampDir::East });
+            g.set(o + IVec2::X, Cell::Floor { height: CATWALK_HEIGHT });
+            g.set(o + IVec2::X * 2, Cell::Floor { height: CATWALK_HEIGHT });
         }
         RoomFeature::LavaPit => {
+            // Central trench ringed by >= 2 cells of floor: always avoidable.
             let c = room.center();
             g.set(c, Cell::HazardPit);
-            if room.size.x == 5 && rng.random_bool(0.5) {
+            if rng.random_bool(0.5) {
                 g.set(c + IVec2::X, Cell::HazardPit);
             }
         }
         RoomFeature::Pillars => {
-            for (dx, dz) in [(1, 1), (4, 1), (1, 4), (4, 4)] {
+            // Columns on interior grid vertices, inset from the walls so the
+            // doorway lanes along every edge stay clear.
+            let inset = |s: i32| if s >= 7 { 2 } else { 1 };
+            let (ix, iz) = (inset(room.size.x), inset(room.size.y));
+            let (fx, fz) = (room.size.x - ix, room.size.y - iz);
+            for (dx, dz) in [(ix, iz), (fx, iz), (ix, fz), (fx, fz)] {
                 let p = Vec2::new((m.x + dx) as f32 * CELL_SIZE, (m.y + dz) as f32 * CELL_SIZE);
                 g.pillars.push(p);
                 g.pillar_radii.push(PILLAR_RADIUS);
             }
         }
     }
+}
+
+/// West end (the ramp) of a Catwalk room's raised run: centered in the room.
+fn catwalk_origin(room: &Room) -> IVec2 {
+    room.min + IVec2::new(room.size.x / 2 - 1, room.size.y / 2)
 }
 
 fn tower_world_xz(c: IVec2) -> Vec2 {
@@ -1921,6 +2171,160 @@ mod tests {
         }
     }
 
+    /// Floors / seeds the openness checks sweep (incl. the playtest bot seeds
+    /// and deep Endless floors whose grid stops growing at Floor 5).
+    fn wide_sweep() -> Vec<(u32, u64)> {
+        let mut v = Vec::new();
+        for floor in [1u32, 2, 3, 4, 5, 8, 15] {
+            for seed in [1234u64, 99, 2026, 7, 31337, 0, 42, 555, 4242, 0xBEEF] {
+                v.push((floor, seed));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn grid_sizes_follow_the_macro_pitch() {
+        assert_eq!((1..=6).map(grid_size_for_floor).collect::<Vec<_>>(), vec![25, 25, 28, 28, 31, 31]);
+        for floor in 1..=40 {
+            assert_eq!((grid_size_for_floor(floor) - 1) % MACRO_STEP, 0);
+        }
+        assert_eq!((rect_nodes(5), rect_nodes(7), rect_nodes(ATRIUM_SIZE)), (2, 3, 3));
+    }
+
+    #[test]
+    fn corridors_are_two_cells_wide_with_no_cramped_tunnels() {
+        let (mut open_total, mut cells_total) = (0usize, 0usize);
+        for (floor, seed) in wide_sweep() {
+            let g = generate_level(floor, seed);
+            assert!(g.validate(), "floor {floor} seed {seed}");
+            // Every open cell sits in a fully open 2x2 block: no 1-cell (4 m)
+            // tunnels, pockets or doorways anywhere.
+            let cramped = cramped_cells(&g);
+            assert!(cramped.is_empty(), "floor {floor} seed {seed}: cramped cells {cramped:?}");
+            // ... so the lateral clearance across either axis is >= 2 cells (8 m).
+            for i in 0..g.width * g.depth {
+                let c = IVec2::new(i % g.width, i / g.width);
+                if !g.cell(c).is_wall() {
+                    assert!(cross_width(&g, c, IVec2::X) >= 2 || cross_width(&g, c, IVec2::Y) >= 2, "floor {floor} seed {seed}: {c}");
+                    assert!(cross_width(&g, c, IVec2::X).max(cross_width(&g, c, IVec2::Y)) >= 2);
+                }
+            }
+            // Still a facility (corridors around solid masses), not one open field.
+            let open = g.cells.iter().filter(|c| !c.is_wall()).count();
+            let frac = open as f32 / g.cells.len() as f32;
+            assert!((0.4..0.75).contains(&frac), "floor {floor} seed {seed}: open fraction {frac}");
+            open_total += open;
+            cells_total += g.cells.len();
+        }
+        let mean = open_total as f32 / cells_total as f32;
+        assert!((0.45..0.7).contains(&mean), "mean open fraction {mean}");
+    }
+
+    #[test]
+    fn bends_and_junctions_open_into_chamfered_hubs() {
+        for (floor, seed) in wide_sweep() {
+            let g = generate_level(floor, seed);
+            let flat = |c: IVec2| is_flat_ground(g.cell(c));
+            // No wall-line post is left as an inner-corner nub between two
+            // perpendicular flat lanes: every turn is a 3x3 hub.
+            let mut hubs = 0;
+            for z in (MACRO_STEP..g.depth - 1).step_by(MACRO_STEP as usize) {
+                for x in (MACRO_STEP..g.width - 1).step_by(MACRO_STEP as usize) {
+                    let c = IVec2::new(x, z);
+                    let nub = [(IVec2::X, IVec2::Y), (IVec2::Y, IVec2::NEG_X), (IVec2::NEG_X, IVec2::NEG_Y), (IVec2::NEG_Y, IVec2::X)]
+                        .into_iter()
+                        .any(|(a, b)| flat(c + a) && flat(c + b) && flat(c + a + b));
+                    if g.cell(c).is_wall() {
+                        assert!(!nub, "floor {floor} seed {seed}: inner-corner nub left at {c}");
+                    } else {
+                        hubs += 1;
+                    }
+                }
+            }
+            assert!(hubs >= 10, "floor {floor} seed {seed}: only {hubs} open hubs");
+        }
+    }
+
+    #[test]
+    fn spawn_launch_bay_faces_a_long_wide_lane() {
+        for (floor, seed) in wide_sweep() {
+            let g = generate_level(floor, seed);
+            assert_eq!(g.spawn, IVec2::ONE);
+            // 3x3 open launch bay around the airlock corner.
+            for z in 1..=3 {
+                for x in 1..=3 {
+                    assert!(is_flat_ground(g.cell(IVec2::new(x, z))), "floor {floor} seed {seed}: bay cell ({x},{z})");
+                }
+            }
+            // Looking down a straight 2-lane corridor >= 8 cells (32 m) long.
+            let fwd = Vec2::new(-g.spawn_yaw.sin(), -g.spawn_yaw.cos());
+            let dir = IVec2::new(fwd.x.round() as i32, fwd.y.round() as i32);
+            assert_eq!(dir.abs().element_sum(), 1, "spawn faces a grid axis");
+            let lanes = [g.spawn, g.spawn + dir.perp().abs()];
+            for lane in lanes {
+                let run = (0..).take_while(|&k| is_flat_ground(g.cell(lane + dir * k))).count() as i32;
+                assert!(run >= MACRO_STEP * SPAWN_LANE_NODES - 1, "floor {floor} seed {seed}: lane {lane} runs {run}");
+            }
+            assert!(!g.is_roof_open(g.spawn));
+        }
+    }
+
+    #[test]
+    fn rooms_are_large_open_and_fully_reachable() {
+        let mut sizes = std::collections::HashSet::new();
+        let mut features = std::collections::HashSet::new();
+        for (floor, seed) in wide_sweep() {
+            let g = generate_level(floor, seed);
+            let dist = g.walk_distances(g.spawn);
+            assert_eq!(g.rooms[0].size, IVec2::splat(ATRIUM_SIZE));
+            for room in g.rooms.iter().skip(1) {
+                assert!([5, 7].contains(&room.size.x) && [5, 7].contains(&room.size.y), "room {room:?}");
+                sizes.insert((room.size.x, room.size.y));
+                features.insert(format!("{:?}", room.feature));
+                // Feature never blocks the edges: the whole perimeter ring is
+                // flat floor, and every flat cell of the room is reachable.
+                for z in 0..room.size.y {
+                    for x in 0..room.size.x {
+                        let c = room.min + IVec2::new(x, z);
+                        let edge = x == 0 || z == 0 || x == room.size.x - 1 || z == room.size.y - 1;
+                        if edge {
+                            assert!(is_flat_ground(g.cell(c)), "floor {floor} seed {seed}: {:?} room edge {c} is {:?}", room.feature, g.cell(c));
+                        }
+                        if is_flat_ground(g.cell(c)) {
+                            assert!(dist[g.idx(c)].is_some(), "floor {floor} seed {seed}: room cell {c} unreachable");
+                        }
+                    }
+                }
+                // At least one wide (>= 2 consecutive cells on a single straight side,
+                // excluding diagonal corners) mouth into the room.
+                let sides: [Vec<IVec2>; 4] = [
+                    (0..room.size.x).map(|x| room.min + IVec2::new(x, -1)).collect(),
+                    (0..room.size.x).map(|x| room.min + IVec2::new(x, room.size.y)).collect(),
+                    (0..room.size.y).map(|z| room.min + IVec2::new(-1, z)).collect(),
+                    (0..room.size.y).map(|z| room.min + IVec2::new(room.size.x, z)).collect(),
+                ];
+                let has_wide_mouth = sides
+                    .iter()
+                    .any(|side| side.windows(2).any(|pair| !g.cell(pair[0]).is_wall() && !g.cell(pair[1]).is_wall()));
+                assert!(has_wide_mouth, "floor {floor} seed {seed}: room {room:?} lacks a >=2-cell contiguous doorway");
+            }
+        }
+        assert_eq!(sizes.len(), 4, "5x5, 5x7, 7x5 and 7x7 rooms all occur: {sizes:?}");
+        assert_eq!(features.len(), 4, "all room features occur: {features:?}");
+    }
+
+    #[test]
+    fn fallback_generation_succeeds_on_floor_1_and_100() {
+        for floor in [1u32, 100] {
+            for seed in [1u64, 42, 1234] {
+                let g = try_generate(floor, seed, false, true).expect("guaranteed fallback must succeed");
+                assert!(g.validate(), "floor {floor} seed {seed}: fallback failed validate()");
+                assert_eq!(g.jammers.len(), jammer_count_for_floor(floor));
+            }
+        }
+    }
+
     #[test]
     fn equidistant_lights_never_exceed_web_cap() {
         let mut entries: Vec<(f32, u32)> = (0..13).map(|id| (5.0f32, id)).collect();
@@ -1929,3 +2333,4 @@ mod tests {
         assert_eq!(kept, WEB_POINT_LIGHT_CAP, "strictly {WEB_POINT_LIGHT_CAP} of 13 equidistant lights survive");
     }
 }
+

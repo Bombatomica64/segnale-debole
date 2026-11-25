@@ -36,16 +36,17 @@ use crate::sculpt;
 pub const WALL_TRIM_MAX_DEPTH: f32 = 0.32;
 /// Max protrusion of wall props (server racks, sector props) from the wall (m).
 pub const WALL_PROP_MAX_DEPTH: f32 = 0.30;
-/// Lowest point of any overhead part (trusses, conduits, lamp cages).
-pub const OVERHEAD_MIN_Y: f32 = 5.2;
+/// Lowest point of any overhead part (trusses, conduits, lamp cages); tracks
+/// the ceiling so the 7.2 m bays keep their full bhop headroom.
+pub const OVERHEAD_MIN_Y: f32 = CEILING_HEIGHT - 0.8;
 /// Industrial skirting height above the floor.
 pub const BASEBOARD_HEIGHT: f32 = 0.28;
 /// Crown molding band height below the ceiling.
 pub const CROWN_HEIGHT: f32 = 0.30;
 /// Bottom of the transverse ceiling I-beams.
-pub const TRUSS_BOTTOM: f32 = 5.65;
+pub const TRUSS_BOTTOM: f32 = CEILING_HEIGHT - 0.35;
 /// Axis height of the overhead conduit pipes.
-pub const CONDUIT_Y: f32 = 5.55;
+pub const CONDUIT_Y: f32 = CEILING_HEIGHT - 0.45;
 const CONDUIT_RADIUS: f32 = 0.09;
 /// Height of the visual curb along open catwalk drop-offs.
 pub const CURB_HEIGHT: f32 = 0.12;
@@ -399,14 +400,36 @@ fn covered(g: &LevelGrid, c: IVec2) -> bool {
     !g.cell(c).is_wall() && !g.is_roof_open(c)
 }
 
-/// Corridor axis of a covered cell: `Some(true)` runs along X, `Some(false)` along Z.
+/// Corridor axis of a covered cell: `Some(true)` runs along X, `Some(false)`
+/// along Z. A lane of a 2-cell wide corridor counts too: open straight
+/// through along the axis, walled on one side, its twin lane on the other.
 fn corridor_axis(g: &LevelGrid, c: IVec2) -> Option<bool> {
     let open = |o: IVec2| !g.cell(c + o).is_wall();
     let ox = open(IVec2::X) || open(IVec2::NEG_X);
     let oz = open(IVec2::Y) || open(IVec2::NEG_Y);
     match (ox, oz) {
+        (true, false) => return Some(true),
+        (false, true) => return Some(false),
+        _ => {}
+    }
+    let through_x = open(IVec2::X) && open(IVec2::NEG_X);
+    let through_z = open(IVec2::Y) && open(IVec2::NEG_Y);
+    let one_wall_z = open(IVec2::Y) != open(IVec2::NEG_Y);
+    let one_wall_x = open(IVec2::X) != open(IVec2::NEG_X);
+    match (through_x && one_wall_z, through_z && one_wall_x) {
         (true, false) => Some(true),
         (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// Lateral unit offset (grid) from `c` toward the wall flanking a corridor
+/// run along `along_x`, if exactly one side is walled.
+fn walled_side(g: &LevelGrid, c: IVec2, along_x: bool) -> Option<IVec2> {
+    let lat = if along_x { IVec2::Y } else { IVec2::X };
+    match (g.cell(c + lat).is_wall(), g.cell(c - lat).is_wall()) {
+        (true, false) => Some(lat),
+        (false, true) => Some(-lat),
         _ => None,
     }
 }
@@ -433,12 +456,17 @@ fn build_overhead(g: &LevelGrid, m: &ArchMeshes, b: &mut ArchBatches) {
                 put_box(b, ArchSlot::Trim, m, &id, size(0.06, 0.35 - 2.0 * fl), edge.with_y(TRUSS_BOTTOM + 0.175));
                 put_box(b, ArchSlot::Trim, m, &id, size(0.32, fl), edge.with_y(TRUSS_BOTTOM + 0.35 - fl * 0.5));
             }
-            // Conduits run along straight corridors, offset toward one wall.
+            // Conduits run along straight corridors, hugging the flanking wall
+            // (1-wide runs walled on both sides keep the +lateral offset).
             if let Some(along_x) = axis {
                 let (rot, lateral, run) = if along_x {
                     (Quat::from_rotation_z(FRAC_PI_2), Vec3::Z, Vec3::X)
                 } else {
                     (Quat::from_rotation_x(FRAC_PI_2), Vec3::X, Vec3::Z)
+                };
+                let lateral = match walled_side(g, c, along_x) {
+                    Some(w) => Vec3::new(w.x as f32, 0.0, w.y as f32),
+                    None => lateral,
                 };
                 let main = center + lateral * 1.25 + Vec3::Y * CONDUIT_Y;
                 b.put(ArchSlot::Trim, &m.pipe, &id, Transform::from_translation(main).with_rotation(rot).with_scale(Vec3::new(1.0, CELL_SIZE, 1.0)));

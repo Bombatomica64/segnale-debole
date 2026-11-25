@@ -27,7 +27,7 @@ use crate::fx::{
     spawn_shockwave, spawn_tracer, BurstColor, FxAssets, HudFeed, OVERLAY_LAYER,
 };
 use crate::hud::signal_color;
-use crate::level::{Cell, CullableLight, DemonJammer, ExplosiveBarrel, JammerCore, LevelEntity, LevelGrid};
+use crate::level::{CullableLight, DemonJammer, ExplosiveBarrel, JammerCore, LevelEntity, LevelGrid};
 use crate::mesh_batch::{MaterialBatches, ParentedBatches};
 use crate::meta::{HandsetSkin, RunLoadout, SkinSlot};
 use crate::phone_screen::PhoneScreenTexture;
@@ -821,8 +821,8 @@ pub fn floor_pickup_plan(grid: &LevelGrid) -> Vec<(PickupKind, IVec2)> {
     grid.rooms
         .iter()
         .skip(1) // rooms[0] is the atrium
-        .map(|r| r.center())
-        .filter(|&c| matches!(grid.cell(c), Cell::Floor { .. }) && c != grid.spawn && c != grid.tower && !grid.jammers.contains(&c))
+        .filter_map(|r| crate::level::room_pickup_cell(grid, r))
+        .filter(|&c| !grid.jammers.contains(&c))
         .take(5 + grid.floor as usize / 2)
         .enumerate()
         .map(|(i, c)| (kinds[i % kinds.len()], c))
@@ -2975,6 +2975,7 @@ impl Plugin for WeaponsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::level::Cell;
 
     fn corridor() -> LevelGrid {
         LevelGrid::from_ascii(&[
