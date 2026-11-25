@@ -1,0 +1,9 @@
+# BuildKit per-Dockerfile ignore for deploy/Dockerfile.server (context = repo root).
+# The API image only needs server/; everything else is excluded.
+*
+!server/
+server/target/
+target/
+android/
+.git/
+dist/

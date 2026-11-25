@@ -1,0 +1,56 @@
+# Authentik blueprint: OIDC provider + application for Segnale Debole.
+#
+# Drop this into the `simple-server` GitOps repo next to `drevia.yaml` (the
+# blueprints Authentik loads for auth.bombatomica64.dev). The client secret is
+# read from the Authentik worker's environment, never committed:
+#
+#   SEGNALE_DEBOLE_OIDC_CLIENT_SECRET=<random 64+ char secret>
+#
+# and the same value goes into the `segnale-debole-secrets` Secret as
+# OIDC_CLIENT_SECRET (see deploy/k8s.yaml).
+#
+# The game backend talks to the token/userinfo endpoints in-cluster
+# (drevia-id-server.drevia-id.svc.cluster.local:9000) and sends browsers to
+# https://auth.bombatomica64.dev/application/o/authorize/.
+version: 1
+metadata:
+  name: segnale-debole
+  labels:
+    blueprints.goauthentik.io/instantiate: "true"
+entries:
+  - model: authentik_providers_oauth2.oauth2provider
+    id: provider-segnale-debole
+    identifiers:
+      name: provider-segnale-debole
+    attrs:
+      name: provider-segnale-debole
+      client_type: confidential
+      client_id: segnale-debole
+      client_secret: !Env SEGNALE_DEBOLE_OIDC_CLIENT_SECRET
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      redirect_uris:
+        - matching_mode: strict
+          url: https://signal.bombatomica64.dev/api/v1/auth/callback
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-profile]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-email]]
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
+      # Stable, non-reversible per-user id: the backend keys players on `sub`.
+      sub_mode: hashed_user_id
+      include_claims_in_id_token: true
+      access_code_validity: minutes=1
+      access_token_validity: minutes=5
+      refresh_token_validity: days=30
+
+  - model: authentik_core.application
+    id: app-segnale-debole
+    identifiers:
+      slug: segnale-debole
+    attrs:
+      name: Segnale Debole
+      slug: segnale-debole
+      provider: !KeyOf provider-segnale-debole
+      meta_launch_url: https://signal.bombatomica64.dev/
+      policy_engine_mode: any

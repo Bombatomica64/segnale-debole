@@ -351,6 +351,7 @@ impl Plugin for PlayerPlugin {
             .add_systems(OnEnter(AppState::MainMenu), despawn_player)
             .add_systems(OnEnter(AppState::Loadout), despawn_player)
             .add_systems(OnEnter(AppState::ContractsFeats), despawn_player)
+            .add_systems(OnEnter(AppState::Leaderboard), despawn_player)
             .add_systems(
                 Update,
                 (

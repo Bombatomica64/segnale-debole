@@ -418,6 +418,11 @@ pub fn gamepad_pause_toggle(pad: Res<GamepadInput>, state: Res<State<AppState>>,
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct GamepadFocusable;
 
+/// While `true` the D-Pad / Left Stick / `A` drive a screen's own text
+/// entry (the Leaderboard callsign editor) instead of moving the menu focus.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PadFocusLock(pub bool);
+
 /// Preferred initial focus of a screen (else the top-left-most control).
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct DefaultFocus;
@@ -491,7 +496,15 @@ fn focus_ready(n: &ComputedNode, vis: Option<&InheritedVisibility>) -> bool {
 /// Move the menu focus with the D-Pad / Left Stick and turn `A` into an
 /// activation of the focused control. Runs on every screen except gameplay
 /// and the screens with bespoke controller logic.
-pub fn gamepad_menu_focus(pad: Res<GamepadInput>, mut focus: ResMut<GamepadFocus>, items: Query<FocusData, With<GamepadFocusable>>) {
+pub fn gamepad_menu_focus(
+    pad: Res<GamepadInput>,
+    mut focus: ResMut<GamepadFocus>,
+    lock: Option<Res<PadFocusLock>>,
+    items: Query<FocusData, With<GamepadFocusable>>,
+) {
+    if lock.is_some_and(|l| l.0) {
+        return;
+    }
     if !pad.connected {
         focus.focused = None;
         return;
@@ -546,6 +559,7 @@ impl Plugin for GamepadPlugin {
             .or_else(in_state(AppState::Compendium));
         app.init_resource::<GamepadInput>()
             .init_resource::<GamepadFocus>()
+            .init_resource::<PadFocusLock>()
             .add_systems(OnEnter(AppState::Playing), latch_jump_on_play_enter)
             .add_systems(PreUpdate, (update_gamepad_input, gamepad_menu_focus.run_if(not(bespoke_screen))).chain().after(InputSystems))
             .add_systems(Update, gamepad_pause_toggle.run_if(in_state(AppState::Playing).or_else(in_state(AppState::Paused))));

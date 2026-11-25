@@ -23,6 +23,7 @@ use crate::boss::BossHud;
 use crate::compendium::{apply_custom_label, pick_run_seed, seed_key_char, shareable_code, CustomSeedState};
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
 use crate::fx::HudFeed;
+use crate::leaderboard::{spawn_account_pill, submit_badge_bundle, LeaderboardState, LeaderboardUiPlugin};
 use crate::gamepad::{DefaultFocus, GamepadFocus, GamepadInput};
 use crate::meta::{live_settings, record_game_over, record_victory, start_run_with_loadout, CrosshairColor, CrosshairStyle, ProfileStore, RunLoadout};
 use crate::meta_ui::{
@@ -97,6 +98,16 @@ pub enum MenuAction {
     ClearSeed,
     /// Pause / end screens: arm (and on the web, link) the run's seed code.
     ShareSeed,
+    /// Main menu / end screens: the global leaderboards (`K`).
+    OpenLeaderboard,
+    /// Leaderboard: switch DAILY <-> TIME TRIAL.
+    LbTab,
+    /// Leaderboard: reload both boards.
+    LbRefresh,
+    /// Leaderboard: open / commit the callsign editor.
+    LbCallsign,
+    /// Main menu / leaderboard: SIGN IN (web) / SIGN OUT.
+    LbAccount,
 }
 
 /// A clickable menu switch (see [`crate::ui_kit::punk_button`]).
@@ -167,6 +178,14 @@ pub fn seed_hotkey_action(state: AppState, mode: RunMode, b: bool, s: bool) -> O
     }
 }
 
+/// `K` opens the global leaderboards from `MainMenu` and the end screens.
+pub fn leaderboard_hotkey_action(state: AppState, k: bool) -> Option<MenuAction> {
+    match state {
+        AppState::MainMenu | AppState::GameOver | AppState::Victory if k => Some(MenuAction::OpenLeaderboard),
+        _ => None,
+    }
+}
+
 /// Controller shortcuts (focus + `A` covers every button; these are extras):
 /// - `Start`: PLAY from `MainMenu`, DEPLOY from `Loadout` / `ContractsFeats`
 ///   (`Start` in `Paused` resumes via `gamepad::gamepad_pause_toggle`)
@@ -190,14 +209,14 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((UiKitPlugin, MetaUiPlugin, crate::perf::PerfOverlayPlugin))
+        app.add_plugins((UiKitPlugin, MetaUiPlugin, crate::perf::PerfOverlayPlugin, LeaderboardUiPlugin))
             .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
             .add_systems(OnEnter(AppState::Playing), spawn_hud)
             .add_systems(OnEnter(AppState::Paused), spawn_pause_menu)
             .add_systems(OnEnter(AppState::UpgradeSelect), spawn_app_store.after(draft_upgrades))
             // End screens read the run summary the profile recorder just stored.
-            .add_systems(OnEnter(AppState::GameOver), spawn_game_over.after(record_game_over))
-            .add_systems(OnEnter(AppState::Victory), spawn_victory.after(record_victory))
+            .add_systems(OnEnter(AppState::GameOver), spawn_game_over.after(record_game_over).after(crate::leaderboard::auto_submit))
+            .add_systems(OnEnter(AppState::Victory), spawn_victory.after(record_victory).after(crate::leaderboard::auto_submit))
             .add_systems(Update, (menu_buttons, menu_keys).run_if(not(in_state(AppState::Playing))))
             .add_systems(Update, seed_entry_keys.after(menu_keys).after(menu_buttons).run_if(in_state(AppState::MainMenu)))
             .add_systems(Update, refresh_seed_ui.after(seed_entry_keys).run_if(not(in_state(AppState::Playing))))
@@ -276,6 +295,7 @@ pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
 fn spawn_main_menu(
     mut commands: Commands,
     store: Res<ProfileStore>,
+    lb: Res<LeaderboardState>,
     seed: Res<CustomSeedState>,
     tex: Option<Res<UiKitTextures>>,
     msaa: Option<Res<crate::perf::RenderMsaa>>,
@@ -311,6 +331,9 @@ fn spawn_main_menu(
         Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() },
         children![stamped_tag(OS_STAMP, STEEL_BORDER, BONE_TEXT, 12.0), text("// BUNKER 7 // FIELD TERMINAL", 12.0, ASH_DIM)],
     ));
+    commands.spawn((ChildOf(stamp_row), Node { flex_grow: 1.0, ..default() }));
+    spawn_account_pill(&mut commands, stamp_row, &lb, &store.profile.callsign);
+    commands.spawn((ChildOf(stamp_row), Node { width: Val::Px(14.0), ..default() }));
     let weak = commands.spawn((ChildOf(stamp_row), Node { column_gap: Val::Px(10.0), align_items: AlignItems::FlexEnd, ..default() })).id();
     commands.spawn((ChildOf(weak), text("SIGNAL 1/5", 12.0, PUNK_RED)));
     signal_bars(&mut commands, weak, 1, PUNK_RED, 6.0);
@@ -370,16 +393,17 @@ fn spawn_main_menu(
 
     // PLAY is the slab that fills the column; the two side doors stay small.
     let actions = commands
-        .spawn((ChildOf(column), Node { margin: UiRect::top(Val::Px(3.0)), column_gap: Val::Px(20.0), align_items: AlignItems::Center, ..default() }))
+        .spawn((ChildOf(column), Node { margin: UiRect::top(Val::Px(3.0)), column_gap: Val::Px(12.0), align_items: AlignItems::Center, ..default() }))
         .id();
     commands.spawn((
         ChildOf(actions),
         Node { flex_grow: 1.0, flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, ..default() },
         children![(punk_button("PLAY  [ENTER]", MenuAction::StartRun, 30.0, ButtonStyle::HeroAcid), DefaultFocus)],
     ));
-    commands.spawn((ChildOf(actions), punk_button("LOADOUT  [L]", MenuAction::OpenLoadout, 19.0, ButtonStyle::HazardAmber)));
-    commands.spawn((ChildOf(actions), punk_button("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, 19.0, ButtonStyle::DangerRed)));
-    commands.spawn((ChildOf(actions), punk_button("SETTINGS  [O]", MenuAction::OpenSettings, 19.0, ButtonStyle::ScrapSteel)));
+    commands.spawn((ChildOf(actions), punk_button("LOADOUT  [L]", MenuAction::OpenLoadout, 17.0, ButtonStyle::HazardAmber)));
+    commands.spawn((ChildOf(actions), punk_button("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, 17.0, ButtonStyle::DangerRed)));
+    commands.spawn((ChildOf(actions), punk_button("SETTINGS  [O]", MenuAction::OpenSettings, 17.0, ButtonStyle::ScrapSteel)));
+    commands.spawn((ChildOf(actions), punk_button("LEADERBOARD  [K]", MenuAction::OpenLeaderboard, 17.0, ButtonStyle::PrimaryAcid)));
 
     // Alternate modes: one compact strip of two doors, each with its live subtitle.
     let modes = commands.spawn((ChildOf(column), Node { column_gap: Val::Px(14.0), align_items: AlignItems::Center, ..default() })).id();
@@ -392,7 +416,7 @@ fn spawn_main_menu(
         commands.spawn((ChildOf(modes), punk_button(label, action, 16.0, style)));
         commands.spawn((
             ChildOf(modes),
-            Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() },
+            Node { flex_grow: 1.0, ..default() },
             children![text(sub, 12.0, color.with_alpha(0.9))],
         ));
     }
@@ -911,7 +935,7 @@ fn spawn_end_screen(
     endless_cta: bool,
     run: &RunStats,
     loadout: &RunLoadout,
-    (store, seed): (&ProfileStore, &CustomSeedState),
+    (store, seed, lb): (&ProfileStore, &CustomSeedState, &LeaderboardState),
     tex: Option<&UiKitTextures>,
 ) {
     // Victory stacks the Endless switch + its subtitle under a full unlock
@@ -973,7 +997,15 @@ fn spawn_end_screen(
         ))
         .id();
     commands.spawn((ChildOf(readout), text(summary(run), 18.0, BONE_TEXT)));
-    commands.spawn((ChildOf(readout), text(movement_line(run), 14.0, ARC_CYAN)));
+    if run.mode.daily_date().is_some() {
+        // Global Daily ranking (SUBMITTING... -> GLOBAL RANK #N) beside the
+        // short movement line: costs no extra row at 720p.
+        let row = commands.spawn((ChildOf(readout), Node { column_gap: Val::Px(14.0), align_items: AlignItems::Center, ..default() })).id();
+        commands.spawn((ChildOf(row), text(movement_line(run), 14.0, ARC_CYAN)));
+        commands.spawn((ChildOf(row), submit_badge_bundle(lb, 14.0)));
+    } else {
+        commands.spawn((ChildOf(readout), text(movement_line(run), 14.0, ARC_CYAN)));
+    }
     commands.spawn((ChildOf(readout), text(installed_list(run), 14.0, look.apps)));
     let loadout_line = with_seed(end_loadout_line(loadout), run);
     match run.mode.daily_date() {
@@ -1060,6 +1092,9 @@ fn spawn_end_screen(
     if shareable_code(run).is_some() {
         buttons.push((&share, MenuAction::ShareSeed, ButtonStyle::ScrapSteel));
     }
+    if run.mode.daily_date().is_some() {
+        buttons.push((LEADERBOARD_BUTTON, MenuAction::OpenLeaderboard, ButtonStyle::PrimaryAcid));
+    }
     button_row(commands, root, &buttons, if compact { 18.0 } else { 21.0 }, if compact { 2.0 } else { 10.0 });
 }
 
@@ -1071,6 +1106,9 @@ pub fn with_seed(line: String, run: &RunStats) -> String {
     }
 }
 
+/// End-card switch to the global leaderboards.
+pub const LEADERBOARD_BUTTON: &str = "LEADERBOARD  [K]";
+
 /// Victory call to action of Endless Overdrive.
 pub const ENDLESS_CTA: &str = "KEEP DESCENDING (ENDLESS)  [E]";
 
@@ -1080,11 +1118,13 @@ fn spawn_game_over(
     loadout: Res<RunLoadout>,
     store: Res<ProfileStore>,
     seed: Res<CustomSeedState>,
+    lb: Res<LeaderboardState>,
     tex: Option<Res<UiKitTextures>>,
 ) {
-    spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), false, &run, &loadout, (&store, &seed), tex.as_deref());
+    spawn_end_screen(&mut commands, AppState::GameOver, no_service_look(), false, &run, &loadout, (&store, &seed, &lb), tex.as_deref());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_victory(
     mut commands: Commands,
     run: Res<RunStats>,
@@ -1092,18 +1132,19 @@ fn spawn_victory(
     store: Res<ProfileStore>,
     trial: Res<TimeTrialState>,
     seed: Res<CustomSeedState>,
+    lb: Res<LeaderboardState>,
     tex: Option<Res<UiKitTextures>>,
 ) {
     if run.mode == RunMode::TimeTrial {
-        spawn_trial_finish(&mut commands, &run, &trial, &store, tex.as_deref());
+        spawn_trial_finish(&mut commands, &run, &trial, (&store, &lb), tex.as_deref());
         return;
     }
-    spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), true, &run, &loadout, (&store, &seed), tex.as_deref());
+    spawn_end_screen(&mut commands, AppState::Victory, full_signal_look(), true, &run, &loadout, (&store, &seed, &lb), tex.as_deref());
 }
 
 /// Time Trial finish card: final time, PB delta / NEW PB, movement telemetry,
 /// checkpoint splits and RETRY [R] / MAIN MENU [ENTER].
-fn spawn_trial_finish(commands: &mut Commands, run: &RunStats, trial: &TimeTrialState, store: &ProfileStore, tex: Option<&UiKitTextures>) {
+fn spawn_trial_finish(commands: &mut Commands, run: &RunStats, trial: &TimeTrialState, (store, lb): (&ProfileStore, &LeaderboardState), tex: Option<&UiKitTextures>) {
     let look = full_signal_look();
     let root = punk_screen_root_tinted(commands, AppState::Victory, tex, look.bg, look.backdrop, ("RF-LINK: COURSE CLEAR", ARC_CYAN));
     screen_rails(commands, root, tex, 16.0, look.tape);
@@ -1146,6 +1187,8 @@ fn spawn_trial_finish(commands: &mut Commands, run: &RunStats, trial: &TimeTrial
         None => ("NO PB ON RECORD".to_string(), ASH_DIM),
     };
     commands.spawn((ChildOf(root), stamped_tag(&pb_line, pb_color, INK_BLACK, 18.0)));
+    // Global Time Trial ranking (SUBMITTING... -> GLOBAL RANK #N).
+    commands.spawn((ChildOf(root), submit_badge_bundle(lb, 17.0)));
     let readout = commands
         .spawn((
             ChildOf(root),
@@ -1175,7 +1218,11 @@ fn spawn_trial_finish(commands: &mut Commands, run: &RunStats, trial: &TimeTrial
     button_row(
         commands,
         root,
-        &[("RETRY  [R]", MenuAction::RetryTimeTrial, ButtonStyle::HeroAcid), ("MAIN MENU  [ENTER]", MenuAction::BackToMenu, ButtonStyle::ScrapSteel)],
+        &[
+            ("RETRY  [R]", MenuAction::RetryTimeTrial, ButtonStyle::HeroAcid),
+            ("MAIN MENU  [ENTER]", MenuAction::BackToMenu, ButtonStyle::ScrapSteel),
+            (LEADERBOARD_BUTTON, MenuAction::OpenLeaderboard, ButtonStyle::PrimaryAcid),
+        ],
         20.0,
         8.0,
     );
@@ -1284,6 +1331,7 @@ fn perform(
     time: &Time,
     (state, ret): (AppState, &mut SettingsReturn),
     next: &mut NextState<AppState>,
+    lb: &mut LeaderboardState,
 ) {
     // Abandoning an active Endless run from Pause preserves earned Endless records/deltas.
     let finalize_endless = |run: &mut RunStats, loadout: &RunLoadout, store: &mut ProfileStore| {
@@ -1397,6 +1445,12 @@ fn perform(
                 crate::compendium::sync_url_hash_seed(&_code);
             }
         }
+        MenuAction::OpenLeaderboard => {
+            finalize_endless(run, loadout, store);
+            next.set(AppState::Leaderboard);
+        }
+        // Handled by `leaderboard::leaderboard_input` (it owns the client).
+        MenuAction::LbTab | MenuAction::LbRefresh | MenuAction::LbCallsign | MenuAction::LbAccount => lb.pending.push(action),
     }
 }
 
@@ -1418,6 +1472,7 @@ fn menu_buttons(
     time: Res<Time>,
     (state, mut ret): (Res<State<AppState>>, ResMut<SettingsReturn>),
     mut next: ResMut<NextState<AppState>>,
+    mut lb: ResMut<LeaderboardState>,
 ) {
     let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
     for (e, node, tf, action, colors, mut bg, mut border, children) in &mut buttons {
@@ -1452,6 +1507,7 @@ fn menu_buttons(
                 &time,
                 (*state.get(), &mut ret),
                 &mut next,
+                &mut lb,
             );
             return;
         }
@@ -1471,7 +1527,12 @@ fn menu_keys(
     mut ret: ResMut<SettingsReturn>,
     mut next: ResMut<NextState<AppState>>,
     pad: Res<GamepadInput>,
+    mut lb: ResMut<LeaderboardState>,
 ) {
+    // The leaderboard owns its keys (`leaderboard::leaderboard_input`).
+    if *state.get() == AppState::Leaderboard {
+        return;
+    }
     // Controller shortcuts (never typed text, so the seed editor allows them).
     if let Some(action) = pad_menu_action(*state.get(), pad.pause, pad.back) {
         perform(
@@ -1484,6 +1545,7 @@ fn menu_keys(
             &time,
             (*state.get(), &mut ret),
             &mut next,
+            &mut lb,
         );
         return;
     }
@@ -1511,7 +1573,8 @@ fn menu_keys(
             keys.just_pressed(KeyCode::KeyR),
         )
     })
-    .or_else(|| seed_hotkey_action(*state.get(), run.mode, keys.just_pressed(KeyCode::KeyB), keys.just_pressed(KeyCode::KeyS)));
+    .or_else(|| seed_hotkey_action(*state.get(), run.mode, keys.just_pressed(KeyCode::KeyB), keys.just_pressed(KeyCode::KeyS)))
+    .or_else(|| leaderboard_hotkey_action(*state.get(), keys.just_pressed(KeyCode::KeyK)));
     if let Some(action) = action {
         perform(
             &mut commands,
@@ -1523,6 +1586,7 @@ fn menu_keys(
             &time,
             (*state.get(), &mut ret),
             &mut next,
+            &mut lb,
         );
     }
 }

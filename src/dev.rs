@@ -30,6 +30,9 @@
 //!   with PBs on record: `01_daily_hud.png` (split plate under 5 toasts),
 //!   `02_daily_victory.png` (Daily badge + floor splits), `03_trial_hud.png`
 //!   (Time Trial plate after CP 1), `04_trial_finish.png`, then exits.
+//! - `SEGNALE_LEADERBOARD_SHOTS=<dir>`: Milestone 26 tour (networking off,
+//!   staged boards): main menu with the account pill, Daily / Time Trial
+//!   leaderboards, the callsign editor and the offline fallback, then exits.
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
@@ -100,6 +103,23 @@ impl Plugin for DevPlugin {
                 }
             }
             app.insert_resource(TrialShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, trial_shots_tour.after(GameSet::Ui));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_LEADERBOARD_SHOTS") {
+            let mut showcase = meta_showcase_profile();
+            showcase.callsign = "BOMBA64".into();
+            showcase.time_trial_best_secs = Some(48.62);
+            showcase.time_trial_best_splits = vec![9.84, 21.5, 36.03, 48.62];
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.profile = showcase;
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(showcase));
+                }
+            }
+            app.insert_resource(LeaderboardShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, leaderboard_shots_tour);
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_COMPENDIUM_SHOTS") {
@@ -660,6 +680,144 @@ fn trial_shots_tour(
             true
         }
         (10, AppState::Victory) if t > 1.5 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_LEADERBOARD_SHOTS (Milestone 26)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct LeaderboardShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+const SHOWCASE_CALLSIGNS: [&str; 25] = [
+    "ZERO_BARS", "BOMBA64", "DOOMSCROLL", "5G-REAPER", "IMP_SLAYER", "DEADZONE", "ROAMER", "STATIC-9", "HELLPING", "NULLCARRIER",
+    "BHOP_GOD", "UPLINK", "TOWERHUNT", "MARINE", "SIGNAL_LOST", "CACO-KING", "JAMMERX", "PACKETLOSS", "DIALTONE", "OVERCLOCK",
+    "VOIDCALL", "AIRPLANE", "LOWBATT", "ROGUE_SIM", "LASTBAR",
+];
+
+/// Staged Daily board: 25 rows, mixed victories / deaths, verified entries.
+pub fn showcase_daily_board() -> Vec<crate::leaderboard::DailyEntry> {
+    SHOWCASE_CALLSIGNS
+        .iter()
+        .enumerate()
+        .map(|(i, cs)| {
+            let victory = i < 9;
+            let floor = if victory { 5 + (8 - i as u32).min(3) / 2 } else { 4 - (i as u32 / 6).min(3) };
+            crate::leaderboard::DailyEntry {
+                rank: i as u32 + 1,
+                callsign: cs.to_string(),
+                verified: i % 3 != 2,
+                victory,
+                floor,
+                time_secs: 380.0 + i as f64 * 37.3,
+                peak_speed: 41.7 - i as f64 * 0.9,
+                max_bhop_chain: 24u32.saturating_sub(i as u32),
+                score: crate::leaderboard::daily_score(victory, floor, 120 - i as u32 * 3, 380.0 + i as f32 * 37.3),
+            }
+        })
+        .collect()
+}
+
+/// Staged Time Trial board.
+pub fn showcase_trial_board() -> Vec<crate::leaderboard::TrialEntry> {
+    SHOWCASE_CALLSIGNS
+        .iter()
+        .enumerate()
+        .map(|(i, cs)| {
+            let t = 41.2 + i as f64 * 1.37;
+            crate::leaderboard::TrialEntry {
+                rank: i as u32 + 1,
+                callsign: cs.to_string(),
+                verified: i % 4 != 3,
+                time_secs: t,
+                splits: vec![t * 0.2, t * 0.44, t * 0.74, t],
+                peak_speed: 52.4 - i as f64 * 0.8,
+                max_bhop_chain: 31u32.saturating_sub(i as u32),
+            }
+        })
+        .collect()
+}
+
+/// Main menu (signed in) -> Daily board -> Time Trial board -> callsign
+/// editor -> offline fallback.
+fn leaderboard_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<LeaderboardShots>,
+    state: Res<State<AppState>>,
+    mut lb: ResMut<crate::leaderboard::LeaderboardState>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use crate::leaderboard::{Account, Board, LbTab};
+    cfg.timer += time.delta_secs();
+    let dir = cfg.dir.clone();
+    let t = cfg.timer;
+    let advance = match (cfg.stage, *state.get()) {
+        (0, AppState::MainMenu) if t > 0.8 => {
+            lb.account = Account::SignedIn { username: "bombatomica64".into() };
+            true
+        }
+        (1, AppState::MainMenu) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "01_main_menu.png");
+            true
+        }
+        (2, AppState::MainMenu) if t > 0.7 => {
+            next.set(AppState::Leaderboard);
+            true
+        }
+        (3, AppState::Leaderboard) if t > 0.5 => {
+            lb.daily = Board::Loaded(showcase_daily_board());
+            lb.trial = Board::Loaded(showcase_trial_board());
+            true
+        }
+        (4, AppState::Leaderboard) if t > 1.2 => {
+            meta_shot(&mut commands, &dir, "02_leaderboard_daily.png");
+            true
+        }
+        (5, AppState::Leaderboard) if t > 0.5 => {
+            lb.tab = LbTab::TimeTrial;
+            true
+        }
+        (6, AppState::Leaderboard) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "03_leaderboard_trial.png");
+            true
+        }
+        (7, AppState::Leaderboard) if t > 0.5 => {
+            lb.editing = Some("BOMBA6".into());
+            lb.notice = Some("TYPE A-Z 0-9 _ -  //  ENTER SAVE  //  ESC CANCEL".into());
+            true
+        }
+        (8, AppState::Leaderboard) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "04_callsign_edit.png");
+            true
+        }
+        (9, AppState::Leaderboard) if t > 0.5 => {
+            lb.editing = None;
+            lb.notice = None;
+            lb.tab = LbTab::Daily;
+            lb.daily = Board::Offline;
+            lb.account = Account::Offline;
+            true
+        }
+        (10, AppState::Leaderboard) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "05_leaderboard_offline.png");
+            true
+        }
+        (11, AppState::Leaderboard) if t > 1.5 => {
             exit.write(AppExit::Success);
             true
         }

@@ -33,6 +33,13 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
 - **Shareable Custom Seeds & 3D Bestiary / Armory (Milestone 21):**
   - **`SEED [S]` / `#seed=CODE`:** enter or roll deterministic bunker seeds (`MARS7`, `791E-0A5A`) and share clickable `#seed=` links directly from the menu, pause, or end screens.
   - **`BESTIARY & ARMORY [B]`:** live interactive 3D turntable inspecting all 7 sculpted demons (with lifetime kill counts and tactical tips) and all 3 weapons.
+- **Wide high-speed corridors (Milestone 25):** 2-cell-wide boomer-shooter corridors and open turn hubs keep bhop chains and rocket jumps flowing through every floor.
+- **Authentik login, cloud profile sync & global leaderboards (Milestone 26):**
+  - **`LEADERBOARD [K]`:** top 25 of today's **Daily** (victory, floor, then time) and of the **Time Trial** (with CP splits). `[ID]` marks Authentik-verified entries, and your own callsign is highlighted. Switch boards with `Tab`/`Q`/`E` or `LB`/`RB`, refresh with `R`/`Y`, and go back with `Esc`/`B`.
+  - **Callsign:** press `C` (or confirm on the plate) to type `[A-Z0-9_-]`, 2 to 12 characters. `Enter` saves it locally and syncs it to the cloud when you're signed in. On a controller, the D-Pad cycles and adds or removes characters.
+  - **Account:** on the web, `SIGN IN` goes through Authentik (`auth.bombatomica64.dev`). Once signed in, the profile is merged into Postgres **monotonically**: unlocks are unioned, records and lifetime stats take the max, the fastest PBs win, and settings stay per device. Play on several devices and your progress never goes backwards. Desktop and Android can pass a session token in `SEGNALE_AUTH_TOKEN`.
+  - **End-card auto-submit:** Daily Victory and Game Over (exhibition runs are never sent) and Time Trial finishes are posted in the background. The end card shows `SUBMITTING...`, then `GLOBAL RANK #N (NEW PB!)` or `OFFLINE - SAVED LOCALLY`.
+  - **Offline-first:** with no server the screen reads `OFFLINE - LOCAL RECORDS ONLY` and shows your local Daily and Time Trial records. Tests, bots, screenshot tours and `SEGNALE_LEADERBOARD_OFFLINE=1` never touch the network. Desktop overrides the server with `SEGNALE_LEADERBOARD_URL`.
 - **90–120 FPS target:** static and demon mesh batching, a `F3` perf overlay and a `F4` VSync toggle.
 
 ## Controls
@@ -92,10 +99,20 @@ cargo clippy --all-targets -- -D warnings
 Meta-progression screenshot tour (uses an in-memory showcase profile and never touches your saved profile):
 ```bash
 xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_META_SHOTS=$HOME/scratch/meta-shots cargo run
+# Milestone 26: main menu account pill + staged Daily / Time Trial boards, callsign editor, offline fallback
+xvfb-run -a -s "-screen 0 1280x720x24" env SEGNALE_LEADERBOARD_SHOTS=$HOME/scratch/lb-shots cargo run
+```
+
+Backend (`server/`, a standalone crate with its own `Cargo.lock`): an in-memory store runs the HTTP tests, so no Postgres is needed. Set `TEST_DATABASE_URL` to also run the Postgres test.
+```bash
+cargo test --manifest-path server/Cargo.toml
+cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
 ```
 
 ## CI & Releases
 - **`.github/workflows/ci.yml`:** runs on pushes to `main` and on pull requests. It runs `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy --all-targets --features audio,gamepad -- -D warnings` and `cargo clippy --all-targets --features raytracing -- -D warnings` on Ubuntu. Parallel jobs run `cargo clippy --target wasm32-unknown-unknown --features audio -- -D warnings` and `cargo ndk -t arm64-v8a -P 26 clippy --lib -- -D warnings` (Android).
+- **`server` job (`ci.yml`):** runs `cargo test` and `cargo clippy -D warnings` on the `server/` backend.
+- **`.github/workflows/deploy-web.yml`:** on `main` pushes (path-filtered) and `v*` tags, builds and pushes `ghcr.io/<owner>/segnale-debole-web` (nginx + WASM) and `ghcr.io/<owner>/segnale-debole-api`.
 - **`.github/workflows/release.yml`:** runs on `v*` tags and manual dispatch. It builds Linux `--release --features audio,gamepad` binaries (plain and `raytracing`) and packages each with this README:
   - `segnale-debole-linux-x86_64.tar.gz`
   - `segnale-debole-raytracing-linux-x86_64.tar.gz`
@@ -137,6 +154,18 @@ Differences from the native build:
 - **Rendering:** MSAA is off, and only the nearest 12 world point lights are lit at once (WebGL2 light budget). `F4` shows `VSYNC MANAGED BY BROWSER`, because the browser paces frames. `F3` works as usual.
 - **Audio** starts on your first click or key press (browser autoplay policy).
 - The `raytracing` feature and the `SEGNALE_*` environment switches are native-only.
+
+## Deployment (k3s + Postgres + Authentik)
+https://signal.bombatomica64.dev runs as one pod with two containers. The `nginx` container serves `dist/` and proxies `/api/` to the `api` sidecar (`segnale_server`: axum + sqlx on `127.0.0.1:8081`).
+- **API (`/api/v1`):** `healthz`, `auth/{login,callback,logout,me}` (OIDC code flow with PKCE; the session is an HttpOnly `segnale_session` cookie, valid for 30 days), `profile` (GET, plus PUT with a monotonic merge), and `leaderboard/{daily,trial}` (GET top 25, plus a strictly validated, per-IP rate-limited POST that keeps the best run only). Tables are created idempotently at startup: `players`, `sessions`, `daily_scores`, `trial_scores`.
+- **Authentik:** add `deploy/authentik-blueprint-snippet.yaml` (provider `provider-segnale-debole` and application `segnale-debole`) to the GitOps blueprints. The redirect URI is `https://signal.bombatomica64.dev/api/v1/auth/callback`.
+- **Secrets** are never in git. Create them once:
+  ```bash
+  kubectl -n segnale-debole create secret generic segnale-debole-secrets \
+    --from-literal=DATABASE_URL='postgres://USER:PASS@HOST:5432/segnale' \
+    --from-literal=OIDC_CLIENT_SECRET='...'
+  ```
+- **Deploy:** `deploy/deploy-k3s.sh` does everything in one step: it builds the WASM, builds the `web` and `api` images, imports them into k3s, runs `kubectl apply -f deploy/k8s.yaml` and waits for the rollout.
 
 See [DESIGN.md](DESIGN.md) for the full game design and architecture notes.
 

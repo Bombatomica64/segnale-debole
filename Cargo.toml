@@ -46,6 +46,10 @@ serde_json = "1"
 # Native-only Bevy features (desktop and Android): multithreaded task pools.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["multi_threaded"] }
+# Global leaderboard / cloud profile client (desktop + Android): blocking HTTPS
+# on a background thread. Pure-Rust TLS (rustls + ring + webpki-roots): no
+# OpenSSL, so `aarch64-linux-android` cross-builds with just the NDK.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 # Desktop-only Bevy features: OS cursors and PNG screenshot encoding (for
 # dev/bot tours; never needed on wasm32 or Android).
@@ -73,7 +77,13 @@ bevy = { version = "0.20.1", default-features = false, features = ["webgl2", "we
 # rand 0.9 -> rand_core -> getrandom 0.3 (the only getrandom in the wasm graph).
 getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Storage", "Document", "Element", "Location"] }
+web-sys = { version = "0.3", features = [
+    "Window", "Storage", "Document", "Element", "Location",
+    # Leaderboard / Authentik session client (`fetch`).
+    "Request", "RequestInit", "RequestCredentials", "RequestMode", "Response", "Headers",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 
 [features]
 default = []

@@ -15,6 +15,7 @@ pub mod extraction;
 pub mod fx;
 pub mod gamepad;
 pub mod hud;
+pub mod leaderboard;
 pub mod ui_kit;
 pub mod level;
 pub mod lifecycle;
@@ -75,8 +76,9 @@ impl Plugin for CoreGameplayPlugin {
             .add_plugins(trials::TrialsPlugin)
             .add_plugins(compendium::CompendiumPlugin)
             .add_plugins(gamepad::GamepadPlugin)
-            // Separate call: the tuple above is at Bevy's 15-plugin limit.
-            .add_plugins(lifecycle::LifecyclePlugin);
+            // Separate calls: the tuple above is at Bevy's 15-plugin limit.
+            .add_plugins(lifecycle::LifecyclePlugin)
+            .add_plugins(leaderboard::LeaderboardPlugin);
     }
 }
 
@@ -150,6 +152,8 @@ impl Plugin for HeadlessGamePlugin {
         .init_asset::<StandardMaterial>()
         .init_asset::<Image>()
         .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(HEADLESS_DT)))
+        // Tests never touch the network (leaderboards / cloud sync stay offline).
+        .insert_resource(leaderboard::NetworkDisabled)
         .add_plugins(CoreGameplayPlugin);
     }
 }

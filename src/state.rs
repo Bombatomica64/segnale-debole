@@ -43,6 +43,10 @@ pub enum AppState {
     /// 3D Bestiary & Armory viewer (see `compendium.rs`): a pre-run screen
     /// reachable from `MainMenu`.
     Compendium,
+    /// Global Daily / Time Trial leaderboards + account & callsign (see
+    /// `leaderboard.rs`). Reachable from `MainMenu` and the end cards; it is a
+    /// pre-run screen (entering it tears down a finished run).
+    Leaderboard,
 }
 
 /// Where `Settings` returns to (`MainMenu` or `Paused`).
@@ -58,7 +62,7 @@ impl Default for SettingsReturn {
 impl AppState {
     /// Pre-run screens where no run is alive (player and level torn down).
     pub fn is_pre_run(self) -> bool {
-        matches!(self, AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats | AppState::Compendium)
+        matches!(self, AppState::MainMenu | AppState::Loadout | AppState::ContractsFeats | AppState::Compendium | AppState::Leaderboard)
     }
 }
 

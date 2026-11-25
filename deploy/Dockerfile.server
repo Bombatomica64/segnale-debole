@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+# Segnale Debole API (segnale_server). Build from the repo root:
+#   docker build -f deploy/Dockerfile.server -t docker.io/library/segnale-debole-api:v0.5.0 .
+# deploy/Dockerfile.server.dockerignore (BuildKit per-Dockerfile ignore) trims the context to server/.
+
+FROM rust:1-bookworm AS builder
+WORKDIR /build/server
+
+# Dependency layer: build against stub sources so `cargo build` of the real
+# code only recompiles this crate.
+COPY server/Cargo.toml server/Cargo.lock ./
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && touch src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+
+COPY server/src ./src
+# COPY keeps the context mtimes, which can be older than the stub build:
+# touch so cargo always rebuilds the real crate.
+RUN touch src/main.rs src/lib.rs \
+    && cargo build --release --locked \
+    && cp target/release/segnale_server /segnale_server
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /segnale_server /usr/local/bin/segnale_server
+USER 1000:1000
+ENV SERVER_BIND=0.0.0.0:8081
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/segnale_server"]

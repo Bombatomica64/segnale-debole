@@ -788,6 +788,41 @@ pub struct PlayerProfile {
     /// Checkpoint + finish splits of that fastest Time Trial.
     #[serde(default)]
     pub time_trial_best_splits: Vec<f32>,
+    /// Global leaderboard callsign (`[A-Z0-9_-]`, 2..=12 chars; see
+    /// [`sanitize_callsign`]).
+    #[serde(default = "default_callsign")]
+    pub callsign: String,
+}
+
+/// Callsign of a fresh profile.
+pub const DEFAULT_CALLSIGN: &str = "MARINE";
+/// Callsign length bounds (inclusive).
+pub const CALLSIGN_MIN: usize = 2;
+pub const CALLSIGN_MAX: usize = 12;
+
+pub fn default_callsign() -> String {
+    DEFAULT_CALLSIGN.to_string()
+}
+
+/// Whether `c` may appear in a callsign (after uppercasing).
+pub fn is_callsign_char(c: char) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '-'
+}
+
+/// Uppercase `raw`, keep only `[A-Z0-9_-]`, cap at [`CALLSIGN_MAX`] chars;
+/// anything shorter than [`CALLSIGN_MIN`] falls back to [`DEFAULT_CALLSIGN`].
+pub fn sanitize_callsign(raw: &str) -> String {
+    let s: String = raw.chars().map(|c| c.to_ascii_uppercase()).filter(|c| is_callsign_char(*c)).take(CALLSIGN_MAX).collect();
+    if s.len() < CALLSIGN_MIN { default_callsign() } else { s }
+}
+
+/// `Some(min)` of two optional "lower is better" times (non-finite ignored).
+fn min_time(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+    let ok = |v: Option<f32>| v.filter(|t| t.is_finite() && *t > 0.0);
+    match (ok(a), ok(b)) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
 }
 
 impl Default for PlayerProfile {
@@ -808,6 +843,7 @@ impl Default for PlayerProfile {
             best_floor_segments: [None; 5],
             time_trial_best_secs: None,
             time_trial_best_splits: Vec::new(),
+            callsign: default_callsign(),
         }
     }
 }
@@ -935,6 +971,78 @@ impl PlayerProfile {
             self.history.drain(..extra);
         }
         crate::trials::sanitize_trial_records(self);
+        self.callsign = sanitize_callsign(&self.callsign);
+    }
+
+    /// Monotonic merge of another copy of this profile (the cloud copy, or
+    /// another device's): progress never regresses. Feats are unioned,
+    /// lifetime counters / records / per-enemy kills take the max, fastest
+    /// times take the min, Daily records merge per date and the Time Trial /
+    /// Standard PBs keep the faster run together with its splits. Device-local
+    /// choices (settings, equipped loadout, history) stay local; the callsign
+    /// is adopted only while the local one is still the default.
+    pub fn merge_from(&mut self, remote: &PlayerProfile) {
+        self.unlocked_feats.extend(remote.unlocked_feats.iter().copied());
+        let (s, r) = (&mut self.stats, &remote.stats);
+        for (a, b) in [
+            (&mut s.runs_played, r.runs_played),
+            (&mut s.victories, r.victories),
+            (&mut s.best_floor, r.best_floor),
+            (&mut s.total_kills, r.total_kills),
+            (&mut s.total_jammers, r.total_jammers),
+            (&mut s.total_fiends, r.total_fiends),
+            (&mut s.total_blackout_kills, r.total_blackout_kills),
+            (&mut s.total_sos_completed, r.total_sos_completed),
+            (&mut s.max_contracts_cleared, r.max_contracts_cleared),
+            (&mut s.best_bhop_chain, r.best_bhop_chain),
+            (&mut s.best_endless_floor, r.best_endless_floor),
+        ] {
+            *a = (*a).max(b);
+        }
+        if r.best_speed.is_finite() {
+            s.best_speed = s.best_speed.max(r.best_speed);
+        }
+        s.fastest_victory_secs = min_time(s.fastest_victory_secs, r.fastest_victory_secs);
+        for (a, b) in s.enemy_kills.iter_mut().zip(r.enemy_kills) {
+            *a = (*a).max(b);
+        }
+        for rr in &remote.daily_records {
+            match self.daily_records.iter_mut().find(|l| l.date == rr.date) {
+                Some(l) => {
+                    l.best_floor = l.best_floor.max(rr.best_floor);
+                    l.victory |= rr.victory;
+                    l.best_time_secs = min_time(l.best_time_secs, rr.best_time_secs);
+                    if rr.peak_speed.is_finite() {
+                        l.peak_speed = l.peak_speed.max(rr.peak_speed);
+                    }
+                    l.attempts = l.attempts.max(rr.attempts);
+                }
+                None => self.daily_records.push(rr.clone()),
+            }
+        }
+        crate::trials::trim_daily_records(&mut self.daily_records);
+        let last = |v: &[f32]| v.last().copied().filter(|t| t.is_finite() && *t > 0.0);
+        if let Some(rt) = last(&remote.standard_pb_splits)
+            && last(&self.standard_pb_splits).is_none_or(|lt| rt < lt)
+        {
+            self.standard_pb_splits = remote.standard_pb_splits.clone();
+        }
+        for (a, b) in self.best_floor_segments.iter_mut().zip(remote.best_floor_segments) {
+            *a = min_time(*a, b);
+        }
+        if let Some(rt) = remote.time_trial_best_secs.filter(|t| t.is_finite() && *t > 0.0)
+            && self.time_trial_best_secs.is_none_or(|lt| rt < lt)
+        {
+            self.time_trial_best_secs = Some(rt);
+            self.time_trial_best_splits = remote.time_trial_best_splits.clone();
+        }
+        if self.history.is_empty() {
+            self.history = remote.history.clone();
+        }
+        if self.callsign == DEFAULT_CALLSIGN && remote.callsign != DEFAULT_CALLSIGN {
+            self.callsign = remote.callsign.clone();
+        }
+        self.sanitize();
     }
 
     /// Snapshot the equipped choices for a new run (locked picks fall back).
@@ -1160,7 +1268,7 @@ pub fn profile_path_policy(
 /// `$XDG_DATA_HOME/segnale-debole/profile.json` (or `~/.local/share/...`).
 pub fn resolve_profile_path(windowed: bool) -> Option<PathBuf> {
     let var = |k: &str| std::env::var(k).ok();
-    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS", "SEGNALE_COMPENDIUM_SHOTS"].into_iter().any(|k| var(k).is_some());
+    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS", "SEGNALE_COMPENDIUM_SHOTS", "SEGNALE_LEADERBOARD_SHOTS"].into_iter().any(|k| var(k).is_some());
     profile_path_policy(var("SEGNALE_PROFILE").as_deref(), windowed, bot_or_shots, var("XDG_DATA_HOME").as_deref(), var("HOME").as_deref())
 }
 
@@ -1471,6 +1579,7 @@ impl Plugin for MetaPlugin {
             .add_systems(OnEnter(AppState::MainMenu), (reset_run_loadout, retry_dirty_save))
             .add_systems(OnEnter(AppState::Loadout), retry_dirty_save)
             .add_systems(OnEnter(AppState::ContractsFeats), retry_dirty_save)
+            .add_systems(OnEnter(AppState::Leaderboard), retry_dirty_save)
             .add_systems(OnEnter(AppState::GameOver), record_game_over)
             .add_systems(OnEnter(AppState::Victory), record_victory);
     }
@@ -2138,5 +2247,72 @@ mod tests {
         kv.fail_reads = true;
         let (_, notice, writable) = load_profile_kv(&mut kv, WEB_PROFILE_KEY);
         assert!(!writable && notice.unwrap().contains("read failed"));
+    }
+
+    #[test]
+    fn callsigns_sanitize_and_default() {
+        assert_eq!(sanitize_callsign("doom_guy-7"), "DOOM_GUY-7");
+        assert_eq!(sanitize_callsign("  s!i@g#n a l "), "SIGNAL");
+        assert_eq!(sanitize_callsign("averyveryverylongname"), "AVERYVERYVER");
+        assert_eq!(sanitize_callsign("x"), DEFAULT_CALLSIGN);
+        assert_eq!(sanitize_callsign(""), DEFAULT_CALLSIGN);
+        assert_eq!(sanitize_callsign("ÀÈ"), DEFAULT_CALLSIGN);
+        assert_eq!(PlayerProfile::default().callsign, "MARINE");
+        // Pre-M26 profiles (no callsign key) load with the default; junk is cleaned.
+        assert_eq!(parse_profile(r#"{"schema_version":1}"#).unwrap().callsign, "MARINE");
+        assert_eq!(parse_profile(r#"{"schema_version":1,"callsign":"ace pilot!"}"#).unwrap().callsign, "ACEPILOT");
+        let json = serde_json::to_string(&PlayerProfile { callsign: "ZERO_BARS".into(), ..default() }).unwrap();
+        assert_eq!(parse_profile(&json).unwrap().callsign, "ZERO_BARS");
+    }
+
+    #[test]
+    fn merge_from_is_monotonic_and_symmetric_on_progress() {
+        let d1 = DailyDate::new(2026, 11, 24);
+        let d2 = DailyDate::new(2026, 11, 25);
+        let mut local = PlayerProfile::default();
+        local.unlocked_feats.insert(FeatId::FirstExtraction);
+        local.stats = LifetimeStats { runs_played: 10, total_kills: 300, best_speed: 30.0, fastest_victory_secs: Some(500.0), ..default() };
+        local.stats.enemy_kills[0] = 200;
+        local.daily_records = vec![DailyRecord { date: d1, best_floor: 3, victory: false, best_time_secs: None, peak_speed: 20.0, attempts: 2 }];
+        local.time_trial_best_secs = Some(50.0);
+        local.time_trial_best_splits = vec![10.0, 20.0, 35.0, 50.0];
+        local.settings.mouse_sensitivity = 2.0;
+
+        let mut remote = PlayerProfile::default();
+        remote.unlocked_feats.insert(FeatId::BunkerCleared);
+        remote.stats = LifetimeStats { runs_played: 14, total_kills: 250, best_speed: 25.0, fastest_victory_secs: Some(450.0), best_floor: 5, ..default() };
+        remote.stats.enemy_kills[1] = 40;
+        remote.daily_records = vec![
+            DailyRecord { date: d1, best_floor: 5, victory: true, best_time_secs: Some(600.0), peak_speed: 18.0, attempts: 1 },
+            DailyRecord { date: d2, best_floor: 2, attempts: 1, ..default() },
+        ];
+        remote.time_trial_best_secs = Some(47.5);
+        remote.time_trial_best_splits = vec![9.0, 19.0, 33.0, 47.5];
+        remote.callsign = "ACE".into();
+        remote.settings.mouse_sensitivity = 0.5;
+
+        let mut merged = local.clone();
+        merged.merge_from(&remote);
+        assert!(merged.has_feat(FeatId::FirstExtraction) && merged.has_feat(FeatId::BunkerCleared));
+        assert_eq!((merged.stats.runs_played, merged.stats.total_kills, merged.stats.best_floor), (14, 300, 5));
+        assert_eq!((merged.stats.best_speed, merged.stats.fastest_victory_secs), (30.0, Some(450.0)));
+        assert_eq!((merged.stats.enemy_kills[0], merged.stats.enemy_kills[1]), (200, 40));
+        let r1 = crate::trials::daily_record(&merged.daily_records, d1).unwrap();
+        assert_eq!((r1.best_floor, r1.victory, r1.best_time_secs, r1.peak_speed, r1.attempts), (5, true, Some(600.0), 20.0, 2));
+        assert!(crate::trials::daily_record(&merged.daily_records, d2).is_some());
+        assert_eq!((merged.time_trial_best_secs, merged.time_trial_best_splits.clone()), (Some(47.5), vec![9.0, 19.0, 33.0, 47.5]));
+        assert_eq!(merged.callsign, "ACE", "a default local callsign adopts the account's");
+        assert_eq!(merged.settings.mouse_sensitivity, 2.0, "device settings stay local");
+
+        // Idempotent, and merging a stale copy never regresses anything.
+        let again = { let mut m = merged.clone(); m.merge_from(&remote); m };
+        assert_eq!(again, merged);
+        let mut stale = merged.clone();
+        stale.merge_from(&PlayerProfile::default());
+        assert_eq!(stale, merged);
+        // A slower remote Time Trial never replaces the local PB; a chosen callsign is kept.
+        let mut slow = PlayerProfile { time_trial_best_secs: Some(60.0), time_trial_best_splits: vec![1.0, 2.0, 3.0, 60.0], callsign: "OTHER".into(), ..default() };
+        slow.merge_from(&PlayerProfile { time_trial_best_secs: Some(70.0), callsign: "ZZ".into(), ..default() });
+        assert_eq!((slow.time_trial_best_secs, slow.callsign.as_str()), (Some(60.0), "OTHER"));
     }
 }

@@ -1143,6 +1143,7 @@ impl Plugin for LevelPlugin {
             .add_systems(OnEnter(AppState::MainMenu), teardown_level)
             .add_systems(OnEnter(AppState::Loadout), teardown_level)
             .add_systems(OnEnter(AppState::ContractsFeats), teardown_level)
+            .add_systems(OnEnter(AppState::Leaderboard), teardown_level)
             .add_systems(Update, animate_props.in_set(GameSet::World))
             .add_systems(Update, cull_world_lights.in_set(GameSet::Ui));
     }
