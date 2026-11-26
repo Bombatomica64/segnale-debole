@@ -2016,8 +2016,53 @@ pub const BOSS_HOLD_STATUS: &str = "CARRIER DAEMON ALIVE - EXTRACTION LOCKED";
 pub fn uplink_status_text(ext: &ExtractionState) -> &'static str {
     match ext {
         ExtractionState::Uploading { boss_hold: true, .. } => BOSS_HOLD_STATUS,
-        _ => "DEMON RUSH - HOLD THE SIGNAL",
+        _ => "DEMON RUSH - SOS UPLINK LIVE",
     }
+}
+
+/// Milestone 32 free-roam SOS uplink speed tier (drives the HUD copy + tone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UplinkTier {
+    /// Inside the Signal Ring: `SOS OVERDRIVE` (acid green boost).
+    Overdrive,
+    /// Near the tower (>= 0.80x): cyan.
+    Near,
+    /// Roaming further (< 0.80x): warm amber, motivating `CLOSER = FASTER`.
+    Roaming,
+}
+
+/// Tier of a live upload `rate` (see [`crate::extraction::proximity_upload_rate`]).
+pub fn uplink_tier(rate: f32) -> UplinkTier {
+    if rate >= crate::extraction::UPLINK_OVERDRIVE_RATE {
+        UplinkTier::Overdrive
+    } else if rate >= crate::extraction::UPLINK_NEAR_RATE {
+        UplinkTier::Near
+    } else {
+        UplinkTier::Roaming
+    }
+}
+
+/// HUD tone of an uplink tier: boost green, cyan, warm amber (never alarm red).
+pub fn uplink_tier_color(tier: UplinkTier) -> Color {
+    match tier {
+        UplinkTier::Overdrive => ACID_GREEN,
+        UplinkTier::Near => COLOR_CYAN,
+        UplinkTier::Roaming => COLOR_SIGNAL_AMBER,
+    }
+}
+
+/// Write the live (unjammed, unheld) uplink label for `progress` / `rate`:
+/// `SOS OVERDRIVE  1.25x  42%`, `UPLINKING  0.93x  42%` or
+/// `UPLINKING  0.61x  (CLOSER = FASTER)  42%`. Returns its tier.
+pub fn write_uplink_speed(b: &mut impl std::fmt::Write, progress: f32, rate: f32) -> UplinkTier {
+    let pct = progress * 100.0;
+    let tier = uplink_tier(rate);
+    let _ = match tier {
+        UplinkTier::Overdrive => write!(b, "SOS OVERDRIVE  {rate:.2}x  {pct:.0}%"),
+        UplinkTier::Near => write!(b, "UPLINKING  {rate:.2}x  {pct:.0}%"),
+        UplinkTier::Roaming => write!(b, "UPLINKING  {rate:.2}x  (CLOSER = FASTER)  {pct:.0}%"),
+    };
+    tier
 }
 
 /// Top-center status line: its kind (drives the underline), text and tone.
@@ -2691,7 +2736,7 @@ fn spawn_hud(mut commands: Commands, store: Option<Res<ProfileStore>>, run: Res<
             Node { display: Display::None, flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(4.0), ..default() },
         ))
         .id();
-    commands.spawn((ChildOf(uplink), HudText::UplinkLabel, hud_text("UPLOADING SOS 0%", 17.0, COLOR_CYAN)));
+    commands.spawn((ChildOf(uplink), HudText::UplinkLabel, hud_text("SOS OVERDRIVE  1.25x  0%", 17.0, ACID_GREEN)));
     let gauge = commands
         .spawn((ChildOf(uplink), Node { width: Val::Px(UPLINK_WIDTH), flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }))
         .id();
@@ -3518,13 +3563,11 @@ fn update_hud(
                     let _ = write!(b, "UPLINK JAMMED! KILL THE JAMMER FIEND  {:.0}%", progress * 100.0);
                     COLOR_SIGNAL_RED.with_alpha(if (t * 10.0).sin() > 0.0 { 1.0 } else { 0.4 })
                 }
-                ExtractionState::Uploading { progress, in_ring: false, .. } => {
-                    let _ = write!(b, "RETURN TO SIGNAL RING!  {:.0}%", progress * 100.0);
-                    COLOR_SIGNAL_AMBER
-                }
-                ExtractionState::Uploading { progress, .. } => {
-                    let _ = write!(b, "UPLOADING SOS {:.0}%", progress * 100.0);
-                    COLOR_CYAN
+                ExtractionState::Uploading { progress, rate, .. } => {
+                    let tier = write_uplink_speed(b, progress, rate);
+                    let c = uplink_tier_color(tier);
+                    // OVERDRIVE shimmers; the other tiers hold steady.
+                    if tier == UplinkTier::Overdrive { c.with_alpha(0.85 + 0.15 * (t * 8.0).sin()) } else { c }
                 }
                 _ => COLOR_CYAN,
             },
@@ -3735,14 +3778,12 @@ fn update_hud_boxes(
             }
             HudBox::UplinkPanel => set_display(&mut node, uploading),
             HudBox::UplinkFill => {
-                if let ExtractionState::Uploading { progress, jammed, in_ring, .. } = *ext {
+                if let ExtractionState::Uploading { progress, jammed, rate, .. } = *ext {
                     set_width_pct(&mut node, progress * 100.0);
                     let c = if jammed {
                         COLOR_SIGNAL_RED.with_alpha(if (t * 10.0).sin() > 0.0 { 1.0 } else { 0.4 })
-                    } else if !in_ring {
-                        COLOR_SIGNAL_AMBER
                     } else {
-                        COLOR_CYAN
+                        uplink_tier_color(uplink_tier(rate))
                     };
                     set_bg(&mut bg, c);
                 }
@@ -4355,10 +4396,41 @@ mod tests {
         assert!(shield.blue > shield.red && shield.blue > 0.9, "shielded bar glows cyan-violet");
         let low = boss_bar_color(&BossHud { hp_frac: 0.35, phase: BossPhase::Phase2, ..p1.clone() }, 0.0).to_srgba();
         assert!(low.green > PUNK_RED.to_srgba().green, "shifts toward molten gold");
-        let held = ExtractionState::Uploading { progress: 0.99, duration: 44.0, in_ring: true, jammed: false, wave_timer: 1.0, baron_spawned: true, boss_hold: true };
+        let held = ExtractionState::Uploading { progress: 0.99, duration: 44.0, in_ring: true, rate: 1.25, jammed: false, wave_timer: 1.0, baron_spawned: true, boss_hold: true };
         assert_eq!(uplink_status_text(&held), BOSS_HOLD_STATUS);
         assert_eq!(crate::boss::BOSS_HOLD_TEXT, "UPLINK HELD AT 99% // KILL THE CARRIER DAEMON TO EXTRACT");
-        assert_eq!(uplink_status_text(&ExtractionState::start_upload(1)), "DEMON RUSH - HOLD THE SIGNAL");
+        assert_eq!(uplink_status_text(&ExtractionState::start_upload(1)), "DEMON RUSH - SOS UPLINK LIVE");
+    }
+
+    #[test]
+    fn free_roam_uplink_label_shows_live_speed_and_never_scolds() {
+        use crate::extraction::{proximity_upload_rate, UPLINK_MAX_RATE, UPLINK_MIN_RATE};
+        let label = |progress: f32, rate: f32| {
+            let mut b = String::new();
+            let tier = write_uplink_speed(&mut b, progress, rate);
+            (b, tier)
+        };
+        assert_eq!(label(0.42, UPLINK_MAX_RATE), ("SOS OVERDRIVE  1.25x  42%".to_string(), UplinkTier::Overdrive));
+        assert_eq!(label(0.42, 0.93), ("UPLINKING  0.93x  42%".to_string(), UplinkTier::Near));
+        assert_eq!(label(0.42, 0.80).1, UplinkTier::Near);
+        assert_eq!(label(0.42, 0.61), ("UPLINKING  0.61x  (CLOSER = FASTER)  42%".to_string(), UplinkTier::Roaming));
+        assert_eq!(label(0.0, UPLINK_MIN_RATE).0, "UPLINKING  0.45x  (CLOSER = FASTER)  0%");
+        // Distances map to the expected tiers: ring, just outside ring, outer atrium + adjacent halls, mid-bunker.
+        assert_eq!(uplink_tier(proximity_upload_rate(5.0, false)), UplinkTier::Overdrive);
+        assert_eq!(uplink_tier(proximity_upload_rate(9.5, false)), UplinkTier::Near);
+        assert_eq!(uplink_tier(proximity_upload_rate(14.0, false)), UplinkTier::Near);
+        assert_eq!(uplink_tier(proximity_upload_rate(20.0, false)), UplinkTier::Near);
+        assert_eq!(uplink_tier(proximity_upload_rate(28.0, false)), UplinkTier::Roaming);
+        // Tones: boost green, cyan, warm amber; never the jam / alarm red.
+        assert_eq!(uplink_tier_color(UplinkTier::Overdrive), ACID_GREEN);
+        assert_eq!(uplink_tier_color(UplinkTier::Near), COLOR_CYAN);
+        assert_eq!(uplink_tier_color(UplinkTier::Roaming), COLOR_SIGNAL_AMBER);
+        for tier in [UplinkTier::Overdrive, UplinkTier::Near, UplinkTier::Roaming] {
+            assert_ne!(uplink_tier_color(tier), COLOR_SIGNAL_RED);
+        }
+        for r in [0.45f32, 0.6, 0.8, 1.0, 1.25] {
+            assert!(!label(0.5, r).0.contains("RETURN"), "no scolding copy at {r}x");
+        }
     }
 
     #[test]
@@ -4371,10 +4443,10 @@ mod tests {
         let (run, trial) = (RunStats::default(), TimeTrialState::default());
         let signal = SignalState { in_dead_zone: false, near_tower: false, ..default() };
         let calm = status_line(&run, &trial, &ExtractionState::Searching { hold: 0.0 }, &signal);
-        let uploading = ExtractionState::Uploading { progress: 0.4, duration: 28.0, in_ring: true, jammed: false, wave_timer: 0.5, baron_spawned: false, boss_hold: false };
+        let uploading = ExtractionState::Uploading { progress: 0.4, duration: 28.0, in_ring: true, rate: 1.25, jammed: false, wave_timer: 0.5, baron_spawned: false, boss_hold: false };
         let rush = status_line(&run, &trial, &uploading, &signal);
         assert_eq!(calm, (StatusKind::Searching, "SEARCH FOR 5-BAR SIGNAL TOWER", COLOR_SIGNAL_AMBER));
-        assert_eq!(rush, (StatusKind::Rush, "DEMON RUSH - HOLD THE SIGNAL", COLOR_SIGNAL_RED));
+        assert_eq!(rush, (StatusKind::Rush, "DEMON RUSH - SOS UPLINK LIVE", COLOR_SIGNAL_RED));
         assert_eq!((floor_rail_color(&run, calm.0), floor_rail_color(&run, rush.0)), (HAZARD_YELLOW, PUNK_RED));
         // Signal states: lock, dead zone; the Time Trial keeps its own cyan lines.
         let near = SignalState { near_tower: true, in_dead_zone: true, ..signal.clone() };

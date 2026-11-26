@@ -16,7 +16,7 @@
 //!   every walkable ramp connection.
 
 use std::collections::HashSet;
-use std::f32::consts::{FRAC_PI_2, PI, TAU};
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
 use bevy::math::Affine2;
 use bevy::prelude::*;
@@ -281,6 +281,10 @@ struct ArchMeshes {
     crt: Mesh,
     cabinet: Mesh,
     dish: Mesh,
+    /// Milestone 32: spare antenna coil / cable loop (ring in the XZ plane).
+    coil: Mesh,
+    /// Milestone 32: cable reel flange disc (axis +Y).
+    reel: Mesh,
 }
 
 impl ArchMeshes {
@@ -311,6 +315,8 @@ impl ArchMeshes {
             cabinet: sculpt::beveled_box(Vec3::new(0.72, 2.2, 0.46), 0.035),
             // Shallow parabolic-ish relay dish: wide rim, small hub (axis +Y).
             dish: sculpt::tapered_prism(16, 0.22, 1.7, 0.5, false),
+            coil: sculpt::armored_ring(0.13, 0.028, 0.03, 10, true),
+            reel: sculpt::tapered_prism(12, 0.26, 0.26, 0.04, true),
         }
     }
 }
@@ -333,10 +339,17 @@ fn put_box(b: &mut ArchBatches, s: ArchSlot, m: &ArchMeshes, frame: &Transform, 
 pub fn build_architecture(g: &LevelGrid) -> ArchBatches {
     let m = ArchMeshes::new();
     let mut b = build_architecture_base(g, &m);
-    for p in plan_telecom_props(g) {
+    let interactive = plan_interactive_props(g);
+    let telecom = plan_telecom_props_with(g, &interactive);
+    for p in &telecom {
         let y = face_floor(g, p.face).unwrap_or(0.0);
         build_telecom_prop(&mut b, &m, &p.face.frame(y), p.kind, p.variant);
     }
+    // Milestone 32: corner equipment nooks + overhead ducts / cable trays.
+    for n in plan_corner_nooks_with(g, &interactive, &telecom) {
+        build_corner_nook(&mut b, &m, &n.frame(), n.variant);
+    }
+    build_ceiling_ducts(g, &m, &mut b);
     build_tower_crown(g, &m, &mut b);
     b
 }
@@ -722,8 +735,8 @@ fn build_wall_prop(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, kind: Wa
 // Milestone 30: wall-flush Mars-telecom clutter + Atrium dish crown
 // ---------------------------------------------------------------------------
 
-/// Max protrusion of any telecom prop part from its backing wall face (m):
-/// 0.55 m out of a 8 m (2-cell) corridor leaves the lanes wide open.
+/// Max protrusion of any telecom / wall furniture part from its backing wall
+/// face (m): 0.55 m out of a 8 m (2-cell) corridor leaves the lanes wide open.
 pub const TELECOM_MAX_DEPTH: f32 = 0.55;
 /// Half-width (along the wall) of every telecom prop: clear of the corner
 /// pilasters on the cell edges (|x| >= 1.87).
@@ -733,15 +746,44 @@ pub const TELECOM_MAX_HEIGHT: f32 = 3.4;
 /// Height band of the Atrium relay dish crown on the mast.
 pub const CROWN_MIN_Y: f32 = 11.0;
 
-/// What a telecom slot holds.
+/// What a telecom / wall furniture slot holds (Milestone 30 + 32 archetypes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelecomKind {
-    /// Wall ledge desk with a crooked, cracked CRT, keyboard slab and tower.
+    /// Wall ledge desk with a crooked, cracked CRT, keyboard slab, tower and
+    /// a swivel chair tucked in beside it.
     PcStation,
     /// Tall flush UAC 19-inch server cabinet with LED status strips.
     WallRack,
     /// "NO SIGNAL" RF status light box + floor-edge cable duct.
     NoSignalBox,
+    /// Wide dual-monitor dispatch desk: twin angled telemetry screens, sloped
+    /// button console, task lamp bar and filing drawers (2.2 m x 0.54 m).
+    OpsConsole,
+    /// Retro UAC ration / beverage vending machine (0.95 x 2.15 x 0.52 m).
+    VendingMachine,
+    /// 4-tier industrial steel shelving with crates, coils and canisters
+    /// (1.8 x 2.2 x 0.50 m).
+    SupplyShelf,
+    /// Triple technician locker bay, one door ajar, bench rail in front
+    /// (1.65 x 2.15 x 0.48 m, bench <= 0.54 m).
+    LockerBank,
+    /// Signal-research workbench: light bar, oscilloscope, canisters and a
+    /// tool pegboard (2.0 m x 0.54 m).
+    LabBench,
+}
+
+impl TelecomKind {
+    /// Every archetype, in placement cycle order.
+    pub const ALL: [TelecomKind; 8] = [
+        TelecomKind::PcStation,
+        TelecomKind::OpsConsole,
+        TelecomKind::WallRack,
+        TelecomKind::VendingMachine,
+        TelecomKind::SupplyShelf,
+        TelecomKind::NoSignalBox,
+        TelecomKind::LockerBank,
+        TelecomKind::LabBench,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,10 +794,14 @@ pub struct TelecomProp {
     pub variant: u8,
 }
 
-/// Telecom props wanted on a floor.
+/// Telecom / wall furniture pieces wanted on a floor (26..=42; Endless
+/// floors keep the Floor 5 count).
 pub fn telecom_prop_target(floor: u32) -> usize {
-    8 + 2 * floor.clamp(1, 5) as usize
+    22 + 4 * floor.clamp(1, 5) as usize
 }
+
+/// Min Manhattan spacing (cells) between two static wall furniture pieces.
+pub const TELECOM_SPACING: i32 = 2;
 
 /// Whether `face` can host a wall-flush telecom prop: a flat ground-level
 /// cell of a room or a corridor at least 2 cells (8 m) wide, mid-way along an
@@ -795,27 +841,41 @@ pub fn telecom_slot_ok(g: &LevelGrid, face: WallFace) -> bool {
         && !g.rooms.iter().any(|r| r.center() == c)
 }
 
-/// Deterministic telecom prop placement (rooms + corridors), spaced >= 3
-/// cells apart and >= 2 cells from the Milestone 16 wall props, cycling
-/// PC station -> server rack -> NO SIGNAL box.
+/// Deterministic static wall furniture placement (rooms + corridors), spaced
+/// at least [`TELECOM_SPACING`] cells apart and 2 cells (Chebyshev) from the
+/// Milestone 16 wall props AND the Milestone 31 interactive CRTs / UPS racks
+/// (planned first, so denser furniture never crowds them out), cycling the 8
+/// [`TelecomKind`] archetypes from a per-floor offset.
 pub fn plan_telecom_props(g: &LevelGrid) -> Vec<TelecomProp> {
-    let walls: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).collect();
+    let interactive = plan_interactive_props(g);
+    plan_telecom_props_with(g, &interactive)
+}
+
+/// [`plan_telecom_props`] with the floor's interactive plan already computed.
+pub fn plan_telecom_props_with(g: &LevelGrid, interactive: &[InteractiveProp]) -> Vec<TelecomProp> {
+    let taken: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).chain(interactive.iter().map(|p| p.face.cell)).collect();
     let mut cands: Vec<WallFace> = wall_faces(g)
         .into_iter()
-        .filter(|f| telecom_slot_ok(g, *f) && walls.iter().all(|w| (*w - f.cell).abs().max_element() >= 2))
+        .filter(|f| telecom_slot_ok(g, *f) && taken.iter().all(|w| (*w - f.cell).abs().max_element() >= 2))
         .collect();
     let mut rng = StdRng::seed_from_u64(g.seed ^ 0x7E1E_C030_5161_A1ED);
     cands.shuffle(&mut rng);
+    // Checkerboard parity first (stable: the shuffle survives within each
+    // half): along a straight wall that packs every other cell, and across a
+    // 2-cell corridor the two walls stagger into a zig-zag.
+    let parity = (g.seed & 1) as i32;
+    cands.sort_by_key(|f| (f.cell.x + f.cell.y + parity).rem_euclid(2));
     let want = telecom_prop_target(g.floor);
-    let kinds = [TelecomKind::PcStation, TelecomKind::WallRack, TelecomKind::NoSignalBox];
+    let kinds = TelecomKind::ALL;
+    let offset = (g.seed % kinds.len() as u64) as usize;
     let mut out: Vec<TelecomProp> = Vec::new();
     for face in cands {
         if out.len() >= want {
             break;
         }
-        if out.iter().all(|p| (p.face.cell - face.cell).abs().element_sum() >= 3) {
+        if out.iter().all(|p| (p.face.cell - face.cell).abs().element_sum() >= TELECOM_SPACING) {
             let i = out.len();
-            out.push(TelecomProp { face, kind: kinds[i % 3], variant: ((face.cell.x * 7 + face.cell.y * 13).rem_euclid(3)) as u8 });
+            out.push(TelecomProp { face, kind: kinds[(i + offset) % kinds.len()], variant: ((face.cell.x * 7 + face.cell.y * 13).rem_euclid(3)) as u8 });
         }
     }
     out
@@ -858,6 +918,19 @@ fn build_telecom_prop(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, kind:
             for k in 0..3 {
                 b.put(Plate, &m.cube, &kb, bx(Vec3::new(0.42, 0.008, 0.03), Vec3::new(0.0, 0.016, -0.045 + k as f32 * 0.045)));
             }
+            // Milestone 32: swivel chair tucked in beside the desk (backrest to the wall).
+            let cx = if variant == 2 { -1.12 } else { 1.12 };
+            let chair = fr.mul_transform(Transform::from_xyz(cx, 0.0, 0.3).with_rotation(Quat::from_rotation_y(0.2)));
+            for a in [FRAC_PI_4, -FRAC_PI_4] {
+                b.put(Trim, &m.cube, &chair, Transform::from_xyz(0.0, 0.05, 0.0).with_rotation(Quat::from_rotation_y(a)).with_scale(Vec3::new(0.46, 0.04, 0.05)));
+            }
+            b.put(Trim, &m.thin_pipe, &chair, Transform::from_xyz(0.0, 0.27, 0.0).with_scale(Vec3::new(0.8, 0.4, 0.8)));
+            b.put(Plate, &m.cube, &chair, bx(Vec3::new(0.44, 0.08, 0.4), Vec3::new(0.0, 0.5, 0.0)));
+            b.put(Plate, &m.cube, &chair, Transform::from_xyz(0.0, 0.86, -0.17).with_rotation(Quat::from_rotation_x(-0.12)).with_scale(Vec3::new(0.42, 0.56, 0.06)));
+            for sx in [-0.2f32, 0.2] {
+                put_box(b, Trim, m, &chair, Vec3::new(0.04, 0.04, 0.28), Vec3::new(sx, 0.68, 0.02));
+                put_box(b, Trim, m, &chair, Vec3::new(0.03, 0.14, 0.03), Vec3::new(sx, 0.6, 0.06));
+            }
         }
         TelecomKind::WallRack => {
             // 19-inch cabinet on a plinth, front door, vent slats, 1U blades.
@@ -899,6 +972,442 @@ fn build_telecom_prop(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, kind:
             put_box(b, Trim, m, fr, Vec3::new(3.2, 0.12, 0.22), Vec3::new(0.0, 0.06, 0.11));
             put_box(b, Plate, m, fr, Vec3::new(3.2, 0.02, 0.24), Vec3::new(0.0, 0.13, 0.12));
             put_box(b, Accent, m, fr, Vec3::new(3.0, 0.015, 0.01), Vec3::new(0.0, 0.08, 0.225));
+        }
+        TelecomKind::OpsConsole => build_ops_console(b, m, fr, glow, variant),
+        TelecomKind::VendingMachine => build_vending_machine(b, m, fr, glow, variant),
+        TelecomKind::SupplyShelf => build_supply_shelf(b, m, fr, variant),
+        TelecomKind::LockerBank => build_locker_bank(b, m, fr, variant),
+        TelecomKind::LabBench => build_lab_bench(b, m, fr, variant),
+    }
+}
+
+/// Wide dual-monitor dispatch desk (2.2 m x 0.54 m) in the face frame.
+fn build_ops_console(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, glow: ArchSlot, variant: u8) {
+    use ArchSlot::{Accent, Lamp, Plate, Screen, Trim};
+    // Desk slab + front accent lip.
+    put_box(b, Trim, m, fr, Vec3::new(2.2, 0.06, 0.54), Vec3::new(0.0, 0.78, 0.27));
+    put_box(b, Accent, m, fr, Vec3::new(2.0, 0.012, 0.012), Vec3::new(0.0, 0.76, 0.53));
+    // Side filing drawer pedestals with drawer seams + pulls.
+    for sx in [-0.84f32, 0.84] {
+        put_box(b, Plate, m, fr, Vec3::new(0.46, 0.72, 0.5), Vec3::new(sx, 0.38, 0.25));
+        for k in 0..3 {
+            let y = 0.2 + k as f32 * 0.22;
+            put_box(b, Trim, m, fr, Vec3::new(0.42, 0.015, 0.01), Vec3::new(sx, y + 0.1, 0.505));
+            put_box(b, Trim, m, fr, Vec3::new(0.14, 0.025, 0.02), Vec3::new(sx, y, 0.51));
+        }
+    }
+    // Twin telemetry monitors angled in toward the operator, on wall arms.
+    for (sx, yaw) in [(-0.38f32, 0.2f32), (0.38, -0.2)] {
+        put_box(b, Trim, m, fr, Vec3::new(0.06, 0.06, 0.1), Vec3::new(sx, 1.2, 0.05));
+        let mon = fr.mul_transform(Transform::from_xyz(sx, 1.2, 0.14).with_rotation(Quat::from_rotation_y(yaw) * Quat::from_rotation_x(-0.08)));
+        b.put(Trim, &m.cube, &mon, bx(Vec3::new(0.62, 0.42, 0.05), Vec3::ZERO));
+        let screen = if sx < 0.0 { glow } else { Screen };
+        b.put(screen, &m.cube, &mon, bx(Vec3::new(0.54, 0.34, 0.01), Vec3::new(0.0, 0.0, 0.03)));
+        // Telemetry trace lines over the glow.
+        for k in 0..2 {
+            b.put(Trim, &m.cube, &mon, bx(Vec3::new(0.46, 0.008, 0.004), Vec3::new(0.0, -0.06 + k as f32 * 0.1, 0.037)));
+        }
+    }
+    // Sloped button console on the desk front.
+    let deck = fr.mul_transform(Transform::from_xyz(0.0, 0.86, 0.36).with_rotation(Quat::from_rotation_x(-0.45)));
+    b.put(Trim, &m.cube, &deck, bx(Vec3::new(1.0, 0.16, 0.04), Vec3::ZERO));
+    b.put(Plate, &m.cube, &deck, bx(Vec3::new(0.92, 0.1, 0.01), Vec3::new(0.0, 0.0, 0.024)));
+    for k in 0..4 {
+        let slot = if (k + variant as usize).is_multiple_of(3) { Lamp } else { Accent };
+        b.put(slot, &m.cube, &deck, bx(Vec3::new(0.06, 0.035, 0.012), Vec3::new(-0.3 + k as f32 * 0.2, 0.01, 0.034)));
+    }
+    // Overhead task lamp bar on two wall brackets.
+    put_box(b, Trim, m, fr, Vec3::new(1.9, 0.06, 0.22), Vec3::new(0.0, 1.78, 0.13));
+    put_box(b, Lamp, m, fr, Vec3::new(1.7, 0.012, 0.08), Vec3::new(0.0, 1.744, 0.15));
+    for sx in [-0.8f32, 0.8] {
+        put_box(b, Trim, m, fr, Vec3::new(0.05, 0.3, 0.05), Vec3::new(sx, 1.95, 0.03));
+    }
+}
+
+/// Retro UAC ration / beverage vending machine (0.95 x 2.15 x 0.52 m).
+fn build_vending_machine(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, glow: ArchSlot, variant: u8) {
+    use ArchSlot::{Accent, Lamp, Plate, Screen, Trim};
+    put_box(b, Trim, m, fr, Vec3::new(0.9, 0.06, 0.48), Vec3::new(0.0, 0.03, 0.24));
+    put_box(b, Plate, m, fr, Vec3::new(0.95, 2.09, 0.5), Vec3::new(0.0, 1.105, 0.25));
+    // Header with a glowing UAC logo strip.
+    put_box(b, Trim, m, fr, Vec3::new(0.95, 0.2, 0.02), Vec3::new(0.0, 2.0, 0.51));
+    put_box(b, Accent, m, fr, Vec3::new(0.7, 0.06, 0.01), Vec3::new(0.0, 2.0, 0.522));
+    // Display window: frame, glow pane, shelves of colorful cans in front of it.
+    let (wx, ww, wh, wy) = (-0.11f32, 0.6f32, 1.12f32, 1.28f32);
+    put_box(b, Trim, m, fr, Vec3::new(ww + 0.06, wh + 0.06, 0.01), Vec3::new(wx, wy, 0.503));
+    put_box(b, glow, m, fr, Vec3::new(ww, wh, 0.008), Vec3::new(wx, wy, 0.51));
+    let can_slots = [Accent, Plate, Lamp, Trim, Screen];
+    for row in 0..4 {
+        let y = wy - wh * 0.5 + 0.06 + row as f32 * 0.27;
+        put_box(b, Trim, m, fr, Vec3::new(ww, 0.02, 0.012), Vec3::new(wx, y, 0.518));
+        for k in 0..4 {
+            let slot = can_slots[(row + k + variant as usize) % can_slots.len()];
+            put_box(b, slot, m, fr, Vec3::new(0.08, 0.13, 0.008), Vec3::new(wx - 0.21 + k as f32 * 0.14, y + 0.08, 0.52));
+        }
+    }
+    // Illuminated keypad strip + coin slot on the right.
+    put_box(b, Trim, m, fr, Vec3::new(0.2, 0.52, 0.012), Vec3::new(0.34, 1.45, 0.506));
+    put_box(b, Lamp, m, fr, Vec3::new(0.13, 0.32, 0.008), Vec3::new(0.34, 1.5, 0.514));
+    for k in 0..3 {
+        put_box(b, Trim, m, fr, Vec3::new(0.14, 0.012, 0.004), Vec3::new(0.34, 1.4 + k as f32 * 0.1, 0.52));
+    }
+    put_box(b, Trim, m, fr, Vec3::new(0.004, 0.32, 0.004), Vec3::new(0.34, 1.5, 0.52));
+    put_box(b, Accent, m, fr, Vec3::new(0.08, 0.02, 0.01), Vec3::new(0.34, 1.12, 0.51));
+    // Recessed pickup bay: lips around a dark flap.
+    put_box(b, Trim, m, fr, Vec3::new(0.62, 0.04, 0.03), Vec3::new(-0.05, 0.5, 0.515));
+    put_box(b, Trim, m, fr, Vec3::new(0.62, 0.04, 0.03), Vec3::new(-0.05, 0.26, 0.515));
+    for sx in [-0.34f32, 0.24] {
+        put_box(b, Trim, m, fr, Vec3::new(0.04, 0.28, 0.03), Vec3::new(sx, 0.38, 0.515));
+    }
+    b.put(Trim, &m.cube, fr, Transform::from_xyz(-0.05, 0.38, 0.505).with_rotation(Quat::from_rotation_x(0.12)).with_scale(Vec3::new(0.54, 0.18, 0.01)));
+}
+
+/// 4-tier industrial steel shelving rack (1.8 x 2.2 x 0.50 m).
+fn build_supply_shelf(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, variant: u8) {
+    use ArchSlot::{Accent, Lamp, Plate, Screen, Trim};
+    for sx in [-0.87f32, 0.87] {
+        for z in [0.03f32, 0.47] {
+            put_box(b, Trim, m, fr, Vec3::new(0.05, 2.2, 0.05), Vec3::new(sx, 1.1, z));
+        }
+    }
+    // Rear X brace.
+    for a in [0.85f32, -0.85] {
+        b.put(Trim, &m.cube, fr, Transform::from_xyz(0.0, 1.1, 0.02).with_rotation(Quat::from_rotation_z(a)).with_scale(Vec3::new(0.03, 2.3, 0.02)));
+    }
+    let decks = [0.12f32, 0.68, 1.24, 1.8];
+    for y in decks {
+        put_box(b, Trim, m, fr, Vec3::new(1.78, 0.04, 0.48), Vec3::new(0.0, y, 0.25));
+        put_box(b, Plate, m, fr, Vec3::new(1.78, 0.06, 0.02), Vec3::new(0.0, y - 0.01, 0.49));
+    }
+    put_box(b, Trim, m, fr, Vec3::new(1.8, 0.04, 0.5), Vec3::new(0.0, 2.18, 0.25));
+    let shift = if variant == 1 { 0.18 } else { -0.12 };
+    // Tier 1: heavy supply crates with hazard stripes.
+    let deck = decks[0] + 0.02;
+    for (x, w, h) in [(-0.45f32 + shift, 0.6f32, 0.46f32), (0.35 + shift, 0.5, 0.38)] {
+        put_box(b, Plate, m, fr, Vec3::new(w, h, 0.42), Vec3::new(x, deck + h * 0.5, 0.25));
+        put_box(b, Accent, m, fr, Vec3::new(w * 0.8, 0.03, 0.01), Vec3::new(x, deck + h * 0.75, 0.465));
+    }
+    // Tier 2: staggered ammo boxes.
+    let deck = decks[1] + 0.02;
+    for (i, x) in [-0.6f32, -0.17, 0.24, 0.62].into_iter().enumerate() {
+        let h = if i % 2 == 0 { 0.26 } else { 0.2 };
+        put_box(b, Plate, m, fr, Vec3::new(0.34, h, 0.3), Vec3::new(x - shift * 0.5, deck + h * 0.5, 0.2 + (i % 2) as f32 * 0.08));
+        put_box(b, Trim, m, fr, Vec3::new(0.12, 0.03, 0.02), Vec3::new(x - shift * 0.5, deck + h - 0.01, 0.37 + (i % 2) as f32 * 0.08));
+    }
+    // Tier 3: spare antenna coils stood on edge.
+    let deck = decks[2] + 0.02;
+    for x in [-0.55f32, -0.22, 0.12] {
+        b.put(Trim, &m.coil, fr, Transform::from_xyz(x + shift, deck + 0.16, 0.24).with_rotation(Quat::from_rotation_z(FRAC_PI_2)));
+    }
+    b.put(Plate, &m.cube, fr, bx(Vec3::new(0.36, 0.3, 0.36), Vec3::new(0.6, deck + 0.15, 0.24)));
+    // Tier 4: hazard canisters with glowing bands.
+    let deck = decks[3] + 0.02;
+    for (i, x) in [-0.6f32, -0.3, 0.0].into_iter().enumerate() {
+        let tf = Transform::from_xyz(x - shift, deck + 0.17, 0.24).with_scale(Vec3::new(0.9, 0.22, 0.9));
+        b.put(Plate, &m.canister, fr, tf);
+        b.put(if i == 1 { Lamp } else { Accent }, &m.cube, fr, bx(Vec3::new(0.24, 0.03, 0.24), Vec3::new(x - shift, deck + 0.24, 0.24)));
+    }
+    // Status LED tag on the upright.
+    put_box(b, Plate, m, fr, Vec3::new(0.14, 0.09, 0.012), Vec3::new(0.78, 1.5, 0.5));
+    put_box(b, Screen, m, fr, Vec3::new(0.05, 0.035, 0.008), Vec3::new(0.78, 1.5, 0.509));
+}
+
+/// Triple UAC technician locker bay (1.65 x 2.15 x 0.48 m) + bench rail.
+fn build_locker_bank(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, variant: u8) {
+    use ArchSlot::{Accent, Lamp, Plate, Trim};
+    put_box(b, Trim, m, fr, Vec3::new(1.65, 0.1, 0.4), Vec3::new(0.0, 0.05, 0.2));
+    put_box(b, Plate, m, fr, Vec3::new(1.65, 2.0, 0.42), Vec3::new(0.0, 1.1, 0.21));
+    put_box(b, Trim, m, fr, Vec3::new(1.65, 0.05, 0.44), Vec3::new(0.0, 2.125, 0.22));
+    let ajar = (variant % 3) as usize;
+    for i in 0..3usize {
+        let x = -0.55 + i as f32 * 0.55;
+        // Doors hinge on their left edge; the ajar one swings out ~10 deg.
+        let open = if i == ajar { 0.1 } else { 0.0 };
+        if i == ajar {
+            // Dark interior + hung gear peeking out of the gap.
+            put_box(b, Trim, m, fr, Vec3::new(0.48, 1.86, 0.004), Vec3::new(x, 1.1, 0.422));
+            put_box(b, Plate, m, fr, Vec3::new(0.22, 0.7, 0.03), Vec3::new(x + 0.1, 1.25, 0.44));
+            put_box(b, Lamp, m, fr, Vec3::new(0.12, 0.04, 0.01), Vec3::new(x + 0.1, 1.72, 0.45));
+        }
+        let door = fr.mul_transform(Transform::from_xyz(x - 0.25, 0.0, 0.42).with_rotation(Quat::from_rotation_y(-open)));
+        b.put(Plate, &m.cube, &door, bx(Vec3::new(0.5, 1.9, 0.02), Vec3::new(0.25, 1.1, 0.01)));
+        for k in 0..4 {
+            b.put(Trim, &m.cube, &door, bx(Vec3::new(0.32, 0.02, 0.008), Vec3::new(0.25, 1.75 + k as f32 * 0.06, 0.024)));
+        }
+        b.put(Accent, &m.cube, &door, bx(Vec3::new(0.03, 0.12, 0.01), Vec3::new(0.44, 1.1, 0.025)));
+        b.put(Trim, &m.cube, &door, bx(Vec3::new(0.18, 0.05, 0.006), Vec3::new(0.25, 1.45, 0.023)));
+    }
+    // Narrow bench rail tucked flush in front (<= 0.54 m), clear of the ajar door.
+    put_box(b, Trim, m, fr, Vec3::new(1.4, 0.05, 0.044), Vec3::new(0.0, 0.45, 0.518));
+    for sx in [-0.6f32, 0.6] {
+        put_box(b, Trim, m, fr, Vec3::new(0.03, 0.42, 0.03), Vec3::new(sx, 0.21, 0.518));
+    }
+}
+
+/// Mars signal-research workbench (2.0 m x 0.54 m) + pegboard + light bar.
+fn build_lab_bench(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, variant: u8) {
+    use ArchSlot::{Accent, Lamp, Plate, Screen, Trim};
+    put_box(b, Trim, m, fr, Vec3::new(2.0, 0.07, 0.54), Vec3::new(0.0, 0.9, 0.27));
+    put_box(b, Plate, m, fr, Vec3::new(1.9, 0.03, 0.46), Vec3::new(0.0, 0.25, 0.25));
+    for sx in [-0.95f32, 0.95] {
+        for z in [0.04f32, 0.5] {
+            put_box(b, Trim, m, fr, Vec3::new(0.06, 0.87, 0.06), Vec3::new(sx, 0.435, z));
+        }
+    }
+    // Tool pegboard with hung tools.
+    put_box(b, Plate, m, fr, Vec3::new(1.8, 0.9, 0.02), Vec3::new(0.0, 1.62, 0.01));
+    for (x, y, a, h) in [(-0.7f32, 1.6f32, 0.3f32, 0.4f32), (-0.45, 1.65, -0.2, 0.32), (0.1, 1.55, 0.0, 0.45), (0.45, 1.7, 0.6, 0.3), (0.7, 1.6, -0.4, 0.36)] {
+        b.put(Trim, &m.cube, fr, Transform::from_xyz(x, y, 0.035).with_rotation(Quat::from_rotation_z(a)).with_scale(Vec3::new(0.04, h, 0.03)));
+    }
+    put_box(b, Accent, m, fr, Vec3::new(0.16, 0.08, 0.03), Vec3::new(0.1, 1.82, 0.035));
+    // Overhead light bar.
+    put_box(b, Trim, m, fr, Vec3::new(1.9, 0.06, 0.2), Vec3::new(0.0, 2.35, 0.12));
+    put_box(b, Lamp, m, fr, Vec3::new(1.7, 0.012, 0.08), Vec3::new(0.0, 2.314, 0.14));
+    for sx in [-0.85f32, 0.85] {
+        put_box(b, Trim, m, fr, Vec3::new(0.04, 0.3, 0.04), Vec3::new(sx, 2.5, 0.03));
+    }
+    // Oscilloscope with a glowing trace screen + knobs.
+    let ox = if variant == 2 { 0.5 } else { -0.5 };
+    put_box(b, Trim, m, fr, Vec3::new(0.44, 0.28, 0.36), Vec3::new(ox, 1.075, 0.24));
+    put_box(b, Screen, m, fr, Vec3::new(0.22, 0.16, 0.01), Vec3::new(ox - 0.06, 1.09, 0.424));
+    put_box(b, Trim, m, fr, Vec3::new(0.18, 0.008, 0.004), Vec3::new(ox - 0.06, 1.1, 0.431));
+    for k in 0..2 {
+        put_box(b, Accent, m, fr, Vec3::new(0.04, 0.04, 0.02), Vec3::new(ox + 0.14, 1.04 + k as f32 * 0.09, 0.43));
+    }
+    // Specimen / battery canisters, one glowing.
+    for (i, x) in [0.05f32, 0.22, 0.39].into_iter().enumerate() {
+        let x = -ox * 0.2 + x - 0.2;
+        b.put(Plate, &m.canister, fr, Transform::from_xyz(x, 1.085, 0.32).with_scale(Vec3::new(0.5, 0.2, 0.5)));
+        b.put(if i == 1 { Screen } else { Accent }, &m.cube, fr, bx(Vec3::new(0.1, 0.03, 0.1), Vec3::new(x, 1.1, 0.32)));
+        b.put(Trim, &m.canister_cap, fr, Transform::from_xyz(x, 1.24, 0.32).with_scale(Vec3::new(0.5, 0.5, 0.5)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 32: corner equipment nooks + overhead ducts / cable trays
+// ---------------------------------------------------------------------------
+
+/// Max reach of a corner nook part from either of its two walls (m).
+pub const NOOK_MAX_DEPTH: f32 = 0.72;
+/// Max height of a corner nook part above its floor (m).
+pub const NOOK_MAX_HEIGHT: f32 = 2.2;
+/// Lowest point of any overhead duct / cable tray part (m above floor 0).
+pub const DUCT_MIN_Y: f32 = 5.6;
+/// Highest point of the duct / tray bodies themselves (hangers reach the ceiling).
+pub const DUCT_MAX_Y: f32 = 6.8;
+
+/// A compact equipment cluster tucked into an interior 90 degree room corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CornerNook {
+    /// The floor cell of the corner.
+    pub cell: IVec2,
+    /// Unit grid offsets from `cell` to its two solid wall neighbours.
+    pub a: IVec2,
+    pub b: IVec2,
+    pub variant: u8,
+}
+
+impl CornerNook {
+    /// The corner point on the floor (where both wall planes meet).
+    pub fn corner(&self) -> Vec3 {
+        let c = (self.cell.as_vec2() + Vec2::splat(0.5) + (self.a + self.b).as_vec2() * 0.5) * CELL_SIZE;
+        Vec3::new(c.x, 0.0, c.y)
+    }
+
+    /// Local right-handed frame: origin at the corner, +Y up, +X / +Z out of
+    /// the two walls (`a` / `b`, swapped where needed to stay right-handed).
+    pub fn frame(&self) -> Transform {
+        let u = Vec3::new(-self.a.x as f32, 0.0, -self.a.y as f32);
+        let v = Vec3::new(-self.b.x as f32, 0.0, -self.b.y as f32);
+        let rot = Quat::from_mat3(&Mat3::from_cols(u, Vec3::Y, v));
+        // A left-handed (u, Y, v) basis mirrors: flip to a proper rotation by
+        // swapping the roles of the walls (the cluster is symmetric enough).
+        let rot = if u.cross(Vec3::Y).dot(v) > 0.0 { rot } else { Quat::from_mat3(&Mat3::from_cols(v, Vec3::Y, u)) };
+        Transform::from_translation(self.corner()).with_rotation(rot)
+    }
+}
+
+/// Corner nooks wanted per floor (7..=12).
+pub fn corner_nook_target(floor: u32) -> usize {
+    6 + floor.clamp(1, 6) as usize
+}
+
+/// Whether `cell` is a clean interior 90 degree corner for a nook: a flat
+/// ground-level cell of a room or a >= 2-cell-wide corridor bend / dead end
+/// (never the Atrium) with solid walls on two orthogonal sides `a` / `b`
+/// that both continue past the corner (no doorway jamb), a 2x2 open block
+/// diagonally out from it (never a 1-cell squeeze), clear of ramps, pits,
+/// raised plates, the spawn, tower, jammers, jump pads, barrels, pickups and
+/// room centers.
+pub fn corner_nook_ok(g: &LevelGrid, cell: IVec2, a: IVec2, b: IVec2) -> bool {
+    if a.dot(b) != 0 || !matches!(g.cell(cell), Cell::Floor { height } if height == 0.0) || g.is_roof_open(cell) {
+        return false;
+    }
+    let wall = |o: IVec2| g.cell(cell + o).is_wall();
+    if !(wall(a) && wall(b) && wall(a + b) && wall(a - b) && wall(b - a)) || wall(-a) || wall(-b) || wall(-a - b) {
+        return false;
+    }
+    if g.rooms.first().is_some_and(|r| r.contains(cell)) || g.rooms.iter().any(|r| r.center() == cell) {
+        return false;
+    }
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            match g.cell(cell + IVec2::new(dx, dz)) {
+                Cell::Ramp { .. } | Cell::HazardPit | Cell::AtriumFloor => return false,
+                Cell::Floor { height } if height > 0.1 => return false,
+                _ => {}
+            }
+        }
+    }
+    let far = |p: IVec2| (p - cell).abs().max_element() >= 2;
+    (cell - g.spawn).abs().element_sum() >= 3
+        && (g.tower - cell).abs().max_element() >= 3
+        && g.jammers.iter().all(|&j| far(j))
+        && g.jump_pads.iter().all(|p| far(p.cell))
+        && g.barrels.iter().all(|&b| far(b))
+        && g.rooms.iter().skip(1).filter_map(|r| crate::level::room_pickup_cell(g, r)).all(far)
+}
+
+/// Deterministic corner nook placement (capped by [`corner_nook_target`]),
+/// clear of the interactive CRTs / UPS racks (>= 2 cells) and of every
+/// static wall prop / furniture cell.
+pub fn plan_corner_nooks(g: &LevelGrid) -> Vec<CornerNook> {
+    let interactive = plan_interactive_props(g);
+    let telecom = plan_telecom_props_with(g, &interactive);
+    plan_corner_nooks_with(g, &interactive, &telecom)
+}
+
+fn plan_corner_nooks_with(g: &LevelGrid, interactive: &[InteractiveProp], telecom: &[TelecomProp]) -> Vec<CornerNook> {
+    let statics: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).chain(telecom.iter().map(|p| p.face.cell)).collect();
+    let mut cands = Vec::new();
+    for z in 0..g.depth {
+        for x in 0..g.width {
+            let c = IVec2::new(x, z);
+            for (a, b) in [(IVec2::X, IVec2::Y), (IVec2::Y, IVec2::NEG_X), (IVec2::NEG_X, IVec2::NEG_Y), (IVec2::NEG_Y, IVec2::X)] {
+                if corner_nook_ok(g, c, a, b) && interactive.iter().all(|p| (p.face.cell - c).abs().max_element() >= 2) && !statics.contains(&c) {
+                    cands.push((c, a, b));
+                }
+            }
+        }
+    }
+    let mut rng = StdRng::seed_from_u64(g.seed ^ 0xC0E2_4E00_0032_B0C5);
+    cands.shuffle(&mut rng);
+    // Room corners first (furnished rooms), then corridor bends / dead ends.
+    cands.sort_by_key(|(c, _, _)| !g.rooms.iter().skip(1).any(|r| r.contains(*c)));
+    let want = corner_nook_target(g.floor);
+    let mut out: Vec<CornerNook> = Vec::new();
+    for (cell, a, b) in cands {
+        if out.len() >= want {
+            break;
+        }
+        if out.iter().all(|n| n.cell != cell) {
+            out.push(CornerNook { cell, a, b, variant: ((cell.x * 5 + cell.y * 3).rem_euclid(3)) as u8 });
+        }
+    }
+    out
+}
+
+/// Bake one corner nook in its frame (origin at the corner, +X / +Z out of
+/// the two walls): stacked crates, a wall-hung cable reel and a diagnostic
+/// beacon, every vertex within `0..=NOOK_MAX_DEPTH` of both walls.
+fn build_corner_nook(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, variant: u8) {
+    use ArchSlot::{Accent, Lamp, Plate, Screen, Trim};
+    // Stacked metal crates (clear of the corner pilasters, < 0.16 m).
+    put_box(b, Trim, m, fr, Vec3::new(0.5, 0.06, 0.5), Vec3::new(0.44, 0.03, 0.44));
+    put_box(b, Plate, m, fr, Vec3::new(0.48, 0.42, 0.48), Vec3::new(0.44, 0.27, 0.44));
+    put_box(b, Accent, m, fr, Vec3::new(0.4, 0.03, 0.01), Vec3::new(0.44, 0.36, 0.685));
+    put_box(b, Trim, m, fr, Vec3::new(0.5, 0.03, 0.5), Vec3::new(0.44, 0.49, 0.44));
+    let top = fr.mul_transform(Transform::from_xyz(0.44, 0.67, 0.44).with_rotation(Quat::from_rotation_y(0.3 + variant as f32 * 0.1)));
+    b.put(Plate, &m.cube, &top, bx(Vec3::new(0.34, 0.32, 0.34), Vec3::ZERO));
+    b.put(Trim, &m.cube, &top, bx(Vec3::new(0.36, 0.03, 0.08), Vec3::new(0.0, 0.17, 0.0)));
+    // Coiled cable reel hung flat on wall `a`.
+    let reel = fr.mul_transform(Transform::from_xyz(0.12, 1.35, 0.42).with_rotation(Quat::from_rotation_z(FRAC_PI_2)));
+    for y in [-0.08f32, 0.08] {
+        b.put(Trim, &m.reel, &reel, Transform::from_xyz(0.0, y, 0.0));
+    }
+    b.put(Plate, &m.coil, &reel, Transform::IDENTITY.with_scale(Vec3::new(1.1, 2.4, 1.1)));
+    put_box(b, Trim, m, fr, Vec3::new(0.06, 0.08, 0.08), Vec3::new(0.03, 1.35, 0.42));
+    // Diagnostic beacon on wall `b`, blinking.
+    put_box(b, Trim, m, fr, Vec3::new(0.16, 0.22, 0.12), Vec3::new(0.42, 1.95, 0.06));
+    put_box(b, if variant == 1 { Screen } else { Lamp }, m, fr, Vec3::new(0.1, 0.08, 0.02), Vec3::new(0.42, 1.98, 0.13));
+    // Conduit from the beacon down to the crate stack.
+    b.put(Trim, &m.thin_pipe, fr, Transform::from_xyz(0.58, 1.3, 0.05).with_scale(Vec3::new(0.5, 1.1, 0.5)));
+}
+
+/// Floor cells an overhead duct run may hang over: covered (closed roof),
+/// flat ground level (no raised plates / ramps underneath).
+fn duct_cell_ok(g: &LevelGrid, c: IVec2) -> bool {
+    let flat = matches!(g.cell(c), Cell::Floor { height } if height <= 0.1) || matches!(g.cell(c), Cell::HazardPit);
+    flat && covered(g, c)
+        && !g.jammers.contains(&c)
+        && !g.pillars.iter().any(|p| g.world_to_cell(Vec3::new(p.x, 0.0, p.y)) == c)
+}
+
+/// Overhead HVAC ducts + cable trays: along every straight corridor lane and
+/// down the long axis of every closed-roof room, all between
+/// [`DUCT_MIN_Y`] and the ceiling (hangers), never over open-roof cells.
+fn build_ceiling_ducts(g: &LevelGrid, m: &ArchMeshes, b: &mut ArchBatches) {
+    let mut runs: Vec<(IVec2, bool, IVec2)> = Vec::new();
+    for z in 0..g.depth {
+        for x in 0..g.width {
+            let c = IVec2::new(x, z);
+            if !duct_cell_ok(g, c) {
+                continue;
+            }
+            if let Some(along_x) = corridor_axis(g, c) {
+                let lat = walled_side(g, c, along_x).unwrap_or(if along_x { IVec2::Y } else { IVec2::X });
+                runs.push((c, along_x, lat));
+            }
+        }
+    }
+    for room in g.rooms.iter().skip(1) {
+        let along_x = room.size.x >= room.size.y;
+        let mid = room.min + room.size / 2;
+        let n = if along_x { room.size.x } else { room.size.y };
+        for k in 0..n {
+            let c = if along_x { IVec2::new(room.min.x + k, mid.y) } else { IVec2::new(mid.x, room.min.y + k) };
+            if duct_cell_ok(g, c) && corridor_axis(g, c).is_none() {
+                runs.push((c, along_x, if along_x { IVec2::Y } else { IVec2::X }));
+            }
+        }
+    }
+    // Tops of the duct bodies face the ceiling: never seen, skip them.
+    let below = |n: Vec3| n.y < 0.5;
+    for (c, along_x, lat) in runs {
+        let center = g.cell_center(c).with_y(0.0);
+        let lat = Vec3::new(lat.x as f32, 0.0, lat.y as f32);
+        debug_assert!(lat.dot(if along_x { Vec3::Z } else { Vec3::X }).abs() > 0.5);
+        // Local frame: +X along the run (either way: the run is symmetric),
+        // +Y up, +Z toward the walled side (right-handed).
+        let fr = Transform::from_translation(center).with_rotation(Quat::from_mat3(&Mat3::from_cols(Vec3::Y.cross(lat), Vec3::Y, lat)));
+        let mut put = |slot: ArchSlot, size: Vec3, at: Vec3, filter: bool| {
+            let tf = fr.mul_transform(bx(size, at));
+            if filter { b.slot(slot).append_filtered(&m.cube, &tf, below) } else { b.slot(slot).append(&m.cube, &tf) }
+        };
+        let half = CELL_SIZE * 0.5;
+        // HVAC duct on the open side, its hangers and joint straps.
+        put(ArchSlot::Plate, Vec3::new(CELL_SIZE, 0.46, 0.72), Vec3::new(0.0, 6.2, -1.0), true);
+        put(ArchSlot::Trim, Vec3::new(0.1, 0.52, 0.78), Vec3::new(-half + 0.12, 6.2, -1.0), true);
+        // Strap + hangers sit 1.3 m along the run: clear of the ceiling lamp
+        // cages on the cell center and the I-beams on the cell edge.
+        put(ArchSlot::Trim, Vec3::new(0.1, 0.52, 0.78), Vec3::new(1.3, 6.2, -1.0), true);
+        for zz in [-1.36f32, -0.64] {
+            put(ArchSlot::Trim, Vec3::new(0.04, CEILING_HEIGHT - 6.43, 0.04), Vec3::new(1.3, (CEILING_HEIGHT + 6.43) * 0.5, zz), false);
+        }
+        // Louvered diffuser grille on the underside.
+        put(ArchSlot::Trim, Vec3::new(0.9, 0.02, 0.5), Vec3::new(-0.9, 5.96, -1.0), false);
+        // Cable tray toward the wall, under the M16 conduit.
+        put(ArchSlot::Trim, Vec3::new(CELL_SIZE, 0.03, 0.42), Vec3::new(0.0, 5.76, 1.48), false);
+        for zz in [1.27f32, 1.69] {
+            put(ArchSlot::Trim, Vec3::new(CELL_SIZE, 0.12, 0.025), Vec3::new(0.0, 5.82, zz), false);
+        }
+        b.put(ArchSlot::Plate, &m.thin_pipe, &fr, Transform::from_xyz(0.0, 5.83, 1.42).with_rotation(Quat::from_rotation_z(FRAC_PI_2)).with_scale(Vec3::new(0.9, CELL_SIZE, 0.9)));
+        b.put(ArchSlot::Plate, &m.thin_pipe, &fr, Transform::from_xyz(0.0, 5.82, 1.56).with_rotation(Quat::from_rotation_z(FRAC_PI_2)).with_scale(Vec3::new(0.7, CELL_SIZE, 0.7)));
+        let mut put = |slot: ArchSlot, size: Vec3, at: Vec3| b.put(slot, &m.cube, &fr, bx(size, at));
+        put(ArchSlot::Trim, Vec3::new(0.04, CEILING_HEIGHT - 5.85, 0.04), Vec3::new(-1.2, (CEILING_HEIGHT + 5.85) * 0.5, 1.72));
+        // Subtle status LED on every fourth tray segment (keeps Solari RT emissive budget roomy).
+        if (c.x + c.y).rem_euclid(4) == 0 {
+            put(ArchSlot::Accent, Vec3::new(0.06, 0.03, 0.01), Vec3::new(0.9, 5.82, 1.25));
         }
     }
 }
@@ -995,11 +1504,13 @@ pub fn ups_target(floor: u32) -> usize {
 /// Deterministic, capped interactive prop placement: the same wall-flush
 /// slot rules as the telecom props (flat cells of rooms or >= 2-cell-wide
 /// corridors, mid-way along unbroken straight walls, never a 1-cell squeeze),
-/// at least 2 cells from every Milestone 16 / 30 wall prop and 3 cells apart.
+/// at least 2 cells from every Milestone 16 wall prop and 3 cells apart.
 /// UPS racks prefer room cells (combat rooms), then wide halls; CRTs take
-/// the remaining slots, hallways first.
+/// the remaining slots, hallways first. Milestone 32: interactive props are
+/// planned BEFORE the static wall furniture ([`plan_telecom_props`] keeps
+/// at least 2 cells clear of them), so denser furniture never eats their budget.
 pub fn plan_interactive_props(g: &LevelGrid) -> Vec<InteractiveProp> {
-    let taken: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).chain(plan_telecom_props(g).iter().map(|p| p.face.cell)).collect();
+    let taken: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).collect();
     let mut cands: Vec<WallFace> = wall_faces(g)
         .into_iter()
         .filter(|f| telecom_slot_ok(g, *f) && taken.iter().all(|w| (*w - f.cell).abs().max_element() >= 2))
@@ -1269,6 +1780,17 @@ mod tests {
                 assert_eq!(mesh.attributes().count(), 3, "exactly POSITION, NORMAL, UV_0");
             }
         }
+        // Also stress-test max-size Floor 5 & Endless Floor 10 across 12 seeds for Solari RT budgets.
+        for floor in [5u32, 10] {
+            for s in 0..12u64 {
+                let g = generate_level(floor, 0xE4D1_E550 ^ (s * 65537) ^ floor as u64);
+                let b = build_architecture(&g);
+                let (t, a) = (b.trim.triangle_count(), b.accent.triangle_count());
+                worst_accent = worst_accent.max(a);
+                assert!(a * 8 < MAX_EMISSIVE_TRIANGLES, "floor {floor} seed {s}: {a} emissive accent triangles");
+                assert!(t < 250_000, "floor {floor} seed {s}: {t} trim triangles");
+            }
+        }
         assert!(worst_accent > 0);
     }
 
@@ -1303,11 +1825,26 @@ mod tests {
     #[test]
     fn telecom_props_are_flush_compact_and_rt_ready_in_their_face_frame() {
         let m = ArchMeshes::new();
-        for kind in [TelecomKind::PcStation, TelecomKind::WallRack, TelecomKind::NoSignalBox] {
+        const { assert!(TELECOM_MAX_DEPTH <= 0.56) };
+        // Milestone 32 footprints: (max |x|, max y, min z reach) per archetype.
+        let footprint = |k: TelecomKind| match k {
+            TelecomKind::OpsConsole => Some((1.1, 2.1, 0.5)),
+            TelecomKind::VendingMachine => Some((0.475, 2.15, 0.5)),
+            TelecomKind::SupplyShelf => Some((0.9, 2.2, 0.48)),
+            TelecomKind::LockerBank => Some((0.825, 2.15, 0.48)),
+            TelecomKind::LabBench => Some((1.0, 2.65, 0.5)),
+            _ => None,
+        };
+        assert_eq!(TelecomKind::ALL.len(), 8);
+        for (i, a) in TelecomKind::ALL.iter().enumerate() {
+            assert!(!TelecomKind::ALL[i + 1..].contains(a), "{a:?} listed twice");
+        }
+        for kind in TelecomKind::ALL {
             for variant in 0..3u8 {
                 let mut b = ArchBatches::default();
                 build_telecom_prop(&mut b, &m, &Transform::IDENTITY, kind, variant);
                 let mut n = 0;
+                let (mut max_x, mut max_y, mut max_z) = (0.0f32, 0.0f32, 0.0f32);
                 for batch in [b.trim, b.accent, b.plate, b.screen, b.lamp] {
                     let Some(mesh) = batch.build() else { continue };
                     assert!(rt_mesh_convertible(&mesh), "{kind:?}");
@@ -1318,9 +1855,21 @@ mod tests {
                         assert!(p.z >= -1e-4 && p.z <= TELECOM_MAX_DEPTH + 1e-4, "{kind:?}: protrudes {} m", p.z);
                         assert!(p.x.abs() <= TELECOM_HALF_WIDTH + 1e-4, "{kind:?}: width {}", p.x);
                         assert!(p.y >= -1e-4 && p.y <= TELECOM_MAX_HEIGHT + 1e-4, "{kind:?}: height {}", p.y);
+                        (max_x, max_y, max_z) = (max_x.max(p.x.abs()), max_y.max(p.y), max_z.max(p.z));
                     }
                 }
                 assert!(n > 0, "{kind:?} builds geometry");
+                if let Some((w, h, reach)) = footprint(kind) {
+                    assert!(max_x <= w + 1e-3 && max_x >= w - 0.15, "{kind:?} v{variant}: half-width {max_x} (want ~{w})");
+                    assert!(max_y <= h + 1e-3 && max_y >= h - 0.25, "{kind:?} v{variant}: height {max_y} (want ~{h})");
+                    assert!(max_z >= reach && max_z <= 0.55 + 1e-3, "{kind:?} v{variant}: depth {max_z}");
+                }
+                if kind == TelecomKind::LockerBank {
+                    assert!(max_z <= 0.54 + 1e-3, "locker bench rail stays tucked: {max_z}");
+                }
+                if kind == TelecomKind::PcStation {
+                    assert!(max_x > 1.25, "PC station has its swivel chair beside the desk ({max_x})");
+                }
             }
         }
     }
@@ -1328,6 +1877,7 @@ mod tests {
     #[test]
     fn telecom_props_hug_straight_walls_and_never_cramp_the_lanes() {
         let mut total = 0;
+        let mut kinds_seen = HashSet::new();
         let m = ArchMeshes::new();
         for (floor, seed) in floors_and_seeds() {
             let g = generate_level(floor, seed);
@@ -1335,7 +1885,11 @@ mod tests {
             assert_eq!(props, plan_telecom_props(&generate_level(floor, seed)), "deterministic");
             assert!(props.len() <= telecom_prop_target(floor));
             total += props.len();
+            for p in &props {
+                kinds_seen.insert(format!("{:?}", p.kind));
+            }
             let walls = plan_wall_props(&g);
+            let interactive = plan_interactive_props(&g);
             for (i, p) in props.iter().enumerate() {
                 let (c, side, perp) = (p.face.cell, p.face.side, p.face.perp());
                 assert!(telecom_slot_ok(&g, p.face));
@@ -1354,8 +1908,11 @@ mod tests {
                 for w in &walls {
                     assert!((w.face.cell - c).abs().max_element() >= 2, "prop {c} stacks on a wall prop");
                 }
+                for q in &interactive {
+                    assert!((q.face.cell - c).abs().max_element() >= 2, "static furniture {c} crowds an interactive prop at {}", q.face.cell);
+                }
                 for o in &props[..i] {
-                    assert!((o.face.cell - c).abs().element_sum() >= 3, "props spaced");
+                    assert!((o.face.cell - c).abs().element_sum() >= TELECOM_SPACING, "props spaced");
                 }
                 // World-space clearance: every vertex within 0.55 m of its
                 // backing wall plane, inside its own cell, out of the lane.
@@ -1375,7 +1932,149 @@ mod tests {
                 }
             }
         }
-        assert!(total >= floors_and_seeds().len() * 4, "telecom props are actually placed ({total})");
+        let avg = total as f32 / floors_and_seeds().len() as f32;
+        println!("static wall furniture per floor: {avg:.1}");
+        assert!(avg >= 15.0, "Milestone 32 density: {avg} pieces per floor");
+        assert_eq!(kinds_seen.len(), TelecomKind::ALL.len(), "every archetype appears: {kinds_seen:?}");
+    }
+
+    #[test]
+    fn m32_density_keeps_full_interactive_budgets_and_the_chain_pair_on_48_floors() {
+        let (mut tel, mut nooks, mut floors) = (0usize, 0usize, 0usize);
+        for floor in 1..=6u32 {
+            for seed in 0..8u64 {
+                let g = generate_level(floor, 0xC0FFEE ^ (seed * 7919) ^ floor as u64);
+                let plan = plan_interactive_props(&g);
+                let crts = plan.iter().filter(|p| p.kind == InteractiveKind::Crt).count();
+                let ups = plan.iter().filter(|p| p.kind == InteractiveKind::Ups).count();
+                assert_eq!((crts, ups), (crt_target(floor), ups_target(floor)), "floor {floor} seed {seed}: interactive budgets met");
+                // The reserved chain-reaction pair: two adjacent UPS racks on one flat wall.
+                let pair = plan.iter().enumerate().any(|(i, a)| {
+                    plan[i + 1..].iter().any(|b| a.kind == InteractiveKind::Ups && b.kind == InteractiveKind::Ups && a.face.side == b.face.side && (a.face.cell - b.face.cell).abs().element_sum() == 1)
+                });
+                assert!(pair, "floor {floor} seed {seed}: UPS chain pair");
+                // Zero overlap: no static wall furniture / wall prop / nook within a cell of an interactive prop.
+                let telecom = plan_telecom_props(&g);
+                let corner = plan_corner_nooks(&g);
+                let statics: Vec<IVec2> = telecom.iter().map(|p| p.face.cell).chain(plan_wall_props(&g).iter().map(|p| p.face.cell)).chain(corner.iter().map(|n| n.cell)).collect();
+                for p in &plan {
+                    for c in &statics {
+                        assert!((p.face.cell - *c).abs().max_element() >= 2, "floor {floor} seed {seed}: {:?} at {} overlaps static furniture at {c}", p.kind, p.face.cell);
+                    }
+                }
+                assert!(telecom.len() <= telecom_prop_target(floor) && corner.len() <= corner_nook_target(floor));
+                tel += telecom.len();
+                nooks += corner.len();
+                floors += 1;
+            }
+        }
+        let (t, n) = (tel as f32 / floors as f32, nooks as f32 / floors as f32);
+        println!("M32 per floor over {floors} floors: {t:.1} wall furniture pieces, {n:.1} corner nooks");
+        assert!(t >= 18.0 && n >= 6.0, "{t} furniture / {n} nooks per floor");
+    }
+
+    #[test]
+    fn corner_nooks_tuck_into_dead_corners_clear_of_doorways_pickups_and_spawn() {
+        let m = ArchMeshes::new();
+        // In its own frame: within NOOK_MAX_DEPTH of both walls, on the floor.
+        for variant in 0..3u8 {
+            let mut b = ArchBatches::default();
+            build_corner_nook(&mut b, &m, &Transform::IDENTITY, variant);
+            let mut n = 0;
+            for batch in [b.trim, b.accent, b.plate, b.screen, b.lamp] {
+                let Some(mesh) = batch.build() else { continue };
+                assert!(rt_mesh_convertible(&mesh));
+                for p in positions(&mesh) {
+                    n += 1;
+                    assert!((-1e-4..=NOOK_MAX_DEPTH + 1e-4).contains(&p.x) && (-1e-4..=NOOK_MAX_DEPTH + 1e-4).contains(&p.z), "nook vertex {p}");
+                    assert!((-1e-4..=NOOK_MAX_HEIGHT).contains(&p.y), "nook vertex {p}");
+                }
+            }
+            assert!(n > 100);
+        }
+        let mut total = 0;
+        for (floor, seed) in floors_and_seeds() {
+            let g = generate_level(floor, seed);
+            let nooks = plan_corner_nooks(&g);
+            assert_eq!(nooks, plan_corner_nooks(&generate_level(floor, seed)), "deterministic");
+            assert!(nooks.len() <= corner_nook_target(floor));
+            total += nooks.len();
+            let pickups: Vec<IVec2> = g.rooms.iter().skip(1).filter_map(|r| crate::level::room_pickup_cell(&g, r)).collect();
+            for (i, nk) in nooks.iter().enumerate() {
+                let c = nk.cell;
+                assert!(corner_nook_ok(&g, c, nk.a, nk.b));
+                // A real corner: both walls continue past it (no doorway jamb), 2x2 open block.
+                for o in [nk.a, nk.b, nk.a + nk.b, nk.a - nk.b, nk.b - nk.a] {
+                    assert!(g.cell(c + o).is_wall(), "floor {floor} seed {seed}: nook {c} next to a doorway");
+                }
+                for o in [-nk.a, -nk.b, -nk.a - nk.b] {
+                    assert!(!g.cell(c + o).is_wall(), "nook {c} in a 1-cell squeeze");
+                }
+                assert!(!g.rooms[0].contains(c) && !g.is_roof_open(c), "never in the atrium");
+                assert!((c - g.spawn).abs().element_sum() >= 3, "spawn stays clear");
+                for q in pickups.iter().chain(&g.jammers).chain(&g.barrels).copied().chain(g.jump_pads.iter().map(|p| p.cell)) {
+                    assert!((q - c).abs().max_element() >= 2, "nook {c} crowds {q}");
+                }
+                for o in &nooks[..i] {
+                    assert_ne!(o.cell, c);
+                }
+                // World space: every vertex hugs both walls of its own cell.
+                let mut b = ArchBatches::default();
+                build_corner_nook(&mut b, &m, &nk.frame(), nk.variant);
+                let corner = nk.corner();
+                let (wa, wb) = (Vec3::new(nk.a.x as f32, 0.0, nk.a.y as f32), Vec3::new(nk.b.x as f32, 0.0, nk.b.y as f32));
+                for batch in [b.trim, b.accent, b.plate, b.screen, b.lamp] {
+                    let Some(mesh) = batch.build() else { continue };
+                    for v in positions(&mesh) {
+                        let (da, db) = ((corner - v).dot(wa), (corner - v).dot(wb));
+                        assert!((-1e-3..=NOOK_MAX_DEPTH + 1e-3).contains(&da) && (-1e-3..=NOOK_MAX_DEPTH + 1e-3).contains(&db), "floor {floor} seed {seed}: {v} is {da}/{db} m off the walls");
+                        assert_eq!(g.world_to_cell(v - (wa + wb) * 2e-3), c, "nook vertex {v} leaves its cell");
+                    }
+                }
+            }
+        }
+        assert!(total >= floors_and_seeds().len() * 5, "nooks are actually placed ({total})");
+    }
+
+    #[test]
+    fn ceiling_ducts_hang_high_and_never_over_open_roof_cells() {
+        let m = ArchMeshes::new();
+        const { assert!(DUCT_MIN_Y >= 5.2 && DUCT_MAX_Y <= CEILING_HEIGHT) };
+        for (floor, seed) in floors_and_seeds() {
+            let g = generate_level(floor, seed);
+            let mut b = ArchBatches::default();
+            build_ceiling_ducts(&g, &m, &mut b);
+            let mut n = 0;
+            for batch in [b.trim, b.accent, b.plate, b.screen, b.lamp] {
+                let Some(mesh) = batch.build() else { continue };
+                assert!(rt_mesh_convertible(&mesh));
+                for v in positions(&mesh) {
+                    n += 1;
+                    assert!(v.is_finite());
+                    assert!(v.y >= DUCT_MIN_Y - 1e-3 && v.y <= CEILING_HEIGHT + 1e-3, "floor {floor} seed {seed}: duct vertex {v} hangs into play space");
+                    let c = g.world_to_cell(v);
+                    if g.is_roof_open(c) || g.cell(c).is_wall() {
+                        // Only allowed exactly on the seam with a covered cell.
+                        let lo = c.as_vec2() * CELL_SIZE;
+                        let q = Vec2::new(v.x, v.z) - lo;
+                        let edge = q.min_element().min((Vec2::splat(CELL_SIZE) - q).min_element());
+                        assert!(edge <= 1e-3, "floor {floor} seed {seed}: duct vertex {v} over open-roof / wall cell {c}");
+                    }
+                }
+            }
+            assert!(n > 1000, "floor {floor} seed {seed}: ducts placed ({n} vertices)");
+            // Duct / tray bodies stay in the 5.6..6.8 m band; only thin hangers reach the ceiling.
+            let mut b = ArchBatches::default();
+            build_ceiling_ducts(&g, &m, &mut b);
+            let plate = b.plate.build().expect("duct bodies");
+            assert!(positions(&plate).iter().all(|v| v.y <= DUCT_MAX_Y + 1e-3 && v.y >= DUCT_MIN_Y - 1e-3));
+        }
+        // The open-roof Atrium gets none, even when it is the whole map.
+        let mut g = generate_level(1, 1234);
+        g.roof_open = vec![true; g.roof_open.len()];
+        let mut b = ArchBatches::default();
+        build_ceiling_ducts(&g, &m, &mut b);
+        assert!(b.trim.build().is_none() && b.plate.build().is_none());
     }
 
     #[test]

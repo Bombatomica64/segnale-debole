@@ -2,7 +2,11 @@
 //!
 //! Placement comes from [`plan_interactive_props`] (deterministic per floor,
 //! capped, wall-flush within [`INTERACTIVE_MAX_DEPTH`], never narrowing a
-//! lane). Every prop shares the prewarmed [`PropAssets`] meshes / materials
+//! lane). Milestone 32: the interactive plan runs BEFORE the denser static
+//! wall furniture / corner nooks of [`crate::architecture`], which keep >= 2
+//! cells clear of every CRT / UPS rack, so the CRT + UPS budgets (and the
+//! chain-reaction pair) are always met and never overlap static furniture.
+//! Every prop shares the prewarmed [`PropAssets`] meshes / materials
 //! (zero per-prop allocation) and is a [`LevelEntity`] (torn down with the
 //! floor). Props have no collision: they hug the wall inside the 0.4 m
 //! player radius band, so nothing snags.

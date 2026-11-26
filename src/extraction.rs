@@ -28,7 +28,19 @@ use crate::weapons::{spawn_pickup, CombatDamage, PickupAssets, PickupKind};
 
 pub const UPLINK_HOLD_RADIUS: f32 = 4.5;
 pub const UPLINK_HOLD_SECS: f32 = 1.5;
-pub const OUTSIDE_RING_RATE: f32 = 0.2;
+/// Upload rate at the far end of the proximity curve. Kept as the historic
+/// name for the free-roam floor (it used to be a flat out-of-ring penalty).
+pub const OUTSIDE_RING_RATE: f32 = UPLINK_MIN_RATE;
+/// Milestone 32: SOS OVERDRIVE rate while inside the Signal Ring.
+pub const UPLINK_MAX_RATE: f32 = 1.25;
+/// Milestone 32: free-roam floor rate anywhere in the bunker (>= [`UPLINK_FALLOFF_DIST`]).
+pub const UPLINK_MIN_RATE: f32 = 0.45;
+/// Flat distance from the tower (m) where the uplink bottoms out at [`UPLINK_MIN_RATE`].
+pub const UPLINK_FALLOFF_DIST: f32 = 42.0;
+/// HUD threshold: at or above this rate the player is in the Signal Ring (OVERDRIVE).
+pub const UPLINK_OVERDRIVE_RATE: f32 = UPLINK_MAX_RATE - 0.005;
+/// HUD threshold: at or above this rate the player is "near" the tower.
+pub const UPLINK_NEAR_RATE: f32 = 0.80;
 pub const EXTRACT_SECS: f32 = 1.6;
 /// Floor 1 (Rust Bunker) sky; every floor uses its theme's sky (see [`sky_for_floor`]).
 pub const SKY_COLOR: Color = Color::srgb(0.32, 0.04, 0.03);
@@ -53,6 +65,9 @@ pub enum ExtractionState {
         progress: f32,
         duration: f32,
         in_ring: bool,
+        /// Live upload speed multiplier from [`proximity_upload_rate`]
+        /// (`0.0` jammed, `UPLINK_MIN_RATE..=UPLINK_MAX_RATE` otherwise).
+        rate: f32,
         jammed: bool,
         wave_timer: f32,
         baron_spawned: bool,
@@ -113,20 +128,44 @@ pub fn rush_kind(floor: u32, roll: f32) -> EnemyKind {
     }
 }
 
-/// Upload speed multiplier.
-/// Firewall Daemon armor regen runs only while the SOS advances in the ring.
-pub fn firewall_regen_active(in_ring: bool, jammed: bool) -> bool {
-    in_ring && !jammed
+/// Firewall Daemon armor regen runs whenever the SOS is actually advancing
+/// (not jammed). Milestone 32: the uplink is free-roam, so kiting the Demon
+/// Rush away from the tower no longer switches regen off; the regen is scaled
+/// by [`firewall_regen_scale`] instead.
+pub fn firewall_regen_active(_in_ring: bool, jammed: bool) -> bool {
+    !jammed
 }
 
-pub fn upload_rate(in_ring: bool, jammed: bool) -> f32 {
+/// Firewall Daemon regen multiplier for an upload `rate`: full speed from
+/// 1.0x upward (near the tower), gently reduced far away, never punishing.
+pub fn firewall_regen_scale(rate: f32) -> f32 {
+    if rate.is_finite() { rate.clamp(0.0, 1.0) } else { 0.0 }
+}
+
+/// Milestone 32 free-roam SOS uplink: upload speed by flat distance (m) to the
+/// Signal Tower. `UPLINK_MAX_RATE` inside the Signal Ring, then a smooth
+/// ease-out down to the `UPLINK_MIN_RATE` free-roam floor at
+/// `UPLINK_FALLOFF_DIST`; `0.0` while a Jammer Fiend jams the ring.
+/// Negative distances count as inside the ring; NaN counts as far away.
+pub fn proximity_upload_rate(dist: f32, jammed: bool) -> f32 {
     if jammed {
-        0.0
-    } else if in_ring {
-        1.0
-    } else {
-        OUTSIDE_RING_RATE
+        return 0.0;
     }
+    if dist.is_nan() {
+        return UPLINK_MIN_RATE;
+    }
+    if dist <= TOWER_RING_RADIUS {
+        return UPLINK_MAX_RATE;
+    }
+    let t = ((dist - TOWER_RING_RADIUS) / (UPLINK_FALLOFF_DIST - TOWER_RING_RADIUS)).clamp(0.0, 1.0);
+    UPLINK_MAX_RATE - (UPLINK_MAX_RATE - UPLINK_MIN_RATE) * (t * (2.0 - t))
+}
+
+/// Legacy two-state upload speed (ring / anywhere else): delegates to
+/// [`proximity_upload_rate`] at the ring (`UPLINK_MAX_RATE`) and at the far
+/// end of the falloff (`UPLINK_MIN_RATE`). Live gameplay uses the distance.
+pub fn upload_rate(in_ring: bool, jammed: bool) -> f32 {
+    proximity_upload_rate(if in_ring { 0.0 } else { UPLINK_FALLOFF_DIST }, jammed)
 }
 
 /// A living Jammer Fiend inside the Signal Ring jams the uplink.
@@ -199,6 +238,7 @@ impl ExtractionState {
             progress: 0.0,
             duration: upload_duration(floor) * duration_mult.max(0.05),
             in_ring: true,
+            rate: UPLINK_MAX_RATE,
             jammed: false,
             wave_timer: 2.5,
             baron_spawned: false,
@@ -214,7 +254,8 @@ impl ExtractionState {
         }
     }
 
-    /// Advance the uplink. Returns true on the frame it completes (now `Extracting`).
+    /// Advance the uplink with the legacy two-state rate (ring / far away).
+    /// Returns true on the frame it completes (now `Extracting`).
     pub fn advance_upload(&mut self, dt: f32, ring: bool, jam: bool) -> bool {
         self.advance_upload_gated(dt, ring, jam, false)
     }
@@ -223,10 +264,24 @@ impl ExtractionState {
     /// stops at [`BOSS_HOLD_PROGRESS`]; the frame the boss dies while held,
     /// extraction locks immediately.
     pub fn advance_upload_gated(&mut self, dt: f32, ring: bool, jam: bool, boss_alive: bool) -> bool {
-        if let ExtractionState::Uploading { progress, duration, in_ring, jammed, boss_hold, .. } = self {
+        self.advance_upload_with_rate(dt, ring, jam, upload_rate(ring, jam), boss_alive)
+    }
+
+    /// Advance the uplink at the player's live proximity distance (m, flat to
+    /// the tower): [`proximity_upload_rate`] with ring / jam / boss gating.
+    pub fn advance_upload_at(&mut self, dt: f32, dist: f32, jam: bool, boss_alive: bool) -> bool {
+        let ring = dist.is_finite() && dist <= TOWER_RING_RADIUS;
+        self.advance_upload_with_rate(dt, ring, jam, proximity_upload_rate(dist, jam), boss_alive)
+    }
+
+    /// Core uplink step at an explicit `rate` (jammed always forces `0.0`).
+    pub fn advance_upload_with_rate(&mut self, dt: f32, ring: bool, jam: bool, rate: f32, boss_alive: bool) -> bool {
+        if let ExtractionState::Uploading { progress, duration, in_ring, jammed, boss_hold, rate: live, .. } = self {
             *in_ring = ring;
             *jammed = jam;
-            *progress = (*progress + dt / *duration * upload_rate(ring, jam)).min(1.0);
+            let r = if jam || !rate.is_finite() { 0.0 } else { rate.clamp(0.0, UPLINK_MAX_RATE) };
+            *live = r;
+            *progress = (*progress + dt.max(0.0) / *duration * r).min(1.0);
             if boss_alive {
                 *progress = progress.min(BOSS_HOLD_PROGRESS);
                 *boss_hold = *progress >= BOSS_HOLD_PROGRESS;
@@ -422,7 +477,7 @@ fn update_extraction(
                 }
                 sfx.play(SfxEvent::UplinkStart);
                 if !is_boss_floor(run.floor) {
-                    feed.alert("SOS UPLINK ONLINE - HOLD THE SIGNAL RING", Color::srgb(0.3, 1.0, 0.85), 3.0);
+                    feed.alert("SOS UPLINK ONLINE - ROAM FREE, CLOSER = FASTER", Color::srgb(0.3, 1.0, 0.85), 3.0);
                 }
                 // Tactical supply drops on the ring perimeter: kiting the tower pays.
                 *supply_idx = 0;
@@ -474,10 +529,15 @@ fn update_extraction(
                     }
                 }
             }
-            // Firewall Daemon: only while the SOS actually advances (in ring, not
-            // jammed, and not stalled at 99% waiting on a spared boss).
+            // Milestone 32 free-roam uplink: speed scales with flat distance to
+            // the tower (the ring itself is OVERDRIVE).
+            let flat = Vec2::new(ppos.x - tower.x, ppos.z - tower.z).length();
+            let dist = if ring { flat.min(TOWER_RING_RADIUS) } else { flat.max(TOWER_RING_RADIUS + 1e-3) };
+            let rate = proximity_upload_rate(dist, jam);
+            // Firewall Daemon: while the SOS actually advances (not jammed, not
+            // stalled at 99% waiting on a spared boss), gently scaled by speed.
             if firewall_regen_active(ring, jam) && !*boss_hold && mods.armor_regen_while_uploading > 0.0 {
-                player.armor = (player.armor + mods.armor_regen_while_uploading * dt).min(player.max_armor);
+                player.armor = (player.armor + mods.armor_regen_while_uploading * firewall_regen_scale(rate) * dt).min(player.max_armor);
             }
             let _ = in_ring;
             // Demon Rush waves.
@@ -539,7 +599,7 @@ fn update_extraction(
                 // Emergency medkit on the ring edge.
                 drop_supply(&mut commands, &grid, ring_cells, pickups, &fx, &mut materials, PickupKind::Health, &mut supply_idx);
             }
-            let advanced = state.advance_upload_gated(dt, ring, jam, boss_alive);
+            let advanced = state.advance_upload_with_rate(dt, ring, jam, rate, boss_alive);
             if let ExtractionState::Uploading { boss_hold: true, .. } = *state
                 && !was_held
             {
@@ -658,8 +718,9 @@ mod tests {
     fn durations_and_rates() {
         assert_eq!(upload_duration(1), 24.0);
         assert_eq!(upload_duration(5), 44.0);
-        assert_eq!(upload_rate(true, false), 1.0);
-        assert_eq!(upload_rate(false, false), OUTSIDE_RING_RATE);
+        assert_eq!(upload_rate(true, false), UPLINK_MAX_RATE);
+        assert_eq!(upload_rate(false, false), UPLINK_MIN_RATE);
+        assert_eq!(OUTSIDE_RING_RATE, UPLINK_MIN_RATE);
         assert_eq!(upload_rate(true, true), 0.0);
         assert_eq!(upload_rate(false, true), 0.0);
     }
@@ -683,27 +744,94 @@ mod tests {
     }
 
     #[test]
-    fn firewall_regen_only_while_sos_advances_in_ring() {
+    fn firewall_regen_runs_while_the_sos_advances_anywhere() {
         assert!(firewall_regen_active(true, false));
         assert!(!firewall_regen_active(true, true), "a living Jammer Fiend is not an armor farm");
-        assert!(!firewall_regen_active(false, false));
+        assert!(firewall_regen_active(false, false), "kiting away from the tower keeps the regen");
         assert!(!firewall_regen_active(false, true));
+        // Gently scaled by speed: full at 1.0x and above, never zero while uploading.
+        assert_eq!(firewall_regen_scale(UPLINK_MAX_RATE), 1.0);
+        assert_eq!(firewall_regen_scale(1.0), 1.0);
+        assert_eq!(firewall_regen_scale(UPLINK_MIN_RATE), UPLINK_MIN_RATE);
+        assert_eq!(firewall_regen_scale(f32::NAN), 0.0);
+        assert_eq!(firewall_regen_scale(-1.0), 0.0);
+    }
+
+    #[test]
+    fn proximity_rate_is_overdrive_in_ring_and_eases_out_to_the_free_roam_floor() {
+        assert_eq!(proximity_upload_rate(0.0, false), 1.25);
+        assert_eq!(proximity_upload_rate(TOWER_RING_RADIUS, false), 1.25);
+        assert_eq!(proximity_upload_rate(-5.0, false), UPLINK_MAX_RATE, "negative distance counts as in ring");
+        assert_eq!(proximity_upload_rate(UPLINK_FALLOFF_DIST, false), 0.45);
+        assert_eq!(proximity_upload_rate(500.0, false), 0.45);
+        assert_eq!(proximity_upload_rate(f32::INFINITY, false), 0.45);
+        assert_eq!(proximity_upload_rate(f32::NAN, false), UPLINK_MIN_RATE, "NaN never stalls or speeds the uplink");
+        for d in [f32::NAN, -3.0, 0.0, 9.0, 20.0, 42.0, 1e9] {
+            assert_eq!(proximity_upload_rate(d, true), 0.0, "jammed at {d}");
+        }
+        // Reference points of the curve (outer atrium, adjacent halls, mid, far).
+        for (d, want) in [(14.0f32, 1.03f32), (20.0, 0.81), (28.0, 0.60)] {
+            let r = proximity_upload_rate(d, false);
+            assert!((r - want).abs() < 0.02, "{d} m -> {r} (want ~{want})");
+        }
+        // Smooth + monotonic: never increases with distance, no jumps.
+        let mut prev = proximity_upload_rate(0.0, false);
+        for k in 1..=600 {
+            let d = k as f32 * 0.1;
+            let r = proximity_upload_rate(d, false);
+            assert!(r <= prev + 1e-6, "monotonic at {d} m");
+            assert!(prev - r < 0.01, "smooth at {d} m");
+            assert!((UPLINK_MIN_RATE..=UPLINK_MAX_RATE).contains(&r));
+            prev = r;
+        }
+    }
+
+    #[test]
+    fn free_roam_upload_completes_outside_the_ring_and_faster_when_close() {
+        let dur = upload_duration(1);
+        let finish_secs = |dist: f32| {
+            let mut s = ExtractionState::start_upload(1);
+            let mut t = 0.0;
+            while !s.advance_upload_at(0.1, dist, false, false) {
+                t += 0.1;
+                assert!(t < 1000.0, "upload stalls at {dist} m");
+                if let ExtractionState::Uploading { rate, in_ring, .. } = s {
+                    assert!((rate - proximity_upload_rate(dist, false)).abs() < 1e-6);
+                    assert_eq!(in_ring, dist <= TOWER_RING_RADIUS);
+                }
+            }
+            t
+        };
+        let (ring, near, far) = (finish_secs(4.0), finish_secs(20.0), finish_secs(60.0));
+        assert!(ring < near && near < far, "closer = faster: {ring} < {near} < {far}");
+        assert!((ring - dur / UPLINK_MAX_RATE).abs() < 0.3, "{ring}");
+        assert!((far - dur / UPLINK_MIN_RATE).abs() < 0.3, "roaming the far side still extracts: {far}");
+        // Jammed anywhere: frozen, rate reads 0.
+        let mut s = ExtractionState::start_upload(1);
+        assert!(!s.advance_upload_at(30.0, 30.0, true, false));
+        assert_eq!(s.progress(), Some(0.0));
+        assert!(matches!(s, ExtractionState::Uploading { rate: 0.0, jammed: true, .. }));
+        // Bogus rates are sanitized.
+        let mut s = ExtractionState::start_upload(1);
+        s.advance_upload_with_rate(1.0, false, false, f32::NAN, false);
+        s.advance_upload_with_rate(1.0, false, false, 50.0, false);
+        assert!((s.progress().unwrap() - UPLINK_MAX_RATE / dur).abs() < 1e-5);
     }
 
     #[test]
     fn upload_progresses_to_extraction() {
         let mut s = ExtractionState::start_upload(1);
         assert_eq!(s.progress(), Some(0.0));
-        // Half the duration inside the ring = 50%.
-        assert!(!s.advance_upload(upload_duration(1) * 0.5, true, false));
+        // 40% of the duration inside the ring = 50% (OVERDRIVE 1.25x).
+        assert!(!s.advance_upload(upload_duration(1) * 0.4, true, false));
         assert!((s.progress().unwrap() - 0.5).abs() < 1e-5);
         // Jammed: no progress.
         assert!(!s.advance_upload(10.0, true, true));
         assert!((s.progress().unwrap() - 0.5).abs() < 1e-5);
         assert!(matches!(s, ExtractionState::Uploading { jammed: true, .. }));
-        // Outside the ring: 20%.
+        // Far outside the ring: the 0.45x free-roam floor.
         s.advance_upload(10.0, false, false);
-        assert!((s.progress().unwrap() - (0.5 + 2.0 / upload_duration(1))).abs() < 1e-5);
+        assert!((s.progress().unwrap() - (0.5 + 4.5 / upload_duration(1))).abs() < 1e-5);
         assert!(matches!(s, ExtractionState::Uploading { in_ring: false, .. }));
         // Finish.
         assert!(s.advance_upload(100.0, true, false));

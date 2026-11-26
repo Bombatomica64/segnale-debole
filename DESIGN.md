@@ -33,10 +33,11 @@ Each run descends through increasingly hostile Mars Bunker Sectors (**Floor 1 �
 ### Phase 2: SOS COUNTDOWN (Hold the Signal / Boomer Shooter Arena)
 1. Reach the **5-Bar Signal Tower** and press `E` (or step onto the uplink pad) to trigger the **SOS Uplink** (`30s` on Floor 1, scaling up to `45s` on deeper floors).
 2. **Alarm lights pulse crimson** across the atrium and a relentless **Demon Rush** converges from all corridors and upper catwalks, capped by an **Extraction Heavy / Hell Baron**!
-3. **Risk-Reward Positioning:**
-   - Standing inside the Tower's **Signal Ring (4–5 bars)** advances the SOS upload at **100% speed** and fuels your **5G Apps**.
-   - Kiting outside the ring keeps you alive during heavy swarms, slowing/pausing the uplink until you fight your way back in.
-   - If a **Jammer Fiend** enters the Tower zone, it jams the uplink until you blast it!
+3. **Free-Roam Proximity Uplink (Milestone 32):** you still *initiate* the SOS at the tower (`E` inside the 9 m Signal Ring, or stand by the mast for `1.5 s`), but once it runs you can **bhop anywhere**: upload speed scales smoothly with flat distance to the tower (`proximity_upload_rate` in `src/extraction.rs`). Closer = faster, and the game never stops you for leaving.
+   - **SOS OVERDRIVE `1.25x`** anywhere inside the Signal Ring (`<= 9 m`), which also fuels your **5G Apps** at 4–5 bars.
+   - Smooth ease-out falloff `1.25 - 0.8 * t * (2 - t)`, `t = (d - 9) / 33`: about `1.03x` at 14 m (outer atrium), `0.81x` at 20 m (adjacent halls), `0.60x` at 28 m (mid-bunker), down to a **`0.45x` free-roam floor** at 42 m or more (far side of the bunker). Kiting a heavy swarm through the halls still uploads.
+   - If a **Jammer Fiend** enters the Tower zone it jams the uplink (`0.0x`, wherever you are) until you blast it; on boss floors the Carrier Daemon still holds the upload at 99% until it dies.
+   - **Frameless HUD readout:** `SOS OVERDRIVE  1.25x  42%` (acid green) in the ring, `UPLINKING  0.93x  42%` (cyan) at 0.80x or faster, `UPLINKING  0.61x  (CLOSER = FASTER)  42%` (warm amber) further out. It motivates and never scolds. The jam and boss-hold lines are unchanged.
 
 ### Phase 3: EXTRACT & DOWNLOAD ("App Store" Roguelike Upgrades)
 1. At **100% SOS Uplink**, an orbital beam locks onto the tower, vaporizing remaining demons and extracting you to the next sector.
@@ -46,7 +47,7 @@ Each run descends through increasingly hostile Mars Bunker Sectors (**Floor 1 �
    - **5G Overclock (S):** At 4–5 bars, fire rate +35% and move speed +25%.
    - **External Copper Antenna (S):** +1.25 minimum signal bars everywhere (capped at 4.0); resists Dead Zones.
    - **Signal Siphon App (S):** While you have 3+ bars, demon kills restore +8 HP.
-   - **Firewall Daemon (S):** +40 armor & max armor; regenerates 6/s while the SOS advances in the Signal Ring (in ring **and not jammed** — a spared Jammer Fiend is not an armor farm).
+   - **Firewall Daemon (S):** +40 armor & max armor; regenerates 6/s while the SOS advances (**not jammed**, so a spared Jammer Fiend is not an armor farm). Since Milestone 32 the regen also works while kiting away from the tower, gently scaled by `min(rate, 1.0)`.
    - **Packet Sniffer (S):** Ping cooldown halved; ping-marked demons take +35% bonus damage.
    - **EMP Overcharge (T):** 5G Overload radius +40%, damage +35%, chains to 3 nearby demons.
    - **Airplane Mode Phase (T):** Dash grants invulnerability, a static shockwave, and -15% dash cooldown.
@@ -132,6 +133,7 @@ Grid-based room-and-corridor labyrinth (`21x21` to `29x29` cells, cell size `4.0
 - **High-Speed Arena Props:**
   - **Signal-Gated Jump Pads:** Launch you up to catwalks only while powered (2+ bars at the pad); a Jammer nearby drains them dormant (red light).
   - **Explosive Server-Rack Barrels:** Shootable racks that detonate with splash damage — chain them into demon packs.
+- **Lived-in Mars Bunker Furniture (Milestone 32, `src/architecture.rs`):** 8 wall-flush archetypes (PC station + swivel chair, 19-inch wall rack, NO SIGNAL box, dual-monitor Ops Console, UAC vending machine, 4-tier supply shelf, triple locker bank + bench rail, signal-research lab bench). Each one stays `<= 0.55 m` off its wall on a straight wall with `>= 1` cell clear of doorways and corners, `>= 2` cells apart, up to `22 + 4 * floor` pieces per floor (limited by available slots). Corner equipment nooks (crates, cable reel, diagnostic beacon) sit `<= 0.72 m` deep in dead 90° corners. Overhead HVAC ducts and cable trays hang at `5.6–6.8 m` in every closed-roof room and corridor (never the open-roof Atrium). Everything is baked into the static per-material batches: zero new materials, no collision, and the 8 m lanes stay fully open. Interactive CRTs and UPS racks are planned first, so their budgets and the chain-reaction pair are always met.
 - **5 Sector Visual Themes:** Floors 1–5 map to *Rust Bunker*, *Toxic Coolant*, *Cryo Relay*, *Magma Foundry* and *Obsidian Core* (sky, fog, lamps, wall/floor tints, hazard-pit glow); Endless floors cycle through them.
 - **100% Procedural Pixel-Art Textures (`64x64`, `ImageSampler::nearest()`):**
   - Riveted steel bunker walls with warning stripes & grime
@@ -242,3 +244,4 @@ Shipped in Milestone 19. The browser build is the same game compiled to `wasm32-
 - **Milestone 17 (Enemy Animation, Decals & Gibs):** procedural enemy attack animations, directional hit-stagger, pooled combat decals (`src/decals.rs`) and gibs.
 - **Milestone 18 (Daily Runs, Splits & Time Trials):** Daily Seeded Runs (UTC date -> seed + loadout, per-date records), the speedrun split timer with PB deltas, and the movement Time Trial course with checkpoints and instant `R` reset (`src/trials.rs`; 374 passing tests).
 - **Milestone 19 (Web / itch.io):** the WebGL2 WASM build described in section 8: `trunk` + `index.html` + `Trunk.toml`, browser UTC clock, `localStorage` profile, a WebGL2 light cap and MSAA off, pointer-lock pause, a wasm32 clippy CI job and the `segnale-debole-web-itch.zip` release asset (379 passing tests).
+- **Milestone 32 (Free-Roam SOS Uplink & Richer Bunker Furniture):** proximity-scaled SOS uplink (`1.25x` OVERDRIVE in the ring, easing out to a `0.45x` free-roam floor at 42 m) with live-speed HUD copy, Firewall regen while kiting, 8 wall-flush furniture archetypes at roughly double the density, corner equipment nooks, and overhead HVAC ducts and cable trays. Interactive props are planned before static furniture, so their budgets always hold.

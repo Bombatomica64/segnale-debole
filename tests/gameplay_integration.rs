@@ -29,7 +29,7 @@ use segnale_debole::enemies::{
 };
 use segnale_debole::boss::{BossHud, BossPhase, BossPylon, BossState, BOSS_ARRIVAL_TEXT, BOSS_DEATH_TEXT, BOSS_SHIELD_STUN};
 use segnale_debole::enemies::{damage_enemy, pick_phase_blink_target, SniperLaser, SNIPER_LOCK_SECS};
-use segnale_debole::extraction::{rush_cap, upload_duration, ExtractionState, BOSS_HOLD_PROGRESS};
+use segnale_debole::extraction::{proximity_upload_rate, rush_cap, upload_duration, ExtractionState, BOSS_HOLD_PROGRESS, UPLINK_MAX_RATE};
 use segnale_debole::fx::{BurstColor, FxAssets, HudFeed};
 use segnale_debole::hud::{HudCrosshair, HudPlugin, ENDLESS_CTA};
 use segnale_debole::menu_scene::{MenuSceneCamera, MenuSceneEntity, MENU_SCENE_MAX_LIGHTS};
@@ -303,6 +303,64 @@ fn fire_until(app: &mut App, max_frames: usize, mut aim: impl FnMut(&mut App), m
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Milestone 32 free-roam uplink: once started at the tower, the SOS keeps
+/// uploading anywhere in the bunker, scaled by distance (closer = faster).
+#[test]
+fn free_roam_uplink_keeps_uploading_away_from_the_tower_and_is_faster_close() {
+    let mut app = build_headless_test_app();
+    begin_run(&mut app, 7);
+    godmode(&mut app);
+    cull_kind(&mut app, EnemyKind::JammerFiend, None);
+    trigger_uplink(&mut app);
+    let g = grid(&app);
+    let tower = g.tower_world();
+    let flat = |p: Vec3| Vec2::new(p.x - tower.x, p.z - tower.z).length();
+    // A reachable flat floor cell out in the halls, 24..40 m from the tower.
+    let far_cell = (0..g.depth)
+        .flat_map(|z| (0..g.width).map(move |x| IVec2::new(x, z)))
+        .filter(|c| matches!(g.cell(*c), Cell::Floor { height } if height == 0.0) && g.is_reachable(g.spawn, *c))
+        .filter(|c| (24.0..40.0).contains(&flat(g.cell_center(*c))))
+        .min_by(|a, b| flat(g.cell_center(*a)).total_cmp(&flat(g.cell_center(*b))))
+        .expect("a hall cell 24..40 m from the tower");
+    let measure = |app: &mut App, frames: usize| {
+        let p0 = extraction(app).progress().unwrap();
+        for _ in 0..frames {
+            godmode(app);
+            cull_kind(app, EnemyKind::JammerFiend, None);
+            step(app, 1);
+        }
+        extraction(app).progress().unwrap() - p0
+    };
+    // Roaming far away: no stall, no "return to ring", just a slower rate.
+    let far = g.cell_center(far_cell);
+    teleport(&mut app, far, far + Vec3::new(1.0, PLAYER_EYE_HEIGHT, 0.0));
+    step(&mut app, 2);
+    let ExtractionState::Uploading { in_ring, rate, jammed, .. } = extraction(&app) else { panic!("still uploading") };
+    let want = proximity_upload_rate(flat(player_feet(&mut app)), false);
+    assert!(!in_ring && !jammed);
+    assert!((rate - want).abs() < 0.03 && (0.45..0.8).contains(&rate), "far rate {rate} (want {want})");
+    let far_gain = measure(&mut app, 2 * FPS);
+    assert!(far_gain > 0.0, "the SOS keeps uploading away from the tower");
+    // Back in the Signal Ring: SOS OVERDRIVE.
+    let ring = g.cell_center(ring_cell(&g));
+    teleport(&mut app, ring, tower + Vec3::Y * 2.0);
+    step(&mut app, 2);
+    assert!(matches!(extraction(&app), ExtractionState::Uploading { in_ring: true, rate, .. } if rate == UPLINK_MAX_RATE));
+    let ring_gain = measure(&mut app, 2 * FPS);
+    assert!(ring_gain > far_gain * 1.4, "closer = faster: ring {ring_gain} vs far {far_gain}");
+    // Finish the whole uplink while roaming the far hall.
+    teleport(&mut app, far, far + Vec3::new(1.0, PLAYER_EYE_HEIGHT, 0.0));
+    let mut frames = 0;
+    while matches!(extraction(&app), ExtractionState::Uploading { .. }) {
+        godmode(&mut app);
+        cull_kind(&mut app, EnemyKind::JammerFiend, None);
+        step(&mut app, 1);
+        frames += 1;
+        assert!(frames < (upload_duration(1) / 0.45) as usize * FPS, "roaming uplink completes");
+    }
+    assert!(matches!(extraction(&app), ExtractionState::Extracting { .. }), "orbital extraction locks from anywhere");
+}
+
 #[test]
 fn full_floor_extraction_upgrade_and_floor2_transition() {
     let mut app = build_headless_test_app();
@@ -346,12 +404,12 @@ fn full_floor_extraction_upgrade_and_floor2_transition() {
         cull_kind(&mut app, EnemyKind::JammerFiend, None);
         step(&mut app, 1);
         frames += 1;
-        assert!(frames < 40 * FPS, "uplink must finish within 40 s at 100% rate");
+        assert!(frames < 40 * FPS, "uplink must finish within 40 s at OVERDRIVE rate");
     }
     let baron_at = baron_at.expect("Hell Baron drops in during the uplink");
     assert!((0.5..0.53).contains(&baron_at), "Hell Baron spawns at ~50% (was {baron_at})");
-    // 24 s at 100% speed on floor 1.
-    assert!((23 * FPS..26 * FPS).contains(&frames), "upload took {frames} frames");
+    // Milestone 32: 24 s of uplink at the 1.25x SOS OVERDRIVE ring rate = 19.2 s on floor 1.
+    assert!((18 * FPS..21 * FPS).contains(&frames), "upload took {frames} frames");
     assert!(matches!(extraction(&app), ExtractionState::Extracting { .. }));
 
     // Orbital beam vaporizes every demon, then the floor completes.

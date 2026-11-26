@@ -328,6 +328,7 @@ fn screenshot_tour(
                 progress: 0.42,
                 duration: 28.0,
                 in_ring: true,
+                rate: crate::extraction::UPLINK_MAX_RATE,
                 jammed: false,
                 wave_timer: 0.5,
                 baron_spawned: false,
@@ -411,6 +412,7 @@ fn screenshot_tour(
                 progress: crate::extraction::BOSS_HOLD_PROGRESS,
                 duration: 44.0,
                 in_ring: true,
+                rate: crate::extraction::UPLINK_MAX_RATE,
                 jammed: false,
                 wave_timer: 999.0,
                 baron_spawned: true,
@@ -1496,7 +1498,18 @@ fn m31_shots_tour(
             }
         }
         Some(HudStage::DemonRush) => {
-            *ext = crate::extraction::ExtractionState::Uploading { progress: 0.42, duration: 30.0, in_ring: true, jammed: false, wave_timer: 99.0, baron_spawned: true, boss_hold: false };
+            // Milestone 32 free-roam uplink: the live proximity rate at the
+            // player's spot (the staged hall sits away from the tower).
+            let dist = match (grid.as_deref(), players.iter().next()) {
+                (Some(g), Some((_, tf))) => {
+                    let tw = g.tower_world();
+                    Vec2::new(tf.translation.x - tw.x, tf.translation.z - tw.z).length()
+                }
+                _ => 20.0,
+            };
+            let rate = crate::extraction::proximity_upload_rate(dist, false);
+            let in_ring = dist <= crate::signal::TOWER_RING_RADIUS;
+            *ext = crate::extraction::ExtractionState::Uploading { progress: 0.42, duration: 30.0, in_ring, rate, jammed: false, wave_timer: 99.0, baron_spawned: true, boss_hold: false };
             feed.alert("WARNING: HELL BARON INBOUND!", Color::srgb(1.0, 0.55, 0.1), 3.5);
             feed.toasts.clear();
             for (mut p, _) in &mut players {

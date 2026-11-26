@@ -6,7 +6,8 @@
 //!
 //! menu -> Floor 1 spawn -> BFS-navigate to the best Demon Jammer and shoot it
 //! (Shotgun) -> Plasma + Ping Scan -> navigate to the Signal Tower -> trigger
-//! the SOS uplink -> hold the ring vs. the Demon Rush (Shotgun / Plasma / Ping
+//! the SOS uplink -> hold the ring for SOS OVERDRIVE (the Milestone 32 uplink is
+//! free-roam, the ring is just the fastest spot) vs. the Demon Rush (Shotgun / Plasma / Ping
 //! / 5G Overload / Dash, Jammer Fiends first) -> orbital extraction -> install
 //! an upgrade -> Floor 2 -> exit.
 //!
@@ -92,9 +93,34 @@ pub struct Telemetry {
     pub signal_max_bars: Option<u8>,
     pub sos_triggered: bool,
     pub sos_completed: bool,
+    /// Milestone 32 free-roam uplink: summed live upload rate over SOS frames.
+    pub sos_rate_sum: f32,
+    pub sos_rate_frames: u32,
+    /// Slowest unjammed upload rate seen (how far the bot roamed).
+    pub sos_min_rate: Option<f32>,
     pub upgrade_picked: Option<String>,
     pub stuck_events: u32,
     pub phase_log: Vec<(String, f32)>,
+}
+
+impl Telemetry {
+    /// Mean live upload rate across SOS frames (`None` before the uplink).
+    pub fn sos_avg_rate(&self) -> Option<f32> {
+        (self.sos_rate_frames > 0).then(|| self.sos_rate_sum / self.sos_rate_frames as f32)
+    }
+
+    /// Record one SOS frame's live upload rate (jammed frames count as 0 in
+    /// the mean but never as the "roamed" minimum).
+    pub fn record_sos_rate(&mut self, rate: f32, jammed: bool) {
+        if !rate.is_finite() {
+            return;
+        }
+        self.sos_rate_sum += rate;
+        self.sos_rate_frames += 1;
+        if !jammed {
+            self.sos_min_rate = Some(self.sos_min_rate.map_or(rate, |m| m.min(rate)));
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -367,6 +393,8 @@ pub fn report_json(passed: bool, failures: &[String], t: &Telemetry, wall_second
     let _ = writeln!(o, "  \"signal_max_bars\": {},", opt_u8(t.signal_max_bars));
     let _ = writeln!(o, "  \"sos_triggered\": {},", t.sos_triggered);
     let _ = writeln!(o, "  \"sos_completed\": {},", t.sos_completed);
+    let _ = writeln!(o, "  \"sos_avg_rate\": {},", t.sos_avg_rate().map_or("null".to_string(), |r| format!("{r:.3}")));
+    let _ = writeln!(o, "  \"sos_min_rate\": {},", t.sos_min_rate.map_or("null".to_string(), |r| format!("{r:.3}")));
     let _ = writeln!(o, "  \"upgrade_picked\": {},", t.upgrade_picked.as_deref().map_or("null".to_string(), json_str));
     let _ = writeln!(o, "  \"stuck_events\": {},", t.stuck_events);
     let _ = writeln!(o, "  \"phase_log\": [{phases}],");
@@ -526,13 +554,14 @@ fn bot_brain(
             }
         }
         BotPhase::Sos => {
-            let ExtractionState::Uploading { progress, jammed, .. } = *ext else {
+            let ExtractionState::Uploading { progress, jammed, rate, .. } = *ext else {
                 if matches!(*ext, ExtractionState::Extracting { .. } | ExtractionState::Complete) {
                     bot.tel.sos_completed = true;
                     bot.set_phase(BotPhase::Extracting);
                 }
                 return;
             };
+            bot.tel.record_sos_rate(rate, jammed);
             let tower = grid.tower_world();
             let stand = tower_stand_cell(&grid, here).unwrap_or(here);
             let stand_pos = grid.cell_center(stand);
@@ -1063,5 +1092,21 @@ mod tests {
         assert!(j.contains("\"signal_max_bars\": null"));
         assert!(j.trim_end().ends_with('}'));
         assert_eq!(j.matches('{').count(), j.matches('}').count());
+        assert!(j.contains("\"sos_avg_rate\": null") && j.contains("\"sos_min_rate\": null"));
+    }
+
+    #[test]
+    fn sos_rate_telemetry_tracks_mean_and_roamed_minimum() {
+        let mut t = Telemetry::default();
+        assert_eq!(t.sos_avg_rate(), None);
+        t.record_sos_rate(1.25, false);
+        t.record_sos_rate(0.0, true);
+        t.record_sos_rate(0.65, false);
+        t.record_sos_rate(f32::NAN, false);
+        assert_eq!(t.sos_rate_frames, 3);
+        assert!((t.sos_avg_rate().unwrap() - 0.6333).abs() < 1e-3);
+        assert_eq!(t.sos_min_rate, Some(0.65), "jammed frames never count as roaming");
+        let j = report_json(true, &[], &t, 1.0, 7, &[]);
+        assert!(j.contains("\"sos_avg_rate\": 0.633,") && j.contains("\"sos_min_rate\": 0.650,"), "{j}");
     }
 }
