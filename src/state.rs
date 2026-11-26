@@ -158,7 +158,7 @@ impl UpgradeId {
             UpgradeId::FiveGOverclock => "At 4-5 bars: +35% fire rate, +25% move speed.",
             UpgradeId::CopperAntenna => "+1.25 minimum signal bars everywhere.",
             UpgradeId::SignalSiphon => "While you have 3+ bars, demon kills restore +8 HP.",
-            UpgradeId::FirewallDaemon => "+40 armor & max armor; regenerates 6/s while SOS advances in the ring.",
+            UpgradeId::FirewallDaemon => "+40 armor & max armor; regenerates up to 6/s while SOS advances (scaled by upload speed).",
             UpgradeId::PacketSniffer => "Ping cooldown halved; marked demons take +35% bonus damage.",
             UpgradeId::EmpOvercharge => "5G Overload radius +40%, more damage, chains.",
             UpgradeId::AirplaneModePhase => "Dash grants invuln, a static shockwave, and -15% cooldown.",

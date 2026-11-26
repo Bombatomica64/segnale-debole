@@ -221,9 +221,11 @@ pub fn wall_prop_slot_ok(g: &LevelGrid, face: WallFace) -> bool {
 }
 
 /// Deterministic wall prop placement for a floor (rooms + atrium walls only),
-/// alternating the sector prop and the shared server rack, spaced >= 3 cells.
+/// alternating the sector prop and the shared server rack, spaced >= 3 cells
+/// and staying >= 2 cells clear of reserved interactive CRT/UPS slots.
 pub fn plan_wall_props(g: &LevelGrid) -> Vec<WallProp> {
     let theme = FloorTheme::for_floor(g.floor);
+    let interactive: Vec<IVec2> = plan_interactive_props(g).iter().map(|p| p.face.cell).collect();
     let mut cands = Vec::new();
     for room in &g.rooms {
         for z in 0..room.size.y {
@@ -231,7 +233,7 @@ pub fn plan_wall_props(g: &LevelGrid) -> Vec<WallProp> {
                 let c = room.min + IVec2::new(x, z);
                 for side in RampDir::ALL.map(RampDir::offset) {
                     let f = WallFace { cell: c, side };
-                    if wall_prop_slot_ok(g, f) {
+                    if wall_prop_slot_ok(g, f) && interactive.iter().all(|p| (*p - f.cell).abs().max_element() >= 2) {
                         cands.push(f);
                     }
                 }
@@ -1024,42 +1026,49 @@ fn build_ops_console(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, glow: 
     }
 }
 
-/// Retro UAC ration / beverage vending machine (0.95 x 2.15 x 0.52 m).
+/// Retro UAC ration / beverage vending machine (0.95 x 2.15 m).
+/// Lower pickup base sits 0.48 m deep; the upper display bay above waist height
+/// recesses to 0.34 m (< `PLAYER_RADIUS` = 0.40 m) so wall-hugging never clips
+/// the eye camera inside the cabinet.
 fn build_vending_machine(b: &mut ArchBatches, m: &ArchMeshes, fr: &Transform, glow: ArchSlot, variant: u8) {
     use ArchSlot::{Accent, Lamp, Plate, Screen, Trim};
-    put_box(b, Trim, m, fr, Vec3::new(0.9, 0.06, 0.48), Vec3::new(0.0, 0.03, 0.24));
-    put_box(b, Plate, m, fr, Vec3::new(0.95, 2.09, 0.5), Vec3::new(0.0, 1.105, 0.25));
+    // Grounded lower plinth + dispenser base (y = 0.0..0.92, depth = 0.48 m).
+    put_box(b, Trim, m, fr, Vec3::new(0.9, 0.06, 0.46), Vec3::new(0.0, 0.03, 0.23));
+    put_box(b, Plate, m, fr, Vec3::new(0.95, 0.84, 0.48), Vec3::new(0.0, 0.48, 0.24));
+    put_box(b, Trim, m, fr, Vec3::new(0.95, 0.04, 0.49), Vec3::new(0.0, 0.92, 0.245));
+    // Recessed upper cabinet (y = 0.94..2.15, depth = 0.34 m, front details <= 0.365 m).
+    put_box(b, Plate, m, fr, Vec3::new(0.95, 1.21, 0.34), Vec3::new(0.0, 1.545, 0.17));
     // Header with a glowing UAC logo strip.
-    put_box(b, Trim, m, fr, Vec3::new(0.95, 0.2, 0.02), Vec3::new(0.0, 2.0, 0.51));
-    put_box(b, Accent, m, fr, Vec3::new(0.7, 0.06, 0.01), Vec3::new(0.0, 2.0, 0.522));
+    put_box(b, Trim, m, fr, Vec3::new(0.95, 0.2, 0.02), Vec3::new(0.0, 2.04, 0.35));
+    put_box(b, Accent, m, fr, Vec3::new(0.7, 0.06, 0.01), Vec3::new(0.0, 2.04, 0.362));
     // Display window: frame, glow pane, shelves of colorful cans in front of it.
-    let (wx, ww, wh, wy) = (-0.11f32, 0.6f32, 1.12f32, 1.28f32);
-    put_box(b, Trim, m, fr, Vec3::new(ww + 0.06, wh + 0.06, 0.01), Vec3::new(wx, wy, 0.503));
-    put_box(b, glow, m, fr, Vec3::new(ww, wh, 0.008), Vec3::new(wx, wy, 0.51));
+    let (wx, ww, wh, wy) = (-0.11f32, 0.6f32, 0.96f32, 1.44f32);
+    put_box(b, Trim, m, fr, Vec3::new(ww + 0.06, wh + 0.06, 0.01), Vec3::new(wx, wy, 0.343));
+    put_box(b, glow, m, fr, Vec3::new(ww, wh, 0.008), Vec3::new(wx, wy, 0.35));
     let can_slots = [Accent, Plate, Lamp, Trim, Screen];
     for row in 0..4 {
-        let y = wy - wh * 0.5 + 0.06 + row as f32 * 0.27;
-        put_box(b, Trim, m, fr, Vec3::new(ww, 0.02, 0.012), Vec3::new(wx, y, 0.518));
+        let y = wy - wh * 0.5 + 0.05 + row as f32 * 0.23;
+        put_box(b, Trim, m, fr, Vec3::new(ww, 0.02, 0.012), Vec3::new(wx, y, 0.358));
         for k in 0..4 {
             let slot = can_slots[(row + k + variant as usize) % can_slots.len()];
-            put_box(b, slot, m, fr, Vec3::new(0.08, 0.13, 0.008), Vec3::new(wx - 0.21 + k as f32 * 0.14, y + 0.08, 0.52));
+            put_box(b, slot, m, fr, Vec3::new(0.08, 0.11, 0.008), Vec3::new(wx - 0.21 + k as f32 * 0.14, y + 0.07, 0.36));
         }
     }
     // Illuminated keypad strip + coin slot on the right.
-    put_box(b, Trim, m, fr, Vec3::new(0.2, 0.52, 0.012), Vec3::new(0.34, 1.45, 0.506));
-    put_box(b, Lamp, m, fr, Vec3::new(0.13, 0.32, 0.008), Vec3::new(0.34, 1.5, 0.514));
+    put_box(b, Trim, m, fr, Vec3::new(0.2, 0.48, 0.012), Vec3::new(0.34, 1.5, 0.346));
+    put_box(b, Lamp, m, fr, Vec3::new(0.13, 0.3, 0.008), Vec3::new(0.34, 1.54, 0.354));
     for k in 0..3 {
-        put_box(b, Trim, m, fr, Vec3::new(0.14, 0.012, 0.004), Vec3::new(0.34, 1.4 + k as f32 * 0.1, 0.52));
+        put_box(b, Trim, m, fr, Vec3::new(0.14, 0.012, 0.004), Vec3::new(0.34, 1.44 + k as f32 * 0.09, 0.36));
     }
-    put_box(b, Trim, m, fr, Vec3::new(0.004, 0.32, 0.004), Vec3::new(0.34, 1.5, 0.52));
-    put_box(b, Accent, m, fr, Vec3::new(0.08, 0.02, 0.01), Vec3::new(0.34, 1.12, 0.51));
-    // Recessed pickup bay: lips around a dark flap.
-    put_box(b, Trim, m, fr, Vec3::new(0.62, 0.04, 0.03), Vec3::new(-0.05, 0.5, 0.515));
-    put_box(b, Trim, m, fr, Vec3::new(0.62, 0.04, 0.03), Vec3::new(-0.05, 0.26, 0.515));
+    put_box(b, Trim, m, fr, Vec3::new(0.004, 0.3, 0.004), Vec3::new(0.34, 1.54, 0.36));
+    put_box(b, Accent, m, fr, Vec3::new(0.08, 0.02, 0.01), Vec3::new(0.34, 1.18, 0.35));
+    // Recessed pickup bay on the lower plinth: lips around a dark flap.
+    put_box(b, Trim, m, fr, Vec3::new(0.62, 0.04, 0.03), Vec3::new(-0.05, 0.54, 0.495));
+    put_box(b, Trim, m, fr, Vec3::new(0.62, 0.04, 0.03), Vec3::new(-0.05, 0.26, 0.495));
     for sx in [-0.34f32, 0.24] {
-        put_box(b, Trim, m, fr, Vec3::new(0.04, 0.28, 0.03), Vec3::new(sx, 0.38, 0.515));
+        put_box(b, Trim, m, fr, Vec3::new(0.04, 0.32, 0.03), Vec3::new(sx, 0.4, 0.495));
     }
-    b.put(Trim, &m.cube, fr, Transform::from_xyz(-0.05, 0.38, 0.505).with_rotation(Quat::from_rotation_x(0.12)).with_scale(Vec3::new(0.54, 0.18, 0.01)));
+    b.put(Trim, &m.cube, fr, Transform::from_xyz(-0.05, 0.4, 0.485).with_rotation(Quat::from_rotation_x(0.12)).with_scale(Vec3::new(0.54, 0.2, 0.01)));
 }
 
 /// 4-tier industrial steel shelving rack (1.8 x 2.2 x 0.50 m).
@@ -1504,30 +1513,27 @@ pub fn ups_target(floor: u32) -> usize {
 /// Deterministic, capped interactive prop placement: the same wall-flush
 /// slot rules as the telecom props (flat cells of rooms or >= 2-cell-wide
 /// corridors, mid-way along unbroken straight walls, never a 1-cell squeeze),
-/// at least 2 cells from every Milestone 16 wall prop and 3 cells apart.
-/// UPS racks prefer room cells (combat rooms), then wide halls; CRTs take
-/// the remaining slots, hallways first. Milestone 32: interactive props are
-/// planned BEFORE the static wall furniture ([`plan_telecom_props`] keeps
-/// at least 2 cells clear of them), so denser furniture never eats their budget.
+/// spaced 3 cells apart (except for one reserved adjacent UPS chain pair).
+/// Planned FIRST before decorative wall props ([`plan_wall_props`]) and
+/// static wall furniture ([`plan_telecom_props`]), so decorative props never
+/// starve the interactive CRT / UPS budget.
 pub fn plan_interactive_props(g: &LevelGrid) -> Vec<InteractiveProp> {
-    let taken: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).collect();
-    let mut cands: Vec<WallFace> = wall_faces(g)
-        .into_iter()
-        .filter(|f| telecom_slot_ok(g, *f) && taken.iter().all(|w| (*w - f.cell).abs().max_element() >= 2))
-        .collect();
+    let mut cands: Vec<WallFace> = wall_faces(g).into_iter().filter(|f| telecom_slot_ok(g, *f)).collect();
     let mut rng = StdRng::seed_from_u64(g.seed ^ 0x0C1A_0531_DEAD_BEEF);
     cands.shuffle(&mut rng);
     let in_room = |c: IVec2| g.rooms.iter().any(|r| c.x >= r.min.x && c.y >= r.min.y && c.x < r.min.x + r.size.x && c.y < r.min.y + r.size.y);
-    // Room slots first (stable partition keeps the shuffle otherwise).
-    cands.sort_by_key(|f| !in_room(f.cell));
     let (want_ups, want_crt) = (ups_target(g.floor), crt_target(g.floor));
     let mut out: Vec<InteractiveProp> = Vec::new();
     let spaced = |out: &[InteractiveProp], f: &WallFace| out.iter().all(|p| (p.face.cell - f.cell).abs().element_sum() >= 3);
     // Reserve one chain-reaction UPS pair along an adjacent flat wall (4 m apart,
-    // well inside the 7.5 m EMP blast radius) so generated floors actually chain.
+    // well inside the 7.5 m EMP blast radius), preferring a combat room pair first
+    // while letting remaining UPS racks spread across both rooms and wide halls so
+    // rooms still have plenty of room for Milestone 16 signature wall props.
     if want_ups >= 2 {
-        'pair: for (i, a) in cands.iter().enumerate() {
-            for b in &cands[i + 1..] {
+        let mut pair_order = cands.clone();
+        pair_order.sort_by_key(|f| !in_room(f.cell));
+        'pair: for (i, a) in pair_order.iter().enumerate() {
+            for b in &pair_order[i + 1..] {
                 if a.side == b.side && (a.cell - b.cell).abs().element_sum() == 1 {
                     out.push(InteractiveProp { face: *a, kind: InteractiveKind::Ups });
                     out.push(InteractiveProp { face: *b, kind: InteractiveKind::Ups });
@@ -1536,7 +1542,7 @@ pub fn plan_interactive_props(g: &LevelGrid) -> Vec<InteractiveProp> {
             }
         }
     }
-    // Remaining UPS racks: combat rooms first, then the wide halls.
+    // Remaining UPS racks spread across shuffled wide halls and rooms.
     for f in &cands {
         if out.len() >= want_ups {
             break;
@@ -2159,5 +2165,33 @@ mod tests {
         let (c, u) = (crt_total as f32 / floors as f32, ups_total as f32 / floors as f32);
         println!("interactive props per floor: {c:.1} CRTs, {u:.1} UPS racks");
         assert!(c >= 3.0 && u >= 2.5, "budgets mostly filled: {c} CRTs, {u} UPS");
+    }
+
+    #[test]
+    fn v101_floor5_seed512_hits_full_interactive_budget_and_vending_recesses_at_eye_height() {
+        // Floor 5 seed 512 previously lost 2 CRTs when decorative wall props ran before interactives.
+        let g = crate::level::generate_level(5, 512);
+        let plan = plan_interactive_props(&g);
+        let crts = plan.iter().filter(|p| p.kind == InteractiveKind::Crt).count();
+        let ups = plan.iter().filter(|p| p.kind == InteractiveKind::Ups).count();
+        assert_eq!(ups, ups_target(5), "Floor 5 seed 512 hits full UPS budget");
+        assert_eq!(crts, crt_target(5), "Floor 5 seed 512 hits full CRT budget");
+        let walls = plan_wall_props(&g);
+        for p in &plan {
+            assert!(walls.iter().all(|w| (w.face.cell - p.face.cell).abs().max_element() >= 2), "wall props stay clear");
+        }
+        // Vending machine upper cabinet stays recessed below PLAYER_RADIUS (0.40 m) at eye height.
+        let meshes = ArchMeshes::new();
+        let mut batches = ArchBatches::default();
+        build_telecom_prop(&mut batches, &meshes, &Transform::IDENTITY, TelecomKind::VendingMachine, 0);
+        for batch in [batches.trim, batches.accent, batches.plate, batches.screen, batches.lamp] {
+            if let Some(mesh) = batch.build() {
+                for pos in positions(&mesh) {
+                    if pos.y >= 1.0 {
+                        assert!(pos.z < 0.38, "vending machine eye-height depth {pos:?} must stay < 0.40 m");
+                    }
+                }
+            }
+        }
     }
 }

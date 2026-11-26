@@ -4215,13 +4215,13 @@ fn wide_lane_aggro_wakes_visible_demons_at_32_m_but_not_screened_ones() {
     step(&mut app, 5);
     let visible = spawn_demon(&mut app, EnemyKind::Imp, Vec3::new(38.0, 0.0, 6.0));
     let screened = spawn_demon(&mut app, EnemyKind::Imp, Vec3::new(36.0, 0.0, 14.0));
+    for e in [visible, screened] {
+        assert!(!enemy(&app, e).unwrap().alerted, "both start idle");
+    }
     step(&mut app, 1);
     let g = grid(&app);
     assert!(has_line_of_sight(&g, feet + Vec3::Y * PLAYER_EYE_HEIGHT, Vec3::new(38.0, 1.5, 6.0)));
     assert!(!has_line_of_sight(&g, feet + Vec3::Y * PLAYER_EYE_HEIGHT, Vec3::new(36.0, 1.5, 14.0)));
-    for e in [visible, screened] {
-        assert!(!enemy(&app, e).unwrap().alerted, "both start idle");
-    }
     step(&mut app, FPS);
     let v = enemy(&app, visible).unwrap();
     assert!(v.alerted && v.sees_player, "32 m in plain sight reacts within ~1 s");
