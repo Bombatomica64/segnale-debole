@@ -280,6 +280,19 @@ pub fn network_allowed_by_env(vars: impl Iterator<Item = (String, String)>) -> b
     true
 }
 
+/// Process-level check: `std::env::vars()` panics on `wasm32-unknown-unknown`
+/// (`library/std/src/sys/env/unsupported.rs`), where no process environment exists.
+pub fn network_allowed_in_process() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        !cfg!(test)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        network_allowed_by_env(std::env::vars())
+    }
+}
+
 /// Base URL + whether to send credentials (cookies) for the current host.
 /// Same-origin (production host / local dev) uses relative URLs + cookies;
 /// anywhere else (itch.io embeds) talks to production as a guest.
@@ -1059,7 +1072,7 @@ pub struct LeaderboardPlugin;
 
 impl Plugin for LeaderboardPlugin {
     fn build(&self, app: &mut App) {
-        let enabled = !app.world().contains_resource::<NetworkDisabled>() && network_allowed_by_env(std::env::vars());
+        let enabled = !app.world().contains_resource::<NetworkDisabled>() && network_allowed_in_process();
         if !app.world().contains_resource::<LeaderboardClient>() {
             app.insert_resource(LeaderboardClient::for_platform(enabled));
         }

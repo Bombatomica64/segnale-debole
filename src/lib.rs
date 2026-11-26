@@ -102,8 +102,8 @@ impl Plugin for GamePlugin {
         let store = meta::ProfileStore::open(meta::resolve_profile_path(true));
         app.insert_resource(store).add_plugins((CoreGameplayPlugin, hud::HudPlugin));
         // Env-driven dev hooks (PNG screenshot tours, playtest bot) are
-        // desktop tooling; Android has no env and builds without `png`.
-        #[cfg(not(target_os = "android"))]
+        // desktop tooling; Android and wasm32 have no env or `png` feature.
+        #[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
         app.add_plugins(dev::DevPlugin);
         // Controllers and the mouse reach Bevy through the JNI bridge.
         #[cfg(target_os = "android")]
