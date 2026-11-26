@@ -40,6 +40,11 @@
 //!   and controller prompts), the full 25-entry leaderboard on all 3 pages as
 //!   a native guest, the controller callsign editor, the App Store upgrade
 //!   cards and the in-run HUD with controller prompts, then exits.
+//! - `SEGNALE_M31_SHOTS=<dir>`: Milestone 31 tour on an in-memory profile:
+//!   `01_style_6g_props.png` (SS / 6G style meter + a CRT desk beside an
+//!   explosive UPS rack in a wide hall), `02_ups_chain_blast.png` (the rack
+//!   detonating, SSS / 6G+) and `03_trial_signal_ghost.png` (the PB Signal
+//!   Ghost on the Time Trial with its live delta), then exits.
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
@@ -156,6 +161,20 @@ impl Plugin for DevPlugin {
                 }
             }
             app.insert_resource(CompendiumShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, compendium_shots_tour);
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_M31_SHOTS") {
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.web_storage = false;
+                    store.profile = PlayerProfile::default();
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(PlayerProfile::default()));
+                }
+            }
+            app.insert_resource(M31Shots { dir, stage: 0, timer: 0.0 }).add_systems(Update, m31_shots_tour.after(GameSet::Ui));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_META_SHOTS") {
@@ -1354,6 +1373,179 @@ fn model_shots_tour(
             true
         }
         16 if t > 1.0 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_M31_SHOTS (Milestone 31)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct M31Shots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+/// Stage the style HUD at `SS / 6G` (or `SSS / 6G+`) with a live feed.
+fn stage_style(meter: &mut crate::style::StyleMeter, points: f32) {
+    meter.points = points;
+    meter.idle = 0.0;
+    meter.pop = 0.35;
+    meter.feed = [Some(("UPS CHAIN BLAST", 0.2)), Some(("WEAPON SWITCH", 0.7)), Some(("AIRBORNE KILL", 1.2))];
+    meter.peak = meter.rank();
+}
+
+/// Milestone 31 tour: `01_style_6g_props.png` (SS / 6G meter + a CRT desk
+/// beside a UPS rack in a wide hall), `02_ups_chain_blast.png` (the rack
+/// detonating, the CRT shattered, SSS / 6G+), `03_trial_signal_ghost.png`
+/// (the PB Signal Ghost running ahead on the Time Trial with its delta).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn m31_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<M31Shots>,
+    state: Res<State<AppState>>,
+    grid: Option<Res<LevelGrid>>,
+    (mut run, mut mods, mut loadout, mut trial): (ResMut<RunStats>, ResMut<PlayerModifiers>, ResMut<RunLoadout>, ResMut<crate::trials::TimeTrialState>),
+    (mut meter, mut ghost, props): (ResMut<crate::style::StyleMeter>, ResMut<crate::trials::TrialGhostStore>, Option<Res<crate::props::PropAssets>>),
+    mut players: Query<(&mut Player, &mut Transform)>,
+    mut racks: Query<&mut crate::props::UpsRack>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+    mut store: Option<ResMut<ProfileStore>>,
+) {
+    cfg.timer += time.delta_secs();
+    for (mut p, _) in &mut players {
+        p.invuln_timer = 999.0;
+        p.hp = p.max_hp;
+    }
+    let dir = cfg.dir.clone();
+    let t = cfg.timer;
+    let advance = match (cfg.stage, *state.get()) {
+        (0, AppState::MainMenu) if t > 1.0 => {
+            commands.insert_resource(DevFreezeAi);
+            crate::state::start_run(&mut run, &mut mods, &mut next, 31);
+            true
+        }
+        (1, AppState::Playing) if t > 2.5 => {
+            // Face a UPS rack from the hall, with a CRT desk staged one cell along the wall.
+            let Some(g) = grid.as_deref() else { return };
+            let plan = crate::architecture::plan_interactive_props(g);
+            let Some(ups) = plan.iter().find(|p| p.kind == crate::architecture::InteractiveKind::Ups) else {
+                warn!("dev: no UPS rack on this floor");
+                exit.write(AppExit::error());
+                return;
+            };
+            let f = ups.face;
+            // CRT desk one cell along the wall (whichever side is a clean slot).
+            let side = [f.perp(), -f.perp()].into_iter().find(|o| g.cell(f.cell + *o + f.side).is_wall() && !g.cell(f.cell + *o).is_wall()).unwrap_or(f.perp());
+            if let Some(a) = props.as_deref() {
+                crate::props::spawn_crt(&mut commands, a, crate::architecture::WallFace { cell: f.cell + side, side: f.side });
+            }
+            if let Ok((mut p, mut tf)) = players.single_mut() {
+                let along = Vec3::new(side.x as f32, 0.0, side.y as f32);
+                let feet = g.cell_center(f.cell) + f.inward() * 2.6 + along * 2.0;
+                let look = f.anchor() + Vec3::Y * 1.15 + along * 2.0;
+                tf.translation = feet;
+                p.velocity = Vec3::ZERO;
+                p.prev_pos = Some(feet);
+                let d = look - (feet + Vec3::Y * crate::player::PLAYER_EYE_HEIGHT);
+                p.yaw = crate::level::yaw_facing(Vec2::new(d.x, d.z));
+                p.prev_yaw = p.yaw;
+                p.pitch = d.y.atan2(Vec2::new(d.x, d.z).length());
+                tf.rotation = Quat::from_rotation_y(p.yaw);
+            }
+            stage_style(&mut meter, 1000.0);
+            true
+        }
+        (2, AppState::Playing) if t > 1.2 => {
+            stage_style(&mut meter, 1000.0);
+            meta_shot(&mut commands, &dir, "01_style_6g_props.png");
+            true
+        }
+        (3, AppState::Playing) if t > 0.6 => {
+            // Blow the rack: EMP + blast shatters the staged CRT.
+            for mut r in &mut racks {
+                if let Ok((_, tf)) = players.single()
+                    && r.bounds.center().distance(tf.translation) < 14.0
+                {
+                    r.damage(100.0, false);
+                }
+            }
+            stage_style(&mut meter, 1400.0);
+            true
+        }
+        (4, AppState::Playing) if t > 0.07 => {
+            stage_style(&mut meter, 1400.0);
+            meter.feed = [Some(("CHAIN REACTION", 0.0)), Some(("UPS CHAIN BLAST", 0.3)), Some(("CRT SHATTERED", 0.5))];
+            meta_shot(&mut commands, &dir, "02_ups_chain_blast.png");
+            true
+        }
+        (5, AppState::Playing) if t > 0.8 => {
+            next.set(AppState::MainMenu);
+            true
+        }
+        (6, AppState::MainMenu) if t > 1.0 => {
+            // A synthetic PB trace along the course: spawn -> CP1 -> CP2 -> CP3 -> finish.
+            let g = crate::trials::build_time_trial_grid();
+            let mut pts: Vec<(Vec3, f32)> = vec![(g.cell_center(g.spawn), g.spawn_yaw)];
+            pts.extend(crate::trials::time_trial_gates().iter().map(|gate| (g.cell_center(gate.cells[0]), gate.respawn_yaw)));
+            let mut samples = Vec::new();
+            let seg = 6.0;
+            for (i, w) in pts.windows(2).enumerate() {
+                for k in 0..60 {
+                    let s = k as f32 / 60.0;
+                    let pos = w[0].0.lerp(w[1].0, s);
+                    let d = w[1].0 - w[0].0;
+                    let yaw = crate::level::yaw_facing(Vec2::new(d.x, d.z));
+                    samples.push(crate::trials::GhostSample { t: (i as f32 + s) * seg, pos: pos.to_array(), yaw });
+                }
+            }
+            let last = pts.last().unwrap();
+            samples.push(crate::trials::GhostSample { t: (pts.len() - 1) as f32 * seg, pos: last.0.to_array(), yaw: last.1 });
+            let time = samples.last().unwrap().t;
+            ghost.backend = crate::trials::GhostBackend::Memory;
+            ghost.loaded = true;
+            ghost.pb = Some(crate::trials::GhostTrace { version: crate::trials::GHOST_VERSION, time, samples });
+            crate::trials::start_time_trial(&mut run, &mut mods, &mut loadout, &mut trial, &mut next, HandsetSkin::UacOrange);
+            true
+        }
+        (7, AppState::Playing) if t > 2.5 => {
+            // Trail the ghost a few metres behind on the first leg.
+            trial.elapsed = 3.4;
+            let Some(pb) = ghost.pb.clone() else { return };
+            if let Some(s) = store.as_deref_mut() {
+                s.profile.time_trial_best_secs = Some(pb.time);
+                s.profile.time_trial_best_splits = vec![6.0, 12.0, 18.0, pb.time];
+            }
+            if let (Some(_), Ok((mut p, mut tf))) = (grid.as_deref(), players.single_mut()) {
+                let (gpos, _) = pb.sample_at(trial.elapsed).unwrap_or_default();
+                let (feet, _) = pb.sample_at(trial.elapsed - 1.1).unwrap_or_default();
+                tf.translation = feet;
+                p.velocity = Vec3::ZERO;
+                p.prev_pos = Some(feet);
+                let d = gpos + Vec3::Y * 1.2 - (feet + Vec3::Y * crate::player::PLAYER_EYE_HEIGHT);
+                p.yaw = crate::level::yaw_facing(Vec2::new(d.x, d.z));
+                p.prev_yaw = p.yaw;
+                p.pitch = d.y.atan2(Vec2::new(d.x, d.z).length()).clamp(-0.3, 0.3);
+                tf.rotation = Quat::from_rotation_y(p.yaw);
+            }
+            true
+        }
+        (8, AppState::Playing) if t > 0.5 => {
+            meta_shot(&mut commands, &dir, "03_trial_signal_ghost.png");
+            true
+        }
+        (9, AppState::Playing) if t > 1.2 => {
             exit.write(AppExit::Success);
             true
         }

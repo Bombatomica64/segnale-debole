@@ -614,6 +614,12 @@ fn default_aim_friction() -> bool {
     true
 }
 
+/// Serde default for settings that are on unless explicitly switched off
+/// (Milestone 31 `rumble`: profiles saved before it get rumble on).
+fn default_true() -> bool {
+    true
+}
+
 /// Player-facing options persisted inside the profile (never gameplay power).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -644,6 +650,9 @@ pub struct UserSettings {
     /// Gentle Right Stick slowdown over visible targets (never the mouse).
     #[serde(default = "default_aim_friction")]
     pub gamepad_aim_friction: bool,
+    /// Controller rumble / haptics (only ever on an active controller).
+    #[serde(default = "default_true")]
+    pub rumble: bool,
 }
 
 impl Default for UserSettings {
@@ -663,6 +672,7 @@ impl Default for UserSettings {
             gamepad_sensitivity: default_gamepad_sensitivity(),
             gamepad_invert_y: false,
             gamepad_aim_friction: default_aim_friction(),
+            rumble: default_true(),
         }
     }
 }
@@ -1278,7 +1288,7 @@ pub fn profile_path_policy(
 /// `$XDG_DATA_HOME/segnale-debole/profile.json` (or `~/.local/share/...`).
 pub fn resolve_profile_path(windowed: bool) -> Option<PathBuf> {
     let var = |k: &str| std::env::var(k).ok();
-    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS", "SEGNALE_COMPENDIUM_SHOTS", "SEGNALE_LEADERBOARD_SHOTS"].into_iter().any(|k| var(k).is_some());
+    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS", "SEGNALE_COMPENDIUM_SHOTS", "SEGNALE_LEADERBOARD_SHOTS", "SEGNALE_M31_SHOTS"].into_iter().any(|k| var(k).is_some());
     profile_path_policy(var("SEGNALE_PROFILE").as_deref(), windowed, bot_or_shots, var("XDG_DATA_HOME").as_deref(), var("HOME").as_deref())
 }
 
@@ -1622,6 +1632,11 @@ mod tests {
         assert!(p.settings.gamepad_aim_friction, "pre-Milestone 28 profiles get aim friction on");
         let off: UserSettings = serde_json::from_str(r#"{"gamepad_aim_friction":false}"#).unwrap();
         assert!(!off.gamepad_aim_friction, "an explicit OFF survives a load");
+        assert!(p.settings.rumble && off.rumble, "pre-Milestone 31 profiles get rumble on");
+        let quiet: UserSettings = serde_json::from_str(r#"{"rumble":false}"#).unwrap();
+        assert!(!quiet.rumble, "an explicit RUMBLE: OFF survives a load");
+        let round: UserSettings = serde_json::from_str(&serde_json::to_string(&quiet).unwrap()).unwrap();
+        assert!(!round.rumble);
         assert_eq!((p.settings.mouse_sensitivity, p.settings.base_fov_deg, p.settings.speedrun_splits), (1.5, 95.0, true));
         // An empty settings block and a bare profile both fall back to defaults.
         assert_eq!(parse_profile(r#"{"settings":{}}"#).unwrap().settings, UserSettings::default());

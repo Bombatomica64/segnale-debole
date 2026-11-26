@@ -285,6 +285,8 @@ pub struct Enemy {
     pub stride_phase: f32,
     /// How the killing blow landed (Milestone 30 fatalities; set by weapons).
     pub kill_cause: crate::fatality::KillCause,
+    /// What last damaged this demon (Milestone 31 style freshness).
+    pub style_source: crate::style::StyleSource,
 }
 
 impl Enemy {
@@ -325,6 +327,7 @@ impl Enemy {
             stagger_timer: 0.0,
             stride_phase: rng.random_range(0.0..TAU),
             kill_cause: crate::fatality::KillCause::Generic,
+            style_source: crate::style::StyleSource::Other,
         }
     }
 
@@ -2853,6 +2856,10 @@ fn animate_rig(tf: &mut Transform, rp: &mut RigPivot, e: &Enemy, boss: Option<&c
     }
 }
 
+/// Demon death processing (drops, fatalities, style + kill telemetry).
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EnemyDeathsSet;
+
 #[allow(clippy::too_many_arguments)]
 fn enemy_deaths(
     mut commands: Commands,
@@ -2869,6 +2876,7 @@ fn enemy_deaths(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut decals: ResMut<DecalQueue>,
     (mut fatal, mut punch, grid): (ResMut<crate::fatality::FatalityState>, ResMut<crate::fx::CameraPunch>, Option<Res<LevelGrid>>),
+    mut style: ResMut<crate::style::StyleQueue>,
 ) {
     let mut rng = rand::rng();
     // Player motion for style callouts (airborne / dashing / speed).
@@ -2918,7 +2926,10 @@ fn enemy_deaths(
         // Milestone 30: random fatality (guaranteed on point-blank overkills,
         // direct mortar hits and the Carrier Daemon), else a style callout.
         let boss = e.kind == EnemyKind::CarrierDaemon;
-        match fatal.roll(e.kill_cause, boss, rng.random(), rng.random()) {
+        let fatality = fatal.roll(e.kill_cause, boss, rng.random(), rng.random());
+        let source = if e.kill_cause == crate::fatality::KillCause::MortarDirect { crate::style::StyleSource::Rocket } else { e.style_source };
+        style.push(crate::style::StyleAction::Kill { kind: e.kind, source, airborne, speed, marked: marked.is_some(), fatality: fatality.is_some() });
+        match fatality {
             Some(kind) => {
                 let dir = Vec3::new(e.stagger_dir.x, 0.0, e.stagger_dir.y);
                 let wall = grid
@@ -3103,7 +3114,8 @@ impl Plugin for EnemiesPlugin {
             .add_systems(OnEnter(crate::state::AppState::Compendium), crate::fatality::reset_fatality_state)
             .add_systems(OnEnter(crate::state::AppState::Playing), crate::fatality::reset_fatality_on_fresh_run)
             .add_systems(Update, crate::fatality::tick_fatality_state.in_set(GameSet::World))
-            .add_systems(Update, enemy_deaths.in_set(GameSet::Combat).after(enemy_visuals).after(crate::weapons::CombatDamage));
+            .configure_sets(Update, EnemyDeathsSet.in_set(GameSet::Combat))
+            .add_systems(Update, enemy_deaths.in_set(EnemyDeathsSet).after(enemy_visuals).after(crate::weapons::CombatDamage));
     }
 }
 

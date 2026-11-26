@@ -173,12 +173,28 @@ fn merge_top_field(key: &str, e: &Value, i: &Value) -> Value {
         "schema_version" => max_num(e, i),
         "unlocked_feats" => union_sorted(e, i),
         "stats" => merge_stats(e, i),
+        "settings" => merge_settings(e, i),
         "daily_records" => merge_daily_records(e, i),
         "best_floor_segments" => elementwise(e, i, min_opt),
         "standard_pb_splits" => lower_last(e, i),
         k if is_best_time_key(k) => min_opt(e, i),
         _ => i.clone(),
     }
+}
+
+/// Incoming settings win, except a pre-M31 client that omits `rumble` must
+/// not erase a newer client's stored `rumble` preference.
+fn merge_settings(e: &Value, i: &Value) -> Value {
+    let (Some(eo), Some(io)) = (e.as_object(), i.as_object()) else {
+        return i.clone();
+    };
+    let mut out = io.clone();
+    if !out.contains_key("rumble")
+        && let Some(r) = eo.get("rumble")
+    {
+        out.insert("rumble".into(), r.clone());
+    }
+    Value::Object(out)
 }
 
 fn union_keys(e: &Map<String, Value>, i: &Map<String, Value>) -> Vec<String> {
@@ -424,6 +440,26 @@ mod tests {
         let m = merge_profile(&e, &i);
         assert_eq!(m["unlocked_feats"], json!(["Alpha", "Beta", "Zeta"]));
         assert_eq!(m["schema_version"], 5);
+    }
+
+    #[test]
+    fn milestone31_rumble_setting_is_accepted_and_merged() {
+        // A client with the new `settings.rumble` field validates and syncs;
+        // an older client without it keeps the newer device's choice intact
+        // only when it sends settings itself (incoming wins, as for every setting).
+        let e = json!({"schema_version": 3, "settings": {"mouse_sensitivity": 1.0, "gamepad_aim_friction": true, "rumble": false}});
+        assert!(validate_profile_json(&e).is_ok());
+        let i = json!({"schema_version": 3, "settings": {"mouse_sensitivity": 1.2, "rumble": true}});
+        assert!(validate_profile_json(&i).is_ok());
+        let m = merge_profile(&e, &i);
+        assert_eq!(m["settings"]["rumble"], json!(true));
+        let old = json!({"schema_version": 3, "stats": {"runs_played": 4}});
+        let kept = merge_profile(&e, &old);
+        assert_eq!(kept["settings"]["rumble"], json!(false), "a profile upload without settings keeps RUMBLE: OFF");
+        let old_with_settings = json!({"schema_version": 3, "settings": {"mouse_sensitivity": 0.8}});
+        let kept_partial = merge_profile(&e, &old_with_settings);
+        assert_eq!(kept_partial["settings"]["mouse_sensitivity"], json!(0.8));
+        assert_eq!(kept_partial["settings"]["rumble"], json!(false), "a pre-M31 settings upload without rumble preserves cloud rumble: false");
     }
 
     #[test]

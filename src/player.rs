@@ -195,6 +195,9 @@ pub struct Player {
     pub bob_phase: f32,
     /// Seconds since the last damage taken (for HUD flashes).
     pub since_damage: f32,
+    /// Monotonic counter incremented on every real hit in [`Player::apply_damage`]
+    /// so same-frame healing never masks damage for style demotion or rumble.
+    pub damage_hits: u32,
     /// True on the frame a dash begins (Airplane Mode shockwave hook).
     pub dash_started: bool,
     /// Seconds left to still jump after leaving the ground.
@@ -237,6 +240,7 @@ impl Default for Player {
             hazard_timer: 0.0,
             bob_phase: 0.0,
             since_damage: 999.0,
+            damage_hits: 0,
             dash_started: false,
             coyote_timer: 0.0,
             jump_buffer_timer: 0.0,
@@ -260,7 +264,10 @@ impl Player {
         self.armor -= absorbed;
         let lost = (amount - absorbed).min(self.hp);
         self.hp -= lost;
-        self.since_damage = 0.0;
+        if absorbed + lost > 0.0 {
+            self.since_damage = 0.0;
+            self.damage_hits = self.damage_hits.wrapping_add(1);
+        }
         lost
     }
 

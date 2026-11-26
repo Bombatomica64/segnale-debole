@@ -411,6 +411,8 @@ pub struct RunStats {
     pub custom_seed: bool,
     /// Kills per demon kind this run (indexed by [`crate::enemies::EnemyKind::index`]).
     pub enemy_kills: [u32; KIND_COUNT],
+    /// Best Bandwidth Style Rank reached this run (Milestone 31 end-card badge).
+    pub peak_style_rank: Option<crate::style::StyleRank>,
 }
 
 impl Default for RunStats {
@@ -437,6 +439,7 @@ impl Default for RunStats {
             seed_label: None,
             custom_seed: false,
             enemy_kills: [0; KIND_COUNT],
+            peak_style_rank: None,
         }
     }
 }

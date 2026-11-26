@@ -355,7 +355,7 @@ fn phone_apps(
         Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
         Query<(&mut crate::boss::BossPylon, &GlobalTransform)>,
     ),
-    (mut bot, pad): (Option<ResMut<BotControl>>, Option<Res<crate::gamepad::GamepadInput>>),
+    (mut bot, pad, mut prop_hits): (Option<ResMut<BotControl>>, Option<Res<crate::gamepad::GamepadInput>>, ResMut<crate::props::PropHits>),
 ) {
     apps.tick(time.delta_secs());
     let (pad_ping, pad_overload) = pad.map_or((false, false), |g| (g.ping, g.overload));
@@ -453,6 +453,8 @@ fn phone_apps(
             None => {
                 let radius = emp_radius(&mods);
                 let dmg = emp_damage(&mods);
+                // CRTs / UPS racks in the EMP short out too.
+                prop_hits.blast(center, radius, dmg, false);
                 if apps.callback_timer > 0.0 {
                     apps.callback_timer = 0.0;
                     feed.toast("EMERGENCY CALLBACK: 5G OVERLOAD FIRED", Color::srgb(1.0, 0.85, 0.25));
@@ -480,6 +482,7 @@ fn phone_apps(
                     let d = c.distance(center) - en.stats.radius;
                     if d <= radius {
                         damage_enemy(&mut en, dmg, mark.is_some(), &mods);
+                        en.style_source = crate::style::StyleSource::Overload;
                         let away = Vec3::new(c.x - center.x, 0.0, c.z - center.z).normalize_or_zero();
                         let kind = en.kind;
                         en.knockback += away * 14.0 * knockback_scale(kind);
@@ -520,6 +523,7 @@ fn phone_apps(
                     for (src, idx) in picks {
                         if let Some((_, mut en, g, mark)) = enemies.iter_mut().nth(idx) {
                             damage_enemy(&mut en, CHAIN_DAMAGE, mark.is_some(), &mods);
+                            en.style_source = crate::style::StyleSource::Overload;
                             en.stun_timer = en.stun_timer.max(EMP_STUN * 0.6);
                             spawn_lightning(&mut commands, &fx, src, en.center(g.translation()));
                         }
@@ -566,6 +570,7 @@ pub fn store_and_forward_discharge(
     for &i in &targets {
         let (en, g, mark) = &mut list[i];
         damage_enemy(en, STORE_FORWARD_DAMAGE, mark.is_some(), &mods);
+        en.style_source = crate::style::StyleSource::Overload;
         let c = en.center(g.translation());
         spawn_lightning(&mut commands, &fx, src, c);
     }
@@ -586,12 +591,15 @@ fn dash_shockwave(
     mut sfx: ResMut<SfxQueue>,
     players: Query<(&Transform, &Player)>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
+    mut prop_hits: ResMut<crate::props::PropHits>,
 ) {
     let Ok((ptf, p)) = players.single() else { return };
     if !p.dash_started || !mods.dash_shockwave {
         return;
     }
     let c = ptf.translation + Vec3::Y * 0.9;
+    // The static shockwave also pops CRTs / zaps UPS racks it sweeps.
+    prop_hits.blast(c, DASH_SHOCK_RADIUS, DASH_SHOCK_DAMAGE, false);
     spawn_shockwave(&mut commands, &fx, &mut materials, ptf.translation + Vec3::Y * 0.2, DASH_SHOCK_RADIUS, 0.4, Color::srgb(0.3, 0.9, 1.0), 0.9, true);
     spawn_burst(&mut commands, &fx, c, BurstColor::Cyan, 10, 6.0, 0.08);
     let mut hits = 0;
@@ -599,6 +607,7 @@ fn dash_shockwave(
         let ec = e.center(g.translation());
         if e.is_alive() && ec.distance(c) - e.stats.radius <= DASH_SHOCK_RADIUS {
             damage_enemy(&mut e, DASH_SHOCK_DAMAGE, mark.is_some(), &mods);
+            e.style_source = crate::style::StyleSource::DashShock;
             let away = Vec3::new(ec.x - c.x, 0.0, ec.z - c.z).normalize_or_zero();
             let kind = e.kind;
             e.knockback += away * 10.0 * knockback_scale(kind);

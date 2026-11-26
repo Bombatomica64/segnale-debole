@@ -961,6 +961,93 @@ fn build_tower_crown(g: &LevelGrid, m: &ArchMeshes, b: &mut ArchBatches) {
 }
 
 // ---------------------------------------------------------------------------
+// Milestone 31: interactive (shootable) wall props
+// ---------------------------------------------------------------------------
+
+/// Max protrusion of an interactive prop (CRT desk, UPS rack) from its wall (m).
+pub const INTERACTIVE_MAX_DEPTH: f32 = 0.55;
+
+/// What an interactive wall slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveKind {
+    /// Shootable CRT monitor on a wall-flush desk.
+    Crt,
+    /// Explosive crimson-LED Lithium UPS server rack.
+    Ups,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractiveProp {
+    pub face: WallFace,
+    pub kind: InteractiveKind,
+}
+
+/// Shootable CRTs wanted on a floor (4..=8).
+pub fn crt_target(floor: u32) -> usize {
+    3 + floor.clamp(1, 5) as usize
+}
+
+/// Explosive UPS racks wanted on a floor (3..=6).
+pub fn ups_target(floor: u32) -> usize {
+    2 + floor.clamp(1, 4) as usize
+}
+
+/// Deterministic, capped interactive prop placement: the same wall-flush
+/// slot rules as the telecom props (flat cells of rooms or >= 2-cell-wide
+/// corridors, mid-way along unbroken straight walls, never a 1-cell squeeze),
+/// at least 2 cells from every Milestone 16 / 30 wall prop and 3 cells apart.
+/// UPS racks prefer room cells (combat rooms), then wide halls; CRTs take
+/// the remaining slots, hallways first.
+pub fn plan_interactive_props(g: &LevelGrid) -> Vec<InteractiveProp> {
+    let taken: Vec<IVec2> = plan_wall_props(g).iter().map(|p| p.face.cell).chain(plan_telecom_props(g).iter().map(|p| p.face.cell)).collect();
+    let mut cands: Vec<WallFace> = wall_faces(g)
+        .into_iter()
+        .filter(|f| telecom_slot_ok(g, *f) && taken.iter().all(|w| (*w - f.cell).abs().max_element() >= 2))
+        .collect();
+    let mut rng = StdRng::seed_from_u64(g.seed ^ 0x0C1A_0531_DEAD_BEEF);
+    cands.shuffle(&mut rng);
+    let in_room = |c: IVec2| g.rooms.iter().any(|r| c.x >= r.min.x && c.y >= r.min.y && c.x < r.min.x + r.size.x && c.y < r.min.y + r.size.y);
+    // Room slots first (stable partition keeps the shuffle otherwise).
+    cands.sort_by_key(|f| !in_room(f.cell));
+    let (want_ups, want_crt) = (ups_target(g.floor), crt_target(g.floor));
+    let mut out: Vec<InteractiveProp> = Vec::new();
+    let spaced = |out: &[InteractiveProp], f: &WallFace| out.iter().all(|p| (p.face.cell - f.cell).abs().element_sum() >= 3);
+    // Reserve one chain-reaction UPS pair along an adjacent flat wall (4 m apart,
+    // well inside the 7.5 m EMP blast radius) so generated floors actually chain.
+    if want_ups >= 2 {
+        'pair: for (i, a) in cands.iter().enumerate() {
+            for b in &cands[i + 1..] {
+                if a.side == b.side && (a.cell - b.cell).abs().element_sum() == 1 {
+                    out.push(InteractiveProp { face: *a, kind: InteractiveKind::Ups });
+                    out.push(InteractiveProp { face: *b, kind: InteractiveKind::Ups });
+                    break 'pair;
+                }
+            }
+        }
+    }
+    // Remaining UPS racks: combat rooms first, then the wide halls.
+    for f in &cands {
+        if out.len() >= want_ups {
+            break;
+        }
+        if spaced(&out, f) {
+            out.push(InteractiveProp { face: *f, kind: InteractiveKind::Ups });
+        }
+    }
+    let mut crts = 0;
+    for f in cands.iter().rev() {
+        if crts >= want_crt {
+            break;
+        }
+        if spaced(&out, f) {
+            out.push(InteractiveProp { face: *f, kind: InteractiveKind::Crt });
+            crts += 1;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Hazard flow / accent pulse
 // ---------------------------------------------------------------------------
 
@@ -1336,5 +1423,42 @@ mod tests {
         assert!((a.uv.translation - b.uv.translation).length() < 1e-3 && (a.lava_gain - b.lava_gain).abs() < 1e-3);
         let c = scale_rgb(LinearRgba::new(1.0, 2.0, 3.0, 0.5), 2.0);
         assert_eq!(c, LinearRgba::new(2.0, 4.0, 6.0, 0.5));
+    }
+
+    #[test]
+    fn interactive_props_are_capped_spaced_wall_flush_and_clear_of_other_props() {
+        let (mut crt_total, mut ups_total, mut floors) = (0, 0, 0);
+        for floor in 1..=6u32 {
+            for seed in 0..8u64 {
+                let g = crate::level::generate_level(floor, 0xC0FFEE ^ (seed * 7919) ^ floor as u64);
+                let plan = plan_interactive_props(&g);
+                assert_eq!(plan, plan_interactive_props(&g), "deterministic");
+                let crts = plan.iter().filter(|p| p.kind == InteractiveKind::Crt).count();
+                let ups = plan.iter().filter(|p| p.kind == InteractiveKind::Ups).count();
+                assert!(crts <= crt_target(floor) && ups <= ups_target(floor));
+                assert!((4..=8).contains(&crt_target(floor)) && (3..=6).contains(&ups_target(floor)));
+                let others: Vec<IVec2> = plan_wall_props(&g).iter().map(|p| p.face.cell).chain(plan_telecom_props(&g).iter().map(|p| p.face.cell)).collect();
+                let mut chain_pairs = 0usize;
+                for (i, p) in plan.iter().enumerate() {
+                    assert!(telecom_slot_ok(&g, p.face), "wide lane, straight wall");
+                    assert!(others.iter().all(|o| (*o - p.face.cell).abs().max_element() >= 2), "clear of M16 / M30 props");
+                    for q in &plan[i + 1..] {
+                        let d = (q.face.cell - p.face.cell).abs().element_sum();
+                        if d == 1 && p.kind == InteractiveKind::Ups && q.kind == InteractiveKind::Ups && p.face.side == q.face.side {
+                            chain_pairs += 1;
+                        } else {
+                            assert!(d >= 3, "non-pair props stay >= 3 cells apart (got {d})");
+                        }
+                    }
+                }
+                assert!(chain_pairs <= 1, "at most one reserved UPS chain pair per floor");
+                crt_total += crts;
+                ups_total += ups;
+                floors += 1;
+            }
+        }
+        let (c, u) = (crt_total as f32 / floors as f32, ups_total as f32 / floors as f32);
+        println!("interactive props per floor: {c:.1} CRTs, {u:.1} UPS racks");
+        assert!(c >= 3.0 && u >= 2.5, "budgets mostly filled: {c} CRTs, {u} UPS");
     }
 }

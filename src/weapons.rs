@@ -36,6 +36,7 @@ use crate::sculpt;
 use crate::player::{live_eye_pose, smooth_factor, CursorCaptured, Player, PlayerCamera, AIR_SPEED_HARD_CAP};
 use crate::signal::{overclock_factor, SignalState};
 use crate::state::{AppState, GameSet, PlayerModifiers, RunStats};
+use crate::style::StyleSource;
 
 pub const SHOTGUN_COOLDOWN: f32 = 0.65;
 pub const PLASMA_COOLDOWN: f32 = 0.14;
@@ -233,6 +234,8 @@ pub enum HitTarget {
     Barrel(usize),
     /// Carrier Daemon Shield Pylon (index into the pylon list).
     Pylon(usize),
+    /// Interactive hallway prop (CRT monitor or explosive UPS rack).
+    Prop,
 }
 
 /// Jammer hit volumes relative to its base.
@@ -2228,7 +2231,7 @@ fn fire_weapons(
         Query<(&mut BossPylon, &GlobalTransform)>,
     ),
     mut bot: Option<ResMut<BotControl>>,
-    (mut scratch, pad): (Local<FireScratch>, Option<Res<crate::gamepad::GamepadInput>>),
+    (mut scratch, pad, mut prop_hits): (Local<FireScratch>, Option<Res<crate::gamepad::GamepadInput>>, ResMut<crate::props::PropHits>),
 ) {
     let dt = time.delta_secs();
     let Ok((mut player, body)) = players.single_mut() else { return };
@@ -2372,6 +2375,7 @@ fn fire_weapons(
                 let (dist, target) = resolve_hitscan_all(&grid, origin, dir, HITSCAN_RANGE, refs, jam_list, bar_list, pyl_list);
                 let hit = origin + dir * dist;
                 let falloff = (1.0 - (dist - 18.0).max(0.0) / 40.0).clamp(0.4, 1.0);
+                prop_hits.ray(origin, dir, dist, PELLET_DAMAGE * falloff * dmult, StyleSource::Shotgun);
                 if i % 2 == 0 {
                     spawn_tracer(&mut commands, &fx, muzzle, hit);
                 }
@@ -2407,7 +2411,7 @@ fn fire_weapons(
                         }
                         wall_sparks += 1;
                     }
-                    HitTarget::Nothing => {}
+                    HitTarget::Nothing | HitTarget::Prop => {}
                 }
             }
             let _ = wall_sparks;
@@ -2417,6 +2421,7 @@ fn fire_weapons(
                     let kb = enemy_kb[idx] * knockback_scale(e.kind);
                     let hp_before = e.hp;
                     damage_enemy(&mut e, enemy_dmg[idx], marked.is_some(), &mods);
+                    e.style_source = StyleSource::Shotgun;
                     // Milestone 30: point-blank overkill blasts always earn a fatality.
                     if !e.is_alive() && crate::fatality::is_point_blank_overkill(enemy_dmg[idx], hp_before, g.translation().distance(origin)) {
                         e.kill_cause = crate::fatality::KillCause::PointBlankOverkill;
@@ -2530,7 +2535,12 @@ fn move_player_projectiles(
     mut barrels: Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
     mut players: Query<(&mut Player, &Transform)>,
     mut pylons: Query<(&mut BossPylon, &GlobalTransform)>,
-    mut decals: ResMut<DecalQueue>,
+    (mut decals, mut prop_hits, crts, racks): (
+        ResMut<DecalQueue>,
+        ResMut<crate::props::PropHits>,
+        Query<&crate::props::CrtMonitor>,
+        Query<&crate::props::UpsRack>,
+    ),
 ) {
     let dt = time.delta_secs().min(1.0 / 20.0);
     for (e, mut b, mut tf) in &mut bolts {
@@ -2577,6 +2587,22 @@ fn move_player_projectiles(
                 best = (t, HitTarget::Pylon(i));
             }
         }
+        for crt in &crts {
+            if !crt.shattered
+                && let Some(t) = crt.bounds.ray_hit(from, dir)
+                && t < best.0
+            {
+                best = (t, HitTarget::Prop);
+            }
+        }
+        for rack in &racks {
+            if rack.is_intact()
+                && let Some(t) = rack.bounds.ray_hit(from, dir)
+                && t < best.0
+            {
+                best = (t, HitTarget::Prop);
+            }
+        }
         let hit = from + dir * best.0;
         if b.kind == ProjectileKind::Rocket {
             if best.1 == HitTarget::Nothing && b.life > 0.0 {
@@ -2591,6 +2617,7 @@ fn move_player_projectiles(
                 continue;
             }
             let blast = if best.1 == HitTarget::Nothing { from } else { hit - dir * 0.08 };
+            prop_hits.blast(blast, rocket_splash_radius(&mods), ROCKET_SPLASH_DAMAGE * b.damage_mult, false);
             let any_hit = detonate_rocket(
                 &mut commands,
                 &grid,
@@ -2631,6 +2658,7 @@ fn move_player_projectiles(
                 if let Some((mut en, _, marked)) = enemies.iter_mut().nth(i) {
                     let kb = dir * 1.5 * knockback_scale(en.kind);
                     damage_enemy(&mut en, damage, marked.is_some(), &mods);
+                    en.style_source = StyleSource::Plasma;
                     en.knockback += Vec3::new(kb.x, 0.0, kb.z);
                     en.stagger(dir);
                     feed.hit(false);
@@ -2660,6 +2688,9 @@ fn move_player_projectiles(
                 if let Some(n) = wall_normal {
                     decals.push(DecalRequest::surface(DecalKind::PlasmaBurn, hit, n, 0.42));
                 }
+            }
+            HitTarget::Prop => {
+                prop_hits.ray(from, dir, best.0 + 0.05, damage, StyleSource::Plasma);
             }
         }
         spawn_burst(&mut commands, &fx, hit - dir * 0.1, BurstColor::Cyan, 7, 4.8, 0.065);
@@ -2732,6 +2763,7 @@ fn detonate_rocket(
         let away = Vec2::new(root.x - blast.x, root.z - blast.z).normalize_or(Vec2::new(dir.x, dir.z).normalize_or_zero());
         let kb = 14.0 * falloff * knockback_scale(en.kind);
         damage_enemy(&mut en, dmg, marked.is_some(), mods);
+        en.style_source = StyleSource::Rocket;
         if direct == HitTarget::Enemy(i) && !en.is_alive() && en.kill_cause == crate::fatality::KillCause::Generic {
             en.kill_cause = crate::fatality::KillCause::MortarDirect;
         }
@@ -2802,7 +2834,7 @@ fn jammer_deaths(
     time: Res<Time>,
     mut jammers: Query<(Entity, &mut DemonJammer, &GlobalTransform, &Children)>,
     mut cores: Query<&mut Transform, With<JammerCore>>,
-    (mods, mut materials): (Res<PlayerModifiers>, ResMut<Assets<StandardMaterial>>),
+    (mods, mut materials, mut style): (Res<PlayerModifiers>, ResMut<Assets<StandardMaterial>>, ResMut<crate::style::StyleQueue>),
 ) {
     for (e, mut j, g, children) in &mut jammers {
         if j.is_active() {
@@ -2823,6 +2855,7 @@ fn jammer_deaths(
         spawn_burst(&mut commands, &fx, base + Vec3::Y * 2.0, BurstColor::Smoke, 10, 3.0, 0.4);
         spawn_flash_light(&mut commands, base + Vec3::Y * 2.5, Color::srgb(1.0, 0.5, 0.2), 3_000_000.0, 18.0, 0.4);
         run.jammers_destroyed += 1;
+        style.push(crate::style::StyleAction::JammerDestroyed);
         sfx.play_at(SfxEvent::JammerDestroyed, base + Vec3::Y * 2.0);
         feed.toast("JAMMER DESTROYED - SIGNAL BOOSTED", Color::srgb(0.3, 1.0, 0.8));
         feed.hit(true);
@@ -2853,6 +2886,7 @@ fn barrel_detonations(
     (mut jammers, mut pylons): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut BossPylon, &GlobalTransform)>),
     mut players: Query<(&mut Player, &Transform), Without<ExplosiveBarrel>>,
     mut blasts: Local<Vec<(Entity, Vec3)>>,
+    mut prop_hits: ResMut<crate::props::PropHits>,
 ) {
     let dt = time.delta_secs();
     blasts.clear();
@@ -2880,6 +2914,7 @@ fn barrel_detonations(
     let mut any_hit = false;
     for &(e, blast) in blasts.iter() {
         commands.entity(e).try_despawn();
+        prop_hits.blast(blast, BARREL_BLAST_RADIUS, BARREL_DAMAGE, true);
         for (mut en, g, marked) in &mut enemies {
             if !en.is_alive() {
                 continue;
@@ -2893,6 +2928,7 @@ fn barrel_detonations(
             let away = Vec2::new(root.x - blast.x, root.z - blast.z).normalize_or(Vec2::X);
             let kb = 16.0 * falloff * knockback_scale(en.kind);
             damage_enemy(&mut en, barrel_blast_damage(d), marked.is_some(), &mods);
+            en.style_source = StyleSource::Barrel;
             en.knockback += Vec3::new(away.x * kb, kb * 0.2, away.y * kb);
             en.stagger(Vec3::new(away.x, 0.0, away.y));
             any_hit = true;

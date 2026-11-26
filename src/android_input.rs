@@ -26,7 +26,7 @@
 //! the desktop.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use bevy::input::gamepad::{
@@ -326,6 +326,71 @@ pub fn wants_pointer_capture() -> bool {
     WANTS_POINTER_CAPTURE.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 31: controller rumble command slot (polled by Kotlin)
+// ---------------------------------------------------------------------------
+
+/// Latest rumble command for `MainActivity.kt` (`0` = nothing pending).
+static PENDING_RUMBLE: AtomicU64 = AtomicU64::new(0);
+
+/// Command kinds in bits 32..40 of a packed rumble command.
+pub const RUMBLE_KIND_PLAY: u64 = 1;
+pub const RUMBLE_KIND_STOP: u64 = 2;
+
+/// Pack a rumble command for the JNI poll: bits 0..8 strong (0-255), 8..16
+/// weak (0-255), 16..32 duration in ms, 32..40 kind (1 = play, 2 = stop).
+/// Mirrored by `MainActivity.applyRumble`.
+pub fn encode_rumble(cmd: crate::rumble::RumbleCommand) -> u64 {
+    use crate::rumble::RumbleCommand;
+    let byte = |v: f32| if v.is_finite() { (v.clamp(0.0, 1.0) * 255.0).round() as u64 } else { 0 };
+    match cmd {
+        RumbleCommand::Stop => RUMBLE_KIND_STOP << 32,
+        RumbleCommand::Play(m) => (RUMBLE_KIND_PLAY << 32) | ((m.duration_ms.min(u16::MAX as u32) as u64) << 16) | (byte(m.weak) << 8) | byte(m.strong),
+    }
+}
+
+/// Inverse of [`encode_rumble`] (`None` for `0` / unknown kinds).
+pub fn decode_rumble(v: u64) -> Option<crate::rumble::RumbleCommand> {
+    use crate::rumble::{RumbleCommand, RumbleMix};
+    match v >> 32 {
+        RUMBLE_KIND_STOP => Some(RumbleCommand::Stop),
+        RUMBLE_KIND_PLAY => Some(RumbleCommand::Play(RumbleMix {
+            strong: (v & 0xFF) as f32 / 255.0,
+            weak: ((v >> 8) & 0xFF) as f32 / 255.0,
+            duration_ms: ((v >> 16) & 0xFFFF) as u32,
+        })),
+        _ => None,
+    }
+}
+
+/// Active controller Android device id for rumble (`-1` = none).
+static ACTIVE_RUMBLE_DEVICE: AtomicI32 = AtomicI32::new(-1);
+
+/// Publish the authoritative Android device id of the owned controller.
+pub fn set_active_rumble_device(device_id: i32) {
+    ACTIVE_RUMBLE_DEVICE.store(device_id, Ordering::Relaxed);
+}
+
+/// Read the authoritative Android device id of the owned controller (`-1` = none).
+pub fn active_rumble_device() -> i32 {
+    ACTIVE_RUMBLE_DEVICE.load(Ordering::Relaxed)
+}
+
+/// Publish a rumble command (the newest one wins until Kotlin takes it).
+pub fn queue_rumble(cmd: crate::rumble::RumbleCommand) {
+    PENDING_RUMBLE.store(encode_rumble(cmd), Ordering::Relaxed);
+}
+
+/// Discard any queued rumble command (used on pause / focus loss).
+pub fn clear_rumble() {
+    PENDING_RUMBLE.store(0, Ordering::Relaxed);
+}
+
+/// Take the pending rumble command (`0` = none).
+pub fn take_rumble() -> u64 {
+    PENDING_RUMBLE.swap(0, Ordering::Relaxed)
+}
+
 /// Digital + analog trigger values tracked separately so stick-motion axis
 /// samples (which report `0.0` for absent analog triggers) cannot clear a
 /// held `KEYCODE_BUTTON_L2`/`R2` press.
@@ -356,6 +421,14 @@ pub struct AndroidInputBridge {
     held_buttons: HashMap<i32, HashSet<GamepadButton>>,
     mouse_state: i32,
     scratch: Vec<AndroidInputEvent>,
+}
+
+impl AndroidInputBridge {
+    /// Reverse-lookup the Android `InputDevice` id for a Bevy gamepad entity (`-1` if none).
+    pub fn device_for_pad(&self, pad: Option<Entity>) -> i32 {
+        let Some(target) = pad else { return -1 };
+        self.pads.iter().find_map(|(&dev, &e)| (e == target).then_some(dev)).unwrap_or(-1)
+    }
 }
 
 /// Every Bevy message the bridge writes.
@@ -590,7 +663,7 @@ impl Plugin for AndroidInputPlugin {
 mod jni_exports {
     use std::ffi::c_void;
 
-    use super::{push_event, wants_pointer_capture, AndroidAxes, AndroidInputEvent};
+    use super::{active_rumble_device, clear_rumble, push_event, take_rumble, wants_pointer_capture, AndroidAxes, AndroidInputEvent};
     use bevy::math::Vec2;
 
     type Env = *mut c_void;
@@ -674,6 +747,7 @@ mod jni_exports {
 
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_dev_bombatomica64_segnaledebole_MainActivity_nativeResetInputs(_env: Env, _this: Obj) {
+        clear_rumble();
         push_event(AndroidInputEvent::ResetAll);
     }
 
@@ -681,12 +755,45 @@ mod jni_exports {
     pub extern "system" fn Java_dev_bombatomica64_segnaledebole_MainActivity_nativeWantsPointerCapture(_env: Env, _this: Obj) -> u8 {
         u8::from(wants_pointer_capture())
     }
+
+    /// Kotlin `external fun nativeTakeRumble(): Long` (packed, see `encode_rumble`).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_dev_bombatomica64_segnaledebole_MainActivity_nativeTakeRumble(_env: Env, _this: Obj) -> i64 {
+        take_rumble() as i64
+    }
+
+    /// Kotlin `external fun nativeActiveRumbleDevice(): Int` (`-1` if none).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_dev_bombatomica64_segnaledebole_MainActivity_nativeActiveRumbleDevice(_env: Env, _this: Obj) -> i32 {
+        active_rumble_device()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bevy::input::gamepad::Gamepad;
+
+    #[test]
+    fn rumble_commands_pack_for_kotlin_and_round_trip() {
+        use crate::rumble::{RumbleCommand, RumbleMix};
+        assert_eq!(decode_rumble(0), None);
+        assert_eq!(decode_rumble(encode_rumble(RumbleCommand::Stop)), Some(RumbleCommand::Stop));
+        let play = RumbleCommand::Play(RumbleMix { strong: 1.0, weak: 0.2, duration_ms: 380 });
+        let v = encode_rumble(play);
+        assert_eq!(v >> 32, RUMBLE_KIND_PLAY);
+        assert_eq!((v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFFFF), (255, 51, 380));
+        match decode_rumble(v) {
+            Some(RumbleCommand::Play(m)) => assert!((m.strong - 1.0).abs() < 0.01 && (m.weak - 0.2).abs() < 0.01 && m.duration_ms == 380),
+            other => panic!("{other:?}"),
+        }
+        let wild = encode_rumble(RumbleCommand::Play(RumbleMix { strong: f32::NAN, weak: 7.0, duration_ms: 999_999 }));
+        assert_eq!((wild & 0xFF, (wild >> 8) & 0xFF, (wild >> 16) & 0xFFFF), (0, 255, 65535), "sanitized");
+        queue_rumble(play);
+        queue_rumble(RumbleCommand::Stop);
+        assert_eq!(decode_rumble(take_rumble()), Some(RumbleCommand::Stop), "newest wins");
+        assert_eq!(take_rumble(), 0, "taken once");
+    }
 
     #[test]
     fn keycodes_map_to_xbox_layout() {

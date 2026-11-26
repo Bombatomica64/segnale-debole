@@ -331,6 +331,7 @@ impl Plugin for HudPlugin {
                     update_hud_boxes,
                     refresh_hud_crosshair,
                     update_split_plate,
+                    update_style_hud,
                     pause_input,
                     debug_skip_floor,
                 )
@@ -1219,14 +1220,15 @@ fn spawn_end_screen(
         ))
         .id();
     commands.spawn((ChildOf(readout), text(summary(run), 18.0, BONE_TEXT)));
+    // Movement line + the peak Style Rank badge (+ the global Daily ranking,
+    // SUBMITTING... -> GLOBAL RANK #N) share one row: no extra row at 720p.
+    let row = commands.spawn((ChildOf(readout), Node { column_gap: Val::Px(14.0), align_items: AlignItems::Center, ..default() })).id();
+    commands.spawn((ChildOf(row), text(movement_line(run), 14.0, ARC_CYAN)));
+    if let Some(rank) = run.peak_style_rank {
+        commands.spawn((ChildOf(row), StylePeakBadge, stamped_tag(&peak_style_label(rank), rank.color(), INK_BLACK, 13.0)));
+    }
     if run.mode.daily_date().is_some() {
-        // Global Daily ranking (SUBMITTING... -> GLOBAL RANK #N) beside the
-        // short movement line: costs no extra row at 720p.
-        let row = commands.spawn((ChildOf(readout), Node { column_gap: Val::Px(14.0), align_items: AlignItems::Center, ..default() })).id();
-        commands.spawn((ChildOf(row), text(movement_line(run), 14.0, ARC_CYAN)));
         commands.spawn((ChildOf(row), submit_badge_bundle(lb, 14.0)));
-    } else {
-        commands.spawn((ChildOf(readout), text(movement_line(run), 14.0, ARC_CYAN)));
     }
     commands.spawn((ChildOf(readout), text(installed_list(run), 14.0, look.apps)));
     let loadout_line = with_seed(end_loadout_line(loadout), run);
@@ -1318,6 +1320,15 @@ fn spawn_end_screen(
         buttons.push((LEADERBOARD_BUTTON, MenuAction::OpenLeaderboard, ButtonStyle::PrimaryAcid));
     }
     button_row_in(commands, root, state, &buttons, if compact { 18.0 } else { 21.0 }, if compact { 2.0 } else { 10.0 });
+}
+
+/// Marker on the end-card peak Style Rank badge.
+#[derive(Component)]
+pub struct StylePeakBadge;
+
+/// End-card badge text: `PEAK STYLE  SS // 6G`.
+pub fn peak_style_label(rank: crate::style::StyleRank) -> String {
+    format!("PEAK STYLE  {} // {}", rank.letter(), rank.tag())
 }
 
 /// `<line>  //  SEED <code>` (unchanged for seedless runs).
@@ -2722,6 +2733,9 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
 
     // Right edge, below the toast stack: speedrun split timer plate.
     spawn_split_plate(&mut commands, root);
+    // Right edge, below the split plate and above the weapon deck: the
+    // Milestone 31 Bandwidth Style Rank meter.
+    spawn_style_meter(&mut commands, root);
 
     // Bottom-center: VEL telemetry strip docked above the vitals panel.
     commands.insert_resource(VelGauge::default());
@@ -2917,6 +2931,8 @@ pub enum SplitText {
     Time,
     Progress,
     Delta,
+    /// Milestone 31 live race delta vs the PB Signal Ghost (Time Trial).
+    Ghost,
 }
 
 /// Root of the split timer plate (hidden unless splits are on / non-standard mode).
@@ -2951,18 +2967,196 @@ fn spawn_split_plate(commands: &mut Commands, root: Entity) {
             (SplitText::Time, text("00:00.0", 30.0, COLOR_TEXT)),
             (SplitText::Progress, text("", 12.0, COLOR_DIM)),
             (SplitText::Delta, text("", 15.0, COLOR_TEXT)),
+            (SplitText::Ghost, Node { display: Display::None, ..default() }, text("", 14.0, ACID_GREEN)),
         ],
     ));
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 31: Bandwidth Style Rank meter
+// ---------------------------------------------------------------------------
+
+/// Top of the style meter: clears the toast stack (~200 px) and the split
+/// plate (214 px + ~92 px tall with its ghost line hidden) at 720p.
+pub const STYLE_HUD_TOP: f32 = 318.0;
+/// Width of the style meter column (matches the split plate).
+pub const STYLE_HUD_WIDTH: f32 = 236.0;
+/// Laid-out height budget of the meter (tag+letter row, subtitle row, bar, 3 feed lines).
+pub const STYLE_HUD_HEIGHT: f32 = 164.0;
+/// Rank letter font size.
+pub const STYLE_LETTER_FONT: f32 = 58.0;
+
+/// Style meter widget parts.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleHud {
+    Root,
+    Letter,
+    Tag,
+    Subtitle,
+    Track,
+    Fill,
+    Feed(u8),
+}
+
+fn spawn_style_meter(commands: &mut Commands, root: Entity) {
+    let meter = commands
+        .spawn((
+            ChildOf(root),
+            StyleHud::Root,
+            hud_plate(
+                Node {
+                    display: Display::None,
+                    position_type: PositionType::Absolute,
+                    right: Val::Px(14.0),
+                    top: Val::Px(STYLE_HUD_TOP),
+                    width: Val::Px(STYLE_HUD_WIDTH),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::FlexEnd,
+                    row_gap: Val::Px(2.0),
+                    ..default()
+                },
+                COLOR_DIM,
+            ),
+        ))
+        .id();
+    // Near-opaque ink so bright world glows (CRT screens, blasts) never bleed through the letter.
+    commands.entity(meter).insert(BackgroundColor(IRON_DARK));
+    let head = commands.spawn((ChildOf(meter), Node { align_items: AlignItems::Center, column_gap: Val::Px(10.0), ..default() })).id();
+    commands.spawn((
+        ChildOf(head),
+        StyleHud::Tag,
+        text("EDGE", 22.0, COLOR_TEXT),
+        TextShadow { offset: Vec2::splat(2.0), color: Color::BLACK.with_alpha(0.85) },
+        TextLayout::no_wrap(),
+    ));
+    commands.spawn((
+        ChildOf(head),
+        StyleHud::Letter,
+        text("D", STYLE_LETTER_FONT, COLOR_TEXT),
+        TextLayout::no_wrap(),
+        TextShadow { offset: Vec2::new(3.0, 3.0), color: Color::BLACK.with_alpha(0.9) },
+        UiTransform::IDENTITY,
+    ));
+    // Subtitle sits on its own full-width row below the letter so long DMC lines
+    // ("SMOKING SEXY SIGNAL!!") never overflow past the left edge of the card.
+    commands.spawn((
+        ChildOf(meter),
+        StyleHud::Subtitle,
+        text("DEAD SLOW", 12.0, COLOR_DIM),
+        TextShadow { offset: Vec2::splat(1.5), color: Color::BLACK.with_alpha(0.85) },
+        TextLayout::no_wrap(),
+    ));
+    let track = commands
+        .spawn((
+            ChildOf(meter),
+            StyleHud::Track,
+            Node { width: Val::Px(STYLE_HUD_WIDTH * 0.78), height: Val::Px(5.0), border: UiRect::all(Val::Px(1.0)), ..default() },
+            BorderColor::all(TRACK_BORDER),
+            BackgroundColor(TRACK_BG),
+        ))
+        .id();
+    commands.spawn((ChildOf(track), StyleHud::Fill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(COLOR_TEXT)));
+    for i in 0..crate::style::FEED_LINES as u8 {
+        commands.spawn((
+            ChildOf(meter),
+            StyleHud::Feed(i),
+            text("", 12.0, COLOR_TEXT),
+            TextLayout::no_wrap(),
+            TextShadow { offset: Vec2::splat(1.5), color: Color::BLACK.with_alpha(0.85) },
+        ));
+    }
+}
+
+/// Whether the style meter shows: a live non-trial run with points banked.
+pub fn style_hud_visible(points: f32, mode: RunMode) -> bool {
+    points > 0.0 && mode != RunMode::TimeTrial
+}
+
+/// Rank letter scale-pop on a climb (1 -> 1.45 -> 1 with a quick overshoot).
+pub fn style_pop_scale(pop: f32) -> f32 {
+    let p = pop.clamp(0.0, 1.0);
+    1.0 + 0.45 * p * p
+}
+
+#[allow(clippy::type_complexity)]
+fn update_style_hud(
+    time: Res<Time>,
+    meter: Res<crate::style::StyleMeter>,
+    run: Res<RunStats>,
+    mut nodes: Query<(&StyleHud, &mut Node, Option<&mut BackgroundColor>, Option<&mut BorderColor>)>,
+    mut texts: Query<(&StyleHud, &mut Text, &mut TextColor, Option<&mut UiTransform>)>,
+) {
+    let show = style_hud_visible(meter.points, run.mode);
+    let rank = meter.rank();
+    let color = rank.map_or(COLOR_DIM, |r| r.color());
+    // Higher tiers shimmer.
+    let t = time.elapsed_secs();
+    let shimmer = match rank {
+        Some(r) if r >= crate::style::StyleRank::SS => 0.75 + 0.25 * (t * 9.0).sin().abs(),
+        _ => 1.0,
+    };
+    for (part, mut node, bg, border) in &mut nodes {
+        match part {
+            StyleHud::Root => {
+                set_display(&mut node, show);
+                if let Some(mut b) = border {
+                    let want = plate_border(color, STEEL_BORDER.with_alpha(0.45));
+                    if *b != want {
+                        *b = want;
+                    }
+                }
+            }
+            StyleHud::Fill => {
+                set_width_pct(&mut node, meter.tier_fill() * 100.0);
+                if let Some(mut bg) = bg {
+                    set_bg(&mut bg, color.with_alpha(0.9));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !show {
+        return;
+    }
+    let Some(r) = rank else { return };
+    for (part, mut txt, mut tc, ui) in &mut texts {
+        let (want, c): (&str, Color) = match part {
+            StyleHud::Letter => (r.letter(), color),
+            StyleHud::Tag => (r.tag(), color),
+            StyleHud::Subtitle => (r.subtitle(), BONE_TEXT),
+            StyleHud::Feed(i) => match meter.feed.get(*i as usize).copied().flatten() {
+                Some((label, age)) => (label, COLOR_TEXT.with_alpha((1.0 - (age / crate::style::FEED_SECS).powi(3)).clamp(0.0, 1.0) * (1.0 - *i as f32 * 0.22))),
+                None => ("", COLOR_TEXT),
+            },
+            _ => continue,
+        };
+        if txt.0 != want {
+            want.clone_into(&mut txt.0);
+        }
+        let c = if *part == StyleHud::Letter { c.mix(&Color::WHITE, (1.0 - shimmer) * 0.8 + meter.pop * 0.35) } else { c };
+        if tc.0 != c {
+            tc.0 = c;
+        }
+        if let Some(mut ui) = ui {
+            let s = Vec2::splat(style_pop_scale(meter.pop));
+            if ui.scale != s {
+                ui.scale = s;
+            }
+        }
+    }
+}
+
+
 /// Live split timer: `RunStats::time_elapsed` / `TimeTrialState::elapsed`
 /// only advance in `Playing`, so the plate freezes with the simulation.
+#[allow(clippy::type_complexity)]
 fn update_split_plate(
     run: Res<RunStats>,
     trial: Res<TimeTrialState>,
     store: Option<Res<ProfileStore>>,
-    mut plates: Query<(&mut Node, &mut BorderColor), With<SplitPlate>>,
-    mut texts: Query<(&SplitText, &mut Text, &mut TextColor)>,
+    ghost: Option<Res<crate::trials::TrialGhostStore>>,
+    mut plates: Query<(&mut Node, &mut BorderColor), (With<SplitPlate>, Without<SplitText>)>,
+    mut texts: Query<(&SplitText, &mut Text, &mut TextColor, &mut Node)>,
 ) {
     let settings = live_settings(store.as_deref());
     let show = split_timer_visible(&settings, run.mode);
@@ -2990,18 +3184,24 @@ fn update_split_plate(
         }
     };
     let v = split_plate_view(&run, &trial, profile);
-    for (field, mut t, mut c) in &mut texts {
+    let ghost_line = if run.mode == RunMode::TimeTrial { crate::trials::ghost_delta_text(ghost.as_deref().and_then(|g| g.delta)) } else { None };
+    let (ghost_text, ghost_color) = ghost_line.unwrap_or_default();
+    for (field, mut t, mut c, mut node) in &mut texts {
         let (want, color) = match field {
             SplitText::Tag => (&v.tag, v.tag_color),
             SplitText::Time => (&v.time, COLOR_TEXT),
             SplitText::Progress => (&v.progress, COLOR_DIM),
             SplitText::Delta => (&v.delta, v.delta_color),
+            SplitText::Ghost => (&ghost_text, ghost_color),
         };
         if t.0 != *want {
             t.0.clone_from(want);
         }
         if c.0 != color {
             c.0 = color;
+        }
+        if *field == SplitText::Ghost {
+            set_display(&mut node, !want.is_empty());
         }
     }
 }
@@ -3997,5 +4197,31 @@ mod tests {
         assert_eq!(slot_ammo_color(0, false), COLOR_SIGNAL_RED);
         assert_eq!(slot_ammo_color(12, true), COLOR_TEXT);
         assert_eq!(slot_ammo_color(12, false), COLOR_DIM);
+    }
+
+    #[test]
+    fn style_meter_hud_rules_and_layout_budget() {
+        assert!(!style_hud_visible(0.0, RunMode::Standard), "hidden at zero points");
+        assert!(style_hud_visible(12.0, RunMode::Standard));
+        assert!(style_hud_visible(12.0, RunMode::Daily(crate::trials::DailyDate::EPOCH)));
+        assert!(!style_hud_visible(500.0, RunMode::TimeTrial), "speedrun HUD stays clean");
+        assert_eq!(style_pop_scale(0.0), 1.0);
+        assert!(style_pop_scale(1.0) > 1.3 && style_pop_scale(5.0) == style_pop_scale(1.0));
+        assert_eq!(peak_style_label(crate::style::StyleRank::SS), "PEAK STYLE  SS // 6G");
+        assert_eq!(peak_style_label(crate::style::StyleRank::SSS), "PEAK STYLE  SSS // 6G+");
+        // Right column at the 720p reference (960x540 and 1280x720 scale to it,
+        // 1024x640 and 1920x1080 are taller): toasts end ~200 px, the split
+        // plate (214 px) ends by ~306 px, the meter must end before the weapon
+        // deck (bottom 14 px, ~172 px tall) starts at ~534 px.
+        let split_bottom = SPLIT_PLATE_TOP + 92.0;
+        assert!(STYLE_HUD_TOP >= split_bottom + 8.0);
+        let deck_top = UI_REFERENCE.1 - 14.0 - 172.0;
+        assert!(STYLE_HUD_TOP + STYLE_HUD_HEIGHT <= deck_top - 8.0, "{} vs {deck_top}", STYLE_HUD_TOP + STYLE_HUD_HEIGHT);
+        // Letter + pop never spills past the column.
+        assert!(STYLE_LETTER_FONT * style_pop_scale(1.0) * 0.6 * 3.0 < STYLE_HUD_WIDTH);
+        for (w, h) in [(960.0, 540.0), (1024.0, 640.0), (1280.0, 720.0), (1920.0, 1080.0)] {
+            let s = ui_scale_for(w, h);
+            assert!((STYLE_HUD_TOP + STYLE_HUD_HEIGHT) * s <= h - (14.0 + 172.0) * s, "{w}x{h}");
+        }
     }
 }

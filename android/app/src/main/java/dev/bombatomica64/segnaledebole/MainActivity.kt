@@ -3,8 +3,11 @@ package dev.bombatomica64.segnaledebole
 import android.hardware.input.InputManager
 import android.os.Build
 import android.os.Bundle
+import android.os.CombinedVibration
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -37,6 +40,17 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
         /** Pointer-capture poll period (ms). */
         private const val CAPTURE_POLL_MS = 100L
+
+        /** Rumble command poll period (ms): about one 60 Hz frame. */
+        private const val RUMBLE_POLL_MS = 16L
+
+        /** Packed rumble command kinds (mirrors `android_input::encode_rumble`). */
+        private const val RUMBLE_KIND_PLAY = 1L
+        private const val RUMBLE_KIND_STOP = 2L
+
+        /** 0..1 motor level -> VibrationEffect amplitude (1..255, 0 = off). */
+        @JvmStatic
+        fun amplitude(level: Int): Int = level.coerceIn(0, 255)
 
         /**
          * Right-stick axis pair from which candidate axes are centered sticks
@@ -88,6 +102,15 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
     private external fun nativeMouseScroll(x: Float, y: Float)
     private external fun nativeResetInputs()
     private external fun nativeWantsPointerCapture(): Boolean
+    private external fun nativeTakeRumble(): Long
+    private external fun nativeActiveRumbleDevice(): Int
+
+    /** Fallback device id of the controller that last sent deliberate input. */
+    private var activePadDeviceId = -1
+    /** Device id of the controller currently vibrating (-1 if none). */
+    private var vibratingDeviceId = -1
+    private var isResumed = false
+    private var hasWindowFocus = false
 
     private val handler = Handler(Looper.getMainLooper())
     private var inputManager: InputManager? = null
@@ -96,6 +119,14 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
         override fun run() {
             syncPointerCapture()
             handler.postDelayed(this, CAPTURE_POLL_MS)
+        }
+    }
+
+    private val rumblePoll = object : Runnable {
+        override fun run() {
+            val cmd = nativeTakeRumble()
+            if (cmd != 0L) applyRumble(cmd)
+            handler.postDelayed(this, RUMBLE_POLL_MS)
         }
     }
 
@@ -132,18 +163,29 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
     override fun onDestroy() {
         inputManager?.unregisterInputDeviceListener(this)
         handler.removeCallbacks(capturePoll)
+        handler.removeCallbacks(rumblePoll)
+        stopRumble()
         super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
+        isResumed = true
         enterImmersiveMode()
         handler.removeCallbacks(capturePoll)
         handler.post(capturePoll)
+        // Discard any stale queued command before resuming rumble polling.
+        nativeTakeRumble()
+        handler.removeCallbacks(rumblePoll)
+        handler.post(rumblePoll)
     }
 
     override fun onPause() {
+        isResumed = false
         handler.removeCallbacks(capturePoll)
+        handler.removeCallbacks(rumblePoll)
+        stopRumble()
+        nativeTakeRumble()
         mSurfaceView?.let { if (it.hasPointerCapture()) it.releasePointerCapture() }
         nativeResetInputs()
         super.onPause()
@@ -151,12 +193,99 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        hasWindowFocus = hasFocus
         if (hasFocus) {
             enterImmersiveMode()
             syncPointerCapture()
         } else {
             mSurfaceView?.let { if (it.hasPointerCapture()) it.releasePointerCapture() }
+            stopRumble()
+            nativeTakeRumble()
             nativeResetInputs()
+        }
+    }
+
+    // ----------------------------------------------------------------- rumble
+
+    /**
+     * Apply a packed rumble command from `src/rumble.rs`: bits 0..8 strong,
+     * 8..16 weak, 16..32 duration (ms), 32..40 kind. Vibrates only the active
+     * controller's own vibrator(s) (API 31+ `vibratorManager`, else the
+     * deprecated `InputDevice.vibrator`); never the phone body. Every call is
+     * guarded: controllers without motors, revoked permissions or OEM quirks
+     * simply do nothing.
+     */
+    private fun applyRumble(cmd: Long) {
+        val kind = (cmd ushr 32) and 0xFFL
+        if (kind == RUMBLE_KIND_STOP) {
+            stopRumble()
+            return
+        }
+        if (kind != RUMBLE_KIND_PLAY) return
+        if (!isResumed || !hasWindowFocus) return
+        val strong = amplitude((cmd and 0xFFL).toInt())
+        val weak = amplitude(((cmd ushr 8) and 0xFFL).toInt())
+        val ms = ((cmd ushr 16) and 0xFFFFL).coerceAtLeast(1L)
+        val rustTarget = nativeActiveRumbleDevice()
+        val targetId = if (rustTarget >= 0) rustTarget else activePadDeviceId
+        if (vibratingDeviceId >= 0 && vibratingDeviceId != targetId) {
+            cancelDeviceRumble(vibratingDeviceId)
+            vibratingDeviceId = -1
+        }
+        val device = InputDevice.getDevice(targetId) ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val manager = device.vibratorManager
+                val ids = manager.vibratorIds
+                if (ids.isEmpty()) return
+                manager.cancel()
+                val combined = if (ids.size >= 2) {
+                    val builder = CombinedVibration.startParallel()
+                    if (strong > 0) builder.addVibrator(ids[0], VibrationEffect.createOneShot(ms, strong))
+                    if (weak > 0) builder.addVibrator(ids[1], VibrationEffect.createOneShot(ms, weak))
+                    if (strong == 0 && weak == 0) return
+                    builder.combine()
+                } else {
+                    val level = maxOf(strong, weak)
+                    if (level == 0) return
+                    CombinedVibration.createParallel(VibrationEffect.createOneShot(ms, level))
+                }
+                manager.vibrate(combined)
+            } else {
+                @Suppress("DEPRECATION")
+                val vibrator: Vibrator = device.vibrator
+                if (!vibrator.hasVibrator()) return
+                val level = maxOf(strong, weak)
+                if (level == 0) return
+                vibrator.cancel()
+                val amp = if (vibrator.hasAmplitudeControl()) level else VibrationEffect.DEFAULT_AMPLITUDE
+                vibrator.vibrate(VibrationEffect.createOneShot(ms, amp))
+            }
+            vibratingDeviceId = targetId
+        } catch (e: Exception) {
+            // No motor / no permission / OEM quirk: rumble is best-effort.
+        }
+    }
+
+    private fun cancelDeviceRumble(deviceId: Int) {
+        val device = InputDevice.getDevice(deviceId) ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                device.vibratorManager.cancel()
+            } else {
+                @Suppress("DEPRECATION")
+                device.vibrator.cancel()
+            }
+        } catch (e: Exception) {
+            // Best-effort.
+        }
+    }
+
+    private fun stopRumble() {
+        val id = vibratingDeviceId
+        vibratingDeviceId = -1
+        if (id >= 0) {
+            cancelDeviceRumble(id)
         }
     }
 
@@ -198,6 +327,7 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
     override fun onInputDeviceRemoved(deviceId: Int) {
         rightStickAxes.remove(deviceId)
+        if (deviceId == activePadDeviceId) activePadDeviceId = -1
         nativeGamepadDisconnected(deviceId)
     }
 
@@ -229,6 +359,7 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (isGamepadKey(event)) {
+            activePadDeviceId = event.deviceId
             when (event.action) {
                 KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) {
                     nativeGamepadKey(event.deviceId, event.keyCode, true)
@@ -285,6 +416,21 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         if (isGamepadSource(event.source) && event.actionMasked == MotionEvent.ACTION_MOVE) {
+            val maxAxis = maxOf(
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_X)),
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_Y)),
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_Z)),
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_RZ)),
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_RX)),
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_RY)),
+                event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_HAT_X)),
+                kotlin.math.abs(event.getAxisValue(MotionEvent.AXIS_HAT_Y)),
+            )
+            if (maxAxis > 0.25f) {
+                activePadDeviceId = event.deviceId
+            }
             sendAxes(event)
             return true
         }

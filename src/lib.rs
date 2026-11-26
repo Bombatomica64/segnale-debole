@@ -29,10 +29,13 @@ pub mod phone_screen;
 pub mod physics;
 pub mod player;
 pub mod playtest_bot;
+pub mod props;
 pub mod raytracing;
+pub mod rumble;
 pub mod sculpt;
 pub mod signal;
 pub mod state;
+pub mod style;
 pub mod trials;
 pub mod upgrades;
 pub mod weapons;
@@ -80,7 +83,11 @@ impl Plugin for CoreGameplayPlugin {
             .add_plugins(gamepad::GamepadPlugin)
             // Separate calls: the tuple above is at Bevy's 15-plugin limit.
             .add_plugins(lifecycle::LifecyclePlugin)
-            .add_plugins(leaderboard::LeaderboardPlugin);
+            .add_plugins(leaderboard::LeaderboardPlugin)
+            // Milestone 31: style rank, shootable props, controller rumble.
+            .add_plugins(style::StylePlugin)
+            .add_plugins(props::PropsPlugin)
+            .add_plugins(rumble::RumblePlugin);
     }
 }
 

@@ -1327,6 +1327,8 @@ pub enum SettingToggle {
     GamepadInvertY,
     /// Gentle Right Stick slowdown over visible targets (controller only).
     AimFriction,
+    /// Controller rumble / haptics.
+    Rumble,
 }
 
 impl SettingToggle {
@@ -1338,6 +1340,7 @@ impl SettingToggle {
             SettingToggle::SpeedrunSplits => "SPEEDRUN SPLITS",
             SettingToggle::GamepadInvertY => "GAMEPAD INVERT Y",
             SettingToggle::AimFriction => "AIM FRICTION",
+            SettingToggle::Rumble => "RUMBLE",
         }
     }
 
@@ -1349,6 +1352,7 @@ impl SettingToggle {
             SettingToggle::SpeedrunSplits => &mut s.speedrun_splits,
             SettingToggle::GamepadInvertY => &mut s.gamepad_invert_y,
             SettingToggle::AimFriction => &mut s.gamepad_aim_friction,
+            SettingToggle::Rumble => &mut s.rumble,
         }
     }
 
@@ -1360,6 +1364,7 @@ impl SettingToggle {
             SettingToggle::SpeedrunSplits => s.speedrun_splits,
             SettingToggle::GamepadInvertY => s.gamepad_invert_y,
             SettingToggle::AimFriction => s.gamepad_aim_friction,
+            SettingToggle::Rumble => s.rumble,
         }
     }
 
@@ -1538,7 +1543,7 @@ pub enum SettingsRow {
 
 /// Controller order: the left column top to bottom, then the right column,
 /// the reticle pickers and the footer.
-pub const SETTINGS_ROWS: [SettingsRow; 16] = [
+pub const SETTINGS_ROWS: [SettingsRow; 17] = [
     SettingsRow::Knob(SettingKnob::Sensitivity),
     SettingsRow::Knob(SettingKnob::BaseFov),
     SettingsRow::Toggle(SettingToggle::SpeedFov),
@@ -1551,6 +1556,7 @@ pub const SETTINGS_ROWS: [SettingsRow; 16] = [
     SettingsRow::Knob(SettingKnob::Volume),
     SettingsRow::Toggle(SettingToggle::Mute),
     SettingsRow::Toggle(SettingToggle::SpeedrunSplits),
+    SettingsRow::Toggle(SettingToggle::Rumble),
     SettingsRow::Style,
     SettingsRow::Color,
     SettingsRow::Reset,
@@ -1969,6 +1975,7 @@ fn spawn_settings_screen(
     knob_row(&mut commands, audio, SettingKnob::Volume, &s);
     toggle_row(&mut commands, audio, SettingToggle::Mute, "silence every sound effect", &s);
     toggle_row(&mut commands, audio, SettingToggle::SpeedrunSplits, "HUD timer + PB deltas on standard runs", &s);
+    toggle_row(&mut commands, audio, SettingToggle::Rumble, "controller haptics (pad only, never M&K)", &s);
 
     // Reticle block: style pills + color swatches beside the live preview.
     let reticle = commands
@@ -2098,7 +2105,7 @@ mod tests {
         for k in SettingKnob::ALL {
             assert_eq!(SETTINGS_ROWS.iter().filter(|r| **r == SettingsRow::Knob(k)).count(), 1, "{k:?}");
         }
-        assert_eq!(SETTINGS_ROWS.iter().filter(|r| matches!(r, SettingsRow::Toggle(_))).count(), 6);
+        assert_eq!(SETTINGS_ROWS.iter().filter(|r| matches!(r, SettingsRow::Toggle(_))).count(), 7);
         // Milestone 28: AIM FRICTION toggles like any switch, right after INVERT Y.
         let af = SettingToggle::AimFriction;
         assert_eq!(settings_pad_edit(SettingsRow::Toggle(af), 0, true, &s), Some(Edit(SettingsTarget::Toggle(af))));
@@ -2113,6 +2120,25 @@ mod tests {
         assert_eq!(s.gamepad_sensitivity, GAMEPAD_SENS_RANGE.1);
         assert!(matches!(apply_settings_edit(&mut s, SettingsTarget::Up(k)), EditOutcome::Unchanged(_)));
         assert_eq!(k.value_text(&s), "3.00x");
+    }
+
+    #[test]
+    fn rumble_toggle_is_a_settings_row_editable_by_pad_and_keys() {
+        use SettingsPadAction::*;
+        let r = SettingToggle::Rumble;
+        let s = UserSettings::default();
+        assert!(s.rumble, "rumble defaults ON");
+        assert_eq!((r.label(), r.state_text(&s)), ("RUMBLE", "ON"));
+        assert_eq!(SETTINGS_ROWS.iter().filter(|x| **x == SettingsRow::Toggle(r)).count(), 1);
+        assert_eq!(settings_row_index(SettingsRow::Toggle(r)), settings_row_index(SettingsRow::Toggle(SettingToggle::SpeedrunSplits)) + 1);
+        for (dx, a) in [(1, false), (-1, false), (0, true)] {
+            assert_eq!(settings_pad_edit(SettingsRow::Toggle(r), dx, a, &s), Some(Edit(SettingsTarget::Toggle(r))));
+        }
+        let mut t = s.clone();
+        apply_settings_edit(&mut t, SettingsTarget::Toggle(r));
+        assert!(!t.rumble && r.state_text(&t) == "OFF");
+        apply_settings_edit(&mut t, SettingsTarget::Toggle(r));
+        assert!(t.rumble);
     }
 
     #[test]

@@ -80,10 +80,20 @@ pub enum SfxEvent {
     PhonePing,
     /// Random kill Fatality: chunky sub thump + bone crunch + bright snap.
     Fatality,
+    /// Milestone 31: Style Rank climbed a tier (D..A): bright two-note stab.
+    StyleRankUp,
+    /// Style Rank reached S / SS / SSS: extra-crisp rising arpeggio + crack.
+    StylePeak,
+    /// Shootable CRT monitor shattered: glass burst + phosphor whine.
+    CrtShatter,
+    /// Lithium UPS rack detonation: deep boom + EMP zap + crackle.
+    UpsDetonate,
+    /// Damaged UPS rack warning hiss + spark crackle.
+    UpsHiss,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 36] = [
+    pub const ALL: [SfxEvent; 41] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -120,6 +130,11 @@ impl SfxEvent {
         SfxEvent::UiConfirm,
         SfxEvent::PhonePing,
         SfxEvent::Fatality,
+        SfxEvent::StyleRankUp,
+        SfxEvent::StylePeak,
+        SfxEvent::CrtShatter,
+        SfxEvent::UpsDetonate,
+        SfxEvent::UpsHiss,
     ];
 
     /// Warnings that must always be heard keep their direction but are pulled
@@ -155,6 +170,14 @@ impl SfxEvent {
             // blast), so it stays below RocketExplode to keep -1 dBFS.
             SfxEvent::PhonePing => 0.22,
             SfxEvent::Fatality => 0.3,
+            // Milestone 31: stingers sit just above the music bed; the UPS
+            // blast stays at the mortar's level so a chain + mortar + peak
+            // stinger over the 6G layer keeps -1 dBFS.
+            SfxEvent::StyleRankUp => 0.16,
+            SfxEvent::StylePeak => 0.18,
+            SfxEvent::CrtShatter => 0.17,
+            SfxEvent::UpsDetonate => 0.2,
+            SfxEvent::UpsHiss => 0.14,
             _ => 0.75,
         }
     }
@@ -681,6 +704,66 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
                 (thump * 0.95 + crunch + snap + ring) * env(t, 0.004, 1.2)
             })
         }
+        SfxEvent::StyleRankUp => render(0.24, |ts, t, _| {
+            // E5 -> B5 square/saw stab with an octave sine sparkle.
+            let f = if ts < 0.07 { 659.25 } else { 987.77 };
+            let local = if ts < 0.07 { ts } else { ts - 0.07 };
+            let body = square(o.step(f)) * 0.32 + saw(o2.step(f * 1.005)) * 0.22;
+            let sparkle = (TAU * f * 2.0 * ts).sin() * 0.18 * decay(local, 14.0);
+            (body * (local / 0.004).min(1.0) * decay(local, 9.0) + sparkle) * env(t, 0.01, 1.1)
+        }),
+        SfxEvent::StylePeak => render(0.46, |ts, t, n| {
+            // Rising E5-G#5-B5-E6 arpeggio (supersaw pair) + white-noise crack.
+            const NOTES: [f32; 4] = [659.25, 830.61, 987.77, 1318.5];
+            let k = ((ts / 0.06) as usize).min(3);
+            let local = ts - k as f32 * 0.06;
+            let f = NOTES[k];
+            let lead = saw(o.step(f)) * 0.3 + saw(o2.step(f * 1.008)) * 0.3;
+            let gate = (local / 0.003).min(1.0) * if k < 3 { decay(local, 10.0) } else { decay(local, 4.5) };
+            let crack = if ts < 0.012 { n.next() * 0.7 * (1.0 - ts / 0.012) } else { 0.0 };
+            let shimmer = (TAU * 2637.0 * ts).sin() * 0.1 * decay(ts, 6.0);
+            (lp.run(lead, 0.55) * gate + crack + shimmer) * env(t, 0.004, 0.9)
+        }),
+        SfxEvent::CrtShatter => {
+            let mut hold = 0.0f32;
+            render(0.44, move |ts, t, n| {
+                // Glass: sample-and-hold high-passed noise bursts + inharmonic
+                // pings, a dying 7.8 kHz flyback whine and a dull tube thunk.
+                let x = n.next();
+                if ((ts * 9000.0) as u32).is_multiple_of(3) {
+                    hold = x;
+                }
+                let hp = hold - lp.run(hold, 0.3);
+                let glass = hp * decay(ts, 11.0) * 0.9;
+                let ping = ((TAU * 3150.0 * ts).sin() * 0.25 + (TAU * 4730.0 * ts).sin() * 0.18 + (TAU * 6020.0 * ts).sin() * 0.12) * decay(ts, 16.0);
+                let whine = (o.step(7800.0 - 2600.0 * t) * TAU).sin() * 0.12 * decay(ts, 7.0);
+                let thunk = (o2.step(140.0 - 60.0 * t) * TAU).sin() * 0.45 * decay(ts, 22.0);
+                (glass + ping + whine + thunk) * env(t, 0.003, 1.0)
+            })
+        }
+        SfxEvent::UpsDetonate => {
+            let mut hold = 0.0f32;
+            render(0.95, move |ts, t, n| {
+                // Deep falling boom, an FM "EMP" zap sweeping down and a
+                // low-passed debris crackle tail.
+                let boom = (o.step(38.0 + 90.0 * decay(ts, 9.0)) * TAU).sin() * decay(ts, 3.6);
+                let zap_f = 1800.0 * decay(ts, 6.0) + 120.0;
+                let zap = (o2.step(zap_f) * TAU + 2.5 * (TAU * zap_f * 0.5 * ts).sin()).sin() * 0.35 * decay(ts, 8.0);
+                if ((ts * 1400.0) as u32).is_multiple_of(5) {
+                    hold = n.next();
+                }
+                let crackle = lp.run(hold, 0.35) * 0.6 * decay((ts - 0.05).max(0.0), 4.0);
+                let snap = if ts < 0.02 { n.next() * 0.8 * (1.0 - ts / 0.02) } else { 0.0 };
+                (boom * 0.95 + zap + crackle + snap) * env(t, 0.003, 1.3)
+            })
+        }
+        SfxEvent::UpsHiss => render(0.26, |ts, t, n| {
+            // Pressurised hiss: band-limited noise with spark ticks.
+            let x = n.next();
+            let hiss = (x - lp.run(x, 0.12)) * 0.6;
+            let tick = if ((ts * 60.0) as u32).is_multiple_of(4) && (ts * 60.0).fract() < 0.08 { n.next() * 0.6 } else { 0.0 };
+            (hiss + tick) * env(t, 0.06, 1.4)
+        }),
     }
 }
 
@@ -805,13 +888,21 @@ pub enum MusicLayer {
     /// Carrier Daemon stem: double-time bass gallop, distorted E Phrygian
     /// Dominant alarm lead and double-kick / snare fills.
     BossOverdrive,
+    /// Milestone 31 **6G Overclock** layer: supersaw 16th arpeggio with a
+    /// sweeping filter, quarter-note pump and offbeat open hats. Rides on top
+    /// of the combat mix while the Style Rank is `S` (FIBER) or higher.
+    Overclock6G,
 }
 
-/// Number of music stems.
+/// Number of state-mixed base stems (the 6G layer has its own weight).
 pub const MUSIC_LAYERS: usize = 4;
 
 impl MusicLayer {
+    /// The four state-mixed base stems.
     pub const ALL: [MusicLayer; MUSIC_LAYERS] = [MusicLayer::DeadZoneDrone, MusicLayer::SignalPulse, MusicLayer::RushMetal, MusicLayer::BossOverdrive];
+    /// Every phase-locked stem the backend plays (base stems + 6G layer).
+    pub const STEMS: [MusicLayer; MUSIC_LAYERS + 1] =
+        [MusicLayer::DeadZoneDrone, MusicLayer::SignalPulse, MusicLayer::RushMetal, MusicLayer::BossOverdrive, MusicLayer::Overclock6G];
 
     pub fn index(self) -> usize {
         match self {
@@ -819,6 +910,7 @@ impl MusicLayer {
             MusicLayer::SignalPulse => 1,
             MusicLayer::RushMetal => 2,
             MusicLayer::BossOverdrive => 3,
+            MusicLayer::Overclock6G => 4,
         }
     }
 }
@@ -1007,6 +1099,34 @@ fn music_raw(layer: MusicLayer, n: usize) -> Vec<f32> {
                 bass + lead + kick + snare
             })
         }
+        MusicLayer::Overclock6G => {
+            // Per-bar arpeggio chord (semitones over E4), E Phrygian.
+            const ARP: [[i32; 4]; 4] = [[0, 3, 7, 12], [1, 5, 8, 13], [0, 3, 7, 12], [-2, 3, 5, 10]];
+            render_music(n, move |i, lph, nz| {
+                let (s, tl) = step_at(i);
+                let bar = s / 16;
+                let st = s % 16;
+                let atk = |t: f32| (t / 0.002).min(1.0);
+                let oct = if st % 8 >= 4 { 12 } else { 0 };
+                let f = e1_semis(36 + ARP[bar][st % 4] + oct);
+                // Detuned supersaw through a filter that opens twice per loop.
+                let raw = saw(o[0].step(f)) + saw(o[1].step(f * 1.006)) * 0.8 + saw(o[2].step(f * 0.994)) * 0.8;
+                let cutoff = 0.12 + 0.3 * (0.5 - 0.5 * (TAU * 2.0 * lph).cos());
+                let lead = lp[0].run(raw, cutoff) * 0.34 * (0.25 + 0.75 * decay(tl, 7.5) * atk(tl));
+                // Quarter-note sidechain pump.
+                let q = (s % 4) as f32 * MUSIC_STEP_SAMPLES as f32 / SAMPLE_RATE as f32 + tl;
+                let pump = 1.0 - 0.55 * decay(q, 10.0);
+                // Offbeat open hats + a glassy octave ping on each bar.
+                let x = nz.next();
+                let hp = x - lp[1].run(x, 0.45);
+                let hat = if st % 4 == 2 { hp * decay(tl, 22.0) * 0.5 * atk(tl) } else { 0.0 };
+                let ping = if st == 0 { (o[3].step(f * 2.0) * TAU).sin() * 0.22 * decay(tl, 5.0) * atk(tl) } else {
+                    o[3].step(f * 2.0);
+                    0.0
+                };
+                lead * pump + hat + ping
+            })
+        }
     }
 }
 
@@ -1048,6 +1168,8 @@ pub struct MusicCues {
     pub boss_overdrive: bool,
     /// Movement time trial run.
     pub time_trial: bool,
+    /// Style Rank tier (`0` = empty meter, `1..=7` = `D..SSS`).
+    pub style_tier: u8,
 }
 
 /// Target stem weights `[drone, pulse, rush, boss]` for the current game situation.
@@ -1065,6 +1187,25 @@ pub fn target_music_weights(c: MusicCues) -> [f32; MUSIC_LAYERS] {
         AppState::Playing if c.bars <= 3 => [0.45, 0.75, 0.0, 0.0],
         AppState::Playing => [0.20, 0.95, 0.25, 0.0],
     }
+}
+
+/// Style tier (`1..=7` = `D..SSS`) at which the 6G Overclock layer joins (`S`).
+pub const OVERCLOCK_MIN_TIER: u8 = 5;
+
+/// Target weight of the 6G Overclock layer: in a live non-trial run at `S`
+/// (FIBER) or higher, peaking at `SS` (6G) / `SSS` (6G+). Under the Carrier
+/// Daemon / SOS Demon Rush beds it rides lower to keep -1 dBFS of headroom.
+pub fn target_overclock_weight(c: MusicCues) -> f32 {
+    if c.state != AppState::Playing || c.time_trial || c.style_tier < OVERCLOCK_MIN_TIER {
+        return 0.0;
+    }
+    let w = match c.style_tier {
+        5 => 0.40,
+        6 => 0.55,
+        _ => 0.62,
+    };
+    // The Demon Rush / Carrier Daemon beds are already dense: ride lower.
+    if c.boss_active || c.uploading { w * 0.4 } else { w }
 }
 
 /// Exponential crossfade of the stem weights toward `target` (frame-rate independent).
@@ -1086,11 +1227,23 @@ pub fn effective_music_volume(weight: f32, settings: &UserSettings) -> f32 {
 #[derive(Resource, Debug, Clone)]
 pub struct MusicMixState {
     pub weights: [f32; MUSIC_LAYERS],
+    /// Live weight of the 6G Overclock layer.
+    pub overclock: f32,
 }
 
 impl Default for MusicMixState {
     fn default() -> Self {
-        MusicMixState { weights: target_music_weights(MusicCues { state: AppState::MainMenu, ..default() }) }
+        MusicMixState { weights: target_music_weights(MusicCues { state: AppState::MainMenu, ..default() }), overclock: 0.0 }
+    }
+}
+
+impl MusicMixState {
+    /// Live weight of any stem.
+    pub fn weight(&self, layer: MusicLayer) -> f32 {
+        match layer {
+            MusicLayer::Overclock6G => self.overclock,
+            l => self.weights[l.index()],
+        }
     }
 }
 
@@ -1104,6 +1257,7 @@ pub fn update_music_mix(
     boss: Option<Res<BossHud>>,
     run: Option<Res<RunStats>>,
     mut mix: ResMut<MusicMixState>,
+    style: Option<Res<crate::style::StyleMeter>>,
 ) {
     let boss = boss.as_deref();
     let cues = MusicCues {
@@ -1113,8 +1267,14 @@ pub fn update_music_mix(
         boss_active: boss.is_some_and(|b| b.active),
         boss_overdrive: boss.is_some_and(|b| b.active && b.phase == BossPhase::Overdrive),
         time_trial: run.is_some_and(|r| r.mode.is_time_trial()),
+        style_tier: style.and_then(|s| s.rank()).map_or(0, |r| r.index() + 1),
     };
-    mix.weights = step_music_mix(mix.weights, target_music_weights(cues), time.delta_secs());
+    let dt = time.delta_secs();
+    mix.weights = step_music_mix(mix.weights, target_music_weights(cues), dt);
+    // The 6G layer swells in a little faster than it fades (rank-ups land hard).
+    let target = target_overclock_weight(cues);
+    let rate = if target > mix.overclock { MUSIC_MIX_RATE * 1.6 } else { MUSIC_MIX_RATE };
+    mix.overclock += (target - mix.overclock) * (1.0 - (-rate * dt.max(0.0)).exp());
 }
 
 /// Game audio is suspended because the OS backgrounded the app (see
@@ -1163,9 +1323,9 @@ mod backend {
     #[derive(Component, Debug, Clone, Copy)]
     pub struct MusicStem(pub MusicLayer);
 
-    /// Start all four stems together (silent) so they stay phase-locked.
+    /// Start every stem together (silent) so they stay phase-locked.
     pub fn spawn_music_stems(mut commands: Commands, mut sources: ResMut<Assets<AudioSource>>) {
-        for layer in MusicLayer::ALL {
+        for layer in MusicLayer::STEMS {
             let handle = sources.add(AudioSource { bytes: synthesize_music_wav(layer).into() });
             commands.spawn((AudioPlayer(handle), PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)), MusicStem(layer)));
         }
@@ -1180,7 +1340,7 @@ mod backend {
     ) {
         let settings = crate::meta::live_settings(store.as_deref());
         for (stem, mut sink) in &mut sinks {
-            let v = effective_music_volume(mix.weights[stem.0.index()], &settings);
+            let v = effective_music_volume(mix.weight(stem.0), &settings);
             sink.set_volume(Volume::Linear(suspended_music_volume(v, *suspended)));
         }
     }
@@ -1373,7 +1533,7 @@ mod tests {
 
     #[test]
     fn rocket_sfx_are_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 36);
+        assert_eq!(SfxEvent::ALL.len(), 41);
         let fire = synthesize_wav(SfxEvent::RocketFire);
         let boom = synthesize_wav(SfxEvent::RocketExplode);
         assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
@@ -1387,7 +1547,7 @@ mod tests {
 
     #[test]
     fn milestone13_sfx_are_valid_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 36);
+        assert_eq!(SfxEvent::ALL.len(), 41);
         let news = [SfxEvent::PhaseBlink, SfxEvent::SniperLock, SfxEvent::BossShield];
         for sfx in news {
             assert!(SfxEvent::ALL.contains(&sfx));
@@ -1549,7 +1709,7 @@ mod tests {
     #[test]
     fn target_music_weights_cover_every_state_and_situation() {
         use AppState::*;
-        let all_on = |state| MusicCues { state, bars: 5, uploading: true, boss_active: true, boss_overdrive: true, time_trial: true };
+        let all_on = |state| MusicCues { state, bars: 5, uploading: true, boss_active: true, boss_overdrive: true, time_trial: true, style_tier: 7 };
         for st in [MainMenu, Loadout, ContractsFeats, Settings] {
             assert_eq!(target_music_weights(all_on(st)), [0.45, 0.15, 0.0, 0.0], "{st:?}");
         }
@@ -1914,6 +2074,133 @@ mod tests {
         println!("milestone 30 worst-case mix peak {peak:.4} ({dbfs:.2} dBFS), clipped samples {clipped}");
         assert_eq!(clipped, 0);
         assert!(peak <= 0.89, "peak {peak:.4} ({dbfs:.2} dBFS) must stay <= -1 dBFS");
+    }
+
+    /// [`worst_case_mix_of`] over an arbitrary music situation, including the
+    /// Milestone 31 6G Overclock stem at its target weight for `music`.
+    fn worst_case_mix_with(music: MusicCues, cues: &[(SfxEvent, bool)]) -> (f32, usize) {
+        let full = UserSettings { audio_master_volume: 1.0, audio_muted: false, ..default() };
+        let weights = target_music_weights(music);
+        let oc = target_overclock_weight(music);
+        let stems: Vec<(Vec<f32>, f32)> = MusicLayer::STEMS
+            .iter()
+            .map(|l| {
+                let w = if *l == MusicLayer::Overclock6G { oc } else { weights[l.index()] };
+                (decode_wav(&synthesize_music_wav(*l)), effective_music_volume(w, &full))
+            })
+            .collect();
+        let loop_len = stems[0].0.len();
+        assert!(stems.iter().all(|(s, _)| s.len() == loop_len), "phase-locked stems incl. 6G");
+        let bed: Vec<f32> = (0..loop_len).map(|i| stems.iter().map(|(s, g)| s[i] * g).sum()).collect();
+        let bed_hi = bed.iter().copied().fold(0.0f32, f32::max);
+        let bed_lo = bed.iter().copied().fold(0.0f32, f32::min);
+        let close = spatial_distance_fade(2.0, SPATIAL_MAX_DIST) * spatial_rolloff(2.0);
+        let sfx: Vec<(Vec<f32>, f32)> =
+            cues.iter().map(|(e, near)| (decode_wav(&synthesize_wav(*e)), effective_sfx_volume(*e, &full) * if *near { close } else { 1.0 })).collect();
+        let len = sfx.iter().map(|(s, _)| s.len()).max().unwrap();
+        let (mut peak, mut clipped) = (0.0f32, 0usize);
+        let mut staggers: Vec<Vec<usize>> = vec![vec![0; cues.len()]];
+        for k in 0..cues.len() {
+            for d in [220usize, 441, 882, 2646] {
+                let mut st = vec![0; cues.len()];
+                st[k] = d;
+                staggers.push(st);
+            }
+        }
+        for st in &staggers {
+            for i in 0..len + 2646 {
+                let fx: f32 = sfx.iter().zip(st).map(|((s, g), d)| i.checked_sub(*d).and_then(|j| s.get(j)).map_or(0.0, |x| x * g)).sum();
+                let v = (fx + bed_hi).abs().max((fx + bed_lo).abs());
+                peak = peak.max(v);
+                clipped += (v >= 1.0) as usize;
+            }
+        }
+        (peak, clipped)
+    }
+
+    #[test]
+    fn milestone31_sfx_are_valid_distinct_and_crisp() {
+        let news = [SfxEvent::StyleRankUp, SfxEvent::StylePeak, SfxEvent::CrtShatter, SfxEvent::UpsDetonate, SfxEvent::UpsHiss];
+        let secs = |e| (synthesize_wav(e).len() - 44) as f32 / 2.0 / SAMPLE_RATE as f32;
+        for sfx in news {
+            assert!(SfxEvent::ALL.contains(&sfx));
+            let w = synthesize_wav(sfx);
+            assert_eq!(w, synthesize_wav(sfx), "{sfx:?} deterministic");
+            for other in SfxEvent::ALL.into_iter().filter(|o| *o != sfx) {
+                assert_ne!(w, synthesize_wav(other), "{sfx:?} vs {other:?}");
+            }
+            let pcm: Vec<i16> = w[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            let rms = (pcm.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt();
+            assert!(rms > 1000.0, "{sfx:?} rms {rms}");
+            assert!(secs(sfx) < 1.0, "{sfx:?} short");
+            assert!(sfx.volume() <= SfxEvent::RocketExplode.volume(), "{sfx:?} sits at or under the mortar");
+        }
+        // The peak stinger is the longer, brighter one; the UPS blast the heaviest.
+        assert!(secs(SfxEvent::StylePeak) > secs(SfxEvent::StyleRankUp));
+        assert!(SfxEvent::StylePeak.volume() > SfxEvent::StyleRankUp.volume());
+        assert!(secs(SfxEvent::UpsDetonate) > secs(SfxEvent::RocketExplode) * 0.5);
+        assert!(SfxEvent::UpsHiss.volume() < SfxEvent::CrtShatter.volume());
+    }
+
+    #[test]
+    fn overclock_6g_layer_joins_at_fiber_and_peaks_at_6g() {
+        let s = music_samples(MusicLayer::Overclock6G);
+        assert_eq!(s.len(), MUSIC_LOOP_SAMPLES, "phase-locked with the base stems");
+        assert!(s.iter().all(|v| v.is_finite()));
+        assert!((s.iter().fold(0.0f32, |m, v| m.max(v.abs())) - MUSIC_PEAK).abs() < 1e-4);
+        assert_eq!(MusicLayer::STEMS.len(), 5);
+        assert_eq!(MusicLayer::Overclock6G.index(), 4);
+        assert!(!MusicLayer::ALL.contains(&MusicLayer::Overclock6G), "not a state-mixed base stem");
+        for base in MusicLayer::ALL {
+            assert_ne!(synthesize_music_wav(base), synthesize_music_wav(MusicLayer::Overclock6G));
+        }
+        // Busier than the drone, every bar carries energy.
+        let motion = |l: MusicLayer| {
+            let s = music_samples(l);
+            s.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / s.len() as f32
+        };
+        assert!(motion(MusicLayer::Overclock6G) > motion(MusicLayer::DeadZoneDrone));
+        let play = |tier| MusicCues { state: AppState::Playing, bars: 5, style_tier: tier, ..default() };
+        for tier in 0..5 {
+            assert_eq!(target_overclock_weight(play(tier)), 0.0, "tier {tier}: below S");
+        }
+        let (s5, s6, s7) = (target_overclock_weight(play(5)), target_overclock_weight(play(6)), target_overclock_weight(play(7)));
+        assert!(s5 > 0.0 && s6 > s5 && s7 >= s6, "{s5} {s6} {s7}");
+        assert_eq!(target_overclock_weight(MusicCues { time_trial: true, ..play(7) }), 0.0);
+        assert!(target_overclock_weight(MusicCues { boss_active: true, ..play(7) }) < s7, "tamed under the boss bed");
+        for st in [AppState::Paused, AppState::MainMenu, AppState::GameOver, AppState::Victory, AppState::UpgradeSelect] {
+            assert_eq!(target_overclock_weight(MusicCues { state: st, ..play(7) }), 0.0, "{st:?}");
+        }
+        let mix = MusicMixState { overclock: 0.5, ..default() };
+        assert_eq!(mix.weight(MusicLayer::Overclock6G), 0.5);
+        assert_eq!(mix.weight(MusicLayer::DeadZoneDrone), mix.weights[0]);
+    }
+
+    #[test]
+    fn milestone31_worst_case_mix_keeps_one_db_of_headroom() {
+        // Boss Overdrive bed + 6G+ layer: a UPS chain right beside the player,
+        // a mortar blast, the SSS peak stinger, a CRT shatter and a fatality.
+        let cues = [
+            (SfxEvent::UpsDetonate, false),
+            (SfxEvent::RocketExplode, false),
+            (SfxEvent::StylePeak, false),
+            (SfxEvent::CrtShatter, false),
+            (SfxEvent::Fatality, false),
+            (SfxEvent::JammerHum, true),
+        ];
+        let boss = MusicCues { state: AppState::Playing, bars: 5, boss_active: true, boss_overdrive: true, style_tier: 7, ..default() };
+        let sos = MusicCues { state: AppState::Playing, bars: 5, uploading: true, style_tier: 7, ..default() };
+        let roam = MusicCues { state: AppState::Playing, bars: 5, style_tier: 7, ..default() };
+        let mut worst = 0.0f32;
+        for (name, music) in [("boss overdrive", boss), ("SOS rush", sos), ("full bars", roam)] {
+            let (peak, clipped) = worst_case_mix_with(music, &cues);
+            let dbfs = 20.0 * peak.log10();
+            println!("milestone 31 worst-case mix ({name} + 6G+): peak {peak:.4} ({dbfs:.2} dBFS), clipped samples {clipped}");
+            assert_eq!(clipped, 0, "{name}");
+            assert!(peak <= 0.89, "{name}: peak {peak:.4} ({dbfs:.2} dBFS) must stay <= -1 dBFS");
+            worst = worst.max(peak);
+        }
+        println!("milestone 31 worst-case overall peak {worst:.4} ({:.2} dBFS)", 20.0 * worst.log10());
     }
 
     /// Worst-case simultaneous combat mix at full master volume: the four

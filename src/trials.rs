@@ -731,6 +731,12 @@ pub struct TrialAssets {
     pub next: Handle<StandardMaterial>,
     pub cleared: Handle<StandardMaterial>,
     pub finish: Handle<StandardMaterial>,
+    /// Milestone 31 PB Signal Ghost silhouette (shared, prewarmed).
+    pub ghost_body: Handle<Mesh>,
+    pub ghost_head: Handle<Mesh>,
+    pub ghost_visor: Handle<Mesh>,
+    pub ghost_glow: Handle<StandardMaterial>,
+    pub ghost_core: Handle<StandardMaterial>,
 }
 
 /// A checkpoint ring / finish halo (index into [`time_trial_gates`]).
@@ -748,6 +754,11 @@ fn create_trial_assets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>,
         next: materials.add(glow(Color::srgb(0.3, 0.95, 1.0), LinearRgba::rgb(0.8, 4.2, 5.0))),
         cleared: materials.add(glow(Color::srgb(0.25, 1.0, 0.45), LinearRgba::rgb(0.6, 3.6, 1.0))),
         finish: materials.add(glow(Color::srgb(1.0, 0.8, 0.28), LinearRgba::rgb(5.0, 3.4, 0.8))),
+        ghost_body: meshes.add(Capsule3d::new(0.3, 1.0)),
+        ghost_head: meshes.add(Sphere::new(0.21).mesh().ico(2).unwrap_or_else(|_| Sphere::new(0.21).mesh().uv(12, 8))),
+        ghost_visor: meshes.add(Cuboid::new(0.3, 0.07, 0.06)),
+        ghost_glow: materials.add(crate::fx::additive_glow(GHOST_COLOR, 0.34)),
+        ghost_core: materials.add(crate::fx::additive_glow(Color::srgb(0.75, 1.0, 1.0), 0.8)),
     });
 }
 
@@ -1041,6 +1052,393 @@ pub fn trial_splits_line(splits: &[f32], best: &[f32]) -> String {
     parts.join("  |  ")
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 31: personal-best Signal Ghost
+// ---------------------------------------------------------------------------
+
+/// Ghost keyframe interval (10 Hz).
+pub const GHOST_INTERVAL: f32 = 0.1;
+/// Ghost keyframe cap (120 s of course).
+pub const GHOST_MAX_SAMPLES: usize = 1200;
+/// Ghost trace file next to `profile.json` (desktop / Android).
+pub const GHOST_FILE: &str = "trial_ghost.json";
+/// Web build: `localStorage` key of the ghost trace.
+pub const WEB_GHOST_KEY: &str = "segnale_debole_trial_ghost_v1";
+/// Ghost trace format version.
+pub const GHOST_VERSION: u32 = 1;
+/// Translucent glowing cyan of the ghost runner.
+pub const GHOST_COLOR: Color = Color::srgb(0.25, 0.95, 1.0);
+
+/// One ghost keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GhostSample {
+    pub t: f32,
+    pub pos: [f32; 3],
+    pub yaw: f32,
+}
+
+/// A recorded Time Trial run (kept apart from `PlayerProfile`, so cloud-sync
+/// JSON never carries it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GhostTrace {
+    pub version: u32,
+    /// Final time of the run the trace belongs to.
+    pub time: f32,
+    pub samples: Vec<GhostSample>,
+}
+
+/// Shortest-arc yaw interpolation.
+fn lerp_yaw(a: f32, b: f32, k: f32) -> f32 {
+    let d = (b - a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    a + d * k
+}
+
+impl GhostTrace {
+    /// Usable trace: right version, 2..=cap finite samples, time-sorted.
+    pub fn is_valid(&self) -> bool {
+        self.version == GHOST_VERSION
+            && (2..=GHOST_MAX_SAMPLES).contains(&self.samples.len())
+            && self.time.is_finite()
+            && self.samples.iter().all(|s| s.t.is_finite() && s.yaw.is_finite() && s.pos.iter().all(|v| v.is_finite()))
+            && self.samples.windows(2).all(|w| w[0].t <= w[1].t)
+    }
+
+    pub fn end_time(&self) -> f32 {
+        self.samples.last().map_or(0.0, |s| s.t)
+    }
+
+    /// Interpolated `(position, yaw)` at `t` (clamped to the trace).
+    pub fn sample_at(&self, t: f32) -> Option<(Vec3, f32)> {
+        let first = self.samples.first()?;
+        let t = if t.is_finite() { t } else { 0.0 };
+        let i = self.samples.partition_point(|s| s.t <= t);
+        if i == 0 {
+            return Some((Vec3::from_array(first.pos), first.yaw));
+        }
+        let a = self.samples[i - 1];
+        let Some(b) = self.samples.get(i) else { return Some((Vec3::from_array(a.pos), a.yaw)) };
+        let k = if b.t > a.t { ((t - a.t) / (b.t - a.t)).clamp(0.0, 1.0) } else { 0.0 };
+        Some((Vec3::from_array(a.pos).lerp(Vec3::from_array(b.pos), k), lerp_yaw(a.yaw, b.yaw, k)))
+    }
+
+    /// Live race delta: `elapsed` minus the time the ghost passed nearest the
+    /// player's position (searched within +-10 s), negative = ahead of the PB.
+    pub fn delta_at(&self, elapsed: f32, pos: Vec3) -> Option<f32> {
+        let lo = self.samples.partition_point(|s| s.t < elapsed - 10.0);
+        let hi = self.samples.partition_point(|s| s.t <= elapsed + 10.0);
+        self.samples[lo..hi]
+            .iter()
+            .map(|s| (Vec3::from_array(s.pos).distance_squared(pos), s.t))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .filter(|(d2, _)| *d2 < 12.0 * 12.0)
+            .map(|(_, t)| elapsed - t)
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn from_json(s: &str) -> Option<GhostTrace> {
+        serde_json::from_str::<GhostTrace>(s).ok().filter(GhostTrace::is_valid)
+    }
+}
+
+/// The attempt being recorded.
+#[derive(Resource, Debug, Clone)]
+pub struct GhostRecorder {
+    pub samples: Vec<GhostSample>,
+    pub interval: f32,
+    pub next_t: f32,
+    pub last_t: f32,
+    /// The finished attempt was already handled.
+    pub finalized: bool,
+}
+
+impl Default for GhostRecorder {
+    fn default() -> Self {
+        GhostRecorder { samples: Vec::new(), interval: GHOST_INTERVAL, next_t: 0.0, last_t: 0.0, finalized: false }
+    }
+}
+
+impl GhostRecorder {
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.interval = GHOST_INTERVAL;
+        self.next_t = 0.0;
+        self.last_t = 0.0;
+        self.finalized = false;
+    }
+
+    /// Halve sample density in place when the cap is reached so long trials
+    /// keep uniform coverage all the way to the finish instead of inventing
+    /// the final stretch in a straight line.
+    fn downsample(&mut self) {
+        let mut kept = Vec::with_capacity(self.samples.len() / 2 + 1);
+        for (i, s) in self.samples.iter().enumerate() {
+            if i % 2 == 0 {
+                kept.push(*s);
+            }
+        }
+        self.samples = kept;
+        self.interval *= 2.0;
+    }
+
+    /// Record `(t, pos, yaw)` if the next keyframe is due (downsampling cleanly
+    /// if the trace reaches [`GHOST_MAX_SAMPLES`]).
+    pub fn record(&mut self, t: f32, pos: Vec3, yaw: f32) {
+        if t + 1e-4 < self.last_t {
+            self.reset();
+        }
+        self.last_t = t;
+        if t + 1e-4 >= self.next_t && pos.is_finite() {
+            if self.samples.len() >= GHOST_MAX_SAMPLES {
+                self.downsample();
+            }
+            self.samples.push(GhostSample { t, pos: pos.to_array(), yaw });
+            // Step the schedule (float clocks land a hair under each boundary);
+            // only a long hitch re-anchors it past `t`.
+            self.next_t += self.interval;
+            if self.next_t <= t {
+                self.next_t = t + self.interval;
+            }
+        }
+    }
+
+    /// The finished attempt as a trace (with an exact final keyframe).
+    pub fn finish(&mut self, time: f32, pos: Vec3, yaw: f32) -> GhostTrace {
+        if self.samples.last().is_none_or(|s| s.t < time) {
+            if self.samples.len() >= GHOST_MAX_SAMPLES {
+                self.downsample();
+            }
+            self.samples.push(GhostSample { t: time, pos: pos.to_array(), yaw });
+        } else if let Some(last) = self.samples.last_mut() {
+            *last = GhostSample { t: time.max(last.t), pos: pos.to_array(), yaw };
+        }
+        self.finalized = true;
+        GhostTrace { version: GHOST_VERSION, time, samples: self.samples.clone() }
+    }
+}
+
+/// Derive a per-profile ghost path from the complete profile filename
+/// (e.g. `profile.json` -> `profile.json.ghost.json`) so custom profiles never
+/// collide with each other or overwrite themselves when named `trial_ghost.json`.
+pub fn ghost_path_for_profile(profile_path: &std::path::Path) -> std::path::PathBuf {
+    let mut os = profile_path.as_os_str().to_os_string();
+    os.push(".ghost.json");
+    std::path::PathBuf::from(os)
+}
+
+/// Whether a locally cached ghost trace still matches the current profile's PB
+/// (prevents a stale trace from rendering after cloud sync improves the PB or a
+/// ghost write fails).
+pub fn ghost_matches_profile_pb(trace: &GhostTrace, profile_pb: Option<f32>) -> bool {
+    trace.is_valid() && profile_pb.is_some_and(|best| best.is_finite() && (trace.time - best).abs() <= 0.05)
+}
+
+/// Where the PB ghost persists.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum GhostBackend {
+    /// Tests, bots, screenshot tours and storage-less sessions.
+    #[default]
+    Memory,
+    /// `trial_ghost.json` next to `profile.json`.
+    File(std::path::PathBuf),
+    /// Browser `localStorage` ([`WEB_GHOST_KEY`]).
+    Web,
+}
+
+/// The local personal-best ghost.
+#[derive(Resource, Debug, Default, Clone)]
+pub struct TrialGhostStore {
+    pub pb: Option<GhostTrace>,
+    pub backend: GhostBackend,
+    pub loaded: bool,
+    /// Live race delta against the ghost (`None` = no ghost / not near it).
+    pub delta: Option<f32>,
+}
+
+impl TrialGhostStore {
+    /// Backend that follows the profile store (file beside it, web storage, or memory).
+    pub fn backend_for(store: Option<&ProfileStore>) -> GhostBackend {
+        match store {
+            Some(s) if s.web_storage => GhostBackend::Web,
+            Some(s) => s.path.as_ref().map_or(GhostBackend::Memory, |p| GhostBackend::File(ghost_path_for_profile(p))),
+            None => GhostBackend::Memory,
+        }
+    }
+
+    pub fn load(backend: GhostBackend) -> Self {
+        let raw: Option<String> = match &backend {
+            GhostBackend::Memory => None,
+            #[cfg(not(target_arch = "wasm32"))]
+            GhostBackend::File(p) => std::fs::read_to_string(p).ok(),
+            #[cfg(target_arch = "wasm32")]
+            GhostBackend::File(_) => None,
+            GhostBackend::Web => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use crate::meta::ProfileKv;
+                    crate::meta::LocalStorageKv::open().and_then(|kv| kv.get(WEB_GHOST_KEY).ok().flatten())
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    None
+                }
+            }
+        };
+        TrialGhostStore { pb: raw.as_deref().and_then(GhostTrace::from_json), backend, loaded: true, delta: None }
+    }
+
+    /// Replace the PB ghost and persist it (best effort; never panics).
+    pub fn set_pb(&mut self, trace: GhostTrace) {
+        if !trace.is_valid() {
+            return;
+        }
+        let json = trace.to_json();
+        self.pb = Some(trace);
+        match &self.backend {
+            GhostBackend::Memory => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            GhostBackend::File(p) => {
+                let mut tmp_os = p.as_os_str().to_os_string();
+                tmp_os.push(".tmp");
+                let tmp = std::path::PathBuf::from(tmp_os);
+                let res = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, p));
+                if let Err(e) = res {
+                    warn!("trial ghost save failed: {e}");
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            GhostBackend::File(_) => {}
+            GhostBackend::Web => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use crate::meta::ProfileKv;
+                    if let Some(mut kv) = crate::meta::LocalStorageKv::open()
+                        && let Err(e) = kv.set(WEB_GHOST_KEY, &json)
+                    {
+                        warn!("trial ghost save failed: {e}");
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = &json;
+            }
+        }
+    }
+}
+
+/// Root of the ghost runner silhouette.
+#[derive(Component)]
+pub struct SignalGhost;
+
+/// Lazily bind the ghost store to the profile's storage (first frame it exists).
+fn load_trial_ghost(store: Option<Res<ProfileStore>>, mut ghost: ResMut<TrialGhostStore>) {
+    if ghost.loaded {
+        return;
+    }
+    *ghost = TrialGhostStore::load(TrialGhostStore::backend_for(store.as_deref()));
+}
+
+/// Record the attempt at 10 Hz; on a finish that beats (or sets) the PB,
+/// store the trace as the new PB ghost.
+fn record_trial_ghost(trial: Res<TimeTrialState>, mut rec: ResMut<GhostRecorder>, mut ghost: ResMut<TrialGhostStore>, players: Query<(&Player, &Transform)>) {
+    let Ok((p, tf)) = players.single() else { return };
+    if trial.reset_requested {
+        return;
+    }
+    if !trial.finished {
+        if rec.finalized || trial.elapsed + 1e-4 < rec.last_t {
+            rec.reset();
+        }
+        rec.record(trial.elapsed, tf.translation, p.yaw);
+        return;
+    }
+    if rec.finalized {
+        return;
+    }
+    let time = trial.final_time().unwrap_or(trial.elapsed);
+    let trace = rec.finish(time, tf.translation, p.yaw);
+    if trial.result.is_some_and(|r| r.new_pb) {
+        ghost.set_pb(trace);
+    }
+}
+
+/// Spawn / drive the translucent ghost runner at `trial.elapsed` (resets to
+/// `t = 0` with the attempt) and refresh the live race delta.
+#[allow(clippy::type_complexity)]
+fn drive_trial_ghost(
+    mut commands: Commands,
+    trial: Res<TimeTrialState>,
+    store: Option<Res<ProfileStore>>,
+    mut ghost: ResMut<TrialGhostStore>,
+    assets: Option<Res<TrialAssets>>,
+    players: Query<&Transform, (With<Player>, Without<SignalGhost>)>,
+    mut ghosts: Query<(Entity, &mut Transform, &mut Visibility), With<SignalGhost>>,
+) {
+    let valid_pb = ghost.pb.as_ref().filter(|pb| match store.as_deref() {
+        Some(s) => ghost_matches_profile_pb(pb, s.profile.time_trial_best_secs),
+        None => pb.is_valid(),
+    });
+    let Some(pb) = valid_pb else {
+        for (e, ..) in &ghosts {
+            commands.entity(e).despawn();
+        }
+        ghost.delta = None;
+        return;
+    };
+    let pose = pb.sample_at(trial.elapsed);
+    let past_end = trial.elapsed > pb.end_time() + 0.5;
+    let delta = players.single().ok().and_then(|p| pb.delta_at(trial.elapsed, p.translation));
+    match ghosts.single_mut() {
+        Ok((_, mut tf, mut vis)) => {
+            if let Some((pos, yaw)) = pose {
+                tf.translation = pos;
+                tf.rotation = Quat::from_rotation_y(yaw);
+            }
+            let want = if past_end { Visibility::Hidden } else { Visibility::Inherited };
+            if *vis != want {
+                *vis = want;
+            }
+        }
+        Err(_) => {
+            if let (Some(a), Some((pos, yaw))) = (assets.as_deref(), pose) {
+                spawn_signal_ghost(&mut commands, a, pos, yaw);
+            }
+        }
+    }
+    ghost.delta = if trial.finished { None } else { delta };
+}
+
+/// Ghost silhouette: capsule torso + head + bright visor (no collision).
+pub fn spawn_signal_ghost(commands: &mut Commands, a: &TrialAssets, pos: Vec3, yaw: f32) -> Entity {
+    commands
+        .spawn((
+            LevelEntity,
+            SignalGhost,
+            Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
+            Visibility::default(),
+            children![
+                (Mesh3d(a.ghost_body.clone()), MeshMaterial3d(a.ghost_glow.clone()), Transform::from_xyz(0.0, 0.85, 0.0)),
+                (Mesh3d(a.ghost_head.clone()), MeshMaterial3d(a.ghost_glow.clone()), Transform::from_xyz(0.0, 1.72, 0.0)),
+                (Mesh3d(a.ghost_visor.clone()), MeshMaterial3d(a.ghost_core.clone()), Transform::from_xyz(0.0, 1.74, -0.18)),
+            ],
+        ))
+        .id()
+}
+
+/// Leaving the Time Trial: forget the in-flight recording.
+fn reset_ghost_recorder(mut rec: ResMut<GhostRecorder>, mut ghost: ResMut<TrialGhostStore>) {
+    rec.reset();
+    ghost.delta = None;
+}
+
+/// `PB GHOST  -0.42s` HUD readout + its tone (`None` without a live delta).
+pub fn ghost_delta_text(delta: Option<f32>) -> Option<(String, Color)> {
+    let d = delta.filter(|d| d.is_finite())?;
+    let sign = if d <= 0.0 { '-' } else { '+' };
+    Some((format!("PB GHOST  {sign}{:.2}s", d.abs()), if d <= 0.0 { ACID_GREEN } else { HAZARD_YELLOW }))
+}
+
 pub struct TrialsPlugin;
 
 impl Plugin for TrialsPlugin {
@@ -1053,13 +1451,17 @@ impl Plugin for TrialsPlugin {
             )
             .add_systems(
                 Update,
-                (trial_restart_key, trial_tick, trial_pit_rescue, trial_gates, update_gate_visuals)
+                (trial_restart_key, trial_tick, trial_pit_rescue, trial_gates, update_gate_visuals, record_trial_ghost, drive_trial_ghost)
                     .chain()
                     .in_set(GameSet::World)
                     .before(crate::player::hazard_damage)
                     .run_if(resource_exists::<LevelGrid>)
                     .run_if(is_time_trial),
-            );
+            )
+            .init_resource::<GhostRecorder>()
+            .init_resource::<TrialGhostStore>()
+            .add_systems(Update, load_trial_ghost)
+            .add_systems(OnEnter(AppState::MainMenu), reset_ghost_recorder);
     }
 }
 
@@ -1344,5 +1746,139 @@ mod tests {
         let bad = r#"{"time_trial_best_secs": -5.0, "time_trial_best_splits": [1.0], "standard_pb_splits": [-1.0]}"#;
         let b = crate::meta::parse_profile(bad).unwrap();
         assert!(b.time_trial_best_secs.is_none() && b.time_trial_best_splits.is_empty() && b.standard_pb_splits.is_empty());
+    }
+
+    fn trace(n: usize) -> GhostTrace {
+        let samples = (0..n).map(|i| GhostSample { t: i as f32 * GHOST_INTERVAL, pos: [i as f32, 0.0, 0.0], yaw: 0.1 * i as f32 }).collect();
+        GhostTrace { version: GHOST_VERSION, time: (n - 1) as f32 * GHOST_INTERVAL, samples }
+    }
+
+    #[test]
+    fn ghost_recorder_samples_at_10hz_caps_and_resets() {
+        let mut r = GhostRecorder::default();
+        let dt = 1.0 / 60.0;
+        for k in 0..60 {
+            r.record(k as f32 * dt, Vec3::new(k as f32, 0.0, 0.0), 0.0);
+        }
+        assert_eq!(r.samples.len(), 10, "1 s at 60 fps = 10 keyframes");
+        assert!(r.samples.windows(2).all(|w| (w[1].t - w[0].t - GHOST_INTERVAL).abs() < dt + 1e-4));
+        // Clock jumping back (instant R) restarts the recording.
+        r.record(0.0, Vec3::ZERO, 0.0);
+        assert_eq!(r.samples.len(), 1);
+        // Long trials (> 120 s) downsample instead of freezing at 120 s.
+        let mut long = GhostRecorder::default();
+        for k in 0..20_000 {
+            let t = k as f32 * 0.02;
+            long.record(t, Vec3::new(t, 0.0, 0.0), 0.0);
+        }
+        assert!(long.samples.len() <= GHOST_MAX_SAMPLES);
+        assert!(long.interval > GHOST_INTERVAL, "downsampled interval {}", long.interval);
+        let t = long.finish(400.0, Vec3::new(400.0, 0.0, 0.0), 1.0);
+        assert!(t.samples.len() <= GHOST_MAX_SAMPLES);
+        assert!(t.is_valid());
+        assert_eq!(t.samples.last().unwrap().pos, [400.0, 0.0, 0.0]);
+        // Mid-late sample around t = 300 s tracks real motion rather than a 280 s straight-line jump.
+        let (p300, _) = t.sample_at(300.0).unwrap();
+        assert!((p300.x - 300.0).abs() < 1.0, "downsampled late stretch accurate: {p300}");
+        assert!(long.finalized);
+        // A normal finish appends the exact final keyframe.
+        let mut f = GhostRecorder::default();
+        f.record(0.0, Vec3::ZERO, 0.0);
+        f.record(0.1, Vec3::X, 0.0);
+        let tr = f.finish(0.15, Vec3::Y, 0.5);
+        assert_eq!(tr.samples.len(), 3);
+        assert_eq!((tr.time, tr.samples[2].t), (0.15, 0.15));
+        assert!(tr.is_valid());
+    }
+
+    #[test]
+    fn ghost_trace_interpolates_position_and_shortest_yaw() {
+        let t = trace(11);
+        let (p, y) = t.sample_at(0.25).unwrap();
+        assert!((p.x - 2.5).abs() < 1e-4, "{p}");
+        assert!((y - 0.25).abs() < 1e-4);
+        assert_eq!(t.sample_at(-3.0).unwrap().0, Vec3::ZERO, "clamped at the start");
+        assert_eq!(t.sample_at(99.0).unwrap().0, Vec3::new(10.0, 0.0, 0.0), "clamped at the end");
+        assert_eq!(t.sample_at(f32::NAN).unwrap().0, Vec3::ZERO);
+        // Yaw wraps the short way across +-PI.
+        let w = GhostTrace {
+            version: GHOST_VERSION,
+            time: 0.1,
+            samples: vec![GhostSample { t: 0.0, pos: [0.0; 3], yaw: 3.0 }, GhostSample { t: 0.1, pos: [0.0; 3], yaw: -3.0 }],
+        };
+        let (_, mid) = w.sample_at(0.05).unwrap();
+        assert!((mid.rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI).abs() < 0.01, "{mid}");
+        assert!(GhostTrace::default().sample_at(1.0).is_none());
+        // Live delta: standing where the ghost was 0.3 s earlier = 0.3 s behind.
+        let d = t.delta_at(0.8, Vec3::new(5.0, 0.0, 0.0)).unwrap();
+        assert!((d - 0.3).abs() < 1e-4, "{d}");
+        let ahead = t.delta_at(0.2, Vec3::new(6.0, 0.0, 0.0)).unwrap();
+        assert!(ahead < 0.0, "ahead of the PB: {ahead}");
+        assert!(t.delta_at(0.5, Vec3::new(500.0, 0.0, 0.0)).is_none(), "far off the line");
+    }
+
+    #[test]
+    fn ghost_json_round_trips_and_rejects_junk() {
+        let t = trace(30);
+        let back = GhostTrace::from_json(&t.to_json()).unwrap();
+        assert_eq!(back, t);
+        for bad in ["", "{}", "not json", r#"{"version":9,"time":1.0,"samples":[]}"#] {
+            assert!(GhostTrace::from_json(bad).is_none(), "{bad}");
+        }
+        let mut unsorted = trace(5);
+        unsorted.samples.swap(1, 3);
+        assert!(!unsorted.is_valid());
+        let mut nan = trace(5);
+        nan.samples[2].pos[1] = f32::NAN;
+        assert!(!nan.is_valid());
+        let mut huge = trace(5);
+        huge.samples = vec![huge.samples[0]; GHOST_MAX_SAMPLES + 1];
+        assert!(!huge.is_valid());
+        // The ghost lives outside the cloud-synced profile JSON.
+        let profile = serde_json::to_string(&PlayerProfile::default()).unwrap();
+        assert!(!profile.contains("ghost") && !profile.contains("samples"));
+    }
+
+    #[test]
+    fn ghost_store_persists_next_to_the_profile_or_in_memory() {
+        assert_eq!(TrialGhostStore::backend_for(None), GhostBackend::Memory);
+        let mem = ProfileStore::in_memory(PlayerProfile::default());
+        assert_eq!(TrialGhostStore::backend_for(Some(&mem)), GhostBackend::Memory);
+        let dir = std::env::temp_dir().join(format!("segnale_ghost_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile_path = dir.join("profile.json");
+        let ghost_path = ghost_path_for_profile(&profile_path);
+        let disk = ProfileStore { path: Some(profile_path.clone()), ..ProfileStore::in_memory(PlayerProfile::default()) };
+        let backend = TrialGhostStore::backend_for(Some(&disk));
+        assert_eq!(backend, GhostBackend::File(ghost_path.clone()));
+        // A profile literally named `trial_ghost.json` never collides with its own ghost file,
+        // and two sibling custom profiles get distinct ghost files.
+        let tricky = dir.join(GHOST_FILE);
+        assert_ne!(ghost_path_for_profile(&tricky), tricky);
+        assert_ne!(ghost_path_for_profile(&dir.join("alice.json")), ghost_path_for_profile(&dir.join("bob.json")));
+        let mut store = TrialGhostStore::load(backend.clone());
+        assert!(store.loaded && store.pb.is_none());
+        store.set_pb(trace(40));
+        assert!(ghost_path.exists());
+        let again = TrialGhostStore::load(backend);
+        assert_eq!(again.pb, Some(trace(40)), "PB ghost survives a restart");
+        assert!(ghost_matches_profile_pb(&trace(40), Some(trace(40).time)));
+        assert!(!ghost_matches_profile_pb(&trace(40), Some(trace(40).time - 2.0)), "cloud PB mismatch hides stale ghost");
+        assert!(!ghost_matches_profile_pb(&trace(40), None), "missing profile PB hides stale ghost");
+        // Invalid traces are never stored.
+        store.set_pb(GhostTrace::default());
+        assert_eq!(store.pb, Some(trace(40)));
+        std::fs::remove_dir_all(&dir).ok();
+        let web = ProfileStore { web_storage: true, ..ProfileStore::in_memory(PlayerProfile::default()) };
+        assert_eq!(TrialGhostStore::backend_for(Some(&web)), GhostBackend::Web);
+        assert_eq!(WEB_GHOST_KEY, "segnale_debole_trial_ghost_v1");
+    }
+
+    #[test]
+    fn ghost_delta_readout_tones() {
+        assert_eq!(ghost_delta_text(None), None);
+        assert_eq!(ghost_delta_text(Some(f32::NAN)), None);
+        assert_eq!(ghost_delta_text(Some(-0.42)), Some(("PB GHOST  -0.42s".to_string(), ACID_GREEN)));
+        assert_eq!(ghost_delta_text(Some(0.31)), Some(("PB GHOST  +0.31s".to_string(), HAZARD_YELLOW)));
     }
 }
