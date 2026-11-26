@@ -1,6 +1,6 @@
 [package]
 name = "segnale_server"
-version = "0.9.1"
+version = "1.0.0"
 edition = "2024"
 publish = false
 description = "Segnale Debole backend: leaderboards, Authentik OIDC login and cloud profile sync."
