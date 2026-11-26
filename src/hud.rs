@@ -13,8 +13,11 @@
 
 use std::fmt::Write as _;
 
+use bevy::asset::RenderAssetUsages;
+use bevy::image::ImageSampler;
 use bevy::prelude::*;
-use bevy::ui::UiGlobalTransform;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::ui::{UiGlobalTransform, Val2};
 use bevy::window::PrimaryWindow;
 
 use crate::assets_gen::FloorTheme;
@@ -31,6 +34,7 @@ use crate::meta_ui::{
 };
 use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::SignalState;
+use crate::style_emblem::{EmblemAtlas, EmblemFrame, EMBLEM_BYTES, EMBLEM_PX};
 use crate::state::{complete_floor, continue_into_endless, AppState, GameSet, PlayerModifiers, RunMode, RunStats, SettingsReturn, FINAL_FLOOR};
 use crate::trials::{
     begin_daily_attempt, daily_loadout, daily_record, daily_rules_line, floor_splits_line, format_split_delta, format_split_time, split_plate_view,
@@ -306,6 +310,7 @@ impl Plugin for HudPlugin {
             .add_plugins(crate::menu_scene::MenuScenePlugin)
             .init_resource::<UiSfxGate>()
             .init_resource::<InputMode>()
+            .add_systems(Startup, init_style_emblem)
             .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
             .add_systems(OnExit(AppState::MainMenu), release_seed_pad_lock)
             .add_systems(OnEnter(AppState::Playing), spawn_hud)
@@ -2494,7 +2499,7 @@ fn spawn_vel_plate(commands: &mut Commands, root: Entity) {
     ));
 }
 
-fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Option<Res<ProfileStore>>, run: Res<RunStats>) {
+fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Option<Res<ProfileStore>>, run: Res<RunStats>, emblem_art: Option<Res<StyleEmblemArt>>) {
     let tex = tex.as_deref();
     let settings = live_settings(store.as_deref());
     let root = commands.spawn((DespawnOnExit(AppState::Playing), abs_full())).id();
@@ -2735,7 +2740,7 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
     spawn_split_plate(&mut commands, root);
     // Right edge, below the split plate and above the weapon deck: the
     // Milestone 31 Bandwidth Style Rank meter.
-    spawn_style_meter(&mut commands, root);
+    spawn_style_meter(&mut commands, root, emblem_art.as_deref());
 
     // Bottom-center: VEL telemetry strip docked above the vitals panel.
     commands.insert_resource(VelGauge::default());
@@ -2973,97 +2978,124 @@ fn spawn_split_plate(commands: &mut Commands, root: Entity) {
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 31: Bandwidth Style Rank meter
+// Milestone 31: Bandwidth Style Rank meter (floating DMC-style emblem)
 // ---------------------------------------------------------------------------
 
-/// Top of the style meter: clears the toast stack (~200 px) and the split
-/// plate (214 px + ~92 px tall with its ghost line hidden) at 720p.
-pub const STYLE_HUD_TOP: f32 = 318.0;
-/// Width of the style meter column (matches the split plate).
-pub const STYLE_HUD_WIDTH: f32 = 236.0;
-/// Laid-out height budget of the meter (tag+letter row, subtitle row, bar, 3 feed lines).
-pub const STYLE_HUD_HEIGHT: f32 = 164.0;
-/// Rank letter font size.
-pub const STYLE_LETTER_FONT: f32 = 58.0;
+/// Top of the style emblem: clears the toast stack (~200 px) and the split
+/// plate (214 px + ~92 px tall with its ghost line hidden) at 720p, even at
+/// the peak of a rank-up slam.
+pub const STYLE_HUD_TOP: f32 = 330.0;
+/// Right gutter of the floating widget.
+pub const STYLE_HUD_RIGHT: f32 = 16.0;
+/// Side of the square rank emblem (logical px; the texture is 2x supersampled).
+pub const STYLE_EMBLEM_SIZE: f32 = 96.0;
+/// Tag + subtitle caption font.
+pub const STYLE_CAPTION_FONT: f32 = 11.0;
+/// Action callout font.
+pub const STYLE_FEED_FONT: f32 = 10.0;
+/// Action callouts shown under the caption (the newest of the meter's feed).
+pub const STYLE_FEED_SHOWN: usize = 2;
+/// Widest the widget ever gets: the longest caption (`6G+ // SMOKING SEXY SIGNAL!!`).
+pub const STYLE_HUD_WIDTH: f32 = 190.0;
+/// Laid-out height budget: emblem, caption row, [`STYLE_FEED_SHOWN`] callouts.
+pub const STYLE_HUD_HEIGHT: f32 = STYLE_EMBLEM_SIZE + 2.0 + 15.0 + STYLE_FEED_SHOWN as f32 * 13.0;
+/// Seconds between emblem texture refreshes (the pose animates every frame;
+/// envelope triggers and rank changes refresh immediately).
+pub const STYLE_EMBLEM_REFRESH: f32 = 1.0 / 30.0;
+
+// Layout contract, checked at compile time: a compact floating emblem far
+// smaller than the old 236 x 164 plate, small captions, two callouts, and a
+// 2x supersampled texture that covers the emblem at every UI scale.
+const _: () = {
+    assert!(STYLE_EMBLEM_SIZE >= 92.0 && STYLE_EMBLEM_SIZE <= 100.0);
+    assert!(STYLE_HUD_WIDTH < 236.0 && STYLE_HUD_HEIGHT < 144.0);
+    assert!(STYLE_FEED_SHOWN == 2 && STYLE_FEED_SHOWN <= crate::style::FEED_LINES);
+    assert!(STYLE_CAPTION_FONT >= 10.5 && STYLE_CAPTION_FONT <= 11.0 && STYLE_FEED_FONT >= 9.5 && STYLE_FEED_FONT <= 10.0);
+    assert!(EMBLEM_PX as f32 == STYLE_EMBLEM_SIZE * 2.0);
+};
 
 /// Style meter widget parts.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StyleHud {
     Root,
-    Letter,
+    /// The procedural rank emblem image (see [`StyleEmblem`]).
+    Emblem,
     Tag,
     Subtitle,
-    Track,
-    Fill,
     Feed(u8),
 }
 
-fn spawn_style_meter(commands: &mut Commands, root: Entity) {
+/// State of the emblem image node: the rank it last drew and how many times
+/// its texture was refreshed in place.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default)]
+pub struct StyleEmblem {
+    pub rank: Option<crate::style::StyleRank>,
+    pub redraws: u32,
+    /// Clock of the last refresh and the envelopes it saw (trigger detection).
+    last: f32,
+    seen: [f32; 3],
+}
+
+/// The pre-baked emblem lettering and the one texture it animates into.
+#[derive(Resource)]
+pub struct StyleEmblemArt {
+    pub atlas: EmblemAtlas,
+    pub image: Handle<Image>,
+}
+
+/// Bake the rank lettering once and allocate the single emblem texture.
+fn init_style_emblem(mut commands: Commands, images: Option<ResMut<Assets<Image>>>) {
+    let Some(mut images) = images else { return };
+    let mut img = Image::new(
+        Extent3d { width: EMBLEM_PX as u32, height: EMBLEM_PX as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        vec![0; EMBLEM_BYTES],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    );
+    img.sampler = ImageSampler::linear();
+    commands.insert_resource(StyleEmblemArt { atlas: EmblemAtlas::bake(), image: images.add(img) });
+}
+
+fn style_caption_shadow() -> TextShadow {
+    TextShadow { offset: Vec2::splat(1.4), color: Color::BLACK.with_alpha(0.96) }
+}
+
+fn spawn_style_meter(commands: &mut Commands, root: Entity, art: Option<&StyleEmblemArt>) {
+    // No plate, no border: the emblem and its captions float over the scene on
+    // ink outlines and hard text shadows alone.
     let meter = commands
         .spawn((
             ChildOf(root),
             StyleHud::Root,
-            hud_plate(
-                Node {
-                    display: Display::None,
-                    position_type: PositionType::Absolute,
-                    right: Val::Px(14.0),
-                    top: Val::Px(STYLE_HUD_TOP),
-                    width: Val::Px(STYLE_HUD_WIDTH),
-                    flex_direction: FlexDirection::Column,
-                    align_items: AlignItems::FlexEnd,
-                    row_gap: Val::Px(2.0),
-                    ..default()
-                },
-                COLOR_DIM,
-            ),
+            Node {
+                display: Display::None,
+                position_type: PositionType::Absolute,
+                right: Val::Px(STYLE_HUD_RIGHT),
+                top: Val::Px(STYLE_HUD_TOP),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexEnd,
+                row_gap: Val::Px(1.0),
+                ..default()
+            },
         ))
         .id();
-    // Near-opaque ink so bright world glows (CRT screens, blasts) never bleed through the letter.
-    commands.entity(meter).insert(BackgroundColor(IRON_DARK));
-    let head = commands.spawn((ChildOf(meter), Node { align_items: AlignItems::Center, column_gap: Val::Px(10.0), ..default() })).id();
-    commands.spawn((
-        ChildOf(head),
-        StyleHud::Tag,
-        text("EDGE", 22.0, COLOR_TEXT),
-        TextShadow { offset: Vec2::splat(2.0), color: Color::BLACK.with_alpha(0.85) },
-        TextLayout::no_wrap(),
-    ));
-    commands.spawn((
-        ChildOf(head),
-        StyleHud::Letter,
-        text("D", STYLE_LETTER_FONT, COLOR_TEXT),
-        TextLayout::no_wrap(),
-        TextShadow { offset: Vec2::new(3.0, 3.0), color: Color::BLACK.with_alpha(0.9) },
-        UiTransform::IDENTITY,
-    ));
-    // Subtitle sits on its own full-width row below the letter so long DMC lines
-    // ("SMOKING SEXY SIGNAL!!") never overflow past the left edge of the card.
-    commands.spawn((
-        ChildOf(meter),
-        StyleHud::Subtitle,
-        text("DEAD SLOW", 12.0, COLOR_DIM),
-        TextShadow { offset: Vec2::splat(1.5), color: Color::BLACK.with_alpha(0.85) },
-        TextLayout::no_wrap(),
-    ));
-    let track = commands
-        .spawn((
-            ChildOf(meter),
-            StyleHud::Track,
-            Node { width: Val::Px(STYLE_HUD_WIDTH * 0.78), height: Val::Px(5.0), border: UiRect::all(Val::Px(1.0)), ..default() },
-            BorderColor::all(TRACK_BORDER),
-            BackgroundColor(TRACK_BG),
-        ))
-        .id();
-    commands.spawn((ChildOf(track), StyleHud::Fill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(COLOR_TEXT)));
-    for i in 0..crate::style::FEED_LINES as u8 {
+    if let Some(art) = art {
         commands.spawn((
             ChildOf(meter),
-            StyleHud::Feed(i),
-            text("", 12.0, COLOR_TEXT),
-            TextLayout::no_wrap(),
-            TextShadow { offset: Vec2::splat(1.5), color: Color::BLACK.with_alpha(0.85) },
+            StyleHud::Emblem,
+            StyleEmblem::default(),
+            Node { width: Val::Px(STYLE_EMBLEM_SIZE), height: Val::Px(STYLE_EMBLEM_SIZE), flex_shrink: 0.0, margin: UiRect::bottom(Val::Px(1.0)), ..default() },
+            ImageNode::new(art.image.clone()),
+            UiTransform::IDENTITY,
         ));
+    }
+    let caption = commands.spawn((ChildOf(meter), Node { align_items: AlignItems::Center, column_gap: Val::Px(5.0), ..default() })).id();
+    commands.spawn((ChildOf(caption), StyleHud::Tag, text("EDGE", STYLE_CAPTION_FONT, COLOR_TEXT), style_caption_shadow(), TextLayout::no_wrap()));
+    commands.spawn((ChildOf(caption), text("//", STYLE_CAPTION_FONT, COLOR_DIM), style_caption_shadow(), TextLayout::no_wrap()));
+    commands.spawn((ChildOf(caption), StyleHud::Subtitle, text("DEAD SLOW", STYLE_CAPTION_FONT, COLOR_TEXT), style_caption_shadow(), TextLayout::no_wrap()));
+    for i in 0..STYLE_FEED_SHOWN as u8 {
+        commands.spawn((ChildOf(meter), StyleHud::Feed(i), text("", STYLE_FEED_FONT, COLOR_TEXT), TextLayout::no_wrap(), style_caption_shadow()));
     }
 }
 
@@ -3072,60 +3104,134 @@ pub fn style_hud_visible(points: f32, mode: RunMode) -> bool {
     points > 0.0 && mode != RunMode::TimeTrial
 }
 
-/// Rank letter scale-pop on a climb (1 -> 1.45 -> 1 with a quick overshoot).
-pub fn style_pop_scale(pop: f32) -> f32 {
-    let p = pop.clamp(0.0, 1.0);
-    1.0 + 0.45 * p * p
+/// Two-leg keyframe curve over a decaying envelope (`1` = just triggered):
+/// `from` snaps to `through` with a cubic ease-out, then settles on `rest`.
+fn slam_curve(envelope: f32, from: f32, through: f32, rest: f32) -> f32 {
+    if !envelope.is_finite() || envelope <= 0.0 {
+        return rest;
+    }
+    let u = 1.0 - envelope.min(1.0);
+    const HIT: f32 = 0.42;
+    if u < HIT {
+        let k = 1.0 - u / HIT;
+        from + (through - from) * (1.0 - k * k * k)
+    } else {
+        let k = (u - HIT) / (1.0 - HIT);
+        through + (rest - through) * (k * k * (3.0 - 2.0 * k))
+    }
 }
 
-#[allow(clippy::type_complexity)]
+/// Rank-up slam scale: lands huge and overshoots (`1.55x -> 0.93x -> 1.0x`).
+pub fn style_pop_scale(pop: f32) -> f32 {
+    slam_curve(pop, 1.55, 0.93, 1.0)
+}
+
+/// Rank-up rotational whip, clockwise degrees (`-14 -> +3 -> 0`).
+pub fn style_pop_tilt(pop: f32) -> f32 {
+    slam_curve(pop, -14.0, 3.0, 0.0)
+}
+
+/// Where the emblem sits this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StyleEmblemPose {
+    pub scale: f32,
+    /// Clockwise tilt (degrees).
+    pub tilt: f32,
+    /// Offset from the laid-out slot (logical px).
+    pub offset: Vec2,
+}
+
+/// Emblem pose: rank-up slam + whip, action micro-bounce, take-hit tremor and
+/// tilt kick, a slow living sway, and an electric micro-tremor at `SS` / `SSS`.
+pub fn style_emblem_pose(rank: Option<crate::style::StyleRank>, pop: f32, action_pop: f32, hit_shake: f32, t: f32) -> StyleEmblemPose {
+    use crate::style::StyleRank;
+    let env = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+    let (act, hit) = (env(action_pop), env(hit_shake));
+    let t = if t.is_finite() { t } else { 0.0 };
+    // Action pulse: a crisp kick that rings once.
+    let bounce = 1.0 + 0.10 * act * ((1.0 - act) * 3.8).cos();
+    let scale = style_pop_scale(pop) * bounce;
+    let tremor = match rank {
+        Some(StyleRank::SSS) => 1.1,
+        Some(StyleRank::SS) => 0.65,
+        _ => 0.0,
+    };
+    let tilt = style_pop_tilt(pop) + (t * 1.3).sin() * 0.8 + hit * hit * 9.0 * (t * 47.0).cos();
+    let mut offset = Vec2::new((t * 61.0).sin() * (t * 37.0 + 1.3).sin(), (t * 53.0 + 2.1).sin() * (t * 29.0).sin()) * tremor;
+    offset.y += (t * 1.9).sin() * 0.6;
+    offset.x += (t * 83.0).sin() * 7.0 * hit;
+    // Grow away from the screen edge (the right side stays on its gutter) and mostly downward.
+    offset += Vec2::new(-0.5, 0.25) * (scale - 1.0).max(0.0) * STYLE_EMBLEM_SIZE;
+    StyleEmblemPose { scale, tilt, offset }
+}
+
+/// Opacity of the action callout in `slot` at `age` seconds (newest brightest).
+pub fn style_feed_alpha(slot: usize, age: f32) -> f32 {
+    (1.0 - (age / crate::style::FEED_SECS).powi(3)).clamp(0.0, 1.0) * (1.0 - slot as f32 * 0.28)
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_style_hud(
     time: Res<Time>,
     meter: Res<crate::style::StyleMeter>,
     run: Res<RunStats>,
-    mut nodes: Query<(&StyleHud, &mut Node, Option<&mut BackgroundColor>, Option<&mut BorderColor>)>,
-    mut texts: Query<(&StyleHud, &mut Text, &mut TextColor, Option<&mut UiTransform>)>,
+    art: Option<Res<StyleEmblemArt>>,
+    images: Option<ResMut<Assets<Image>>>,
+    mut roots: Query<(&StyleHud, &mut Node), Without<StyleEmblem>>,
+    mut emblems: Query<(&mut StyleEmblem, &mut UiTransform)>,
+    mut texts: Query<(&StyleHud, &mut Text, &mut TextColor)>,
 ) {
     let show = style_hud_visible(meter.points, run.mode);
-    let rank = meter.rank();
-    let color = rank.map_or(COLOR_DIM, |r| r.color());
-    // Higher tiers shimmer.
-    let t = time.elapsed_secs();
-    let shimmer = match rank {
-        Some(r) if r >= crate::style::StyleRank::SS => 0.75 + 0.25 * (t * 9.0).sin().abs(),
-        _ => 1.0,
-    };
-    for (part, mut node, bg, border) in &mut nodes {
-        match part {
-            StyleHud::Root => {
-                set_display(&mut node, show);
-                if let Some(mut b) = border {
-                    let want = plate_border(color, STEEL_BORDER.with_alpha(0.45));
-                    if *b != want {
-                        *b = want;
-                    }
-                }
-            }
-            StyleHud::Fill => {
-                set_width_pct(&mut node, meter.tier_fill() * 100.0);
-                if let Some(mut bg) = bg {
-                    set_bg(&mut bg, color.with_alpha(0.9));
-                }
-            }
-            _ => {}
+    for (part, mut node) in &mut roots {
+        if *part == StyleHud::Root {
+            set_display(&mut node, show);
         }
     }
-    if !show {
+    let Some(r) = meter.rank().filter(|_| show) else {
+        for (mut emblem, _) in &mut emblems {
+            // Redraw from scratch the next time the meter comes back.
+            if emblem.rank.is_some() {
+                emblem.rank = None;
+            }
+        }
         return;
+    };
+    let t = time.elapsed_secs_wrapped();
+    let color = r.color();
+    if let Ok((mut emblem, mut ui)) = emblems.single_mut() {
+        let pose = style_emblem_pose(Some(r), meter.pop, meter.action_pop, meter.hit_shake, t);
+        let want = UiTransform { translation: Val2::px(pose.offset.x, pose.offset.y), scale: Vec2::splat(pose.scale), rotation: Rot2::degrees(pose.tilt) };
+        if *ui != want {
+            *ui = want;
+        }
+        // Refresh the texture in place at ~30 Hz, at once on a rank change or a fresh envelope.
+        let now = [meter.pop, meter.action_pop, meter.hit_shake];
+        let triggered = emblem.rank != Some(r) || now.iter().zip(emblem.seen).any(|(n, s)| *n > s + 0.02);
+        if (triggered || (t - emblem.last).abs() >= STYLE_EMBLEM_REFRESH)
+            && let (Some(art), Some(mut images)) = (art, images)
+            && let Some(mut img) = images.get_mut(&art.image)
+            && let Some(data) = img.data.as_mut()
+        {
+            let c = color.to_srgba();
+            let frame = EmblemFrame { rank: r.index() as usize, color: [c.red, c.green, c.blue], fill: meter.tier_fill(), time: t, pop: meter.pop, action_pop: meter.action_pop, hit_shake: meter.hit_shake };
+            art.atlas.render(&frame, data);
+            *emblem = StyleEmblem { rank: Some(r), redraws: emblem.redraws.wrapping_add(1), last: t, seen: now };
+        } else if emblem.seen != now {
+            // Track the decaying envelopes so the next trigger is seen.
+            let seen = [now[0].min(emblem.seen[0]), now[1].min(emblem.seen[1]), now[2].min(emblem.seen[2])];
+            if emblem.seen != seen {
+                emblem.seen = seen;
+            }
+        }
     }
-    let Some(r) = rank else { return };
-    for (part, mut txt, mut tc, ui) in &mut texts {
+    // A demotion stains the caption crimson for a beat.
+    let tag_color = color.mix(&COLOR_SIGNAL_RED, meter.hit_shake.clamp(0.0, 1.0));
+    for (part, mut txt, mut tc) in &mut texts {
         let (want, c): (&str, Color) = match part {
-            StyleHud::Letter => (r.letter(), color),
-            StyleHud::Tag => (r.tag(), color),
+            StyleHud::Tag => (r.tag(), tag_color),
             StyleHud::Subtitle => (r.subtitle(), BONE_TEXT),
             StyleHud::Feed(i) => match meter.feed.get(*i as usize).copied().flatten() {
-                Some((label, age)) => (label, COLOR_TEXT.with_alpha((1.0 - (age / crate::style::FEED_SECS).powi(3)).clamp(0.0, 1.0) * (1.0 - *i as f32 * 0.22))),
+                Some((label, age)) => (label, COLOR_TEXT.with_alpha(style_feed_alpha(*i as usize, age))),
                 None => ("", COLOR_TEXT),
             },
             _ => continue,
@@ -3133,19 +3239,11 @@ fn update_style_hud(
         if txt.0 != want {
             want.clone_into(&mut txt.0);
         }
-        let c = if *part == StyleHud::Letter { c.mix(&Color::WHITE, (1.0 - shimmer) * 0.8 + meter.pop * 0.35) } else { c };
         if tc.0 != c {
             tc.0 = c;
         }
-        if let Some(mut ui) = ui {
-            let s = Vec2::splat(style_pop_scale(meter.pop));
-            if ui.scale != s {
-                ui.scale = s;
-            }
-        }
     }
 }
-
 
 /// Live split timer: `RunStats::time_elapsed` / `TimeTrialState::elapsed`
 /// only advance in `Playing`, so the plate freezes with the simulation.
@@ -4201,27 +4299,82 @@ mod tests {
 
     #[test]
     fn style_meter_hud_rules_and_layout_budget() {
+        use crate::style::StyleRank;
         assert!(!style_hud_visible(0.0, RunMode::Standard), "hidden at zero points");
         assert!(style_hud_visible(12.0, RunMode::Standard));
         assert!(style_hud_visible(12.0, RunMode::Daily(crate::trials::DailyDate::EPOCH)));
         assert!(!style_hud_visible(500.0, RunMode::TimeTrial), "speedrun HUD stays clean");
-        assert_eq!(style_pop_scale(0.0), 1.0);
-        assert!(style_pop_scale(1.0) > 1.3 && style_pop_scale(5.0) == style_pop_scale(1.0));
-        assert_eq!(peak_style_label(crate::style::StyleRank::SS), "PEAK STYLE  SS // 6G");
-        assert_eq!(peak_style_label(crate::style::StyleRank::SSS), "PEAK STYLE  SSS // 6G+");
+        assert_eq!(peak_style_label(StyleRank::SS), "PEAK STYLE  SS // 6G");
+        assert_eq!(peak_style_label(StyleRank::SSS), "PEAK STYLE  SSS // 6G+");
+        // Every caption (`TAG // SUBTITLE`, two 5 px gaps) fits the width budget.
+        for r in StyleRank::ALL {
+            let w = mono_width(r.tag().len() + 2 + r.subtitle().len(), STYLE_CAPTION_FONT) + 10.0;
+            assert!(w <= STYLE_HUD_WIDTH, "{r:?}: {w}");
+        }
         // Right column at the 720p reference (960x540 and 1280x720 scale to it,
         // 1024x640 and 1920x1080 are taller): toasts end ~200 px, the split
-        // plate (214 px) ends by ~306 px, the meter must end before the weapon
+        // plate (214 px) ends by ~306 px, the widget must end before the weapon
         // deck (bottom 14 px, ~172 px tall) starts at ~534 px.
         let split_bottom = SPLIT_PLATE_TOP + 92.0;
-        assert!(STYLE_HUD_TOP >= split_bottom + 8.0);
         let deck_top = UI_REFERENCE.1 - 14.0 - 172.0;
         assert!(STYLE_HUD_TOP + STYLE_HUD_HEIGHT <= deck_top - 8.0, "{} vs {deck_top}", STYLE_HUD_TOP + STYLE_HUD_HEIGHT);
-        // Letter + pop never spills past the column.
-        assert!(STYLE_LETTER_FONT * style_pop_scale(1.0) * 0.6 * 3.0 < STYLE_HUD_WIDTH);
         for (w, h) in [(960.0, 540.0), (1024.0, 640.0), (1280.0, 720.0), (1920.0, 1080.0)] {
             let s = ui_scale_for(w, h);
             assert!((STYLE_HUD_TOP + STYLE_HUD_HEIGHT) * s <= h - (14.0 + 172.0) * s, "{w}x{h}");
         }
+        // Even the biggest frame of a rank-up slam keeps clear of the split
+        // plate and never crosses the right gutter.
+        let half = STYLE_EMBLEM_SIZE / 2.0;
+        for i in 0..=200 {
+            let pop = i as f32 / 200.0;
+            for rank in [StyleRank::D, StyleRank::A, StyleRank::SSS] {
+                let p = style_emblem_pose(Some(rank), pop, 0.0, 0.0, i as f32 * 0.37);
+                let top = STYLE_HUD_TOP + half + p.offset.y - half * p.scale;
+                assert!(top >= split_bottom + 6.0, "{rank:?} pop {pop}: top {top}");
+                let right_overhang = p.offset.x + half * p.scale - half;
+                assert!(right_overhang <= 1.2, "{rank:?} pop {pop}: {right_overhang}");
+                assert!(STYLE_HUD_TOP + half + p.offset.y + half * p.scale <= deck_top, "{rank:?} pop {pop}");
+            }
+        }
+    }
+
+    #[test]
+    fn style_emblem_pose_slams_bounces_shakes_and_trembles() {
+        use crate::style::StyleRank;
+        // Rank-up slam: 1.55x -> 0.93x -> 1.0x with a -14 deg -> +3 deg -> 0 whip.
+        assert_eq!(style_pop_scale(0.0), 1.0);
+        assert!((style_pop_scale(1.0) - 1.55).abs() < 1e-4 && style_pop_scale(5.0) == style_pop_scale(1.0));
+        assert!((style_pop_scale(0.58) - 0.93).abs() < 1e-3, "{}", style_pop_scale(0.58));
+        assert!((style_pop_tilt(1.0) + 14.0).abs() < 1e-3 && (style_pop_tilt(0.58) - 3.0).abs() < 1e-2 && style_pop_tilt(0.0) == 0.0);
+        let scales: Vec<f32> = (0..=100).map(|i| style_pop_scale(1.0 - i as f32 / 100.0)).collect();
+        let low = scales.iter().copied().fold(f32::MAX, f32::min);
+        assert!((0.925..0.94).contains(&low), "overshoot dips under 1x: {low}");
+        assert!(scales.windows(2).all(|w| (w[0] - w[1]).abs() < 0.06), "no pops in the curve");
+        assert_eq!((style_pop_scale(f32::NAN), style_pop_tilt(f32::NAN), style_pop_scale(-1.0)), (1.0, 0.0, 1.0));
+        // Resting pose: unscaled, a barely-there living sway.
+        let span = |rank, pop, act, hit| {
+            let poses: Vec<StyleEmblemPose> = (0..240).map(|i| style_emblem_pose(Some(rank), pop, act, hit, i as f32 / 60.0)).collect();
+            let max = |f: fn(&StyleEmblemPose) -> f32| poses.iter().map(f).fold(0.0f32, f32::max);
+            (max(|p| (p.scale - 1.0).abs()), max(|p| p.tilt.abs()), max(|p| p.offset.x.abs()), max(|p| p.offset.y.abs()))
+        };
+        let rest = span(StyleRank::A, 0.0, 0.0, 0.0);
+        assert!(rest.0 == 0.0 && rest.1 > 0.3 && rest.1 <= 0.8 && rest.2 == 0.0 && rest.3 > 0.2 && rest.3 <= 0.6, "{rest:?}");
+        // SS / 6G and SSS / 6G+ carry an electric micro-tremor.
+        let (ss, sss) = (span(StyleRank::SS, 0.0, 0.0, 0.0), span(StyleRank::SSS, 0.0, 0.0, 0.0));
+        assert!(ss.2 > 0.3 && sss.2 > ss.2 && sss.2 <= 1.2, "{ss:?} {sss:?}");
+        // Action pulse: a crisp ~10% kick that is gone when the envelope ends.
+        let kick = style_emblem_pose(Some(StyleRank::B), 0.0, 1.0, 0.0, 0.0);
+        assert!((kick.scale - 1.10).abs() < 1e-4, "{}", kick.scale);
+        assert!(style_emblem_pose(Some(StyleRank::B), 0.0, 0.5, 0.0, 0.0).scale < kick.scale);
+        // Take-hit: a horizontal tremor and a tilt kick, far beyond the idle sway.
+        let hit = span(StyleRank::S, 0.0, 0.0, 1.0);
+        assert!(hit.2 > 5.0 && hit.2 <= 7.0 && hit.1 > 5.0, "{hit:?}");
+        // Garbage in, a sane pose out.
+        let nan = style_emblem_pose(None, f32::NAN, f32::INFINITY, f32::NAN, f32::NAN);
+        assert!(nan.scale.is_finite() && nan.tilt.is_finite() && nan.offset.is_finite());
+        // Callouts fade with age, the older slot dimmer.
+        assert_eq!(style_feed_alpha(0, 0.0), 1.0);
+        assert!(style_feed_alpha(1, 0.0) < 1.0 && style_feed_alpha(0, crate::style::FEED_SECS) == 0.0);
+        assert!(style_feed_alpha(0, 2.0) < style_feed_alpha(0, 1.0));
     }
 }

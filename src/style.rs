@@ -67,8 +67,12 @@ pub const FRESH_MEMORY: f32 = 6.0;
 pub const STYLE_BHOP_SPEED: f32 = 18.0;
 /// Seconds a style feed line stays up.
 pub const FEED_SECS: f32 = 2.6;
-/// Style feed lines shown at once.
+/// Style feed lines kept at once (the HUD shows the newest two).
 pub const FEED_LINES: usize = 3;
+/// Seconds the action pulse envelope ([`StyleMeter::action_pop`]) lasts.
+pub const ACTION_POP_SECS: f32 = 0.22;
+/// Seconds the take-hit envelope ([`StyleMeter::hit_shake`]) lasts.
+pub const HIT_SHAKE_SECS: f32 = 0.38;
 
 impl StyleRank {
     pub const ALL: [StyleRank; 7] = [StyleRank::D, StyleRank::C, StyleRank::B, StyleRank::A, StyleRank::S, StyleRank::SS, StyleRank::SSS];
@@ -281,8 +285,14 @@ pub struct StyleMeter {
     pub multi: u32,
     /// Newest-first style feed lines `(label, age)`.
     pub feed: [Option<(&'static str, f32)>; FEED_LINES],
-    /// Rank-up pop envelope (1 on a climb, decays to 0; HUD scale pop).
+    /// Rank-up pop envelope (1 on a climb, decays to 0; HUD emblem slam).
     pub pop: f32,
+    /// Action pulse envelope (1 whenever points are gained, decays to 0 in
+    /// ~[`ACTION_POP_SECS`]; HUD emblem micro-bounce + ring surge).
+    pub action_pop: f32,
+    /// Take-hit envelope (1 on a demotion, decays to 0 in ~[`HIT_SHAKE_SECS`];
+    /// HUD emblem crimson glitch shake).
+    pub hit_shake: f32,
     /// Best tier this run (mirrored to [`RunStats::peak_style_rank`]).
     pub peak: Option<StyleRank>,
     /// Hits that demoted the meter (telemetry / tests).
@@ -303,6 +313,8 @@ impl Default for StyleMeter {
             multi: 0,
             feed: [None; FEED_LINES],
             pop: 0.0,
+            action_pop: 0.0,
+            hit_shake: 0.0,
             peak: None,
             hits_taken: 0,
         }
@@ -359,6 +371,7 @@ impl StyleMeter {
         if pts > 0.0 && pts.is_finite() {
             self.points = (self.points + pts).min(STYLE_MAX_POINTS);
             self.idle = 0.0;
+            self.action_pop = 1.0;
             if let Some(r) = self.rank() {
                 self.peak = Some(self.peak.map_or(r, |p| p.max(r)));
             }
@@ -454,6 +467,7 @@ impl StyleMeter {
         };
         self.multi = 0;
         self.hits_taken += 1;
+        self.hit_shake = 1.0;
         self.feed_line("SIGNAL LOST");
         true
     }
@@ -465,6 +479,8 @@ impl StyleMeter {
         self.idle += dt;
         self.hit_grace = (self.hit_grace - dt).max(0.0);
         self.pop = (self.pop - dt * 2.2).max(0.0);
+        self.action_pop = (self.action_pop - dt / ACTION_POP_SECS).max(0.0);
+        self.hit_shake = (self.hit_shake - dt / HIT_SHAKE_SECS).max(0.0);
         if self.idle > DECAY_GRACE
             && let Some(r) = self.rank()
         {
@@ -749,5 +765,40 @@ mod tests {
         }
         assert_eq!(m.rank(), None);
         assert!(m.feed.iter().all(Option::is_none), "feed expires");
+    }
+    #[test]
+    fn action_pop_and_hit_shake_envelopes_trigger_and_decay() {
+        let mut m = StyleMeter::default();
+        assert_eq!((m.action_pop, m.hit_shake), (0.0, 0.0));
+        // Every scoring action kicks the pulse; it is gone a beat later.
+        assert!(m.award(kill(EnemyKind::Imp, StyleSource::Shotgun)) > 0.0);
+        assert_eq!(m.action_pop, 1.0);
+        m.tick(ACTION_POP_SECS * 0.5);
+        assert!(m.action_pop > 0.3 && m.action_pop < 0.7, "{}", m.action_pop);
+        m.tick(ACTION_POP_SECS);
+        assert_eq!(m.action_pop, 0.0);
+        for a in [StyleAction::CrtShatter, StyleAction::JammerDestroyed, StyleAction::UpsDetonation { chain: true }] {
+            m.tick(1.0);
+            assert_eq!(m.action_pop, 0.0);
+            m.award(a);
+            assert_eq!(m.action_pop, 1.0, "{a:?}");
+        }
+        // A demoting hit starts the glitch shake; a hit inside the grace (or on
+        // an empty meter) does not restart it.
+        assert_eq!(m.hit_shake, 0.0);
+        assert!(m.take_hit());
+        assert_eq!(m.hit_shake, 1.0);
+        m.tick(HIT_SHAKE_SECS * 0.5);
+        let mid = m.hit_shake;
+        assert!(mid > 0.3 && mid < 0.7, "{mid}");
+        assert!(!m.take_hit() && m.hit_shake == mid, "grace: no re-trigger");
+        m.tick(HIT_SHAKE_SECS);
+        assert_eq!(m.hit_shake, 0.0);
+        let mut empty = StyleMeter::default();
+        assert!(!empty.take_hit() && empty.hit_shake == 0.0);
+        // Decay alone never fires either envelope.
+        let mut idle = StyleMeter { points: 500.0, ..default() };
+        idle.tick(5.0);
+        assert_eq!((idle.action_pop, idle.hit_shake), (0.0, 0.0));
     }
 }

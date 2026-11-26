@@ -13,7 +13,7 @@ use segnale_debole::bot_input::BotControl;
 use segnale_debole::enemies::{spawn_enemy, Enemy, EnemyAssets, EnemyKind};
 use segnale_debole::fx::FxAssets;
 use segnale_debole::gamepad::InputMode;
-use segnale_debole::hud::{HudPlugin, StyleHud};
+use segnale_debole::hud::{HudPlugin, StyleEmblem, StyleEmblemArt, StyleHud};
 use segnale_debole::level::{LevelEntity, LevelGrid, CELL_SIZE};
 use segnale_debole::meta::{ProfileStore, RunLoadout};
 use segnale_debole::player::{Player, PLAYER_EYE_HEIGHT};
@@ -21,6 +21,7 @@ use segnale_debole::props::{spawn_ups, CrtMonitor, PropAssets, UpsRack, UPS_CHAI
 use segnale_debole::rumble::{RumbleCommand, RumblePulse, RumbleState};
 use segnale_debole::state::{complete_floor, start_run, AppState, PlayerModifiers, RunMode, RunStats};
 use segnale_debole::style::{StyleMeter, StyleRank};
+use segnale_debole::style_emblem::{EMBLEM_BYTES, EMBLEM_PX};
 use segnale_debole::trials::{start_time_trial, time_trial_gates, SignalGhost, TimeTrialState, TrialGhostStore};
 use segnale_debole::{build_headless_test_app, HeadlessGamePlugin};
 
@@ -140,12 +141,24 @@ fn material_count(app: &App) -> usize {
     app.world().resource::<Assets<StandardMaterial>>().len()
 }
 
+/// The style widget's display and the rank letter its emblem last drew.
 fn style_hud_letter(app: &mut App) -> (Display, String) {
     let mut roots = app.world_mut().query::<(&StyleHud, &Node)>();
     let display = roots.iter(app.world()).find(|(h, _)| **h == StyleHud::Root).map(|(_, n)| n.display).unwrap();
-    let mut texts = app.world_mut().query::<(&StyleHud, &Text)>();
-    let letter = texts.iter(app.world()).find(|(h, _)| **h == StyleHud::Letter).map(|(_, t)| t.0.clone()).unwrap();
+    let mut emblems = app.world_mut().query::<&StyleEmblem>();
+    let letter = emblems.single(app.world()).unwrap().rank.map(|r| r.letter().to_string()).unwrap_or_default();
     (display, letter)
+}
+
+/// `(texels with any alpha, alpha of the four corners)` of the live emblem texture.
+fn emblem_coverage(app: &App) -> (usize, [u8; 4]) {
+    let art = app.world().resource::<StyleEmblemArt>();
+    let img = app.world().resource::<Assets<Image>>().get(&art.image).expect("emblem texture");
+    let data = img.data.as_ref().expect("cpu-side texels");
+    assert_eq!(data.len(), EMBLEM_BYTES);
+    let alpha = |x: usize, y: usize| data[(y * EMBLEM_PX + x) * 4 + 3];
+    let last = EMBLEM_PX - 1;
+    (data.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count(), [alpha(0, 0), alpha(last, 0), alpha(0, last), alpha(last, last)])
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +177,8 @@ fn style_meter_climbs_on_mixed_kills_drops_on_damage_and_is_run_scoped() {
     step(&mut app, 5);
     assert_eq!(meter(&app).points, 0.0);
     assert_eq!(style_hud_letter(&mut app).0, Display::None, "hidden at zero points");
+    assert_eq!(emblem_coverage(&app).0, 0, "nothing drawn while hidden");
+    let images_before = app.world().resource::<Assets<Image>>().len();
 
     // Nonstop mixed-weapon multi-kills climb the ladder to 6G / 6G+.
     let feet = player_pos(&mut app);
@@ -189,6 +204,19 @@ fn style_meter_climbs_on_mixed_kills_drops_on_damage_and_is_run_scoped() {
     let (display, letter) = style_hud_letter(&mut app);
     assert_eq!(display, Display::Flex);
     assert_eq!(letter, m.rank().unwrap().letter());
+    // The procedural emblem animates in place: one texture, redrawn, never reallocated.
+    let (drawn, corners) = emblem_coverage(&app);
+    assert!(drawn > EMBLEM_PX * EMBLEM_PX / 5, "emblem texels drawn: {drawn}");
+    assert_eq!(corners, [0; 4], "floating emblem: transparent corners, no plate");
+    let mut emblems = app.world_mut().query::<&StyleEmblem>();
+    let redraws = emblems.single(app.world()).unwrap().redraws;
+    assert!(redraws > 20, "emblem redrawn across the climb: {redraws}");
+    assert_eq!(app.world().resource::<Assets<Image>>().len(), images_before, "zero new Image assets");
+    let mut plates = app.world_mut().query::<(&StyleHud, Option<&BackgroundColor>, Option<&BorderColor>)>();
+    for (part, bg, border) in plates.iter(app.world()) {
+        assert!(bg.is_none_or(|b| b.0.alpha() == 0.0), "{part:?}: no background box");
+        assert!(border.is_none_or(|b| *b == BorderColor::default() || [b.top, b.right, b.bottom, b.left].iter().all(|c| c.alpha() == 0.0)), "{part:?}: no border");
+    }
 
     // DMC damage penalty: one clean rank down.
     let before = meter(&app).rank().unwrap();
@@ -198,6 +226,8 @@ fn style_meter_climbs_on_mixed_kills_drops_on_damage_and_is_run_scoped() {
     });
     step(&mut app, 1);
     assert_eq!(meter(&app).rank(), before.prev(), "damage demotes exactly one tier");
+    assert!(meter(&app).hit_shake > 0.5, "the hit starts the glitch shake");
+    assert_eq!(style_hud_letter(&mut app).1, before.prev().unwrap().letter(), "the emblem redraws the demoted rank at once");
     godmode(&mut app);
 
     // Pause <-> Playing and UpgradeSelect -> Playing keep the meter.

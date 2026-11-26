@@ -36,6 +36,7 @@ pub mod sculpt;
 pub mod signal;
 pub mod state;
 pub mod style;
+pub mod style_emblem;
 pub mod trials;
 pub mod upgrades;
 pub mod weapons;

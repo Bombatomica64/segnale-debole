@@ -41,10 +41,13 @@
 //!   a native guest, the controller callsign editor, the App Store upgrade
 //!   cards and the in-run HUD with controller prompts, then exits.
 //! - `SEGNALE_M31_SHOTS=<dir>`: Milestone 31 tour on an in-memory profile:
-//!   `01_style_6g_props.png` (SS / 6G style meter + a CRT desk beside an
-//!   explosive UPS rack in a wide hall), `02_ups_chain_blast.png` (the rack
-//!   detonating, SSS / 6G+) and `03_trial_signal_ghost.png` (the PB Signal
-//!   Ghost on the Time Trial with its live delta), then exits.
+//!   `01_style_6g_props.png` (the floating SS / 6G style emblem at rest + a
+//!   CRT desk beside an explosive UPS rack in a wide hall),
+//!   `01b_style_a_action_pulse.png` (A / 5G mid action pulse),
+//!   `01c_style_hit_glitch.png` (the crimson take-hit glitch shake),
+//!   `02_ups_chain_blast.png` (the rack detonating, SSS / 6G+ mid rank-up
+//!   slam) and `03_trial_signal_ghost.png` (the PB Signal Ghost on the Time
+//!   Trial with its live delta), then exits.
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
@@ -174,7 +177,7 @@ impl Plugin for DevPlugin {
                     app.insert_resource(ProfileStore::in_memory(PlayerProfile::default()));
                 }
             }
-            app.insert_resource(M31Shots { dir, stage: 0, timer: 0.0 }).add_systems(Update, m31_shots_tour.after(GameSet::Ui));
+            app.insert_resource(M31Shots { dir, stage: 0, timer: 0.0, hold: None }).add_systems(Update, m31_shots_tour.after(GameSet::Ui));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_META_SHOTS") {
@@ -1393,21 +1396,44 @@ struct M31Shots {
     dir: String,
     stage: u32,
     timer: f32,
+    /// Style HUD pose re-staged every frame until the next shot is taken.
+    hold: Option<StyleStage>,
 }
 
-/// Stage the style HUD at `SS / 6G` (or `SSS / 6G+`) with a live feed.
-fn stage_style(meter: &mut crate::style::StyleMeter, points: f32) {
-    meter.points = points;
-    meter.idle = 0.0;
-    meter.pop = 0.35;
-    meter.feed = [Some(("UPS CHAIN BLAST", 0.2)), Some(("WEAPON SWITCH", 0.7)), Some(("AIRBORNE KILL", 1.2))];
-    meter.peak = meter.rank();
+/// A frozen style meter moment for a screenshot.
+#[derive(Clone, Copy)]
+struct StyleStage {
+    points: f32,
+    pop: f32,
+    action_pop: f32,
+    hit_shake: f32,
+    feed: [Option<(&'static str, f32)>; crate::style::FEED_LINES],
 }
 
-/// Milestone 31 tour: `01_style_6g_props.png` (SS / 6G meter + a CRT desk
-/// beside a UPS rack in a wide hall), `02_ups_chain_blast.png` (the rack
-/// detonating, the CRT shattered, SSS / 6G+), `03_trial_signal_ghost.png`
-/// (the PB Signal Ghost running ahead on the Time Trial with its delta).
+impl StyleStage {
+    fn at(points: f32, feed: [(&'static str, f32); 2]) -> Self {
+        StyleStage { points, pop: 0.0, action_pop: 0.0, hit_shake: 0.0, feed: [Some(feed[0]), Some(feed[1]), None] }
+    }
+
+    /// Pin the meter to this moment (the envelopes would otherwise decay away).
+    fn apply(&self, meter: &mut crate::style::StyleMeter) {
+        meter.points = self.points;
+        meter.idle = 0.0;
+        meter.pop = self.pop;
+        meter.action_pop = self.action_pop;
+        meter.hit_shake = self.hit_shake;
+        meter.feed = self.feed;
+        meter.peak = meter.rank();
+    }
+}
+
+/// Milestone 31 tour: `01_style_6g_props.png` (the floating SS / 6G emblem at
+/// rest + a CRT desk beside a UPS rack in a wide hall),
+/// `01b_style_a_action_pulse.png` (A / 5G mid action pulse),
+/// `01c_style_hit_glitch.png` (the take-hit glitch shake),
+/// `02_ups_chain_blast.png` (the rack detonating, the CRT shattered, SSS / 6G+
+/// mid rank-up slam), `03_trial_signal_ghost.png` (the PB Signal Ghost running
+/// ahead on the Time Trial with its delta).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn m31_shots_tour(
     mut commands: Commands,
@@ -1430,6 +1456,10 @@ fn m31_shots_tour(
     }
     let dir = cfg.dir.clone();
     let t = cfg.timer;
+    if let Some(hold) = cfg.hold {
+        hold.apply(&mut meter);
+    }
+    let rest = StyleStage::at(1000.0, [("UPS CHAIN BLAST", 0.2), ("WEAPON SWITCH", 0.7)]);
     let advance = match (cfg.stage, *state.get()) {
         (0, AppState::MainMenu) if t > 1.0 => {
             commands.insert_resource(DevFreezeAi);
@@ -1464,15 +1494,30 @@ fn m31_shots_tour(
                 p.pitch = d.y.atan2(Vec2::new(d.x, d.z).length());
                 tf.rotation = Quat::from_rotation_y(p.yaw);
             }
-            stage_style(&mut meter, 1000.0);
+            cfg.hold = Some(rest);
             true
         }
         (2, AppState::Playing) if t > 1.2 => {
-            stage_style(&mut meter, 1000.0);
             meta_shot(&mut commands, &dir, "01_style_6g_props.png");
             true
         }
-        (3, AppState::Playing) if t > 0.6 => {
+        (3, AppState::Playing) if t > 0.3 => {
+            cfg.hold = Some(StyleStage { action_pop: 0.85, ..StyleStage::at(540.0, [("AIRBORNE KILL", 0.0), ("WEAPON SWITCH", 0.6)]) });
+            true
+        }
+        (4, AppState::Playing) if t > 0.3 => {
+            meta_shot(&mut commands, &dir, "01b_style_a_action_pulse.png");
+            true
+        }
+        (5, AppState::Playing) if t > 0.3 => {
+            cfg.hold = Some(StyleStage { hit_shake: 0.8, ..StyleStage::at(crate::style::StyleRank::S.threshold(), [("SIGNAL LOST", 0.0), ("AIRBORNE KILL", 0.9)]) });
+            true
+        }
+        (6, AppState::Playing) if t > 0.3 => {
+            meta_shot(&mut commands, &dir, "01c_style_hit_glitch.png");
+            true
+        }
+        (7, AppState::Playing) if t > 0.3 => {
             // Blow the rack: EMP + blast shatters the staged CRT.
             for mut r in &mut racks {
                 if let Ok((_, tf)) = players.single()
@@ -1481,20 +1526,19 @@ fn m31_shots_tour(
                     r.damage(100.0, false);
                 }
             }
-            stage_style(&mut meter, 1400.0);
+            cfg.hold = Some(StyleStage { pop: 0.9, action_pop: 0.6, ..StyleStage::at(1400.0, [("CHAIN REACTION", 0.0), ("UPS CHAIN BLAST", 0.3)]) });
             true
         }
-        (4, AppState::Playing) if t > 0.07 => {
-            stage_style(&mut meter, 1400.0);
-            meter.feed = [Some(("CHAIN REACTION", 0.0)), Some(("UPS CHAIN BLAST", 0.3)), Some(("CRT SHATTERED", 0.5))];
+        (8, AppState::Playing) if t > 0.07 => {
             meta_shot(&mut commands, &dir, "02_ups_chain_blast.png");
             true
         }
-        (5, AppState::Playing) if t > 0.8 => {
+        (9, AppState::Playing) if t > 0.8 => {
+            cfg.hold = None;
             next.set(AppState::MainMenu);
             true
         }
-        (6, AppState::MainMenu) if t > 1.0 => {
+        (10, AppState::MainMenu) if t > 1.0 => {
             // A synthetic PB trace along the course: spawn -> CP1 -> CP2 -> CP3 -> finish.
             let g = crate::trials::build_time_trial_grid();
             let mut pts: Vec<(Vec3, f32)> = vec![(g.cell_center(g.spawn), g.spawn_yaw)];
@@ -1519,7 +1563,7 @@ fn m31_shots_tour(
             crate::trials::start_time_trial(&mut run, &mut mods, &mut loadout, &mut trial, &mut next, HandsetSkin::UacOrange);
             true
         }
-        (7, AppState::Playing) if t > 2.5 => {
+        (11, AppState::Playing) if t > 2.5 => {
             // Trail the ghost a few metres behind on the first leg.
             trial.elapsed = 3.4;
             let Some(pb) = ghost.pb.clone() else { return };
@@ -1541,11 +1585,11 @@ fn m31_shots_tour(
             }
             true
         }
-        (8, AppState::Playing) if t > 0.5 => {
+        (12, AppState::Playing) if t > 0.5 => {
             meta_shot(&mut commands, &dir, "03_trial_signal_ghost.png");
             true
         }
-        (9, AppState::Playing) if t > 1.2 => {
+        (13, AppState::Playing) if t > 1.2 => {
             exit.write(AppExit::Success);
             true
         }
