@@ -46,8 +46,11 @@
 //!   `01b_style_a_action_pulse.png` (A / 5G mid action pulse),
 //!   `01c_style_hit_glitch.png` (the crimson take-hit glitch shake),
 //!   `02_ups_chain_blast.png` (the rack detonating, SSS / 6G+ mid rank-up
-//!   slam) and `03_trial_signal_ghost.png` (the PB Signal Ghost on the Time
-//!   Trial with its live delta), then exits.
+//!   slam), `04_hud_feed_low_hp.png` (the frameless HUD under fire: killfeed
+//!   callouts at every age, a kill pop, critical HP and a dry magazine),
+//!   `05_hud_demon_rush.png` (the SOS uplink block and alert) and
+//!   `03_trial_signal_ghost.png` (the PB Signal Ghost on the Time Trial with
+//!   its live delta), then exits.
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
@@ -177,7 +180,7 @@ impl Plugin for DevPlugin {
                     app.insert_resource(ProfileStore::in_memory(PlayerProfile::default()));
                 }
             }
-            app.insert_resource(M31Shots { dir, stage: 0, timer: 0.0, hold: None }).add_systems(Update, m31_shots_tour.after(GameSet::Ui));
+            app.insert_resource(M31Shots { dir, stage: 0, timer: 0.0, hold: None, hud: None }).add_systems(Update, m31_shots_tour.after(GameSet::Ui));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_META_SHOTS") {
@@ -1398,6 +1401,18 @@ struct M31Shots {
     timer: f32,
     /// Style HUD pose re-staged every frame until the next shot is taken.
     hold: Option<StyleStage>,
+    /// Frameless HUD moment re-staged every frame (envelopes and toast
+    /// timers would otherwise run out before the shot).
+    hud: Option<HudStage>,
+}
+
+/// A frozen frameless-HUD moment for a screenshot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HudStage {
+    /// Callouts at every age, a kill pop, critical HP, a dry magazine.
+    FeedLowHp,
+    /// SOS uplink running: alert hairlines, uplink gauge, center alert.
+    DemonRush,
 }
 
 /// A frozen style meter moment for a screenshot.
@@ -1432,8 +1447,10 @@ impl StyleStage {
 /// `01b_style_a_action_pulse.png` (A / 5G mid action pulse),
 /// `01c_style_hit_glitch.png` (the take-hit glitch shake),
 /// `02_ups_chain_blast.png` (the rack detonating, the CRT shattered, SSS / 6G+
-/// mid rank-up slam), `03_trial_signal_ghost.png` (the PB Signal Ghost running
-/// ahead on the Time Trial with its delta).
+/// mid rank-up slam), `04_hud_feed_low_hp.png` / `05_hud_demon_rush.png` (the
+/// frameless HUD under fire and during the SOS uplink),
+/// `03_trial_signal_ghost.png` (the PB Signal Ghost running ahead on the Time
+/// Trial with its delta).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn m31_shots_tour(
     mut commands: Commands,
@@ -1443,6 +1460,7 @@ fn m31_shots_tour(
     grid: Option<Res<LevelGrid>>,
     (mut run, mut mods, mut loadout, mut trial): (ResMut<RunStats>, ResMut<PlayerModifiers>, ResMut<RunLoadout>, ResMut<crate::trials::TimeTrialState>),
     (mut meter, mut ghost, props): (ResMut<crate::style::StyleMeter>, ResMut<crate::trials::TrialGhostStore>, Option<Res<crate::props::PropAssets>>),
+    (mut feed, mut pulse, mut ext): (ResMut<crate::fx::HudFeed>, ResMut<crate::hud_fx::HudPulse>, ResMut<crate::extraction::ExtractionState>),
     mut players: Query<(&mut Player, &mut Transform)>,
     mut racks: Query<&mut crate::props::UpsRack>,
     mut next: ResMut<NextState<AppState>>,
@@ -1458,6 +1476,34 @@ fn m31_shots_tour(
     let t = cfg.timer;
     if let Some(hold) = cfg.hold {
         hold.apply(&mut meter);
+    }
+    match cfg.hud {
+        Some(HudStage::FeedLowHp) => {
+            use crate::fx::{Toast, TOAST_SECONDS};
+            // Newest last: one snapping in, two holding, one fading out.
+            let toast = |text: &str, color: Color, age: f32| Toast { text: text.to_string(), color, timer: TOAST_SECONDS - age };
+            feed.toasts = vec![
+                toast("FATALITY // STATIC IMP", Color::srgb(1.0, 0.3, 0.25), TOAST_SECONDS - 0.3),
+                toast("SMS // CARRIER: YOUR PLAN EXPIRES TODAY", Color::srgb(0.3, 0.95, 1.0), 1.9),
+                toast("UPS DETONATION // EMP BURST", Color::srgb(1.0, 0.3, 0.25), 0.9),
+                toast("+ STATIC IMP DOWN", Color::srgb(1.0, 0.55, 0.35), 0.11),
+            ];
+            run.kills = 7;
+            pulse.stats[0] = 0.85;
+            for (mut p, _) in &mut players {
+                p.hp = 18.0;
+                p.ammo_shells = 0;
+            }
+        }
+        Some(HudStage::DemonRush) => {
+            *ext = crate::extraction::ExtractionState::Uploading { progress: 0.42, duration: 30.0, in_ring: true, jammed: false, wave_timer: 99.0, baron_spawned: true, boss_hold: false };
+            feed.alert("WARNING: HELL BARON INBOUND!", Color::srgb(1.0, 0.55, 0.1), 3.5);
+            feed.toasts.clear();
+            for (mut p, _) in &mut players {
+                p.ammo_shells = 32;
+            }
+        }
+        None => {}
     }
     let rest = StyleStage::at(1000.0, [("UPS CHAIN BLAST", 0.2), ("WEAPON SWITCH", 0.7)]);
     let advance = match (cfg.stage, *state.get()) {
@@ -1534,11 +1580,31 @@ fn m31_shots_tour(
             true
         }
         (9, AppState::Playing) if t > 0.8 => {
+            cfg.hold = Some(rest);
+            cfg.hud = Some(HudStage::FeedLowHp);
+            true
+        }
+        (10, AppState::Playing) if t > 0.6 => {
+            meta_shot(&mut commands, &dir, "04_hud_feed_low_hp.png");
+            true
+        }
+        (11, AppState::Playing) if t > 0.3 => {
+            cfg.hud = Some(HudStage::DemonRush);
+            true
+        }
+        (12, AppState::Playing) if t > 0.6 => {
+            meta_shot(&mut commands, &dir, "05_hud_demon_rush.png");
+            true
+        }
+        (13, AppState::Playing) if t > 0.4 => {
             cfg.hold = None;
+            cfg.hud = None;
+            *ext = crate::extraction::ExtractionState::default();
+            feed.alert = None;
             next.set(AppState::MainMenu);
             true
         }
-        (10, AppState::MainMenu) if t > 1.0 => {
+        (14, AppState::MainMenu) if t > 1.0 => {
             // A synthetic PB trace along the course: spawn -> CP1 -> CP2 -> CP3 -> finish.
             let g = crate::trials::build_time_trial_grid();
             let mut pts: Vec<(Vec3, f32)> = vec![(g.cell_center(g.spawn), g.spawn_yaw)];
@@ -1563,7 +1629,7 @@ fn m31_shots_tour(
             crate::trials::start_time_trial(&mut run, &mut mods, &mut loadout, &mut trial, &mut next, HandsetSkin::UacOrange);
             true
         }
-        (11, AppState::Playing) if t > 2.5 => {
+        (15, AppState::Playing) if t > 2.5 => {
             // Trail the ghost a few metres behind on the first leg.
             trial.elapsed = 3.4;
             let Some(pb) = ghost.pb.clone() else { return };
@@ -1585,11 +1651,11 @@ fn m31_shots_tour(
             }
             true
         }
-        (12, AppState::Playing) if t > 0.5 => {
+        (16, AppState::Playing) if t > 0.5 => {
             meta_shot(&mut commands, &dir, "03_trial_signal_ghost.png");
             true
         }
-        (13, AppState::Playing) if t > 1.2 => {
+        (17, AppState::Playing) if t > 1.2 => {
             exit.write(AppExit::Success);
             true
         }

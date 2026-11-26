@@ -16,6 +16,7 @@ pub mod fatality;
 pub mod fx;
 pub mod gamepad;
 pub mod hud;
+pub mod hud_fx;
 pub mod leaderboard;
 pub mod ui_kit;
 pub mod level;

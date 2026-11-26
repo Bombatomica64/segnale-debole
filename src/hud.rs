@@ -4,8 +4,10 @@
 //! Dead-Zone edge frame. Signal bars, radar and phone apps live on the 3D
 //! phone screen (`phone_screen.rs`), not here.
 //!
-//! Everything is built from the gritty industrial-punk kit in `ui_kit.rs`
-//! (hard corners, bolted-plate borders, tape strips, stencil titles).
+//! The menus are built from the gritty industrial-punk kit in `ui_kit.rs`
+//! (hard corners, bolted-plate borders, tape strips, stencil titles). The
+//! in-game HUD is frameless instead: shadowed type, dark gauge wells and thin
+//! glowing accents from `hud_fx.rs`, matching the floating style emblem.
 //!
 //! Buttons use a small manual hit test (`ComputedNode::contains_point` with the
 //! window's physical cursor position) because Bevy 0.20 deprecated `Interaction`
@@ -17,6 +19,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::text::LineHeight;
 use bevy::ui::{UiGlobalTransform, Val2};
 use bevy::window::PrimaryWindow;
 
@@ -25,7 +28,11 @@ use crate::audio::{SfxEvent, SfxQueue, UiSfxGate};
 use crate::boss::BossHud;
 use crate::compendium::{apply_custom_label, pick_run_seed, seed_key_char, shareable_code, CustomSeedState};
 use crate::extraction::{ExtractionState, UPLINK_HOLD_SECS};
-use crate::fx::HudFeed;
+use crate::fx::{HudFeed, TOAST_SECONDS};
+use crate::hud_fx::{
+    accent_bar, danger_pulse, flash, glow, hud_text, pop_scale, pop_transform, set_glow, shadow_color, slam_curve, status_rule_look, toast_pose,
+    HudPulse, HudSnapshot, StatusKind, ToastPose, HUD_GUTTER, HUD_SUB, HUD_TOP, RAIL_WIDTH,
+};
 use crate::leaderboard::{spawn_account_pill, submit_badge_bundle, LeaderboardState, LeaderboardUiPlugin};
 use crate::gamepad::{pad_edit_text, DefaultFocus, DualPrompt, GamepadFocus, GamepadInput, InputMode, PadFocusLock, PAD_TEXT_HINT};
 use crate::meta::{live_settings, record_game_over, record_victory, start_run_with_loadout, CrosshairColor, CrosshairStyle, ProfileStore, RunLoadout};
@@ -41,9 +48,9 @@ use crate::trials::{
     split_timer_visible, start_daily_run, start_time_trial, trial_splits_line, DailyDate, TimeTrialState, SPLIT_GOLD,
 };
 use crate::ui_kit::{
-    hard_shadow, hazard_strip, hero_title, hud_plate, inset_border, keycap, plate_border, plate_rect, punk_button, punk_screen_root,
+    hard_shadow, hero_title, inset_border, keycap, plate_border, plate_rect, punk_button, punk_screen_root,
     punk_screen_root_tinted, recessed_bezel, screen_rails, section_crate, signal_bars, stamped_tag, stencil_title, stencil_title_layers,
-    terminal_chassis, tiled_image, ButtonStyle, PunkButtonColors, Tape, UiKitPlugin, UiKitTextures, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_DARK, IRON_MID, PUNK_RED, STEEL_BORDER, STEEL_LIGHT,
+    terminal_chassis, tiled_image, ButtonStyle, PunkButtonColors, Tape, UiKitPlugin, UiKitTextures, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_DARK, HAZARD_YELLOW, INK_BLACK, IRON_MID, PUNK_RED, STEEL_BORDER, STEEL_LIGHT,
 };
 use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeChoices, UpgradeFocus};
 use crate::weapons::{doppler_active, Weapon, WeaponState};
@@ -328,10 +335,12 @@ impl Plugin for HudPlugin {
             .add_systems(PreUpdate, fit_ui_scale)
             .add_systems(Update, upgrade_cards.run_if(in_state(AppState::UpgradeSelect)))
             .init_resource::<VelGauge>()
+            .init_resource::<HudPulse>()
             .add_systems(
                 Update,
                 (
                     track_vel_gauge.before(update_hud).before(update_hud_boxes),
+                    track_hud_pulse.before(update_hud).before(update_hud_boxes).before(update_split_plate),
                     update_hud,
                     update_hud_boxes,
                     refresh_hud_crosshair,
@@ -1864,20 +1873,25 @@ fn menu_keys(
 // ---------------------------------------------------------------------------
 //
 // Layout (the 3D phone in the left hand carries signal / radar / apps, so the
-// bottom-left stays clear):
-// - top-left: floor + kills/jammers panel
-// - top-center: status panel (+ SOS uplink bar while uploading), alert below
-// - top-right: killfeed toasts, each on its own backing chip
-// - bottom-center: vitals panel (HP / ARMOR / STAMINA bars), the docked VEL
-//   telemetry strip above it (with its stamped `BHOP xN` tag) and the prompt
-// - bottom-right: weapon & ammo deck (active card, shell pips, plasma bar or
-//   warhead pips, 3 slot chips, 5G overclock + Doppler pills)
+// bottom-left stays clear). The whole HUD is frameless, like the floating
+// style emblem: no plates and no backing slabs. Text floats on hard ink
+// shadows, every gauge keeps a dark track under its fill, and each cluster
+// hangs off one razor-thin glowing accent (see `hud_fx.rs`).
+// - top-left: floor strip on a glowing rail (floor, sector, counters, loadout)
+// - top-center: status line over a glowing underline (+ SOS uplink bar while
+//   uploading), boss bar and alert below
+// - top-right: split timer, then the killfeed callouts (right-edge pips)
+// - right edge: the style rank emblem
+// - bottom-center: VEL tachometer, HP, ARMOR | STAMINA (+ the stamped
+//   `BHOP xN` tag), the prompt above
+// - bottom-right: weapon & ammo deck (title + buff pills, ammo count, shell
+//   pips / plasma bar / warhead pips, 3 slot tabs)
 // - edges: subtle dark-red Dead-Zone frame (no scanlines across the view)
 
-const PANEL_BG: Color = Color::srgba(0.085, 0.072, 0.066, 0.8);
-const PANEL_EDGE: Color = Color::srgba(0.32, 0.28, 0.25, 0.45);
-const TRACK_BG: Color = Color::srgba(0.02, 0.018, 0.016, 0.8);
-const TRACK_BORDER: Color = Color::srgba(0.32, 0.28, 0.25, 0.7);
+/// Dark well under every gauge fill: the only backing the HUD keeps.
+const TRACK_BG: Color = Color::srgba(0.02, 0.018, 0.016, 0.86);
+/// Ink outline of a gauge track.
+const TRACK_EDGE: Color = Color::srgba(0.0, 0.0, 0.0, 0.9);
 const COLOR_HP_GREEN: Color = Color::srgb(0.16, 0.9, 0.46);
 const COLOR_ARMOR: Color = Color::srgb(0.46, 0.74, 0.88);
 pub const COLOR_GOLD: Color = Color::srgb(1.0, 0.8, 0.28);
@@ -1888,30 +1902,39 @@ const COLOR_WARHEAD: Color = Color::srgb(0.3, 0.32, 0.34);
 const COLOR_WARHEAD_TIP: Color = Color::srgb(1.0, 0.62, 0.18);
 const COLOR_SHELL: Color = Color::srgb(0.82, 0.13, 0.09);
 const COLOR_BRASS: Color = Color::srgb(0.95, 0.72, 0.3);
-const COLOR_PIP_OFF: Color = Color::srgba(1.0, 1.0, 1.0, 0.07);
-const COLOR_PIP_OFF_BORDER: Color = Color::srgba(1.0, 1.0, 1.0, 0.16);
+/// Spent ammo pip / idle keycap: a dark cell, so the row keeps its shape over bright floors.
+const COLOR_PIP_OFF: Color = Color::srgba(0.02, 0.018, 0.016, 0.7);
+const COLOR_PIP_OFF_BORDER: Color = Color::srgba(0.0, 0.0, 0.0, 0.85);
+/// Deep ember the dry-magazine count throbs down to.
+const COLOR_EMBER: Color = Color::srgb(0.5, 0.05, 0.04);
 
 const TOAST_SLOTS: u8 = 5;
 /// Shell pips shown for the shotgun magazine.
 pub const SHELL_PIPS: u8 = 10;
 /// Warhead pips shown for the Signal-Mortar rack.
 pub const ROCKET_PIPS: u8 = 10;
-const DECK_WIDTH: f32 = 340.0;
-/// Weapon card frame (left, right, top, bottom px) and horizontal padding.
-const CARD_BORDER: (f32, f32, f32, f32) = (5.0, 1.0, 1.0, 3.0);
-const CARD_PAD_X: f32 = 12.0;
-/// Weapon title font of the card header.
-const WEAPON_TITLE_FONT: f32 = 15.0;
-/// Buff pills docked right in the card header.
+/// Width of the weapon deck (matches the vitals cluster).
+const DECK_WIDTH: f32 = 312.0;
+/// Laid-out height budget of the weapon deck: title row, ammo count, pips, slot tabs.
+pub const DECK_HEIGHT: f32 = 104.0;
+/// Weapon title font of the deck header.
+const WEAPON_TITLE_FONT: f32 = 14.0;
+/// Hero ammo count font.
+const AMMO_FONT: f32 = 36.0;
+/// Buff pills docked left of the weapon title.
 const OVERCLOCK_PILL: &str = "5G OC";
 const DOPPLER_PILL: &str = "DOPPLER";
 const PILL_FONT: f32 = 11.0;
 const PILL_PAD_X: f32 = 6.0;
 const PILL_GAP: f32 = 5.0;
-/// Slot badge metrics: frame, padding, keycap, gaps and the two font sizes.
-const SLOT_BORDER: (f32, f32, f32, f32) = (4.0, 1.0, 1.0, 2.0);
-const SLOT_GAP: f32 = 6.0;
-const SLOT_PAD_X: f32 = 5.0;
+/// Ammo pip cell (shells and warheads) and the gap between two.
+const PIP_SIZE: (f32, f32) = (18.0, 10.0);
+const PIP_GAP: f32 = 3.0;
+/// Width of a full pip row (and of the plasma cell bar that replaces it).
+const PIP_ROW_WIDTH: f32 = SHELL_PIPS as f32 * PIP_SIZE.0 + (SHELL_PIPS - 1) as f32 * PIP_GAP;
+/// Slot tab metrics: padding, keycap, gaps and the two font sizes.
+const SLOT_GAP: f32 = 8.0;
+const SLOT_PAD_X: f32 = 1.0;
 const SLOT_INNER_GAP: f32 = 5.0;
 const SLOT_KEY_WIDTH: f32 = 13.0;
 const SLOT_LABEL_FONT: f32 = 10.0;
@@ -1926,11 +1949,11 @@ fn mono_width(chars: usize, font: f32) -> f32 {
     chars as f32 * font * MONO_ADVANCE
 }
 
-/// Inner (content) width of one slot badge: the deck split three ways.
+/// Inner (content) width of one slot tab: the deck split three ways.
 #[cfg(test)]
 fn slot_inner_width() -> f32 {
     let n = Weapon::ALL.len() as f32;
-    (DECK_WIDTH - SLOT_GAP * (n - 1.0)) / n - SLOT_BORDER.0 - SLOT_BORDER.1 - 2.0 * SLOT_PAD_X
+    (DECK_WIDTH - SLOT_GAP * (n - 1.0)) / n - 2.0 * SLOT_PAD_X
 }
 
 /// Width one slot badge row needs for `name` and an ammo count of `digits`.
@@ -1939,17 +1962,25 @@ fn slot_row_width(name: &str, digits: usize) -> f32 {
     SLOT_KEY_WIDTH + SLOT_INNER_GAP + mono_width(name.len(), SLOT_LABEL_FONT) + SLOT_INNER_GAP + mono_width(digits, SLOT_AMMO_FONT)
 }
 
-/// Slot badge reserve color: red when dry, bone on the equipped weapon, dim otherwise.
+/// Slot tab reserve color: red when dry, bone on the equipped weapon, muted otherwise.
 fn slot_ammo_color(n: u32, active: bool) -> Color {
     if n == 0 {
         COLOR_SIGNAL_RED
     } else if active {
         COLOR_TEXT
     } else {
-        COLOR_DIM
+        HUD_SUB
     }
 }
 const VITALS_WIDTH: f32 = 312.0;
+/// Laid-out height budget of the vitals cluster: VEL row, HP, ARMOR | STAMINA.
+pub const VITALS_HEIGHT: f32 = 84.0;
+/// Extra height while the `BHOP xN` stamp shows above the VEL row.
+const BHOP_TAG_HEIGHT: f32 = 24.0;
+/// Bottom inset of the bottom clusters.
+pub const HUD_BOTTOM: f32 = 14.0;
+/// Bottom of the interact prompt: clears the vitals cluster and its BHOP stamp.
+pub const PROMPT_BOTTOM: f32 = HUD_BOTTOM + VITALS_HEIGHT + BHOP_TAG_HEIGHT + 8.0;
 const UPLINK_WIDTH: f32 = 440.0;
 /// Width of the Carrier Daemon health bar.
 const BOSS_BAR_WIDTH: f32 = 460.0;
@@ -1988,8 +2019,35 @@ pub fn uplink_status_text(ext: &ExtractionState) -> &'static str {
         _ => "DEMON RUSH - HOLD THE SIGNAL",
     }
 }
-/// Height of the danger tape rails that clamp the status plate during a rush.
-const RUSH_RAIL_HEIGHT: f32 = 6.0;
+
+/// Top-center status line: its kind (drives the underline), text and tone.
+pub fn status_line(run: &RunStats, trial: &TimeTrialState, ext: &ExtractionState, signal: &SignalState) -> (StatusKind, &'static str, Color) {
+    if run.mode == RunMode::TimeTrial {
+        return if trial.next_gate >= crate::trials::TRIAL_CHECKPOINTS {
+            (StatusKind::TrialFinal, "FINAL STRETCH - LAND ON THE TOWER PAD", ARC_CYAN)
+        } else {
+            (StatusKind::Trial, "TIME TRIAL - 3 CHECKPOINTS, THEN THE TOWER", ARC_CYAN)
+        };
+    }
+    match *ext {
+        ExtractionState::Uploading { boss_hold, .. } => (if boss_hold { StatusKind::BossHold } else { StatusKind::Rush }, uplink_status_text(ext), COLOR_SIGNAL_RED),
+        ExtractionState::Extracting { .. } | ExtractionState::Complete => (StatusKind::Extracting, "ORBITAL EXTRACTION IN PROGRESS", COLOR_CYAN),
+        _ if signal.near_tower => (StatusKind::Locked, "5-BAR SIGNAL - EXTRACTION TOWER IN RANGE", COLOR_SIGNAL_GREEN),
+        _ if signal.in_dead_zone => (StatusKind::DeadZone, "NO SERVICE - DEAD ZONE", COLOR_SIGNAL_RED),
+        _ => (StatusKind::Searching, "SEARCH FOR 5-BAR SIGNAL TOWER", COLOR_SIGNAL_AMBER),
+    }
+}
+
+/// Accent of the top-left floor rail: alert red in a dead zone or during the
+/// rush, cyan on the Time Trial, magenta in Endless, caution amber otherwise.
+pub fn floor_rail_color(run: &RunStats, kind: StatusKind) -> Color {
+    match kind {
+        StatusKind::Rush | StatusKind::BossHold | StatusKind::DeadZone => PUNK_RED,
+        StatusKind::Trial | StatusKind::TrialFinal => ARC_CYAN,
+        _ if run.endless => COLOR_ENDLESS,
+        _ => HAZARD_YELLOW,
+    }
+}
 
 /// `cur / max` clamped to `0..=1` (0 when `max` is not positive).
 pub fn fraction(cur: f32, max: f32) -> f32 {
@@ -2042,8 +2100,6 @@ pub const VEL_GAUGE_MAX: f32 = 32.0;
 pub const VEL_SEGMENTS: u8 = 16;
 /// Hysteresis (m/s) before the VEL gauge drops back a tier / un-snaps the badge.
 pub const VEL_HYSTERESIS: f32 = 0.5;
-/// Width (px) of the docked VEL strip and the vitals plate under it.
-const VEL_PLATE_WIDTH: f32 = 312.0;
 
 /// Momentum band of the VEL gauge.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -2185,6 +2241,32 @@ fn track_vel_gauge(mut gauge: ResMut<VelGauge>, players: Query<&Player>) {
     }
 }
 
+/// Decay the HUD pulse envelopes and re-arm the ones whose value changed.
+#[allow(clippy::too_many_arguments)]
+fn track_hud_pulse(
+    time: Res<Time>,
+    mut pulse: ResMut<HudPulse>,
+    run: Res<RunStats>,
+    trial: Res<TimeTrialState>,
+    ext: Res<ExtractionState>,
+    signal: Res<SignalState>,
+    ws: Res<WeaponState>,
+    ghost: Option<Res<crate::trials::TrialGhostStore>>,
+    players: Query<&Player>,
+) {
+    let Ok(p) = players.single() else { return };
+    let is_trial = run.mode == RunMode::TimeTrial;
+    pulse.tick(time.delta_secs());
+    pulse.observe(HudSnapshot {
+        stats: if is_trial { [trial.next_gate.min(crate::trials::TRIAL_CHECKPOINTS) as u32, trial.rescues] } else { [run.kills, run.jammers_destroyed] },
+        status: status_line(&run, &trial, &ext, &signal).0,
+        splits: if is_trial { trial.splits.len() } else { run.floor_splits.len() } as u32,
+        ghost_ahead: ghost.as_deref().filter(|_| is_trial).and_then(|g| g.delta).filter(|d| d.is_finite()).map(|d| d <= 0.0),
+        weapon: Weapon::ALL.iter().position(|w| *w == ws.current).unwrap_or(0) as u8,
+        ammo: ammo(p, ws.current).0,
+    });
+}
+
 /// The 5G overclock damage bonus is live.
 pub fn overclock_active(bars: u8, bonus: f32) -> bool {
     bars >= 4 && bonus > 0.0
@@ -2238,7 +2320,8 @@ enum HudText {
     Floor,
     /// Sector theme subtitle (`SECTOR 01 // RUST BUNKER`).
     Sector,
-    Stats,
+    /// Top-left counter `0` (kills / checkpoints) or `1` (jammers / rescues).
+    Stats(u8),
     /// Starter chip label of the run loadout.
     LoadoutChip,
     /// Active contract tags (empty without contracts).
@@ -2272,32 +2355,37 @@ enum HudText {
 enum HudBox {
     DamageFlash,
     DeadZoneFrame,
-    /// Status plate: its rail goes alert-red during the SOS uplink.
-    StatusPlate,
-    /// Danger tape rail above / below the status plate (SOS uplink only).
+    /// Glowing rail of the top-left floor strip (mode / state colored).
+    FloorRail,
+    /// Glowing underline of the status line.
+    StatusRule,
+    /// Alert hairline above / below the status + uplink block (SOS uplink only).
     RushRail,
     UplinkPanel,
     UplinkFill,
-    /// Carrier Daemon boss plate (only while a living boss is present).
+    /// Carrier Daemon boss bar block (only while a living boss is present).
     BossPlate,
     /// Boss health fill (crimson / molten gold, cyan-violet while shielded).
     BossFill,
     /// Boss health track: its end caps follow the phase tag color.
     BossTrack,
     AlertPanel,
+    /// One killfeed callout row (text + pip).
     ToastChip(u8),
+    /// Glowing right-edge pip of a callout.
+    ToastPip(u8),
     /// Square bullet between the chip label and the contract tags.
     LoadoutDot,
-    /// Docked VEL telemetry strip above the vitals plate (tier-colored rail).
-    VelPlate,
     /// Framed bracket track around the VEL tachometer segments.
     VelTrack,
     /// Readout badge (snaps solid hazard yellow at 32+ m/s).
     VelValueBadge,
-    /// Stamped `BHOP xN` tag bolted atop the VEL strip (hidden below x2).
+    /// Stamped `BHOP xN` tag floating above the VEL row (hidden below x2).
     VelChainTag,
     /// One segment of the VEL tachometer.
     VelSeg(u8),
+    /// HP gauge track: glows alert red while HP is critical.
+    HpTrack,
     HpFill,
     ArmorFill,
     StaminaFill,
@@ -2307,7 +2395,7 @@ enum HudBox {
     PlasmaFill,
     RocketRow,
     RocketPip(u8),
-    WeaponCard,
+    /// One weapon slot tab (the equipped one pops on a swap).
     SlotChip(u8),
     /// Keycap block of a slot badge (weapon accent while equipped).
     SlotKey(u8),
@@ -2368,36 +2456,37 @@ fn spawn_ruler(commands: &mut Commands, parent: Entity) {
 
 const RULER_HEIGHT: f32 = 5.0;
 
-/// Framed bar track: a colored left cap, a matching dimmer right cap and a
-/// dark bottom lip, so the bar reads as a bracketed gauge.
+/// Track frame colors: the accent on the left cap, dimmer on the right, ink above and below.
+fn track_border(color: Color) -> BorderColor {
+    BorderColor { left: color, right: color.with_alpha(0.55), top: TRACK_EDGE, bottom: TRACK_EDGE }
+}
+
+/// Bracketed gauge track: a colored left cap, a dimmer right cap and an ink
+/// outline around a dark well, so the fill stays legible with no plate behind it.
 fn bar_track(width: Val, height: f32, color: Color, display: Display) -> impl Bundle {
     (
-        Node { display, width, height: Val::Px(height), border: plate_rect((3.0, 2.0, 1.0, 2.0)), padding: UiRect::all(Val::Px(1.0)), ..default() },
-        BorderColor { left: color, right: color.with_alpha(0.55), top: TRACK_BORDER, bottom: INK_BLACK },
+        Node { display, width, height: Val::Px(height), border: plate_rect((3.0, 2.0, 1.0, 1.0)), padding: UiRect::all(Val::Px(1.0)), ..default() },
+        track_border(color),
         BackgroundColor(TRACK_BG),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Labelled horizontal bar: `LABEL ......... value` over a framed track, with
-/// an instrument ruler under tall (primary) bars.
-fn spawn_bar(commands: &mut Commands, parent: Entity, label: &str, label_color: Color, value: HudText, fill: HudBox, height: f32, color: Color) {
-    let block = commands
-        .spawn((ChildOf(parent), Node { width: Val::Percent(100.0), flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }))
-        .id();
+/// Floating labelled gauge: `LABEL ......... value` over a framed track
+/// (`fonts` = label / value size). Returns the track.
+fn spawn_bar(commands: &mut Commands, parent: Entity, block: Node, label: &str, label_color: Color, fonts: (f32, f32), value: HudText, fill: HudBox, height: f32, color: Color) -> Entity {
+    let block = commands.spawn((ChildOf(parent), Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..block })).id();
     commands.spawn((
         ChildOf(block),
         Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::FlexEnd, ..default() },
-        children![(text(label, 12.0, label_color), DualPrompt::new(label, pad_bar_label(label))), (value, text("", 15.0, COLOR_TEXT))],
+        children![(hud_text(label, fonts.0, label_color), DualPrompt::new(label, pad_bar_label(label))), (value, hud_text("", fonts.1, COLOR_TEXT))],
     ));
     let track = commands.spawn((ChildOf(block), bar_track(Val::Percent(100.0), height, color, Display::Flex))).id();
     commands.spawn((ChildOf(track), fill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(color)));
-    if height >= 8.0 {
+    if height >= 10.0 {
         spawn_ticks(commands, track);
     }
-    if height >= 12.0 {
-        spawn_ruler(commands, block);
-    }
+    track
 }
 
 /// Stamina bar label per input mode (the dash key / button).
@@ -2431,36 +2520,30 @@ pub fn slot_key_label(mode: InputMode, i: usize, current: usize, slots: usize) -
     }
 }
 
-/// Docked VEL telemetry strip (31 px) bolted 4 px above the vitals plate:
+/// VEL telemetry row, the first line of the vitals cluster:
 /// `VEL [tachometer] 18 m/s`. The tachometer is 16 fixed 9 px segments
 /// (2 m/s each) in four fixed zones with 4 px breaks at 12 / 20 / 28 m/s,
-/// framed by a tier-colored bracket track. A stamped `BHOP xN` tag sits on
-/// top of the strip, flush with its left rail.
-fn spawn_vel_plate(commands: &mut Commands, root: Entity) {
-    let plate = commands
-        .spawn((
-            ChildOf(root),
-            HudBox::VelPlate,
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Percent(50.0),
-                margin: UiRect::left(Val::Px(-VEL_PLATE_WIDTH / 2.0)),
-                width: Val::Px(VEL_PLATE_WIDTH),
-                // 14 px screen margin + 120 px vitals plate + 4 px gap.
-                bottom: Val::Px(138.0),
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(8.0),
-                padding: UiRect::axes(Val::Px(12.0), Val::Px(5.0)),
-                border: plate_rect((4.0, 1.0, 1.0, 2.0)),
-                ..default()
-            },
-            plate_border(ASH_DIM, STEEL_BORDER.with_alpha(0.45)),
-            BackgroundColor(IRON_DARK.with_alpha(0.8)),
-        ))
-        .id();
-    commands.spawn((ChildOf(plate), text("VEL", 12.0, ASH_DIM)));
+/// framed by a tier-colored bracket track. A stamped `BHOP xN` tag floats
+/// above the row, flush left.
+fn spawn_vel_plate(commands: &mut Commands, vitals: Entity) {
+    commands.spawn((
+        ChildOf(vitals),
+        HudBox::VelChainTag,
+        Node {
+            display: Display::None,
+            align_self: AlignSelf::FlexStart,
+            padding: UiRect::axes(Val::Px(6.0), Val::Px(1.0)),
+            border: UiRect::bottom(Val::Px(2.0)),
+            ..default()
+        },
+        BorderColor::all(INK_BLACK.with_alpha(0.85)),
+        BackgroundColor(ASH_DIM),
+        children![(HudText::VelChain, text("", 11.0, INK_BLACK), TextLayout::no_wrap())],
+    ));
+    let row = commands.spawn((ChildOf(vitals), Node { width: Val::Percent(100.0), align_items: AlignItems::Center, column_gap: Val::Px(8.0), ..default() })).id();
+    commands.spawn((ChildOf(row), hud_text("VEL", 11.0, HUD_SUB)));
     let track = commands
-        .spawn((ChildOf(plate), HudBox::VelTrack, bar_track(Val::Px(187.0), 12.0, ASH_DIM, Display::Flex)))
+        .spawn((ChildOf(row), HudBox::VelTrack, bar_track(Val::Px(187.0), 12.0, ASH_DIM, Display::Flex)))
         .id();
     commands.entity(track).entry::<Node>().and_modify(|mut n| n.flex_shrink = 0.0);
     for i in 0..VEL_SEGMENTS {
@@ -2468,39 +2551,20 @@ fn spawn_vel_plate(commands: &mut Commands, root: Entity) {
         commands.spawn((
             ChildOf(track),
             HudBox::VelSeg(i),
-            Node { width: Val::Px(9.0), height: Val::Px(7.0), flex_grow: 0.0, flex_shrink: 0.0, margin: UiRect::right(Val::Px(gap)), ..default() },
+            Node { width: Val::Px(9.0), height: Val::Percent(100.0), flex_grow: 0.0, flex_shrink: 0.0, margin: UiRect::right(Val::Px(gap)), ..default() },
             BackgroundColor(segment_color(i, 0)),
         ));
     }
     commands.spawn((
-        ChildOf(plate),
+        ChildOf(row),
         HudBox::VelValueBadge,
         Node { margin: UiRect::left(Val::Auto), padding: UiRect::axes(Val::Px(2.0), Val::Px(0.0)), flex_shrink: 0.0, ..default() },
         BackgroundColor(Color::NONE),
-        children![(HudText::VelValue, text(speed_label(0.0), 15.0, BONE_TEXT))],
-    ));
-    // Stamped chain tag, sitting on top of the 31 px strip (138 + 31 + 2).
-    commands.spawn((
-        ChildOf(root),
-        HudBox::VelChainTag,
-        Node {
-            display: Display::None,
-            position_type: PositionType::Absolute,
-            left: Val::Percent(50.0),
-            margin: UiRect::left(Val::Px(-VEL_PLATE_WIDTH / 2.0)),
-            bottom: Val::Px(171.0),
-            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-            border: UiRect::bottom(Val::Px(2.0)),
-            ..default()
-        },
-        BorderColor::all(INK_BLACK.with_alpha(0.85)),
-        BackgroundColor(ASH_DIM),
-        children![(HudText::VelChain, text("", 11.0, INK_BLACK))],
+        children![(HudText::VelValue, hud_text(speed_label(0.0), 14.0, BONE_TEXT))],
     ));
 }
 
-fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Option<Res<ProfileStore>>, run: Res<RunStats>, emblem_art: Option<Res<StyleEmblemArt>>) {
-    let tex = tex.as_deref();
+fn spawn_hud(mut commands: Commands, store: Option<Res<ProfileStore>>, run: Res<RunStats>, emblem_art: Option<Res<StyleEmblemArt>>) {
     let settings = live_settings(store.as_deref());
     let root = commands.spawn((DespawnOnExit(AppState::Playing), abs_full())).id();
 
@@ -2545,52 +2609,61 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
         children![(HudText::Hitmarker, text("X", 34.0, Color::NONE))],
     ));
 
-    // Top-left: floor + kills / jammers (+ the custom seed code when one is live).
-    let plate = commands.spawn((
-        ChildOf(root),
-        hud_plate(
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(14.0),
-                top: Val::Px(12.0),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(2.0),
-                ..default()
-            },
-            HAZARD_YELLOW,
-        ),
-        children![
-            (HudText::Floor, text("FLOOR 1/5", 20.0, COLOR_TEXT)),
-            (HudText::Sector, text(sector_label(1), 11.0, HAZARD_YELLOW)),
-            (HudText::Stats, text("KILLS 0  |  JAMMERS 0", 14.0, COLOR_DIM)),
-            (
-                Node { column_gap: Val::Px(7.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(1.0)), ..default() },
-                children![
-                    (HudText::LoadoutChip, text("STOCK OS", 12.0, COLOR_DIM)),
-                    (
-                        HudBox::LoadoutDot,
-                        Node { display: Display::None, width: Val::Px(5.0), height: Val::Px(5.0), ..default() },
-                        BackgroundColor(COLOR_SIGNAL_AMBER),
-                    ),
-                    (HudText::LoadoutContracts, text("", 12.0, COLOR_SIGNAL_AMBER)),
-                ],
-            ),
-        ],
-    )).id();
+    // Top-left: floor strip hanging off a glowing rail (+ the custom seed
+    // code when one is live). The rail stretches to the strip's height.
+    let strip = commands
+        .spawn((
+            ChildOf(root),
+            Node { position_type: PositionType::Absolute, left: Val::Px(HUD_GUTTER), top: Val::Px(HUD_TOP), column_gap: Val::Px(9.0), ..default() },
+        ))
+        .id();
+    commands.spawn((ChildOf(strip), HudBox::FloorRail, accent_bar(Node { width: Val::Px(RAIL_WIDTH), ..default() }, HAZARD_YELLOW)));
+    let plate = commands
+        .spawn((
+            ChildOf(strip),
+            Node { flex_direction: FlexDirection::Column, align_items: AlignItems::FlexStart, ..default() },
+            children![
+                (HudText::Floor, hud_text("FLOOR 1/5", 20.0, COLOR_TEXT)),
+                (HudText::Sector, hud_text(sector_label(1), 11.0, HAZARD_YELLOW)),
+                (
+                    Node { column_gap: Val::Px(9.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(2.0)), ..default() },
+                    children![
+                        (HudText::Stats(0), hud_text("KILLS 0", 13.0, COLOR_TEXT)),
+                        (Node { width: Val::Px(4.0), height: Val::Px(4.0), ..default() }, BackgroundColor(HUD_SUB), hard_shadow(1.0)),
+                        (HudText::Stats(1), hud_text("JAMMERS 0", 13.0, COLOR_TEXT)),
+                    ],
+                ),
+                (
+                    Node { column_gap: Val::Px(7.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(1.0)), ..default() },
+                    children![
+                        (HudText::LoadoutChip, hud_text("STOCK OS", 11.0, HUD_SUB)),
+                        (
+                            HudBox::LoadoutDot,
+                            Node { display: Display::None, width: Val::Px(5.0), height: Val::Px(5.0), ..default() },
+                            BackgroundColor(COLOR_SIGNAL_AMBER),
+                            hard_shadow(1.0),
+                        ),
+                        (HudText::LoadoutContracts, hud_text("", 11.0, COLOR_SIGNAL_AMBER)),
+                    ],
+                ),
+            ],
+        ))
+        .id();
     if run.custom_seed
         && let Some(code) = shareable_code(&run)
     {
-        commands.spawn((ChildOf(plate), text(format!("SEED {code}"), 11.0, ARC_CYAN)));
+        commands.spawn((ChildOf(plate), hud_text(format!("SEED {code}"), 11.0, ARC_CYAN)));
     }
 
-    // Top-center: status panel (+ SOS uplink), alert under it.
+    // Top-center: status line over its glowing underline (+ SOS uplink), boss
+    // bar and alert under it.
     let top = commands
         .spawn((
             ChildOf(root),
             Node {
                 position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
-                top: Val::Px(12.0),
+                top: Val::Px(HUD_TOP),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
                 row_gap: Val::Px(8.0),
@@ -2598,56 +2671,51 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
             },
         ))
         .id();
-    // The status plate sits between two tape rails that only show during the
-    // SOS uplink (DEMON RUSH), when its left rail also flips to alert red.
-    let rush = commands.spawn((ChildOf(top), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, ..default() })).id();
-    let rail = hazard_strip(&mut commands, rush, tex, RUSH_RAIL_HEIGHT, Tape::Danger);
-    commands.entity(rail).insert((HudBox::RushRail, Node { display: Display::None, width: Val::Percent(100.0), height: Val::Px(RUSH_RAIL_HEIGHT), ..default() }));
-    let status = commands
-        .spawn((
-            ChildOf(rush),
-            HudBox::StatusPlate,
-            hud_plate(Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(6.0), ..default() }, ARC_CYAN),
-        ))
-        .id();
-    commands.spawn((ChildOf(status), HudText::Status, text("SEARCH FOR 5-BAR SIGNAL TOWER", 22.0, COLOR_SIGNAL_AMBER)));
+    // During the SOS uplink (DEMON RUSH) two alert hairlines clamp the status
+    // line and the uplink gauge.
+    let rush = commands.spawn((ChildOf(top), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(6.0), ..default() })).id();
+    let rush_rail = || (HudBox::RushRail, accent_bar(Node { display: Display::None, width: Val::Px(UPLINK_WIDTH + 36.0), height: Val::Px(2.0), ..default() }, PUNK_RED));
+    commands.spawn((ChildOf(rush), rush_rail()));
+    // The underline overhangs the text by 10 px a side and follows its width.
+    let status = commands.spawn((ChildOf(rush), Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(3.0), ..default() })).id();
+    commands.spawn((ChildOf(status), HudText::Status, hud_text("SEARCH FOR 5-BAR SIGNAL TOWER", 20.0, COLOR_SIGNAL_AMBER)));
+    commands.spawn((
+        ChildOf(status),
+        HudBox::StatusRule,
+        accent_bar(Node { height: Val::Px(2.0), margin: UiRect::horizontal(Val::Px(-10.0)), ..default() }, COLOR_SIGNAL_AMBER),
+    ));
     let uplink = commands
         .spawn((
-            ChildOf(status),
+            ChildOf(rush),
             HudBox::UplinkPanel,
             Node { display: Display::None, flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(4.0), ..default() },
         ))
         .id();
-    commands.spawn((ChildOf(uplink), HudText::UplinkLabel, text("UPLOADING SOS 0%", 19.0, COLOR_CYAN)));
+    commands.spawn((ChildOf(uplink), HudText::UplinkLabel, hud_text("UPLOADING SOS 0%", 17.0, COLOR_CYAN)));
     let gauge = commands
         .spawn((ChildOf(uplink), Node { width: Val::Px(UPLINK_WIDTH), flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }))
         .id();
-    let track = commands.spawn((ChildOf(gauge), bar_track(Val::Percent(100.0), 16.0, ARC_CYAN, Display::Flex))).id();
+    let track = commands.spawn((ChildOf(gauge), bar_track(Val::Percent(100.0), 14.0, ARC_CYAN, Display::Flex))).id();
     commands.spawn((ChildOf(track), HudBox::UplinkFill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(COLOR_CYAN)));
     spawn_ticks(&mut commands, track);
     spawn_ruler(&mut commands, gauge);
-    let rail = hazard_strip(&mut commands, rush, tex, RUSH_RAIL_HEIGHT, Tape::Danger);
-    commands.entity(rail).insert((HudBox::RushRail, Node { display: Display::None, width: Val::Percent(100.0), height: Val::Px(RUSH_RAIL_HEIGHT), ..default() }));
-    // Boss plate: docked under the status / uplink plate, above the alert.
+    commands.spawn((ChildOf(rush), rush_rail()));
+    // Boss bar: under the status / uplink block, above the alert.
     let boss = commands
-        .spawn((
-            ChildOf(top),
-            HudBox::BossPlate,
-            hud_plate(Node { display: Display::None, flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() }, PUNK_RED),
-        ))
+        .spawn((ChildOf(top), HudBox::BossPlate, Node { display: Display::None, flex_direction: FlexDirection::Column, row_gap: Val::Px(3.0), ..default() }))
         .id();
     commands.spawn((
         ChildOf(boss),
         Node { width: Val::Px(BOSS_BAR_WIDTH), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
         children![
-            (HudText::BossName, text(crate::enemies::EnemyKind::CarrierDaemon.name(), 18.0, HAZARD_YELLOW)),
-            (HudText::BossPhase, text("PHASE I", 14.0, PUNK_RED)),
+            (HudText::BossName, hud_text(crate::enemies::EnemyKind::CarrierDaemon.name(), 17.0, HAZARD_YELLOW)),
+            (HudText::BossPhase, hud_text("PHASE I", 13.0, PUNK_RED)),
         ],
     ));
     let bgauge = commands
         .spawn((ChildOf(boss), Node { width: Val::Px(BOSS_BAR_WIDTH), flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }))
         .id();
-    let btrack = commands.spawn((ChildOf(bgauge), HudBox::BossTrack, bar_track(Val::Percent(100.0), 14.0, PUNK_RED, Display::Flex))).id();
+    let btrack = commands.spawn((ChildOf(bgauge), HudBox::BossTrack, bar_track(Val::Percent(100.0), 13.0, PUNK_RED, Display::Flex))).id();
     commands.spawn((ChildOf(btrack), HudBox::BossFill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(PUNK_RED)));
     // Segment cuts + heavy phase-threshold ticks at 30% / 65%.
     for n in 1..20 {
@@ -2688,38 +2756,98 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
                 margin: UiRect::left(Val::Px(if major { -1.0 } else { 0.0 })),
                 ..default()
             },
-            BackgroundColor(if major { HAZARD_YELLOW } else { ASH_DIM.with_alpha(0.6) }),
+            BackgroundColor(if major { HAZARD_YELLOW } else { HUD_SUB.with_alpha(0.75) }),
+            hard_shadow(1.0),
         ));
     }
     commands.spawn((
         ChildOf(top),
         HudBox::AlertPanel,
-        hud_plate(Node { display: Display::None, ..default() }, PUNK_RED),
-        children![(HudText::Alert, text("", 30.0, COLOR_SIGNAL_AMBER))],
+        Node { display: Display::None, ..default() },
+        children![(HudText::Alert, hud_text("", 28.0, COLOR_SIGNAL_AMBER))],
     ));
 
-    // Bottom-center prompt (above the vitals panel).
+    // Bottom-center prompt (above the vitals cluster).
     commands.spawn((
         ChildOf(root),
-        Node {
-            position_type: PositionType::Absolute,
-            width: Val::Percent(100.0),
-            // Clears the vitals plate, the docked VEL strip and its BHOP stamp.
-            bottom: Val::Px(200.0),
-            justify_content: JustifyContent::Center,
-            ..default()
-        },
-        children![(HudText::Prompt, text("", 24.0, COLOR_SIGNAL_GREEN))],
+        Node { position_type: PositionType::Absolute, width: Val::Percent(100.0), bottom: Val::Px(PROMPT_BOTTOM), justify_content: JustifyContent::Center, ..default() },
+        children![(HudText::Prompt, hud_text("", 22.0, COLOR_SIGNAL_GREEN))],
     ));
 
-    // Top-right: killfeed / status toasts.
-    let feed = commands
+    // Top-right column: the split timer in the corner, the killfeed callouts
+    // flowing under it (or from the corner while the timer is hidden).
+    let column = commands
         .spawn((
             ChildOf(root),
             Node {
                 position_type: PositionType::Absolute,
-                right: Val::Px(14.0),
-                top: Val::Px(12.0),
+                right: Val::Px(HUD_GUTTER),
+                top: Val::Px(HUD_TOP),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexEnd,
+                row_gap: Val::Px(RIGHT_COLUMN_GAP),
+                ..default()
+            },
+        ))
+        .id();
+    spawn_split_plate(&mut commands, column);
+    let feed = commands
+        .spawn((ChildOf(column), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::FlexEnd, row_gap: Val::Px(TOAST_GAP), ..default() }))
+        .id();
+    for i in 0..TOAST_SLOTS {
+        // A frameless callout: shadowed text ending on a glowing pip.
+        commands.spawn((
+            ChildOf(feed),
+            HudBox::ToastChip(i),
+            Node { display: Display::None, column_gap: Val::Px(7.0), ..default() },
+            children![
+                (HudText::Toast(i), hud_text("", TOAST_FONT, COLOR_TEXT)),
+                (HudBox::ToastPip(i), accent_bar(Node { width: Val::Px(RAIL_WIDTH), ..default() }, Color::NONE)),
+            ],
+        ));
+    }
+
+    // Right edge, below that column and above the weapon deck: the Milestone
+    // 31 Bandwidth Style Rank emblem.
+    spawn_style_meter(&mut commands, root, emblem_art.as_deref());
+
+    // Bottom-center: vitals cluster (VEL row, HP, ARMOR | STAMINA).
+    commands.insert_resource(VelGauge::default());
+    commands.insert_resource(HudPulse::default());
+    let vitals = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(50.0),
+                bottom: Val::Px(HUD_BOTTOM),
+                width: Val::Px(VITALS_WIDTH),
+                margin: UiRect::left(Val::Px(-VITALS_WIDTH / 2.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(5.0),
+                ..default()
+            },
+        ))
+        .id();
+    spawn_vel_plate(&mut commands, vitals);
+    let wide = Node { width: Val::Percent(100.0), ..default() };
+    let hp = spawn_bar(&mut commands, vitals, wide, "HP", COLOR_TEXT, (11.0, 14.0), HudText::HpValue, HudBox::HpFill, 12.0, COLOR_HP_GREEN);
+    commands.entity(hp).insert((HudBox::HpTrack, glow(Color::NONE)));
+    // Armor and stamina share one row: two half-width gauges.
+    let pair = commands.spawn((ChildOf(vitals), Node { width: Val::Percent(100.0), column_gap: Val::Px(10.0), ..default() })).id();
+    let half = || Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), min_width: Val::Px(0.0), ..default() };
+    spawn_bar(&mut commands, pair, half(), "ARMOR", COLOR_ARMOR, (10.0, 12.0), HudText::ArmorValue, HudBox::ArmorFill, 7.0, COLOR_ARMOR);
+    spawn_bar(&mut commands, pair, half(), STAMINA_LABEL_KBM, HUD_SUB, (10.0, 12.0), HudText::StaminaValue, HudBox::StaminaFill, 7.0, COLOR_GOLD);
+
+    // Bottom-right: weapon & ammo deck, right-aligned on the gutter.
+    let deck = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(HUD_GUTTER),
+                bottom: Val::Px(HUD_BOTTOM),
+                width: Val::Px(DECK_WIDTH),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::FlexEnd,
                 row_gap: Val::Px(4.0),
@@ -2727,120 +2855,41 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
             },
         ))
         .id();
-    for i in 0..TOAST_SLOTS {
-        commands.spawn((
-            ChildOf(feed),
-            HudBox::ToastChip(i),
-            hud_plate(Node { display: Display::None, padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)), ..default() }, STEEL_BORDER),
-            children![(HudText::Toast(i), text("", 15.0, COLOR_TEXT))],
-        ));
-    }
-
-    // Right edge, below the toast stack: speedrun split timer plate.
-    spawn_split_plate(&mut commands, root);
-    // Right edge, below the split plate and above the weapon deck: the
-    // Milestone 31 Bandwidth Style Rank meter.
-    spawn_style_meter(&mut commands, root, emblem_art.as_deref());
-
-    // Bottom-center: VEL telemetry strip docked above the vitals panel.
-    commands.insert_resource(VelGauge::default());
-    spawn_vel_plate(&mut commands, root);
-
-    // Bottom-center: vitals panel.
-    let vitals = commands
-        .spawn((
-            ChildOf(root),
-            hud_plate(
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Percent(50.0),
-                    bottom: Val::Px(14.0),
-                    width: Val::Px(VITALS_WIDTH),
-                    margin: UiRect::left(Val::Px(-VITALS_WIDTH / 2.0)),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(4.0),
-                    padding: UiRect { left: Val::Px(12.0), right: Val::Px(12.0), top: Val::Px(7.0), bottom: Val::Px(8.0) },
-                    ..default()
-                },
-                PUNK_RED,
-            ),
-        ))
-        .id();
-    spawn_bar(&mut commands, vitals, "HP", COLOR_TEXT, HudText::HpValue, HudBox::HpFill, 14.0, COLOR_HP_GREEN);
-    spawn_bar(&mut commands, vitals, "ARMOR", COLOR_ARMOR, HudText::ArmorValue, HudBox::ArmorFill, 8.0, COLOR_ARMOR);
-    spawn_bar(&mut commands, vitals, STAMINA_LABEL_KBM, COLOR_DIM, HudText::StaminaValue, HudBox::StaminaFill, 6.0, COLOR_GOLD);
-
-    // Bottom-right: weapon & ammo deck.
-    let deck = commands
-        .spawn((
-            ChildOf(root),
-            Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(14.0),
-                bottom: Val::Px(14.0),
-                width: Val::Px(DECK_WIDTH),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(6.0),
-                ..default()
-            },
-        ))
-        .id();
-    let card = commands
-        .spawn((
-            ChildOf(deck),
-            HudBox::WeaponCard,
-            Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(4.0),
-                padding: UiRect::axes(Val::Px(CARD_PAD_X), Val::Px(8.0)),
-                border: plate_rect(CARD_BORDER),
-                ..default()
-            },
-            plate_border(COLOR_SHOTGUN, PANEL_EDGE),
-            BackgroundColor(PANEL_BG),
-        ))
-        .id();
     commands.spawn((
-        ChildOf(card),
-        Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, column_gap: Val::Px(8.0), min_height: Val::Px(20.0), ..default() },
+        ChildOf(deck),
+        Node { align_items: AlignItems::Center, column_gap: Val::Px(8.0), min_height: Val::Px(18.0), ..default() },
         children![
-            (HudText::WeaponName, text("SHOTGUN", WEAPON_TITLE_FONT, COLOR_SHOTGUN), TextLayout::no_wrap()),
-            // Buff pills dock right as one cluster, so one or both lit never
-            // shifts the title or collides with it.
+            // Buff pills dock left of the title as one cluster, so one or both
+            // lit never shifts it off the gutter.
             (
                 Node { column_gap: Val::Px(PILL_GAP), align_items: AlignItems::Center, flex_shrink: 0.0, ..default() },
                 children![buff_pill(HudBox::OverclockPill, OVERCLOCK_PILL, ACID_GREEN), buff_pill(HudBox::DopplerPill, DOPPLER_PILL, COLOR_ROCKET)],
             ),
+            (HudText::WeaponName, hud_text("SHOTGUN", WEAPON_TITLE_FONT, COLOR_SHOTGUN)),
         ],
     ));
     commands.spawn((
-        ChildOf(card),
+        ChildOf(deck),
         Node { align_items: AlignItems::Baseline, column_gap: Val::Px(6.0), ..default() },
-        children![(HudText::AmmoCount, text("0", 38.0, COLOR_TEXT)), (HudText::AmmoMax, text("/ 0", 17.0, COLOR_DIM))],
+        children![
+            (HudText::AmmoCount, hud_text("0", AMMO_FONT, COLOR_TEXT), LineHeight::RelativeToFont(1.0)),
+            (HudText::AmmoMax, hud_text("/ 0", 15.0, HUD_SUB)),
+        ],
     ));
     let pips = commands
-        .spawn((ChildOf(card), HudBox::ShellRow, Node { column_gap: Val::Px(4.0), height: Val::Px(14.0), ..default() }))
+        .spawn((ChildOf(deck), HudBox::ShellRow, Node { column_gap: Val::Px(PIP_GAP), height: Val::Px(PIP_SIZE.1), ..default() }))
         .id();
     for i in 0..SHELL_PIPS {
         commands.spawn((
             ChildOf(pips),
             HudBox::ShellPip(i),
-            Node {
-                width: Val::Px(20.0),
-                height: Val::Px(14.0),
-                border: UiRect::top(Val::Px(4.0)),
-                ..default()
-            },
-            BorderColor::all(COLOR_BRASS),
+            Node { width: Val::Px(PIP_SIZE.0), height: Val::Px(PIP_SIZE.1), border: UiRect { top: Val::Px(3.0), ..UiRect::all(Val::Px(1.0)) }, ..default() },
+            shell_pip_border(true),
             BackgroundColor(COLOR_SHELL),
         ));
     }
     let ptrack = commands
-        .spawn((
-            ChildOf(card),
-            HudBox::PlasmaTrack,
-            bar_track(Val::Percent(100.0), 14.0, COLOR_CYAN, Display::None),
-        ))
+        .spawn((ChildOf(deck), HudBox::PlasmaTrack, bar_track(Val::Px(PIP_ROW_WIDTH), PIP_SIZE.1, COLOR_CYAN, Display::None)))
         .id();
     commands.spawn((
         ChildOf(ptrack),
@@ -2851,26 +2900,24 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
     spawn_ticks(&mut commands, ptrack);
     // Signal-Mortar rack: steel warhead pips with a glowing amber nose.
     let rockets = commands
-        .spawn((
-            ChildOf(card),
-            HudBox::RocketRow,
-            Node { display: Display::None, column_gap: Val::Px(4.0), height: Val::Px(14.0), ..default() },
-        ))
+        .spawn((ChildOf(deck), HudBox::RocketRow, Node { display: Display::None, column_gap: Val::Px(PIP_GAP), height: Val::Px(PIP_SIZE.1), ..default() }))
         .id();
     for i in 0..ROCKET_PIPS {
         commands.spawn((
             ChildOf(rockets),
             HudBox::RocketPip(i),
-            Node { width: Val::Px(20.0), height: Val::Px(14.0), border: UiRect::left(Val::Px(5.0)), ..default() },
-            BorderColor::all(COLOR_WARHEAD_TIP),
+            Node { width: Val::Px(PIP_SIZE.0), height: Val::Px(PIP_SIZE.1), border: UiRect { left: Val::Px(5.0), ..UiRect::all(Val::Px(1.0)) }, ..default() },
+            rocket_pip_border(true),
             BackgroundColor(COLOR_WARHEAD),
         ));
     }
-    // Slot deck: three identical two-row telemetry badges. Row 1 is
+    // Slot deck: three identical frameless two-row tabs. Row 1 is
     // `[keycap] NAME ...... reserve` on one never-wrapping line, row 2 a thin
-    // reserve gauge, so every chip keeps the same height and alignment
+    // reserve gauge, so every tab keeps the same height and alignment
     // whatever the ammo digits are.
-    let slots = commands.spawn((ChildOf(deck), Node { column_gap: Val::Px(SLOT_GAP), ..default() })).id();
+    let slots = commands
+        .spawn((ChildOf(deck), Node { width: Val::Percent(100.0), column_gap: Val::Px(SLOT_GAP), margin: UiRect::top(Val::Px(2.0)), ..default() }))
+        .id();
     for i in 0..Weapon::ALL.len() as u8 {
         let chip = commands
             .spawn((
@@ -2882,13 +2929,9 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
                     min_width: Val::Px(0.0),
                     flex_direction: FlexDirection::Column,
                     row_gap: Val::Px(3.0),
-                    padding: UiRect::new(Val::Px(SLOT_PAD_X), Val::Px(SLOT_PAD_X), Val::Px(3.0), Val::Px(4.0)),
-                    border: plate_rect(SLOT_BORDER),
-                    overflow: Overflow::clip(),
+                    padding: UiRect::horizontal(Val::Px(SLOT_PAD_X)),
                     ..default()
                 },
-                plate_border(PANEL_EDGE, PANEL_EDGE),
-                BackgroundColor(PANEL_BG),
             ))
             .id();
         commands.spawn((
@@ -2909,27 +2952,37 @@ fn spawn_hud(mut commands: Commands, tex: Option<Res<UiKitTextures>>, store: Opt
                                 flex_shrink: 0.0,
                                 ..default()
                             },
-                            BorderColor::all(INK_BLACK),
+                            BorderColor::all(Color::BLACK),
                             BackgroundColor(COLOR_PIP_OFF),
-                            children![(HudText::SlotKey(i), text((i + 1).to_string(), SLOT_LABEL_FONT, COLOR_DIM), TextLayout::no_wrap())],
+                            children![(HudText::SlotKey(i), hud_text((i + 1).to_string(), SLOT_LABEL_FONT, HUD_SUB))],
                         ),
-                        (HudText::Slot(i), text("", SLOT_LABEL_FONT, COLOR_DIM), TextLayout::no_wrap()),
+                        (HudText::Slot(i), hud_text("", SLOT_LABEL_FONT, HUD_SUB)),
                     ],
                 ),
-                (HudText::SlotAmmo(i), text("", SLOT_AMMO_FONT, COLOR_DIM), TextLayout::no_wrap()),
+                (HudText::SlotAmmo(i), hud_text("", SLOT_AMMO_FONT, HUD_SUB)),
             ],
         ));
         commands.spawn((
             ChildOf(chip),
-            Node { width: Val::Percent(100.0), height: Val::Px(3.0), ..default() },
+            Node { width: Val::Percent(100.0), height: Val::Px(4.0), border: UiRect::all(Val::Px(1.0)), ..default() },
+            BorderColor::all(TRACK_EDGE),
             BackgroundColor(TRACK_BG),
             children![(HudBox::SlotFill(i), Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(COLOR_PIP_OFF))],
         ));
     }
 }
 
-/// Stamped buff pill of the weapon card header (hidden until its buff is live).
-/// Split timer plate fields.
+/// Shell pip frame: a brass rim on top while loaded, ink all round.
+fn shell_pip_border(lit: bool) -> BorderColor {
+    BorderColor { top: if lit { COLOR_BRASS } else { COLOR_PIP_OFF_BORDER }, ..BorderColor::all(COLOR_PIP_OFF_BORDER) }
+}
+
+/// Warhead pip frame: a glowing amber nose while loaded, ink all round.
+fn rocket_pip_border(lit: bool) -> BorderColor {
+    BorderColor { left: if lit { COLOR_WARHEAD_TIP } else { COLOR_PIP_OFF_BORDER }, ..BorderColor::all(COLOR_PIP_OFF_BORDER) }
+}
+
+/// Split timer fields.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitText {
     Tag,
@@ -2940,39 +2993,51 @@ pub enum SplitText {
     Ghost,
 }
 
-/// Root of the split timer plate (hidden unless splits are on / non-standard mode).
+/// Root of the split timer cluster (hidden unless splits are on / non-standard mode).
 #[derive(Component)]
 pub struct SplitPlate;
 
-/// Top of the split plate: clears the full 5-slot toast stack (12 px + 5 x
-/// ~39 px chips, last one ending near 200 px at 720p) with a 14 px gap.
-pub const SPLIT_PLATE_TOP: f32 = 214.0;
-pub const SPLIT_PLATE_WIDTH: f32 = 236.0;
+/// Glowing accent rule under the timer numerals.
+#[derive(Component)]
+pub struct SplitRule;
 
-fn spawn_split_plate(commands: &mut Commands, root: Entity) {
+/// Top of the split timer: the top-right corner (the callouts flow under it).
+pub const SPLIT_PLATE_TOP: f32 = HUD_TOP;
+/// Widest the timer cluster ever gets (its longest line, `FLOOR 5/5  PB 00:00.0`).
+pub const SPLIT_PLATE_WIDTH: f32 = 150.0;
+/// Laid-out height budget of the timer cluster with its ghost line showing.
+pub const SPLIT_PLATE_HEIGHT: f32 = 98.0;
+/// Timer numerals font (monospace, so the digits never jitter).
+pub const SPLIT_TIME_FONT: f32 = 28.0;
+/// Width of the accent rule: the 7 numerals of `00:00.0`.
+const SPLIT_RULE_WIDTH: f32 = 118.0;
+/// Killfeed callout font, the gap between two and the gap under the timer.
+pub const TOAST_FONT: f32 = 13.0;
+const TOAST_GAP: f32 = 3.0;
+const RIGHT_COLUMN_GAP: f32 = 10.0;
+/// Lowest the top-right column ever reaches: timer + a full callout stack.
+pub const RIGHT_COLUMN_BOTTOM: f32 = SPLIT_PLATE_TOP + SPLIT_PLATE_HEIGHT + RIGHT_COLUMN_GAP + TOAST_SLOTS as f32 * (TOAST_FONT * 1.2 + TOAST_GAP);
+
+fn spawn_split_plate(commands: &mut Commands, column: Entity) {
+    // No plate: a tiny header, shadowed numerals on a glowing rule, tight
+    // right-aligned lines under it.
     commands.spawn((
-        ChildOf(root),
+        ChildOf(column),
         SplitPlate,
-        hud_plate(
-            Node {
-                display: Display::None,
-                position_type: PositionType::Absolute,
-                right: Val::Px(14.0),
-                top: Val::Px(SPLIT_PLATE_TOP),
-                width: Val::Px(SPLIT_PLATE_WIDTH),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::FlexEnd,
-                row_gap: Val::Px(1.0),
-                ..default()
-            },
-            ARC_CYAN,
-        ),
+        Node { display: Display::None, flex_direction: FlexDirection::Column, align_items: AlignItems::FlexEnd, ..default() },
         children![
-            (SplitText::Tag, text("SPLITS", 11.0, ARC_CYAN)),
-            (SplitText::Time, text("00:00.0", 30.0, COLOR_TEXT)),
-            (SplitText::Progress, text("", 12.0, COLOR_DIM)),
-            (SplitText::Delta, text("", 15.0, COLOR_TEXT)),
-            (SplitText::Ghost, Node { display: Display::None, ..default() }, text("", 14.0, ACID_GREEN)),
+            (SplitText::Tag, hud_text("SPLITS", 10.0, ARC_CYAN)),
+            (SplitText::Time, hud_text("00:00.0", SPLIT_TIME_FONT, COLOR_TEXT), LineHeight::RelativeToFont(1.05)),
+            (
+                SplitRule,
+                accent_bar(
+                    Node { width: Val::Px(SPLIT_RULE_WIDTH), height: Val::Px(2.0), margin: UiRect { top: Val::Px(2.0), bottom: Val::Px(4.0), ..default() }, ..default() },
+                    ARC_CYAN,
+                ),
+            ),
+            (SplitText::Progress, hud_text("", 11.0, HUD_SUB)),
+            (SplitText::Delta, hud_text("", 13.0, COLOR_TEXT)),
+            (SplitText::Ghost, Node { display: Display::None, ..default() }, hud_text("", 13.0, ACID_GREEN)),
         ],
     ));
 }
@@ -2981,9 +3046,9 @@ fn spawn_split_plate(commands: &mut Commands, root: Entity) {
 // Milestone 31: Bandwidth Style Rank meter (floating DMC-style emblem)
 // ---------------------------------------------------------------------------
 
-/// Top of the style emblem: clears the toast stack (~200 px) and the split
-/// plate (214 px + ~92 px tall with its ghost line hidden) at 720p, even at
-/// the peak of a rank-up slam.
+/// Top of the style emblem: clears the top-right column (split timer + a full
+/// callout stack, [`RIGHT_COLUMN_BOTTOM`]) at 720p, even at the peak of a
+/// rank-up slam.
 pub const STYLE_HUD_TOP: f32 = 330.0;
 /// Right gutter of the floating widget.
 pub const STYLE_HUD_RIGHT: f32 = 16.0;
@@ -3012,6 +3077,15 @@ const _: () = {
     assert!(STYLE_FEED_SHOWN == 2 && STYLE_FEED_SHOWN <= crate::style::FEED_LINES);
     assert!(STYLE_CAPTION_FONT >= 10.5 && STYLE_CAPTION_FONT <= 11.0 && STYLE_FEED_FONT >= 9.5 && STYLE_FEED_FONT <= 10.0);
     assert!(EMBLEM_PX as f32 == STYLE_EMBLEM_SIZE * 2.0);
+    // Frameless right edge: timer + callouts, then the emblem, then the deck.
+    assert!(RIGHT_COLUMN_BOTTOM + 40.0 <= STYLE_HUD_TOP);
+    assert!(STYLE_HUD_TOP + STYLE_HUD_HEIGHT + 40.0 <= UI_REFERENCE.1 - HUD_BOTTOM - DECK_HEIGHT);
+    assert!(SPLIT_PLATE_WIDTH <= DECK_WIDTH && PIP_ROW_WIDTH <= DECK_WIDTH);
+    // The frameless bottom HUD is far shorter than the old plates (120 px
+    // vitals plate + 35 px VEL strip, ~172 px weapon deck), and the prompt
+    // clears the vitals even with the BHOP stamp up.
+    assert!(VITALS_HEIGHT <= 90.0 && DECK_HEIGHT <= 110.0);
+    assert!(PROMPT_BOTTOM >= HUD_BOTTOM + VITALS_HEIGHT + BHOP_TAG_HEIGHT);
 };
 
 /// Style meter widget parts.
@@ -3058,7 +3132,7 @@ fn init_style_emblem(mut commands: Commands, images: Option<ResMut<Assets<Image>
 }
 
 fn style_caption_shadow() -> TextShadow {
-    TextShadow { offset: Vec2::splat(1.4), color: Color::BLACK.with_alpha(0.96) }
+    TextShadow { offset: Vec2::splat(1.4), color: Color::BLACK.with_alpha(crate::hud_fx::SHADOW_ALPHA) }
 }
 
 fn spawn_style_meter(commands: &mut Commands, root: Entity, art: Option<&StyleEmblemArt>) {
@@ -3102,23 +3176,6 @@ fn spawn_style_meter(commands: &mut Commands, root: Entity, art: Option<&StyleEm
 /// Whether the style meter shows: a live non-trial run with points banked.
 pub fn style_hud_visible(points: f32, mode: RunMode) -> bool {
     points > 0.0 && mode != RunMode::TimeTrial
-}
-
-/// Two-leg keyframe curve over a decaying envelope (`1` = just triggered):
-/// `from` snaps to `through` with a cubic ease-out, then settles on `rest`.
-fn slam_curve(envelope: f32, from: f32, through: f32, rest: f32) -> f32 {
-    if !envelope.is_finite() || envelope <= 0.0 {
-        return rest;
-    }
-    let u = 1.0 - envelope.min(1.0);
-    const HIT: f32 = 0.42;
-    if u < HIT {
-        let k = 1.0 - u / HIT;
-        from + (through - from) * (1.0 - k * k * k)
-    } else {
-        let k = (u - HIT) / (1.0 - HIT);
-        through + (rest - through) * (k * k * (3.0 - 2.0 * k))
-    }
 }
 
 /// Rank-up slam scale: lands huge and overshoots (`1.55x -> 0.93x -> 1.0x`).
@@ -3246,29 +3303,24 @@ fn update_style_hud(
 }
 
 /// Live split timer: `RunStats::time_elapsed` / `TimeTrialState::elapsed`
-/// only advance in `Playing`, so the plate freezes with the simulation.
-#[allow(clippy::type_complexity)]
+/// only advance in `Playing`, so the timer freezes with the simulation. A
+/// banked split pops the numerals and snaps the rule out from the gutter in
+/// the split's tone; the ghost line pops when the PB delta changes sign.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_split_plate(
     run: Res<RunStats>,
     trial: Res<TimeTrialState>,
     store: Option<Res<ProfileStore>>,
     ghost: Option<Res<crate::trials::TrialGhostStore>>,
-    mut plates: Query<(&mut Node, &mut BorderColor), (With<SplitPlate>, Without<SplitText>)>,
-    mut texts: Query<(&SplitText, &mut Text, &mut TextColor, &mut Node)>,
+    pulse: Res<HudPulse>,
+    mut plates: Query<&mut Node, (With<SplitPlate>, Without<SplitText>)>,
+    mut rules: Query<(&mut BackgroundColor, &mut BoxShadow, &mut UiTransform), (With<SplitRule>, Without<SplitText>)>,
+    mut texts: Query<(&SplitText, &mut Text, &mut TextColor, &mut Node, &mut UiTransform)>,
 ) {
     let settings = live_settings(store.as_deref());
     let show = split_timer_visible(&settings, run.mode);
-    for (mut node, mut border) in &mut plates {
+    for mut node in &mut plates {
         set_display(&mut node, show);
-        let rail = match run.mode {
-            RunMode::Standard => ACID_GREEN,
-            RunMode::Daily(_) => HAZARD_YELLOW,
-            RunMode::TimeTrial => ARC_CYAN,
-        };
-        let want = plate_border(rail, STEEL_BORDER.with_alpha(0.45));
-        if *border != want {
-            *border = want;
-        }
     }
     if !show {
         return;
@@ -3281,16 +3333,33 @@ fn update_split_plate(
             &default_profile
         }
     };
-    let v = split_plate_view(&run, &trial, profile);
+    let mut v = split_plate_view(&run, &trial, profile);
+    // The menus' muted ash is too dark to float without a plate.
+    if v.delta_color == ASH_DIM {
+        v.delta_color = HUD_SUB;
+    }
     let ghost_line = if run.mode == RunMode::TimeTrial { crate::trials::ghost_delta_text(ghost.as_deref().and_then(|g| g.delta)) } else { None };
     let (ghost_text, ghost_color) = ghost_line.unwrap_or_default();
-    for (field, mut t, mut c, mut node) in &mut texts {
-        let (want, color) = match field {
-            SplitText::Tag => (&v.tag, v.tag_color),
-            SplitText::Time => (&v.time, COLOR_TEXT),
-            SplitText::Progress => (&v.progress, COLOR_DIM),
-            SplitText::Delta => (&v.delta, v.delta_color),
-            SplitText::Ghost => (&ghost_text, ghost_color),
+    let (split, flip) = (pulse.split, pulse.ghost);
+    let right = Vec2::new(1.0, 0.0);
+    let rail = match run.mode {
+        RunMode::Standard => ACID_GREEN,
+        RunMode::Daily(_) => HAZARD_YELLOW,
+        RunMode::TimeTrial => ARC_CYAN,
+    };
+    for (mut bg, mut shadow, mut ui) in &mut rules {
+        let c = flash(rail.mix(&v.delta_color, split), split);
+        set_bg(&mut bg, c);
+        set_glow(&mut shadow, c);
+        set_ui(&mut ui, pop_transform(Vec2::new(slam_curve(split, 0.2, 1.12, 1.0), 1.0), right));
+    }
+    for (field, mut t, mut c, mut node, mut ui) in &mut texts {
+        let (want, color, scale) = match field {
+            SplitText::Tag => (&v.tag, v.tag_color, 1.0),
+            SplitText::Time => (&v.time, COLOR_TEXT.mix(&v.delta_color, split), pop_scale(split, 0.14)),
+            SplitText::Progress => (&v.progress, HUD_SUB, 1.0),
+            SplitText::Delta => (&v.delta, flash(v.delta_color, split), pop_scale(split, 0.2)),
+            SplitText::Ghost => (&ghost_text, flash(ghost_color, flip), pop_scale(flip, 0.22)),
         };
         if t.0 != *want {
             t.0.clone_from(want);
@@ -3298,6 +3367,7 @@ fn update_split_plate(
         if c.0 != color {
             c.0 = color;
         }
+        set_ui(&mut ui, pop_transform(Vec2::splat(scale), right));
         if *field == SplitText::Ghost {
             set_display(&mut node, !want.is_empty());
         }
@@ -3330,8 +3400,8 @@ fn update_hud(
     boss: Option<Res<BossHud>>,
     trial: Res<TimeTrialState>,
     players: Query<&Player>,
-    mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
-    (mut buf, mut tags, mode): (Local<String>, Local<LoadoutTags>, Option<Res<InputMode>>),
+    mut texts: Query<(&HudText, &mut Text, &mut TextColor, &mut UiTransform, Option<&mut TextShadow>)>,
+    (mut buf, mut tags, mode, pulse): (Local<String>, Local<LoadoutTags>, Option<Res<InputMode>>, Res<HudPulse>),
 ) {
     let mode = mode.map(|m| *m).unwrap_or_default();
     let t = time.elapsed_secs();
@@ -3344,11 +3414,14 @@ fn update_hud(
     let contract_color = loadout_contract_color(loadout.contract_count());
     let accent = weapon_accent(ws.current);
     let (cur, max) = ammo(p, ws.current);
-    for (slot, mut txt, mut col) in &mut texts {
+    let is_trial = run.mode == RunMode::TimeTrial;
+    for (slot, mut txt, mut col, mut ui, shadow) in &mut texts {
         // Every label is written into one reused buffer; `Text` / `TextColor`
         // are only touched (marked changed) when the value really differs.
         let b = &mut *buf;
         b.clear();
+        // Micro-animations ride on `UiTransform` (no relayout).
+        let mut pose = UiTransform::IDENTITY;
         let c: Color = match *slot {
             HudText::BossName => {
                 b.push_str(crate::enemies::EnemyKind::CarrierDaemon.name());
@@ -3371,51 +3444,44 @@ fn update_hud(
                     COLOR_TEXT
                 }
             }
-            HudText::Sector if run.mode == RunMode::TimeTrial => {
+            HudText::Sector if is_trial => {
                 b.push_str("COURSE // SIGNAL RUN");
                 HAZARD_YELLOW
-            }
-            HudText::Stats if run.mode == RunMode::TimeTrial => {
-                let _ = write!(b, "CP {}/{}  |  RESCUES {}", trial.next_gate.min(3), crate::trials::TRIAL_CHECKPOINTS, trial.rescues);
-                COLOR_DIM
             }
             HudText::Sector => {
                 let _ = write!(b, "SECTOR {:02} // {}", run.floor, FloorTheme::for_floor(run.floor).name());
                 HAZARD_YELLOW
             }
-            HudText::Stats => {
-                let _ = write!(b, "KILLS {}  |  JAMMERS {}", run.kills, run.jammers_destroyed);
-                COLOR_DIM
+            HudText::Stats(i) => {
+                let i = (i as usize).min(1);
+                let _ = match (is_trial, i) {
+                    (true, 0) => write!(b, "CP {}/{}", trial.next_gate.min(crate::trials::TRIAL_CHECKPOINTS), crate::trials::TRIAL_CHECKPOINTS),
+                    (true, _) => write!(b, "RESCUES {}", trial.rescues),
+                    (false, 0) => write!(b, "KILLS {}", run.kills),
+                    (false, _) => write!(b, "JAMMERS {}", run.jammers_destroyed),
+                };
+                // Only the counter that went up pops: white-hot, red for a pit rescue.
+                let e = pulse.stats[i];
+                pose = pop_transform(Vec2::splat(pop_scale(e, 0.2)), Vec2::new(-1.0, 0.0));
+                COLOR_TEXT.mix(if is_trial && i == 1 { &COLOR_SIGNAL_RED } else { &Color::WHITE }, e)
             }
             HudText::LoadoutChip => {
                 b.push_str(chip_tag);
-                if loadout.chip == crate::meta::StarterChip::StockUac { COLOR_DIM } else { COLOR_CYAN.with_alpha(0.9) }
+                if loadout.chip == crate::meta::StarterChip::StockUac { HUD_SUB } else { COLOR_CYAN }
             }
             HudText::LoadoutContracts => {
                 b.push_str(contract_tags.as_deref().unwrap_or_default());
                 contract_color
             }
-            HudText::Status if run.mode == RunMode::TimeTrial => {
-                b.push_str(if trial.next_gate >= crate::trials::TRIAL_CHECKPOINTS {
-                    "FINAL STRETCH - LAND ON THE TOWER PAD"
-                } else {
-                    "TIME TRIAL - 3 CHECKPOINTS, THEN THE TOWER"
-                });
-                ARC_CYAN
-            }
             HudText::Status => {
-                let (s, c) = match *ext {
-                    ExtractionState::Uploading { .. } => (uplink_status_text(&ext), COLOR_SIGNAL_RED),
-                    ExtractionState::Extracting { .. } | ExtractionState::Complete => ("ORBITAL EXTRACTION IN PROGRESS", COLOR_CYAN),
-                    _ if signal.near_tower => ("5-BAR SIGNAL - EXTRACTION TOWER IN RANGE", COLOR_SIGNAL_GREEN),
-                    _ if signal.in_dead_zone => ("NO SERVICE - DEAD ZONE", COLOR_SIGNAL_RED),
-                    _ => ("SEARCH FOR 5-BAR SIGNAL TOWER", COLOR_SIGNAL_AMBER),
-                };
-                b.push_str(s);
-                c
+                let (_, line, c) = status_line(&run, &trial, &ext, &signal);
+                b.push_str(line);
+                // A new line lands with a small pop and a white-hot flash.
+                pose = pop_transform(Vec2::splat(pop_scale(pulse.status, 0.12)), Vec2::ZERO);
+                flash(c, pulse.status)
             }
             HudText::Prompt => match *ext {
-                _ if run.mode == RunMode::TimeTrial => Color::NONE,
+                _ if is_trial => Color::NONE,
                 ExtractionState::Searching { hold } if signal.near_tower => {
                     let a = 0.6 + 0.4 * (t * 5.0).sin();
                     b.push_str(sos_prompt(mode));
@@ -3464,7 +3530,12 @@ fn update_hud(
             },
             HudText::HpValue => {
                 let _ = write!(b, "{}/{}", p.hp.ceil().max(0.0) as i32, p.max_hp as i32);
-                if hp_band(fraction(p.hp, p.max_hp)) == HpBand::Critical { hp_color(0.0, t) } else { COLOR_TEXT }
+                // A hit kicks the readout red; critical HP keeps it throbbing.
+                let hit = hp_hit_envelope(p.since_damage);
+                let critical = hp_band(fraction(p.hp, p.max_hp)) == HpBand::Critical;
+                let throb = if critical { 1.0 + 0.07 * danger_pulse(t) } else { 1.0 };
+                pose = pop_transform(Vec2::splat(pop_scale(hit, 0.2) * throb), Vec2::new(1.0, 1.0));
+                if critical { hp_color(0.0, t) } else { COLOR_TEXT.mix(&COLOR_SIGNAL_RED, hit) }
             }
             HudText::ArmorValue => {
                 let _ = write!(b, "{}/{}", p.armor.ceil().max(0.0) as i32, p.max_armor as i32);
@@ -3481,25 +3552,35 @@ fn update_hud(
             }
             HudText::WeaponName => {
                 b.push_str(weapon_title(ws.current));
-                accent
+                // A swap slots the new title in toward the gutter.
+                let e = pulse.swap;
+                if e > 0.0 {
+                    pose = UiTransform { translation: Val2::px(-14.0 * e * e, 0.0), ..UiTransform::IDENTITY };
+                }
+                flash(accent, e)
             }
             HudText::AmmoCount => {
                 let _ = write!(b, "{cur}");
-                if cur == 0 { COLOR_SIGNAL_RED } else { COLOR_TEXT }
+                // Every round kicks the count; a swap lands it harder; a dry
+                // magazine throbs ember red.
+                let kick = pop_scale(pulse.ammo, 0.1) * pop_scale(pulse.swap, 0.18);
+                let dry = if cur == 0 { danger_pulse(t) } else { 0.0 };
+                pose = pop_transform(Vec2::splat(kick * (1.0 + 0.06 * dry)), Vec2::ONE);
+                if cur == 0 { COLOR_EMBER.mix(&COLOR_SIGNAL_RED, dry) } else { COLOR_TEXT.mix(&accent, 0.7 * pulse.ammo) }
             }
             HudText::AmmoMax => {
                 let _ = write!(b, "/ {max}");
-                COLOR_DIM
+                HUD_SUB
             }
             HudText::Slot(i) => {
                 let w = Weapon::ALL[i as usize];
                 b.push_str(weapon_slot_name(w));
-                if ws.current == w { weapon_accent(w) } else { COLOR_DIM }
+                if ws.current == w { weapon_accent(w) } else { HUD_SUB }
             }
             HudText::SlotKey(i) => {
                 let cur = Weapon::ALL.iter().position(|w| *w == ws.current).unwrap_or(0);
                 b.push(slot_key_label(mode, i as usize, cur, Weapon::ALL.len()));
-                if ws.current == Weapon::ALL[i as usize] { INK_BLACK } else { COLOR_DIM }
+                if ws.current == Weapon::ALL[i as usize] { INK_BLACK } else { HUD_SUB }
             }
             HudText::SlotAmmo(i) => {
                 let w = Weapon::ALL[i as usize];
@@ -3510,7 +3591,7 @@ fn update_hud(
             HudText::Toast(i) => match feed.toasts.iter().rev().nth(i as usize) {
                 Some(toast) => {
                     b.push_str(&toast.text);
-                    toast.color.with_alpha((toast.timer / 0.6).min(1.0))
+                    toast.color.with_alpha(toast_pose(TOAST_SECONDS - toast.timer, toast.timer).alpha)
                 }
                 None => Color::NONE,
             },
@@ -3526,22 +3607,26 @@ fn update_hud(
         if col.0 != c {
             col.0 = c;
         }
+        set_ui(&mut ui, pose);
+        // The ink shadow fades with its text; ink lettering sits on a solid
+        // stamp (keycap, maxed VEL badge) and casts none.
+        if let Some(mut shadow) = shadow {
+            let want = if c == INK_BLACK { Color::NONE } else { shadow_color(c.alpha()) };
+            if shadow.color != want {
+                shadow.color = want;
+            }
+        }
     }
+}
+
+/// `1 -> 0` envelope of the HP readout kick after taking damage.
+pub fn hp_hit_envelope(since_damage: f32) -> f32 {
+    if since_damage.is_finite() { (1.0 - since_damage / 0.3).clamp(0.0, 1.0) } else { 0.0 }
 }
 
 /// HUD contract-tag accent: amber, red at 3+ contracts.
 fn loadout_contract_color(contracts: u32) -> Color {
     if contracts >= 3 { COLOR_SIGNAL_RED } else { COLOR_SIGNAL_AMBER }
-}
-
-/// Status plate frame: calm cyan rail while searching, a full alert-red frame
-/// while the SOS uplink (DEMON RUSH) is running.
-fn status_plate_border(ext: &ExtractionState) -> BorderColor {
-    if matches!(ext, ExtractionState::Uploading { .. }) {
-        plate_border(PUNK_RED, PUNK_RED.with_alpha(0.55))
-    } else {
-        plate_border(ARC_CYAN, STEEL_BORDER.with_alpha(0.45))
-    }
 }
 
 /// Change-guarded writes: `DerefMut` (and the UI relayout it triggers) only
@@ -3566,7 +3651,21 @@ fn set_bg(bg: &mut Mut<BackgroundColor>, c: Color) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Tint an accent rail and its glow together.
+fn set_rail(bg: &mut Mut<BackgroundColor>, shadow: &mut Option<Mut<BoxShadow>>, c: Color) {
+    set_bg(bg, c);
+    if let Some(s) = shadow {
+        set_glow(s, c);
+    }
+}
+
+fn set_ui(ui: &mut Mut<UiTransform>, want: UiTransform) {
+    if **ui != want {
+        **ui = want;
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_hud_boxes(
     signal: Res<SignalState>,
     time: Res<Time>,
@@ -3577,12 +3676,15 @@ fn update_hud_boxes(
     loadout: Res<RunLoadout>,
     gauge: Res<VelGauge>,
     boss: Option<Res<BossHud>>,
+    (run, trial, pulse): (Res<RunStats>, Res<TimeTrialState>, Res<HudPulse>),
     players: Query<&Player>,
-    mut boxes: Query<(&HudBox, &mut Node, &mut BackgroundColor, Option<&mut BorderColor>)>,
+    mut boxes: Query<(&HudBox, &mut Node, &mut BackgroundColor, &mut UiTransform, Option<&mut BorderColor>, Option<&mut BoxShadow>)>,
 ) {
     let t = time.elapsed_secs();
     let Ok(p) = players.single() else { return };
-    let accent = weapon_accent(ws.current);
+    let (status, _, status_color) = status_line(&run, &trial, &ext, &signal);
+    let uploading = matches!(*ext, ExtractionState::Uploading { .. });
+    let critical = hp_band(fraction(p.hp, p.max_hp)) == HpBand::Critical;
     let shotgun = ws.current == Weapon::Shotgun;
     let (cur, max) = ammo(p, ws.current);
     let lit = lit_pips(p.ammo_shells, p.max_shells, SHELL_PIPS);
@@ -3591,8 +3693,10 @@ fn update_hud_boxes(
     let stamina = stamina_fill(p.dash_cooldown, DASH_COOLDOWN * mods.dash_cooldown_mult);
     let vel_lit = speed_segments(gauge.speed);
     let tier_color = gauge.color();
-    let toast_look = |i: u8| feed.toasts.iter().rev().nth(i as usize).map(|toast| ((toast.timer / 0.6).min(1.0), toast.color));
-    for (b, mut node, mut bg, border) in &mut boxes {
+    let toast_look = |i: u8| -> Option<(ToastPose, Color)> {
+        feed.toasts.iter().rev().nth(i as usize).map(|toast| (toast_pose(TOAST_SECONDS - toast.timer, toast.timer), toast.color))
+    };
+    for (b, mut node, mut bg, mut ui, border, mut shadow) in &mut boxes {
         let set_border = |c: BorderColor| {
             if let Some(mut bc) = border
                 && *bc != c
@@ -3612,9 +3716,24 @@ fn update_hud_boxes(
                     set_bg(&mut bg, Color::NONE);
                 }
             }
-            HudBox::StatusPlate => set_border(status_plate_border(&ext)),
-            HudBox::RushRail => set_display(&mut node, matches!(*ext, ExtractionState::Uploading { .. })),
-            HudBox::UplinkPanel => set_display(&mut node, matches!(*ext, ExtractionState::Uploading { .. })),
+            HudBox::FloorRail => {
+                // The rail thickens and flashes with whichever counter just went up.
+                let e = pulse.stats[0].max(pulse.stats[1]);
+                set_rail(&mut bg, &mut shadow, flash(floor_rail_color(&run, status), e));
+                set_ui(&mut ui, pop_transform(Vec2::new(1.0 + 1.2 * e, 1.0), Vec2::new(-1.0, 0.0)));
+            }
+            HudBox::StatusRule => {
+                let look = status_rule_look(status, t, pulse.status);
+                set_rail(&mut bg, &mut shadow, flash(status_color.with_alpha(look.alpha), pulse.status));
+                set_ui(&mut ui, pop_transform(Vec2::new(look.scale_x, 1.0), Vec2::ZERO));
+            }
+            HudBox::RushRail => {
+                set_display(&mut node, uploading);
+                if uploading {
+                    set_rail(&mut bg, &mut shadow, PUNK_RED.with_alpha(status_rule_look(status, t, 0.0).alpha));
+                }
+            }
+            HudBox::UplinkPanel => set_display(&mut node, uploading),
             HudBox::UplinkFill => {
                 if let ExtractionState::Uploading { progress, jammed, in_ring, .. } = *ext {
                     set_width_pct(&mut node, progress * 100.0);
@@ -3629,18 +3748,10 @@ fn update_hud_boxes(
                 }
             }
             HudBox::AlertPanel => set_display(&mut node, feed.alert.is_some()),
-            HudBox::BossPlate => {
-                let h = boss.as_deref().cloned().unwrap_or_default();
-                set_display(&mut node, h.active);
-                if h.active {
-                    let c = boss_tag_color(&h);
-                    set_border(plate_border(c, STEEL_BORDER.with_alpha(0.45)));
-                }
-            }
+            HudBox::BossPlate => set_display(&mut node, boss.as_deref().is_some_and(|h| h.active)),
             HudBox::BossTrack => {
                 if let Some(h) = boss.as_deref().filter(|h| h.active) {
-                    let c = boss_tag_color(h);
-                    set_border(BorderColor { left: c, right: c.with_alpha(0.55), top: TRACK_BORDER, bottom: INK_BLACK });
+                    set_border(track_border(boss_tag_color(h)));
                 }
             }
             HudBox::BossFill => {
@@ -3654,20 +3765,31 @@ fn update_hud_boxes(
                 set_bg(&mut bg, loadout_contract_color(loadout.contract_count()));
             }
             HudBox::ToastChip(i) => {
+                // Snap in from the gutter, hold, drift back out.
                 let look = toast_look(i);
                 set_display(&mut node, look.is_some());
-                let (a, c) = look.unwrap_or((0.0, Color::NONE));
-                set_bg(&mut bg, PANEL_BG.with_alpha(0.8 * a));
-                set_border(plate_border(c.with_alpha(a), PANEL_EDGE.with_alpha(0.45 * a)));
+                if let Some((pose, _)) = look {
+                    set_ui(&mut ui, UiTransform { translation: Val2::px(pose.slide, 0.0), scale: Vec2::splat(pose.scale), rotation: Rot2::IDENTITY });
+                }
             }
-            HudBox::VelPlate => set_border(plate_border(tier_color, STEEL_BORDER.with_alpha(0.45))),
-            HudBox::VelTrack => set_border(BorderColor { left: tier_color, right: tier_color.with_alpha(0.55), top: TRACK_BORDER, bottom: INK_BLACK }),
+            HudBox::ToastPip(i) => {
+                let c = toast_look(i).map_or(Color::NONE, |(pose, c)| c.with_alpha(pose.alpha));
+                set_rail(&mut bg, &mut shadow, c);
+            }
+            HudBox::VelTrack => set_border(track_border(tier_color)),
             HudBox::VelValueBadge => set_bg(&mut bg, gauge.badge_color()),
             HudBox::VelChainTag => {
                 set_display(&mut node, bhop_chain_label(p.bhop_chain).is_some());
                 set_bg(&mut bg, tier_color);
             }
             HudBox::VelSeg(i) => set_bg(&mut bg, segment_color(i, vel_lit)),
+            HudBox::HpTrack => {
+                // Critical HP: the gauge throbs in an alert-red halo.
+                if let Some(s) = &mut shadow {
+                    set_glow(s, if critical { PUNK_RED.with_alpha(0.3 + 0.7 * danger_pulse(t)) } else { Color::NONE });
+                }
+                set_border(track_border(hp_color(fraction(p.hp, p.max_hp), t)));
+            }
             HudBox::HpFill => {
                 let f = fraction(p.hp, p.max_hp);
                 set_width_pct(&mut node, f * 100.0);
@@ -3682,25 +3804,23 @@ fn update_hud_boxes(
             HudBox::ShellPip(i) => {
                 let on = i < lit;
                 set_bg(&mut bg, if on { COLOR_SHELL } else { COLOR_PIP_OFF });
-                set_border(BorderColor::all(if on { COLOR_BRASS } else { COLOR_PIP_OFF_BORDER }));
+                set_border(shell_pip_border(on));
             }
             HudBox::PlasmaTrack => set_display(&mut node, ws.current == Weapon::Plasma),
             HudBox::RocketRow => set_display(&mut node, ws.current == Weapon::Rocket),
             HudBox::RocketPip(i) => {
                 let on = i < rocket_lit;
                 set_bg(&mut bg, if on { COLOR_WARHEAD } else { COLOR_PIP_OFF });
-                set_border(BorderColor::all(if on { COLOR_WARHEAD_TIP } else { COLOR_PIP_OFF_BORDER }));
+                set_border(rocket_pip_border(on));
             }
             HudBox::PlasmaFill => {
                 set_width_pct(&mut node, fraction(cur as f32, max as f32) * 100.0);
                 set_bg(&mut bg, COLOR_CYAN.with_alpha(0.8 + 0.2 * (t * 4.0).sin()));
             }
-            HudBox::WeaponCard => set_border(plate_border(accent, PANEL_EDGE)),
             HudBox::SlotChip(i) => {
-                let w = Weapon::ALL[i as usize];
-                let active = ws.current == w;
-                set_border(if active { plate_border(weapon_accent(w), weapon_accent(w).with_alpha(0.5)) } else { plate_border(PANEL_EDGE, PANEL_EDGE) });
-                set_bg(&mut bg, if active { weapon_accent(w).with_alpha(0.18) } else { PANEL_BG });
+                // The freshly equipped tab pops up off the bottom edge.
+                let e = if ws.current == Weapon::ALL[i as usize] { pulse.swap } else { 0.0 };
+                set_ui(&mut ui, pop_transform(Vec2::splat(pop_scale(e, 0.14)), Vec2::new(0.0, 1.0)));
             }
             HudBox::SlotKey(i) => {
                 let w = Weapon::ALL[i as usize];
@@ -3710,7 +3830,7 @@ fn update_hud_boxes(
                 let w = Weapon::ALL[i as usize];
                 let (n, m) = ammo(p, w);
                 set_width_pct(&mut node, fraction(n as f32, m as f32) * 100.0);
-                set_bg(&mut bg, weapon_accent(w).with_alpha(if ws.current == w { 1.0 } else { 0.4 }));
+                set_bg(&mut bg, weapon_accent(w).with_alpha(if ws.current == w { 1.0 } else { 0.5 }));
             }
             HudBox::OverclockPill => set_display(&mut node, overclock_active(signal.bars, mods.overclock_bonus)),
             HudBox::DopplerPill => set_display(&mut node, doppler_active(speed, &mods)),
@@ -4247,19 +4367,27 @@ mod tests {
         // The hero switch is set larger than the secondary switches of its row.
         assert_eq!(button_font(ButtonStyle::HazardAmber, 20.0), 20.0);
         assert_eq!(button_font(ButtonStyle::HeroAcid, 20.0), 30.0);
-        // DEMON RUSH: the status plate's rail and edges go alert red.
-        let calm = status_plate_border(&ExtractionState::Searching { hold: 0.0 });
-        let rush = status_plate_border(&ExtractionState::Uploading {
-            progress: 0.4,
-            duration: 28.0,
-            in_ring: true,
-            jammed: false,
-            wave_timer: 0.5,
-            baron_spawned: false,
-            boss_hold: false,
-        });
-        assert_eq!((calm.left, rush.left), (ARC_CYAN, PUNK_RED));
-        assert_ne!(calm.top, rush.top);
+        // DEMON RUSH: the status line, its underline and the floor rail go alert red.
+        let (run, trial) = (RunStats::default(), TimeTrialState::default());
+        let signal = SignalState { in_dead_zone: false, near_tower: false, ..default() };
+        let calm = status_line(&run, &trial, &ExtractionState::Searching { hold: 0.0 }, &signal);
+        let uploading = ExtractionState::Uploading { progress: 0.4, duration: 28.0, in_ring: true, jammed: false, wave_timer: 0.5, baron_spawned: false, boss_hold: false };
+        let rush = status_line(&run, &trial, &uploading, &signal);
+        assert_eq!(calm, (StatusKind::Searching, "SEARCH FOR 5-BAR SIGNAL TOWER", COLOR_SIGNAL_AMBER));
+        assert_eq!(rush, (StatusKind::Rush, "DEMON RUSH - HOLD THE SIGNAL", COLOR_SIGNAL_RED));
+        assert_eq!((floor_rail_color(&run, calm.0), floor_rail_color(&run, rush.0)), (HAZARD_YELLOW, PUNK_RED));
+        // Signal states: lock, dead zone; the Time Trial keeps its own cyan lines.
+        let near = SignalState { near_tower: true, in_dead_zone: true, ..signal.clone() };
+        assert_eq!(status_line(&run, &trial, &ExtractionState::Searching { hold: 0.0 }, &near).0, StatusKind::Locked);
+        let dead = SignalState { in_dead_zone: true, ..signal.clone() };
+        let dz = status_line(&run, &trial, &ExtractionState::Searching { hold: 0.0 }, &dead);
+        assert_eq!((dz.0, dz.1, floor_rail_color(&run, dz.0)), (StatusKind::DeadZone, "NO SERVICE - DEAD ZONE", PUNK_RED));
+        let tt = RunStats { mode: RunMode::TimeTrial, ..default() };
+        let line = status_line(&tt, &trial, &uploading, &dead);
+        assert_eq!((line.0, line.2, floor_rail_color(&tt, line.0)), (StatusKind::Trial, ARC_CYAN, ARC_CYAN));
+        let last = TimeTrialState { next_gate: crate::trials::TRIAL_CHECKPOINTS, ..default() };
+        assert_eq!(status_line(&tt, &last, &uploading, &dead).0, StatusKind::TrialFinal);
+        assert_eq!(floor_rail_color(&RunStats { endless: true, ..default() }, StatusKind::Searching), COLOR_ENDLESS);
         // Every control row of the field manual has a category and keys.
         assert!(CONTROLS.iter().all(|(cat, binds)| !cat.is_empty() && binds.iter().all(|(keys, what)| !keys.is_empty() && what.is_ascii())));
     }
@@ -4284,7 +4412,7 @@ mod tests {
             assert!(need <= inner, "{} slot row needs {need} px of {inner}", weapon_slot_name(w));
         }
         // The longest weapon title clears both buff pills lit at once.
-        let card_inner = DECK_WIDTH - CARD_BORDER.0 - CARD_BORDER.1 - 2.0 * CARD_PAD_X;
+        let card_inner = DECK_WIDTH;
         let pills: f32 = [OVERCLOCK_PILL, DOPPLER_PILL].iter().map(|l| mono_width(l.len(), PILL_FONT) + 2.0 * PILL_PAD_X).sum::<f32>() + PILL_GAP;
         for w in Weapon::ALL {
             let title = mono_width(weapon_title(w).len(), WEAPON_TITLE_FONT);
@@ -4294,7 +4422,10 @@ mod tests {
         assert_eq!(slot_ammo_color(0, true), COLOR_SIGNAL_RED);
         assert_eq!(slot_ammo_color(0, false), COLOR_SIGNAL_RED);
         assert_eq!(slot_ammo_color(12, true), COLOR_TEXT);
-        assert_eq!(slot_ammo_color(12, false), COLOR_DIM);
+        assert_eq!(slot_ammo_color(12, false), HUD_SUB);
+        // Pips and the plasma bar share one right-aligned row inside the deck.
+        assert_eq!(PIP_ROW_WIDTH, 207.0);
+        assert_eq!(ROCKET_PIPS, SHELL_PIPS);
     }
 
     #[test]
@@ -4312,15 +4443,16 @@ mod tests {
             assert!(w <= STYLE_HUD_WIDTH, "{r:?}: {w}");
         }
         // Right column at the 720p reference (960x540 and 1280x720 scale to it,
-        // 1024x640 and 1920x1080 are taller): toasts end ~200 px, the split
-        // plate (214 px) ends by ~306 px, the widget must end before the weapon
-        // deck (bottom 14 px, ~172 px tall) starts at ~534 px.
-        let split_bottom = SPLIT_PLATE_TOP + 92.0;
-        let deck_top = UI_REFERENCE.1 - 14.0 - 172.0;
+        // 1024x640 and 1920x1080 are taller): the split timer sits in the
+        // corner and a full callout stack under it ends by ~215 px; the widget
+        // must end before the weapon deck (bottom 14 px, ~104 px tall) starts
+        // at ~602 px.
+        let split_bottom = RIGHT_COLUMN_BOTTOM;
+        let deck_top = UI_REFERENCE.1 - HUD_BOTTOM - DECK_HEIGHT;
         assert!(STYLE_HUD_TOP + STYLE_HUD_HEIGHT <= deck_top - 8.0, "{} vs {deck_top}", STYLE_HUD_TOP + STYLE_HUD_HEIGHT);
         for (w, h) in [(960.0, 540.0), (1024.0, 640.0), (1280.0, 720.0), (1920.0, 1080.0)] {
             let s = ui_scale_for(w, h);
-            assert!((STYLE_HUD_TOP + STYLE_HUD_HEIGHT) * s <= h - (14.0 + 172.0) * s, "{w}x{h}");
+            assert!((STYLE_HUD_TOP + STYLE_HUD_HEIGHT) * s <= h - (HUD_BOTTOM + DECK_HEIGHT) * s, "{w}x{h}");
         }
         // Even the biggest frame of a rank-up slam keeps clear of the split
         // plate and never crosses the right gutter.
@@ -4336,6 +4468,128 @@ mod tests {
                 assert!(STYLE_HUD_TOP + half + p.offset.y + half * p.scale <= deck_top, "{rank:?} pop {pop}");
             }
         }
+    }
+
+    #[test]
+    fn frameless_hud_has_no_plates_and_every_label_casts_a_shadow() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(RunStats::default());
+        world.run_system_once(spawn_hud).unwrap();
+
+        // No slab anywhere: the only dark backgrounds left are gauge wells,
+        // ammo cells, keycaps and tick marks, all of them thin.
+        let px = |v: Val| if let Val::Px(p) = v { Some(p) } else { None };
+        let mut nodes = world.query::<(&Node, &BackgroundColor)>();
+        let mut wells = 0;
+        for (node, bg) in nodes.iter(&world) {
+            let c = bg.0.to_srgba();
+            if c.alpha <= 0.3 || c.red.max(c.green).max(c.blue) >= 0.25 {
+                continue;
+            }
+            // Fills and cuts span their own (thin) track.
+            if node.height == Val::Percent(100.0) {
+                continue;
+            }
+            wells += 1;
+            let thin = px(node.height).is_some_and(|h| h <= 16.0) || px(node.width).is_some_and(|w| w <= 20.0);
+            assert!(thin, "dark slab: {:?} x {:?}", node.width, node.height);
+        }
+        assert!(wells >= 8, "gauge tracks keep their dark wells: {wells}");
+
+        // Cluster roots and rows carry no background, border or padding.
+        let bare = |node: &Node, bg: &BackgroundColor, what: &str| {
+            assert_eq!(bg.0.alpha(), 0.0, "{what}: background");
+            assert_eq!((node.border, node.padding), (UiRect::default(), UiRect::default()), "{what}: frame");
+        };
+        let mut split = world.query_filtered::<(&Node, &BackgroundColor), With<SplitPlate>>();
+        let (node, bg) = split.single(&world).unwrap();
+        bare(node, bg, "split timer");
+        assert_eq!((node.display, node.align_items), (Display::None, AlignItems::FlexEnd));
+        let mut boxes = world.query::<(&HudBox, &Node, &BackgroundColor, Option<&BoxShadow>)>();
+        let (mut rails, mut toasts) = (0, 0);
+        for (b, node, bg, shadow) in boxes.iter(&world) {
+            match b {
+                HudBox::ToastChip(_) | HudBox::BossPlate | HudBox::AlertPanel | HudBox::UplinkPanel => {
+                    toasts += usize::from(matches!(b, HudBox::ToastChip(_)));
+                    bare(node, bg, "row");
+                }
+                HudBox::SlotChip(_) => {
+                    assert_eq!(bg.0.alpha(), 0.0, "slot tab");
+                    assert_eq!(node.border, UiRect::default(), "slot tab");
+                }
+                // Every accent rail glows: a halo over an ink edge.
+                HudBox::FloorRail | HudBox::StatusRule | HudBox::RushRail | HudBox::ToastPip(_) | HudBox::HpTrack => {
+                    rails += 1;
+                    assert_eq!(shadow.map(|s| s.0.len()), Some(2), "{b:?}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((rails, toasts), (5 + TOAST_SLOTS as usize, TOAST_SLOTS as usize));
+        let mut rule = world.query_filtered::<(&Node, &BoxShadow), With<SplitRule>>();
+        assert_eq!(rule.single(&world).unwrap().0.height, Val::Px(2.0));
+
+        // Every floating label sits on a hard ink shadow and never wraps; only
+        // ink lettering on a solid stamp and the reticle hitmarker go without.
+        let mut labels = world.query::<(&HudText, Option<&TextShadow>, &TextLayout)>();
+        let mut seen = 0;
+        for (label, shadow, layout) in labels.iter(&world) {
+            seen += 1;
+            match label {
+                HudText::Hitmarker | HudText::VelChain => assert!(shadow.is_none(), "{label:?}"),
+                _ => {
+                    let s = shadow.unwrap_or_else(|| panic!("{label:?} has no shadow"));
+                    assert!(s.color.alpha() > 0.9 && s.offset.x >= 1.4 && s.offset.x <= 2.6, "{label:?}");
+                    assert_eq!(layout.linebreak, bevy::text::LineBreak::NoWrap, "{label:?}");
+                }
+            }
+        }
+        assert!(seen >= 30, "{seen} HUD labels");
+        let mut split_text = world.query::<(&SplitText, &TextShadow)>();
+        assert_eq!(split_text.iter(&world).count(), 5);
+        // Both counters of the floor strip exist, and they pop independently.
+        let mut stats: Vec<u8> = labels.iter(&world).filter_map(|(l, ..)| if let HudText::Stats(i) = l { Some(*i) } else { None }).collect();
+        stats.sort_unstable();
+        assert_eq!(stats, [0, 1]);
+    }
+
+    #[test]
+    fn frameless_layout_budget_holds_at_every_resolution() {
+        // Longest lines of each top-row cluster (monospace).
+        let status = [
+            "TIME TRIAL - 3 CHECKPOINTS, THEN THE TOWER",
+            "5-BAR SIGNAL - EXTRACTION TOWER IN RANGE",
+            "FINAL STRETCH - LAND ON THE TOWER PAD",
+            BOSS_HOLD_STATUS,
+        ];
+        let status_half = status.iter().map(|s| mono_width(s.len(), 20.0)).fold(0.0, f32::max) / 2.0 + 10.0;
+        let strip_right = HUD_GUTTER + RAIL_WIDTH + 9.0 + (1..=5).map(|f| mono_width(sector_label(f).len(), 11.0)).fold(0.0, f32::max);
+        for line in ["TIME TRIAL  [R] RESET", "FLOOR 5/5  PB 00:00.0", "PB GHOST  +12.34s", "DAILY 2026-11-26"] {
+            let font = if line.starts_with("FLOOR") { 11.0 } else if line.starts_with("PB") { 13.0 } else { 10.0 };
+            assert!(mono_width(line.len(), font) <= SPLIT_PLATE_WIDTH, "{line}");
+        }
+        assert!(mono_width(7, SPLIT_TIME_FONT) <= SPLIT_PLATE_WIDTH);
+        for (w, h) in [(960.0, 540.0), (1024.0, 640.0), (1280.0, 720.0), (1920.0, 1080.0)] {
+            // Logical canvas: every size keeps at least the 1280 x 720 reference.
+            let s = ui_scale_for(w, h);
+            let (lw, lh) = (w / s, h / s);
+            assert!(lw >= UI_REFERENCE.0 - 0.5 && lh >= UI_REFERENCE.1 - 0.5, "{w}x{h}");
+            // Top row: floor strip | status line | split timer never touch.
+            assert!(strip_right + 24.0 <= lw / 2.0 - status_half, "{w}x{h}: strip vs status");
+            assert!(lw / 2.0 + status_half + 24.0 <= lw - HUD_GUTTER - SPLIT_PLATE_WIDTH, "{w}x{h}: status vs timer");
+            // Right edge, top to bottom: timer + callouts (checked at compile
+            // time against the emblem), emblem, weapon deck.
+            assert!(STYLE_HUD_TOP + STYLE_HUD_HEIGHT + 24.0 <= lh - HUD_BOTTOM - DECK_HEIGHT, "{w}x{h}");
+            // Bottom row: the centered vitals never reach the deck.
+            assert!(lw / 2.0 + VITALS_WIDTH / 2.0 + 24.0 <= lw - HUD_GUTTER - DECK_WIDTH, "{w}x{h}: vitals vs deck");
+            // The prompt floats above the vitals (even with the BHOP stamp up,
+            // by construction of `PROMPT_BOTTOM`) and stays well below the reticle.
+            assert!(lh - PROMPT_BOTTOM - 28.0 >= lh / 2.0 + CROSSHAIR_BOX, "{w}x{h}: prompt vs reticle");
+        }
+        // HP readout kick: full on the hit, gone 0.3 s later.
+        assert_eq!((hp_hit_envelope(0.0), hp_hit_envelope(0.3), hp_hit_envelope(99.0), hp_hit_envelope(f32::NAN)), (1.0, 0.0, 0.0, 0.0));
+        assert!((hp_hit_envelope(0.15) - 0.5).abs() < 1e-5);
     }
 
     #[test]
