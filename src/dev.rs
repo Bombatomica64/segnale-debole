@@ -531,7 +531,7 @@ fn meta_shot(commands: &mut Commands, dir: &str, name: &str) {
     commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
 }
 
-/// Main menu -> Loadout -> Contracts & Feats -> Settings -> live Floor 1 -> Pause ->
+/// Main menu -> Controls overlay -> Loadout -> Contracts & Feats -> Settings -> live Floor 1 -> Pause ->
 /// Victory -> a separate Floor 2 Game Over.
 #[allow(clippy::too_many_arguments)]
 fn meta_shots_tour(
@@ -544,6 +544,7 @@ fn meta_shots_tour(
     mut players: Query<&mut Player>,
     mut next: ResMut<NextState<AppState>>,
     mut exit: MessageWriter<AppExit>,
+    mut controls: ResMut<crate::hud::ControlsOverlayOpen>,
 ) {
     cfg.timer += time.delta_secs();
     for mut p in &mut players {
@@ -558,49 +559,58 @@ fn meta_shots_tour(
             meta_shot(&mut commands, &dir, "01_main_menu.png");
             true
         }
-        (1, AppState::MainMenu) if t > 0.7 => {
+        (1, AppState::MainMenu) if t > 0.5 => {
+            // Milestone 35: the FIELD MANUAL // CONTROLS overlay (H).
+            controls.0 = true;
+            true
+        }
+        (2, AppState::MainMenu) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "01b_controls_overlay.png");
+            true
+        }
+        (3, AppState::MainMenu) if t > 0.7 => {
             next.set(AppState::Loadout);
             true
         }
-        (2, AppState::Loadout) if t > 1.5 => {
+        (4, AppState::Loadout) if t > 1.5 => {
             meta_shot(&mut commands, &dir, "02_loadout.png");
             true
         }
-        (3, AppState::Loadout) if t > 0.7 => {
+        (5, AppState::Loadout) if t > 0.7 => {
             next.set(AppState::ContractsFeats);
             true
         }
-        (4, AppState::ContractsFeats) if t > 1.5 => {
+        (6, AppState::ContractsFeats) if t > 1.5 => {
             meta_shot(&mut commands, &dir, "03_contracts_feats.png");
             true
         }
-        (5, AppState::ContractsFeats) if t > 0.7 => {
+        (7, AppState::ContractsFeats) if t > 0.7 => {
             // Settings opened from the menus (`SettingsReturn` stays MainMenu).
             next.set(AppState::Settings);
             true
         }
-        (6, AppState::Settings) if t > 1.5 => {
+        (8, AppState::Settings) if t > 1.5 => {
             meta_shot(&mut commands, &dir, "03b_settings.png");
             true
         }
-        (7, AppState::Settings) if t > 0.7 => {
+        (9, AppState::Settings) if t > 0.7 => {
             commands.insert_resource(DevFreezeAi);
             start_run_with_loadout(&mut run, &mut mods, &mut loadout, store.profile.build_loadout(), &mut next, 1234);
             true
         }
-        (8, AppState::Playing) if t > 4.0 => {
+        (10, AppState::Playing) if t > 4.0 => {
             meta_shot(&mut commands, &dir, "04_in_hand_gold.png");
             true
         }
-        (9, AppState::Playing) if t > 0.8 => {
+        (11, AppState::Playing) if t > 0.8 => {
             next.set(AppState::Paused);
             true
         }
-        (10, AppState::Paused) if t > 1.2 => {
+        (12, AppState::Paused) if t > 1.2 => {
             meta_shot(&mut commands, &dir, "04b_pause_menu.png");
             true
         }
-        (11, AppState::Paused) if t > 0.7 => {
+        (13, AppState::Paused) if t > 0.7 => {
             // Stage a fast earned contract victory (non-demo) so the Victory
             // screenshot showcases real newly-unlocked feats and rewards.
             loadout.jam_demo = false;
@@ -616,11 +626,11 @@ fn meta_shots_tour(
             complete_floor(&mut run, &mut next);
             true
         }
-        (12, AppState::Victory) if t > 2.0 => {
+        (14, AppState::Victory) if t > 2.0 => {
             meta_shot(&mut commands, &dir, "05_victory_unlocks.png");
             true
         }
-        (13, AppState::Victory) if t > 1.0 => {
+        (15, AppState::Victory) if t > 1.0 => {
             // A separate, genuinely lost run (not the victory replayed): died on
             // Floor 2 after one uplink, with a single app installed. It is
             // recorded like any real death, so NO SERVICE shows its own
@@ -641,11 +651,11 @@ fn meta_shots_tour(
             next.set(AppState::GameOver);
             true
         }
-        (14, AppState::GameOver) if t > 1.5 => {
+        (16, AppState::GameOver) if t > 1.5 => {
             meta_shot(&mut commands, &dir, "06_game_over.png");
             true
         }
-        (15, AppState::GameOver) if t > 1.5 => {
+        (17, AppState::GameOver) if t > 1.5 => {
             exit.write(AppExit::Success);
             true
         }

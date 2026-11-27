@@ -10,6 +10,7 @@ use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::mouse::AccumulatedMouseScroll;
+use bevy::math::Affine2;
 use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
 use bevy::render::view::Msaa;
@@ -22,9 +23,10 @@ use crate::bot_input::BotControl;
 use crate::decals::{DecalKind, DecalQueue, DecalRequest};
 use crate::boss::{damage_pylon, pylon_ray_hit, BossPylon, PYLON_SPHERES};
 use crate::enemies::{damage_enemy, ray_sphere, Enemy, EnemyKind, PingMarked};
+use crate::assets_gen::ProjectileTextures;
 use crate::fx::{
-    additive_glow, overlay_layer, spawn_burst, spawn_ejected_shell, spawn_flash_light, spawn_mortar_casing, spawn_particles, spawn_plasma_vent,
-    spawn_shockwave, spawn_tracer, BurstColor, FxAssets, HudFeed, OVERLAY_LAYER,
+    additive_glow, textured_additive, textured_glow, overlay_layer, spawn_burst, spawn_ejected_shell, spawn_flash_light, spawn_mortar_casing, spawn_particles, spawn_plasma_vent,
+    spawn_shockwave, spawn_tracer, BurstColor, FxAssets, HudFeed, OVERLAY_LAYER, SHEATH_ALPHA,
 };
 use crate::hud::signal_color;
 use crate::level::{CullableLight, DemonJammer, ExplosiveBarrel, JammerCore, LevelEntity, LevelGrid};
@@ -283,6 +285,17 @@ pub fn barrel_ray_hit(base: Vec3, origin: Vec3, dir: Vec3) -> Option<f32> {
     best.is_finite().then_some(best)
 }
 
+/// World center of a barrel root (upright or tumbling after a Phone Punch launch).
+pub fn barrel_center(tf: &Transform) -> Vec3 {
+    tf.translation + tf.rotation * (Vec3::Y * BARREL_CENTER_Y)
+}
+
+/// Ray hit against a barrel at its live root transform (upright or tumbling).
+pub fn barrel_ray_hit_tf(tf: &Transform, origin: Vec3, dir: Vec3) -> Option<f32> {
+    let inv = tf.rotation.inverse();
+    barrel_ray_hit(Vec3::ZERO, inv * (origin - tf.translation), inv * dir)
+}
+
 /// Damage a barrel. Lethal damage arms its fuse: instant for weapons, a
 /// short staggered [`BARREL_CHAIN_FUSE`] for another barrel's blast. Returns
 /// true if this armed it.
@@ -445,6 +458,84 @@ pub enum ProjectileKind {
     #[default]
     Plasma,
     Rocket,
+    /// Milestone 33: an enemy projectile parried back by a Phone Punch:
+    /// blazing gold-white bolt that detonates on impact.
+    Parried,
+}
+
+/// Parried projectile: direct-hit damage, splash damage and splash radius.
+pub const PARRY_DIRECT_DAMAGE: f32 = 115.0;
+pub const PARRY_SPLASH_DAMAGE: f32 = 95.0;
+pub const PARRY_SPLASH_RADIUS: f32 = 4.5;
+/// Reflected speed: `max(old * PARRY_SPEED_MULT, PARRY_MIN_SPEED)` m/s.
+pub const PARRY_SPEED_MULT: f32 = 2.2;
+pub const PARRY_MIN_SPEED: f32 = 52.0;
+pub const PARRY_LIFE: f32 = 3.0;
+/// Seconds between two spark-trail puffs of a parried bolt.
+pub const PARRY_TRAIL_SECS: f32 = 0.025;
+
+/// Speed of a parried projectile that arrived at `old_speed` m/s.
+pub fn parried_speed(old_speed: f32) -> f32 {
+    let s = if old_speed.is_finite() { old_speed.max(0.0) } else { 0.0 };
+    (s * PARRY_SPEED_MULT).max(PARRY_MIN_SPEED)
+}
+
+/// Explosion parameters of an explosive player projectile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlastSpec {
+    pub radius: f32,
+    pub direct: f32,
+    pub splash: f32,
+    pub source: StyleSource,
+    /// Kill cause of a lethal direct hit.
+    pub direct_cause: crate::fatality::KillCause,
+    /// Quake blast jump + self-damage on the player.
+    pub player_jump: bool,
+    /// `(ring, core)` shockwave glows.
+    pub glows: [(Color, f32); 2],
+    pub light: Color,
+}
+
+impl BlastSpec {
+    pub fn rocket(mods: &PlayerModifiers) -> Self {
+        BlastSpec {
+            radius: rocket_splash_radius(mods),
+            direct: ROCKET_DIRECT_DAMAGE,
+            splash: ROCKET_SPLASH_DAMAGE,
+            source: StyleSource::Rocket,
+            direct_cause: crate::fatality::KillCause::MortarDirect,
+            player_jump: true,
+            glows: [ROCKET_BLAST_GLOW, ROCKET_CORE_GLOW],
+            light: Color::srgb(1.0, 0.5, 0.15),
+        }
+    }
+
+    /// Parried bolts never blast-jump or hurt the player who returned them.
+    pub fn parried() -> Self {
+        BlastSpec {
+            radius: PARRY_SPLASH_RADIUS,
+            direct: PARRY_DIRECT_DAMAGE,
+            splash: PARRY_SPLASH_DAMAGE,
+            source: StyleSource::Parry,
+            direct_cause: crate::fatality::KillCause::ParryDirect,
+            player_jump: false,
+            glows: [PARRY_BLAST_GLOW, PARRY_CORE_GLOW],
+            light: Color::srgb(1.0, 0.86, 0.45),
+        }
+    }
+
+    pub fn for_kind(kind: ProjectileKind, mods: &PlayerModifiers) -> Option<Self> {
+        match kind {
+            ProjectileKind::Plasma => None,
+            ProjectileKind::Rocket => Some(BlastSpec::rocket(mods)),
+            ProjectileKind::Parried => Some(BlastSpec::parried()),
+        }
+    }
+
+    /// Splash damage on a non-direct target `dist` away.
+    pub fn splash_damage(&self, dist: f32, damage_mult: f32) -> f32 {
+        self.splash * splash_falloff(dist, self.radius) * damage_mult
+    }
 }
 
 #[derive(Component, Debug, Clone)]
@@ -466,6 +557,9 @@ impl PlayerProjectile {
     }
     pub fn rocket(vel: Vec3, damage_mult: f32) -> Self {
         PlayerProjectile { kind: ProjectileKind::Rocket, vel, damage: ROCKET_DIRECT_DAMAGE, life: ROCKET_LIFE, damage_mult, trail: 0.0 }
+    }
+    pub fn parried(vel: Vec3) -> Self {
+        PlayerProjectile { kind: ProjectileKind::Parried, vel, damage: PARRY_DIRECT_DAMAGE, life: PARRY_LIFE, damage_mult: 1.0, trail: 0.0 }
     }
 }
 
@@ -2013,8 +2107,9 @@ fn animate_viewmodels(
     }
     let cast = apps.cast_anim.clamp(0.0, 1.0);
     if let Ok(mut tf) = set.p1().single_mut() {
-        tf.translation = PHONE_REST + bob * 0.55 + Vec3::new(0.045 * cast, 0.055 * cast + feel.dip * 0.7, 0.03 * cast);
-        tf.rotation = Quat::from_rotation_y(0.24 + 0.10 * cast) * Quat::from_rotation_x(0.11 + 0.18 * cast) * Quat::from_rotation_z(-0.04);
+        let (strike_off, strike_rot) = phone_strike_pose(apps.punch_anim, apps.punch_hit, apps.flash_anim);
+        tf.translation = PHONE_REST + bob * 0.55 + Vec3::new(0.045 * cast, 0.055 * cast + feel.dip * 0.7, 0.03 * cast) + strike_off;
+        tf.rotation = Quat::from_rotation_y(0.24 + 0.10 * cast) * Quat::from_rotation_x(0.11 + 0.18 * cast) * Quat::from_rotation_z(-0.04) * strike_rot;
     }
     if let Ok(mut tf) = set.p2().single_mut() {
         let k = (ws.pump * std::f32::consts::PI).sin().max(0.0);
@@ -2069,6 +2164,7 @@ fn animate_viewmodels(
     // Animate phone status LED + antenna beacon + plasma coils.
     let Some(pm) = pm else { return };
     let (base, emissive) = phone_led_glow(signal.bars, signal.in_dead_zone, apps.ping_active_timer > 0.0 || apps.overload_flash_timer > 0.0, t);
+    let (base, emissive) = phone_led_strobe(base, emissive, apps.flash_anim, apps.parry_flash);
     if let Some(mut m) = materials.get_mut(&pm.led) {
         m.base_color = base;
         m.emissive = emissive;
@@ -2083,6 +2179,58 @@ fn animate_viewmodels(
     if let Some(mut m) = materials.get_mut(&pm.warhead) {
         let k = if shown == Weapon::Rocket { 0.45 + 0.55 * ws.cycle_progress() + 1.0 * (ws.recoil / 1.4).clamp(0.0, 1.0) } else { 1.0 };
         m.emissive = ROCKET_GLOW * k;
+    }
+}
+
+/// Phone Punch jab envelope over the normalised animation progress `u`
+/// (0 = punch pressed, 1 = settled): snaps out in the first ~25%, then eases home.
+pub fn punch_thrust(u: f32) -> f32 {
+    let u = if u.is_finite() { u.clamp(0.0, 1.0) } else { 1.0 };
+    const OUT: f32 = 0.25;
+    if u < OUT {
+        let k = u / OUT;
+        1.0 - (1.0 - k) * (1.0 - k) * (1.0 - k)
+    } else {
+        let k = (u - OUT) / (1.0 - OUT);
+        1.0 - k * k * (3.0 - 2.0 * k)
+    }
+}
+
+/// Phone viewmodel offset + extra rotation for the Phone Punch jab
+/// (`punch_anim` 1 -> 0) and the Camera Flash lift (`flash_anim` 1 -> 0).
+/// The jab thrusts the phone forward toward center-left with the bezel edge
+/// twisted forward like knuckles; the flash lifts it upright like a photo.
+pub fn phone_strike_pose(punch_anim: f32, punch_hit: bool, flash_anim: f32) -> (Vec3, Quat) {
+    let mut off = Vec3::ZERO;
+    let mut rot = Quat::IDENTITY;
+    let punch = punch_anim.clamp(0.0, 1.0);
+    if punch > 0.0 {
+        let u = 1.0 - punch;
+        let k = punch_thrust(u);
+        // Impact shudder right at full extension when the jab connected.
+        let shudder = if punch_hit { (u * 70.0).sin() * 0.035 * k * (1.0 - u) } else { 0.0 };
+        off += Vec3::new(0.15, 0.065, -0.24) * k;
+        rot *= Quat::from_rotation_y(-0.55 * k) * Quat::from_rotation_z(0.62 * k + shudder) * Quat::from_rotation_x(-0.22 * k);
+    }
+    let flash = flash_anim.clamp(0.0, 1.0);
+    if flash > 0.0 {
+        let u = 1.0 - flash;
+        let lift = (u.sqrt() * PI).sin();
+        off += Vec3::new(0.05, 0.085, -0.05) * lift;
+        rot *= Quat::from_rotation_x(-0.42 * lift) * Quat::from_rotation_y(-0.14 * lift);
+    }
+    (off, rot)
+}
+
+/// LED override for the Camera Flash (white-hot strobe) and a parry (gold).
+pub fn phone_led_strobe(base: Color, emissive: LinearRgba, flash_anim: f32, parry_flash: f32) -> (Color, LinearRgba) {
+    if flash_anim > 0.0 {
+        let k = flash_anim.clamp(0.0, 1.0);
+        (Color::WHITE, emissive.mix(&LinearRgba::rgb(40.0, 38.0, 30.0), k))
+    } else if parry_flash > 0.0 {
+        (Color::srgb(1.0, 0.85, 0.4), LinearRgba::rgb(9.0, 6.5, 1.8))
+    } else {
+        (base, emissive)
     }
 }
 
@@ -2116,18 +2264,69 @@ pub struct BoltAssets {
     pub halo_mat: Handle<StandardMaterial>,
 }
 
-fn create_bolt_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
+fn create_bolt_assets(
+    mut commands: Commands,
+    tex: Res<ProjectileTextures>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     commands.insert_resource(BoltAssets {
         core_mesh: meshes.add(Capsule3d::new(0.045, 0.48)),
         halo_mesh: meshes.add(Capsule3d::new(0.11, 0.62)),
-        core_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.92, 1.0, 1.0),
-            emissive: LinearRgba::rgb(8.0, 18.0, 22.0),
-            unlit: true,
-            ..default()
-        }),
-        halo_mat: materials.add(additive_glow(Color::srgb(0.18, 0.9, 1.0), 0.55)),
+        core_mat: materials.add(textured_glow(&tex.plasma_bolt, Color::srgb(0.95, 1.0, 1.0), LinearRgba::rgb(2.4, 4.6, 5.4))),
+        halo_mat: materials.add(textured_additive(&tex.plasma_bolt, Color::srgb(0.18, 0.9, 1.0), SHEATH_ALPHA + 0.08)),
     });
+}
+
+/// Parried projectile visuals: blazing gold-white core + additive halo.
+#[derive(Resource, Clone)]
+pub struct ParryAssets {
+    pub core_mesh: Handle<Mesh>,
+    pub halo_mesh: Handle<Mesh>,
+    pub core_mat: Handle<StandardMaterial>,
+    pub halo_mat: Handle<StandardMaterial>,
+    /// Orbiting energy ring (spins with the bolt's axial spin).
+    pub ring_mesh: Handle<Mesh>,
+    pub ring_mat: Handle<StandardMaterial>,
+}
+
+fn create_parry_assets(
+    mut commands: Commands,
+    tex: Res<ProjectileTextures>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    commands.insert_resource(ParryAssets {
+        core_mesh: meshes.add(Sphere::new(0.16).mesh().uv(12, 8)),
+        halo_mesh: meshes.add(Capsule3d::new(0.3, 0.9)),
+        core_mat: materials.add(textured_glow(&tex.parry_bolt, Color::srgb(1.0, 0.98, 0.9), LinearRgba::rgb(5.8, 4.6, 2.4))),
+        halo_mat: materials.add(textured_additive(&tex.parry_bolt, Color::srgb(1.0, 0.78, 0.25), SHEATH_ALPHA + 0.08)),
+        ring_mesh: meshes.add(Torus::new(0.26, 0.32)),
+        ring_mat: materials.add(textured_additive(&tex.energy_ring, Color::srgb(1.0, 0.85, 0.35), 0.9)),
+    });
+}
+
+/// Spawn a parried (reflected) bolt at `start` flying along `dir` at `speed`.
+pub fn spawn_parried_projectile(commands: &mut Commands, assets: &ParryAssets, start: Vec3, dir: Vec3, speed: f32) -> Entity {
+    let dir = dir.normalize_or(Vec3::NEG_Z);
+    commands
+        .spawn((
+            LevelEntity,
+            PlayerProjectile::parried(dir * speed),
+            Mesh3d(assets.core_mesh.clone()),
+            MeshMaterial3d(assets.core_mat.clone()),
+            Transform::from_translation(start).with_rotation(Quat::from_rotation_arc(Vec3::Y, dir)),
+            children![
+                (Mesh3d(assets.halo_mesh.clone()), MeshMaterial3d(assets.halo_mat.clone()), Transform::from_xyz(0.0, -0.25, 0.0)),
+                (Mesh3d(assets.ring_mesh.clone()), MeshMaterial3d(assets.ring_mat.clone()), Transform::from_rotation(Quat::from_rotation_x(0.45))),
+                (
+                    CullableLight::for_range(9.0),
+                    PointLight { color: Color::srgb(1.0, 0.85, 0.45), intensity: 260_000.0, range: 9.0, shadow_maps_enabled: false, ..default() },
+                    Transform::default(),
+                ),
+            ],
+        ))
+        .id()
 }
 
 /// Pre-baked rocket projectile model (one merged mesh per material, built
@@ -2137,18 +2336,32 @@ pub struct RocketAssets {
     pub models: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
 }
 
-fn create_rocket_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
-    let casing = materials.add(StandardMaterial { base_color: Color::srgb(0.32, 0.34, 0.36), metallic: 0.85, perceptual_roughness: 0.35, ..default() });
-    let fins = materials.add(StandardMaterial { base_color: Color::srgb(0.12, 0.13, 0.14), metallic: 0.7, perceptual_roughness: 0.5, ..default() });
-    let core = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.7, 0.3),
-        emissive: LinearRgba::rgb(14.0, 5.5, 0.8),
-        unlit: true,
+fn create_rocket_assets(
+    mut commands: Commands,
+    tex: Res<ProjectileTextures>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let casing = materials.add(StandardMaterial {
+        base_color_texture: Some(tex.rocket_body.clone()),
+        // Mostly paint: a high metallic would leave the hazard stripes and
+        // warhead band with almost no diffuse response in the dark.
+        metallic: 0.4,
+        perceptual_roughness: 0.45,
         ..default()
     });
-    let flame = materials.add(additive_glow(Color::srgb(1.0, 0.45, 0.08), 0.7));
+    let fins = materials.add(StandardMaterial { base_color: Color::srgb(0.12, 0.13, 0.14), metallic: 0.7, perceptual_roughness: 0.5, ..default() });
+    // Glowing warhead: samples only the red / amber warhead rows of the body
+    // texture, so the seeker cone and its collar show crisp chevrons.
+    let core = materials.add(StandardMaterial {
+        uv_transform: rocket_warhead_uv(),
+        ..textured_glow(&tex.rocket_body, Color::srgb(1.0, 0.94, 0.82), LinearRgba::rgb(4.6, 3.0, 1.4))
+    });
+    let flame = materials.add(textured_additive(&tex.rocket_flame, Color::srgb(1.0, 0.55, 0.15), 0.8));
     let cyl = Mesh::from(Cylinder::new(1.0, 1.0));
-    let cone = Mesh::from(Cone::new(1.0, 1.0));
+    // Faceted cone with wrap-around UVs (`U` around, `V` base -> tip); Bevy's
+    // `Cone` projects its texture top-down, which smears banded textures.
+    let cone = crate::sculpt::tapered_prism(12, 1.0, 0.0, 1.0, true);
     let cube = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
     let sphere = Sphere::new(1.0).mesh().uv(12, 8);
     let mut b = MaterialBatches::new();
@@ -2162,6 +2375,13 @@ fn create_rocket_assets(mut commands: Commands, mut materials: ResMut<Assets<Sta
     b.add(&cone, &flame, Transform::from_xyz(0.0, -0.33, 0.0).with_rotation(Quat::from_rotation_x(std::f32::consts::PI)).with_scale(Vec3::new(0.06, 0.24, 0.06)));
     b.add(&sphere, &flame, t(Vec3::new(0.0, -0.24, 0.0), Vec3::splat(0.12)));
     commands.insert_resource(RocketAssets { models: b.finish(&mut meshes) });
+}
+
+/// UV window of the glowing warhead material: the warhead rows of
+/// [`crate::assets_gen::rocket_body_texture`], full wrap around.
+pub fn rocket_warhead_uv() -> Affine2 {
+    let v0 = crate::assets_gen::ROCKET_WARHEAD_ROW as f32 / crate::assets_gen::TEX_SIZE as f32;
+    Affine2::from_scale_angle_translation(Vec2::new(1.0, 1.0 - v0), 0.0, Vec2::new(0.0, v0))
 }
 
 /// World velocity of a freshly fired rocket: inherits half of the shooter's
@@ -2519,8 +2739,18 @@ fn fire_weapons(
     }
 }
 
+/// Axial spin (rad/s) of a player projectile around its local +Y flight axis:
+/// the plasma helix spirals, rockets rifle, parried bolts whirl.
+pub fn projectile_spin_rate(kind: ProjectileKind) -> f32 {
+    match kind {
+        ProjectileKind::Plasma => 22.0,
+        ProjectileKind::Rocket => 9.0,
+        ProjectileKind::Parried => 18.0,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn move_player_projectiles(
+pub(crate) fn move_player_projectiles(
     mut commands: Commands,
     time: Res<Time>,
     grid: Res<LevelGrid>,
@@ -2532,7 +2762,7 @@ fn move_player_projectiles(
     mut bolts: Query<(Entity, &mut PlayerProjectile, &mut Transform), Without<Player>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     mut jammers: Query<(&mut DemonJammer, &GlobalTransform)>,
-    mut barrels: Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
+    mut barrels: Query<(&mut ExplosiveBarrel, &Transform), (Without<PlayerProjectile>, Without<Player>)>,
     mut players: Query<(&mut Player, &Transform)>,
     mut pylons: Query<(&mut BossPylon, &GlobalTransform)>,
     (mut decals, mut prop_hits, crts, racks): (
@@ -2571,9 +2801,9 @@ fn move_player_projectiles(
                 best = (t, HitTarget::Jammer(i));
             }
         }
-        for (i, (b, g)) in barrels.iter().enumerate() {
+        for (i, (b, tf)) in barrels.iter().enumerate() {
             if b.is_intact()
-                && let Some(t) = barrel_ray_hit(g.translation(), from, dir)
+                && let Some(t) = barrel_ray_hit_tf(tf, from, dir)
                 && t < best.0
             {
                 best = (t, HitTarget::Barrel(i));
@@ -2604,20 +2834,28 @@ fn move_player_projectiles(
             }
         }
         let hit = from + dir * best.0;
-        if b.kind == ProjectileKind::Rocket {
+        if let Some(spec) = BlastSpec::for_kind(b.kind, &mods) {
             if best.1 == HitTarget::Nothing && b.life > 0.0 {
                 tf.translation = from + step;
+                tf.rotate_local_y(dt * projectile_spin_rate(b.kind));
                 b.trail -= dt;
                 if b.trail <= 0.0 {
-                    b.trail += ROCKET_TRAIL_SECS;
                     let tail = tf.translation - dir * 0.35;
-                    spawn_particles(&mut commands, &fx, tail, BurstColor::Smoke, 1, 0.6, 0.09);
-                    spawn_particles(&mut commands, &fx, tail, BurstColor::Fire, 1, 1.2, 0.045);
+                    if b.kind == ProjectileKind::Parried {
+                        // Crisp gold spark trail + white-hot embers.
+                        b.trail += PARRY_TRAIL_SECS;
+                        spawn_particles(&mut commands, &fx, tail, BurstColor::Gold, 2, 1.6, 0.05);
+                        spawn_particles(&mut commands, &fx, tail, BurstColor::Spark, 1, 2.2, 0.035);
+                    } else {
+                        b.trail += ROCKET_TRAIL_SECS;
+                        spawn_particles(&mut commands, &fx, tail, BurstColor::Smoke, 1, 0.6, 0.09);
+                        spawn_particles(&mut commands, &fx, tail, BurstColor::Fire, 1, 1.2, 0.045);
+                    }
                 }
                 continue;
             }
             let blast = if best.1 == HitTarget::Nothing { from } else { hit - dir * 0.08 };
-            prop_hits.blast(blast, rocket_splash_radius(&mods), ROCKET_SPLASH_DAMAGE * b.damage_mult, false);
+            prop_hits.blast(blast, spec.radius, spec.splash * b.damage_mult, false);
             let any_hit = detonate_rocket(
                 &mut commands,
                 &grid,
@@ -2628,6 +2866,7 @@ fn move_player_projectiles(
                 dir,
                 best.1,
                 b.damage_mult,
+                &spec,
                 &mods,
                 &mut enemies,
                 &mut jammers,
@@ -2651,6 +2890,7 @@ fn move_player_projectiles(
                     commands.entity(e).try_despawn();
                 } else {
                     tf.translation = from + step;
+                    tf.rotate_local_y(dt * projectile_spin_rate(b.kind));
                 }
                 continue;
             }
@@ -2702,7 +2942,7 @@ fn move_player_projectiles(
 /// Rocket detonation: direct hit (no splash double-dip on that target),
 /// linear-falloff splash on demons and active jammers, Quake rocket jump on
 /// the player and the explosion VFX. Returns whether any target was hurt.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn detonate_rocket(
     commands: &mut Commands,
     grid: &LevelGrid,
@@ -2713,31 +2953,32 @@ fn detonate_rocket(
     dir: Vec3,
     direct: HitTarget,
     damage_mult: f32,
+    spec: &BlastSpec,
     mods: &PlayerModifiers,
     enemies: &mut Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     jammers: &mut Query<(&mut DemonJammer, &GlobalTransform)>,
-    barrels: &mut Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
+    barrels: &mut Query<(&mut ExplosiveBarrel, &Transform), (Without<PlayerProjectile>, Without<Player>)>,
     pylons: &mut Query<(&mut BossPylon, &GlobalTransform)>,
     players: &mut Query<(&mut Player, &Transform)>,
     decals: &mut DecalQueue,
     wall_normal: Option<Vec3>,
 ) -> bool {
-    let radius = rocket_splash_radius(mods);
+    let radius = spec.radius;
     // Charred scorch on the impact wall and / or the floor under the blast.
     if let Some(n) = wall_normal.filter(|n| n.y <= 0.7) {
         decals.push(DecalRequest::surface(DecalKind::Scorch, blast + dir * 0.08, n, 1.5));
     }
     decals.push(DecalRequest::floor(DecalKind::Scorch, blast, 2.2));
-    for (i, (mut b, g)) in barrels.iter_mut().enumerate() {
+    for (i, (mut b, tf)) in barrels.iter_mut().enumerate() {
         if !b.is_intact() {
             continue;
         }
         let dmg = if direct == HitTarget::Barrel(i) {
-            ROCKET_DIRECT_DAMAGE * damage_mult
+            spec.direct * damage_mult
         } else {
-            let c = g.translation() + Vec3::Y * BARREL_CENTER_Y;
+            let c = barrel_center(tf);
             let d = (c.distance(blast) - BARREL_RADIUS).max(0.0);
-            if d > radius || !has_line_of_sight(grid, blast, c) { 0.0 } else { rocket_splash_damage(d, radius, damage_mult) }
+            if d > radius || !has_line_of_sight(grid, blast, c) { 0.0 } else { spec.splash_damage(d, damage_mult) }
         };
         damage_barrel(&mut b, dmg, false);
     }
@@ -2748,13 +2989,13 @@ fn detonate_rocket(
         }
         let root = g.translation();
         let (dmg, falloff) = if direct == HitTarget::Enemy(i) {
-            (ROCKET_DIRECT_DAMAGE * damage_mult, 1.0)
+            (spec.direct * damage_mult, 1.0)
         } else {
             let d = splash_distance(blast, root, en.stats.hit_spheres);
             if d > radius || !has_line_of_sight(grid, blast, en.center(root)) {
                 (0.0, 0.0)
             } else {
-                (rocket_splash_damage(d, radius, damage_mult), splash_falloff(d, radius))
+                (spec.splash_damage(d, damage_mult), splash_falloff(d, radius))
             }
         };
         if dmg <= 0.0 {
@@ -2763,9 +3004,9 @@ fn detonate_rocket(
         let away = Vec2::new(root.x - blast.x, root.z - blast.z).normalize_or(Vec2::new(dir.x, dir.z).normalize_or_zero());
         let kb = 14.0 * falloff * knockback_scale(en.kind);
         damage_enemy(&mut en, dmg, marked.is_some(), mods);
-        en.style_source = StyleSource::Rocket;
+        en.style_source = spec.source;
         if direct == HitTarget::Enemy(i) && !en.is_alive() && en.kill_cause == crate::fatality::KillCause::Generic {
-            en.kill_cause = crate::fatality::KillCause::MortarDirect;
+            en.kill_cause = spec.direct_cause;
         }
         en.knockback += Vec3::new(away.x * kb, kb * 0.15, away.y * kb);
         en.stagger(Vec3::new(away.x, 0.0, away.y));
@@ -2776,14 +3017,14 @@ fn detonate_rocket(
             continue;
         }
         let dmg = if direct == HitTarget::Jammer(i) {
-            ROCKET_DIRECT_DAMAGE * damage_mult
+            spec.direct * damage_mult
         } else {
             let base = g.translation();
             let d = splash_distance(blast, base, &JAMMER_SPHERES);
             if d > radius || !has_line_of_sight(grid, blast, base + Vec3::Y * 1.3) {
                 0.0
             } else {
-                rocket_splash_damage(d, radius, damage_mult)
+                spec.splash_damage(d, damage_mult)
             }
         };
         if dmg > 0.0 {
@@ -2796,26 +3037,30 @@ fn detonate_rocket(
             continue;
         }
         let dmg = if direct == HitTarget::Pylon(i) {
-            ROCKET_DIRECT_DAMAGE * damage_mult
+            spec.direct * damage_mult
         } else {
             let base = g.translation();
             let d = splash_distance(blast, base, &PYLON_SPHERES);
-            if d > radius || !has_line_of_sight(grid, blast, base + Vec3::Y * 1.5) { 0.0 } else { rocket_splash_damage(d, radius, damage_mult) }
+            if d > radius || !has_line_of_sight(grid, blast, base + Vec3::Y * 1.5) { 0.0 } else { spec.splash_damage(d, damage_mult) }
         };
         if dmg > 0.0 {
             damage_pylon(&mut p, dmg);
             any_hit = true;
         }
     }
-    if let Ok((mut p, ptf)) = players.single_mut()
+    if spec.player_jump
+        && let Ok((mut p, ptf)) = players.single_mut()
         && has_line_of_sight(grid, blast, ptf.translation + Vec3::Y * 0.9)
         && let Some(jump) = compute_rocket_jump(ptf.translation, blast, radius, mods)
     {
         apply_rocket_jump(&mut p, &jump);
     }
-    spawn_flash_light(commands, blast, Color::srgb(1.0, 0.5, 0.15), 2_600_000.0, 16.0, 0.28);
-    spawn_shockwave(commands, fx, materials, blast, radius * 0.9, 0.32, ROCKET_BLAST_GLOW.0, ROCKET_BLAST_GLOW.1, true);
-    spawn_shockwave(commands, fx, materials, blast, radius * 0.45, 0.2, ROCKET_CORE_GLOW.0, ROCKET_CORE_GLOW.1, false);
+    spawn_flash_light(commands, blast, spec.light, 2_600_000.0, 16.0, 0.28);
+    spawn_shockwave(commands, fx, materials, blast, radius * 0.9, 0.32, spec.glows[0].0, spec.glows[0].1, true);
+    spawn_shockwave(commands, fx, materials, blast, radius * 0.45, 0.2, spec.glows[1].0, spec.glows[1].1, false);
+    if spec.source == StyleSource::Parry {
+        spawn_burst(commands, fx, blast, BurstColor::Gold, 16, 10.0, 0.12);
+    }
     spawn_burst(commands, fx, blast, BurstColor::Fire, 14, 9.0, 0.16);
     spawn_particles(commands, fx, blast, BurstColor::Spark, 8, 11.0, 0.06);
     spawn_particles(commands, fx, blast + Vec3::Y * 0.3, BurstColor::Smoke, 5, 2.4, 0.3);
@@ -2881,16 +3126,18 @@ fn barrel_detonations(
     fx: Res<FxAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     (mut sfx, mut feed, mut decals): (ResMut<SfxQueue>, ResMut<HudFeed>, ResMut<DecalQueue>),
-    mut barrels: Query<(Entity, &mut ExplosiveBarrel, &GlobalTransform, &mut Transform), Without<Player>>,
+    mut barrels: Query<(Entity, &mut ExplosiveBarrel, &mut Transform, Has<crate::phone_combat::LaunchedBarrel>), Without<Player>>,
     mut enemies: Query<(&mut Enemy, &GlobalTransform, Option<&PingMarked>)>,
     (mut jammers, mut pylons): (Query<(&mut DemonJammer, &GlobalTransform)>, Query<(&mut BossPylon, &GlobalTransform)>),
     mut players: Query<(&mut Player, &Transform), Without<ExplosiveBarrel>>,
-    mut blasts: Local<Vec<(Entity, Vec3)>>,
+    mut blasts: Local<Vec<(Entity, Vec3, bool)>>,
     mut prop_hits: ResMut<crate::props::PropHits>,
 ) {
     let dt = time.delta_secs();
     blasts.clear();
-    for (e, mut b, g, mut tf) in &mut barrels {
+    // Barrels are root entities: `Transform` is their world pose this frame
+    // (a punched barrel in flight moved this frame, its `GlobalTransform` not yet).
+    for (e, mut b, mut tf, launched) in &mut barrels {
         if b.exploded {
             continue;
         }
@@ -2905,14 +3152,16 @@ fn barrel_detonations(
             let f = f - dt;
             if f <= 0.0 {
                 b.exploded = true;
-                blasts.push((e, g.translation() + Vec3::Y * BARREL_CENTER_Y));
+                blasts.push((e, barrel_center(&tf), launched));
             } else {
                 b.fuse = Some(f);
             }
         }
     }
     let mut any_hit = false;
-    for &(e, blast) in blasts.iter() {
+    for &(e, blast, launched) in blasts.iter() {
+        // A barrel launched by a Phone Punch credits the punch.
+        let source = if launched { StyleSource::PhonePunch } else { StyleSource::Barrel };
         commands.entity(e).try_despawn();
         prop_hits.blast(blast, BARREL_BLAST_RADIUS, BARREL_DAMAGE, true);
         for (mut en, g, marked) in &mut enemies {
@@ -2928,7 +3177,7 @@ fn barrel_detonations(
             let away = Vec2::new(root.x - blast.x, root.z - blast.z).normalize_or(Vec2::X);
             let kb = 16.0 * falloff * knockback_scale(en.kind);
             damage_enemy(&mut en, barrel_blast_damage(d), marked.is_some(), &mods);
-            en.style_source = StyleSource::Barrel;
+            en.style_source = source;
             en.knockback += Vec3::new(away.x * kb, kb * 0.2, away.y * kb);
             en.stagger(Vec3::new(away.x, 0.0, away.y));
             any_hit = true;
@@ -2952,8 +3201,8 @@ fn barrel_detonations(
                 any_hit = true;
             }
         }
-        for (_, mut b, g, _) in &mut barrels {
-            let c = g.translation() + Vec3::Y * BARREL_CENTER_Y;
+        for (_, mut b, tf, _) in &mut barrels {
+            let c = barrel_center(&tf);
             let d = (c.distance(blast) - BARREL_RADIUS).max(0.0);
             if b.is_intact() && d <= BARREL_BLAST_RADIUS && has_line_of_sight(&grid, blast, c) {
                 damage_barrel(&mut b, barrel_blast_damage(d), true);
@@ -2962,8 +3211,12 @@ fn barrel_detonations(
         if let Ok((mut p, ptf)) = players.single_mut()
             && !p.is_dead()
             && has_line_of_sight(&grid, blast, ptf.translation + Vec3::Y * 0.9)
-            && let Some(jump) = compute_barrel_jump(ptf.translation, blast, &mods)
+            && let Some(mut jump) = compute_barrel_jump(ptf.translation, blast, &mods)
         {
+            // The player's own punched barrel never burns them (the blast jump stays).
+            if launched {
+                jump.self_damage = 0.0;
+            }
             apply_rocket_jump(&mut p, &jump);
         }
         decals.push(DecalRequest::floor(DecalKind::Scorch, blast - Vec3::Y * BARREL_CENTER_Y, 2.8));
@@ -2989,9 +3242,12 @@ const BOLT_IMPACT_GLOW: (Color, f32) = (Color::srgb(0.3, 0.95, 1.0), 0.7);
 const ROCKET_BLAST_GLOW: (Color, f32) = (Color::srgb(1.0, 0.55, 0.12), 0.75);
 /// Rocket explosion fireball core glow `(color, alpha)`.
 const ROCKET_CORE_GLOW: (Color, f32) = (Color::srgb(1.0, 0.78, 0.35), 0.8);
+/// Parried bolt blast ring / white-hot core glows `(color, alpha)`.
+const PARRY_BLAST_GLOW: (Color, f32) = (Color::srgb(1.0, 0.84, 0.3), 0.85);
+const PARRY_CORE_GLOW: (Color, f32) = (Color::srgb(1.0, 0.97, 0.82), 0.9);
 
 fn prewarm_weapon_fades(fx: Res<FxAssets>, mut materials: ResMut<Assets<StandardMaterial>>) {
-    fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW, ROCKET_BLAST_GLOW, ROCKET_CORE_GLOW, BARREL_BLAST_GLOW]);
+    fx.prewarm_fades(&mut materials, &[BOLT_IMPACT_GLOW, ROCKET_BLAST_GLOW, ROCKET_CORE_GLOW, BARREL_BLAST_GLOW, PARRY_BLAST_GLOW, PARRY_CORE_GLOW]);
 }
 
 fn reset_viewmodel_feel(mut feel: ResMut<ViewmodelFeel>) {
@@ -3006,7 +3262,7 @@ impl Plugin for WeaponsPlugin {
             .init_resource::<ViewmodelFeel>()
             .add_systems(OnExit(AppState::Playing), cancel_inspect)
             .configure_sets(Update, CombatDamage.in_set(GameSet::Combat))
-            .add_systems(Startup, (create_pickup_assets, create_bolt_assets, create_rocket_assets, prewarm_weapon_fades))
+            .add_systems(Startup, (create_pickup_assets, create_bolt_assets, create_rocket_assets, create_parry_assets, prewarm_weapon_fades))
             .add_systems(Update, spawn_viewmodels)
             .add_systems(Update, (spawn_floor_pickups, reset_viewmodel_feel).run_if(resource_exists_and_changed::<LevelGrid>).in_set(GameSet::World))
             .add_systems(
@@ -3025,6 +3281,20 @@ impl Plugin for WeaponsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_projectile_spin_keeps_the_flight_axis() {
+        let dir = Vec3::new(0.3, 0.2, -1.0).normalize();
+        for kind in [ProjectileKind::Plasma, ProjectileKind::Rocket, ProjectileKind::Parried] {
+            assert!(projectile_spin_rate(kind) > 5.0, "{kind:?} visibly spins");
+            let mut tf = Transform::from_rotation(Quat::from_rotation_arc(Vec3::Y, dir));
+            for _ in 0..90 {
+                tf.rotate_local_y(projectile_spin_rate(kind) / 60.0);
+            }
+            assert!(tf.rotation.is_finite() && tf.rotation.is_normalized());
+            assert!((tf.rotation * Vec3::Y).dot(dir) > 0.999, "{kind:?}");
+        }
+    }
     use crate::level::Cell;
 
     fn corridor() -> LevelGrid {

@@ -4,7 +4,8 @@
 //! Designed for instant at-a-glance combat readability at 1280x720:
 //! big high-contrast 5-bar signal meter, large 2x dBm & distance readouts,
 //! bold 2px oscilloscope waveform, large directional radar arrow, chunky
-//! color-coded `[RMB] PING` / `[Q] 5G` app status tiles, bold SOS bar, and
+//! color-coded `PING` / `FLSH` / `EMP` app status tiles (with punch / parry /
+//! flash accents), bold SOS bar, and
 //! subtle in-screen Dead-Zone static snow.
 
 use std::fmt::Write as _;
@@ -15,6 +16,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::apps::{app_block_reason, overload_cooldown, ping_cooldown, PhoneApps, OVERLOAD_MIN_BARS, PING_MIN_BARS};
+use crate::phone_combat::{flash_cooldown, FLASH_MIN_BARS};
 use crate::extraction::ExtractionState;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::fx::HudFeed;
@@ -50,6 +52,15 @@ pub struct PhoneScreenSnapshot {
     pub overload_max_cd: f32,
     pub ping_flash: f32,
     pub overload_flash: f32,
+    /// Milestone 33 Camera Flash Strobe cooldown / max cooldown / strobe envelope.
+    pub flash_cd: f32,
+    pub flash_max_cd: f32,
+    pub flash_anim: f32,
+    /// Phone Punch jab envelope (1 -> 0) and whether it connected.
+    pub punch_anim: f32,
+    pub punch_hit: bool,
+    /// Golden parry accent timer.
+    pub parry_flash: f32,
     pub sos_progress: Option<f32>,
     pub sos_jammed: bool,
     pub sos_in_ring: bool,
@@ -88,6 +99,12 @@ impl Default for PhoneScreenSnapshot {
             overload_max_cd: 10.0,
             ping_flash: 0.0,
             overload_flash: 0.0,
+            flash_cd: 0.0,
+            flash_max_cd: 7.5,
+            flash_anim: 0.0,
+            punch_anim: 0.0,
+            punch_hit: false,
+            parry_flash: 0.0,
             sos_progress: None,
             sos_jammed: false,
             sos_in_ring: false,
@@ -104,10 +121,18 @@ impl Default for PhoneScreenSnapshot {
     }
 }
 
-/// Ping / 5G Overload tile labels per input mode.
-pub const fn app_tile_labels(pad: bool) -> (&'static str, &'static str) {
-    if pad { ("LT PNG", "RB EMP") } else { ("RMB PNG", "Q  EMP") }
+/// Ping / Camera Flash / 5G Overload tile labels per input mode.
+pub const fn app_tile_labels(pad: bool) -> (&'static str, &'static str, &'static str) {
+    if pad { ("LT PNG", "UP FLS", "RB EMP") } else { ("RMB PNG", "C FLSH", "Q EMP") }
 }
+
+/// Phone Punch key hint drawn in the status bar while the punch accent is on.
+pub const fn punch_label(pad: bool) -> &'static str {
+    if pad { "B" } else { "V" }
+}
+
+/// App tile columns `(x, width)`: Ping, Camera Flash, 5G Overload.
+pub const TILE_COLS: [(i32, i32); 3] = [(5, 48), (56, 48), (107, 48)];
 
 pub struct PhoneScreenPlugin;
 
@@ -187,6 +212,12 @@ fn update_phone_screen(
         overload_max_cd: overload_cooldown(&mods).max(0.1),
         ping_flash: apps.ping_active_timer,
         overload_flash: apps.overload_flash_timer,
+        flash_cd: apps.flash_cooldown,
+        flash_max_cd: flash_cooldown(&mods).max(0.1),
+        flash_anim: apps.flash_anim,
+        punch_anim: apps.punch_anim,
+        punch_hit: apps.punch_hit,
+        parry_flash: apps.parry_flash,
         sos_progress,
         sos_jammed,
         sos_in_ring,
@@ -904,41 +935,27 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         draw_notif_banner(&mut g, kind, text, s.time);
     }
 
-    // ---- 5. Chunky At-a-Glance App Tiles (y = 170..212) ----
-    let (ping_lbl, emp_lbl) = app_tile_labels(s.pad_prompts);
+    // ---- 5. Chunky At-a-Glance App Tiles (y = 170..212): PNG / FLSH / EMP ----
+    let (ping_lbl, flash_lbl, emp_lbl) = app_tile_labels(s.pad_prompts);
+    let [(px0, tw), (px1, _), (px2, _)] = TILE_COLS;
     if s.decoy_ready {
-        draw_special_tile(&mut g, 5, 170, 73, 42, ping_lbl, "DECOY", [44, 26, 4], [255, 196, 48], [255, 214, 90], s.time);
+        draw_special_tile(&mut g, px0, 170, tw, 42, ping_lbl, "DECOY", [44, 26, 4], [255, 196, 48], [255, 214, 90], s.time);
     } else {
-        draw_app_tile(
-        &mut g,
-        5,
-        170,
-        73,
-        42,
-        ping_lbl,
-        s.bars,
-        PING_MIN_BARS,
-        s.ping_cd,
-        s.ping_max_cd,
-        s.ping_flash > 0.0,
-        );
+        draw_app_tile(&mut g, px0, 170, tw, 42, ping_lbl, s.bars, PING_MIN_BARS, s.ping_cd, s.ping_max_cd, s.ping_flash > 0.0);
+    }
+    if s.flash_anim > 0.0 {
+        // White-hot strobe tile while the LED fires.
+        g.rect(px1, 170, tw, 42, [250, 246, 228]);
+        g.rect_thick_outline(px1, 170, tw, 42, [255, 214, 120]);
+        g.text(px1 + 4, 175, flash_lbl, 1, [60, 44, 10]);
+        g.text(px1 + 4, 187, "SNAP", 2, [120, 80, 10]);
+    } else {
+        draw_app_tile(&mut g, px1, 170, tw, 42, flash_lbl, s.bars, FLASH_MIN_BARS, s.flash_cd, s.flash_max_cd, false);
     }
     if s.callback_ready {
-        draw_special_tile(&mut g, 82, 170, 73, 42, emp_lbl, "CALL!", [40, 34, 6], [255, 222, 70], [120, 250, 255], s.time);
+        draw_special_tile(&mut g, px2, 170, tw, 42, emp_lbl, "CALL!", [40, 34, 6], [255, 222, 70], [120, 250, 255], s.time);
     } else {
-        draw_app_tile(
-        &mut g,
-        82,
-        170,
-        73,
-        42,
-        emp_lbl,
-        s.bars,
-        OVERLOAD_MIN_BARS,
-        s.overload_cd,
-        s.overload_max_cd,
-        s.overload_flash > 0.0,
-        );
+        draw_app_tile(&mut g, px2, 170, tw, 42, emp_lbl, s.bars, OVERLOAD_MIN_BARS, s.overload_cd, s.overload_max_cd, s.overload_flash > 0.0);
     }
 
     // ---- 6. Bold Bottom SOS Status Bar (y = 216..236) ----
@@ -987,6 +1004,33 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     if s.ping_flash > 0.0 || s.overload_flash > 0.0 {
         g.rect_thick_outline(1, 1, SCREEN_W as i32 - 2, SCREEN_H as i32 - 2, cyan);
     }
+    // Milestone 33 accents (outermost frame, drawn last so they read on top):
+    // golden parry > white camera strobe > punch impact (orange hit / dim swing).
+    if s.parry_flash > 0.0 {
+        let gold = [255, 214, 70];
+        g.rect_thick_outline(0, 0, SCREEN_W as i32, SCREEN_H as i32, gold);
+        g.rect_thick_outline(3, 3, SCREEN_W as i32 - 6, SCREEN_H as i32 - 6, [255, 246, 200]);
+        g.rect(40, 0, 80, 22, [70, 52, 6]);
+        g.text(51, 4, "PARRY", 2, gold);
+    } else if s.flash_anim > 0.0 {
+        let k = s.flash_anim.clamp(0.0, 1.0);
+        let wash = [255, 250, 236];
+        for y in (0..SCREEN_H as i32).step_by(2) {
+            for x in 0..SCREEN_W as i32 {
+                g.blend(x, y, wash, 0.55 * k);
+            }
+        }
+        g.rect_thick_outline(0, 0, SCREEN_W as i32, SCREEN_H as i32, wash);
+    } else if s.punch_anim > 0.0 {
+        let c = if s.punch_hit { [255, 128, 40] } else { [150, 96, 60] };
+        g.rect_thick_outline(0, 0, SCREEN_W as i32, SCREEN_H as i32, c);
+        if s.punch_hit {
+            // Double impact frame + the punch key tag on the SOS bar's right end.
+            g.rect_outline(3, 3, SCREEN_W as i32 - 6, SCREEN_H as i32 - 6, [255, 200, 120]);
+            g.rect(140, 218, 13, 16, c);
+            g.text(144, 222, punch_label(s.pad_prompts), 1, [30, 12, 4]);
+        }
+    }
 }
 
 /// Highlighted upgrade-override tile (Missed Call DECOY / Emergency Callback CALL!).
@@ -996,8 +1040,13 @@ fn draw_special_tile(g: &mut ScreenBuf<'_>, x: i32, y: i32, w: i32, h: i32, titl
     g.rect(x, y, w, h, bg);
     g.rect(x + 3, y + h - 8, w - 6, 5, if blink { border } else { status_c });
     g.rect_thick_outline(x, y, w, h, if blink { border } else { status_c });
-    g.text(x + 6, y + 5, title, 1, [255, 245, 220]);
-    g.text(x + 6, y + 17, status, 2, status_c);
+    g.text(x + 4, y + 5, title, 1, [255, 245, 220]);
+    // 2x when it fits the tile, else a crisp 1x line.
+    if status.len() as i32 * 12 - 2 <= w - 8 {
+        g.text(x + 4, y + 17, status, 2, status_c);
+    } else {
+        g.text(x + 4, y + 20, status, 1, status_c);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1035,15 +1084,16 @@ fn draw_app_tile(
         g.rect(x + 3, y + h - 8, w - 6, 5, [65, 255, 205]);
     }
     g.rect_thick_outline(x, y, w, h, border);
-    g.text(x + 6, y + 5, title, 1, title_c);
-    // Large 2x status so player reads READY / 1B / 3B / 2.3 at a single peripheral glance!
+    g.text(x + 4, y + 5, title, 1, title_c);
+    // Large 2x status so player reads RDY / 2B / 3B / 2.3 at a single peripheral glance!
     let mut status = StackStr::new();
     let _ = match blocked {
-        None => write!(status, "READY"),
-        Some(_) if bars < min_bars => write!(status, "NO {min_bars}B"),
-        Some(_) => write!(status, "{cd:.1}S"),
+        None => write!(status, "RDY"),
+        Some(_) if bars < min_bars => write!(status, "{min_bars}B"),
+        Some(_) if cd >= 9.95 => write!(status, "{cd:.0}S"),
+        Some(_) => write!(status, "{cd:.1}"),
     };
-    g.text(x + 6, y + 17, status.as_str(), 2, status_c);
+    g.text(x + 4, y + 17, status.as_str(), 2, status_c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,8 +1241,17 @@ mod tests {
 
     #[test]
     fn app_tiles_follow_the_input_mode() {
-        assert_eq!(app_tile_labels(false), ("RMB PNG", "Q  EMP"));
-        assert_eq!(app_tile_labels(true), ("LT PNG", "RB EMP"));
+        assert_eq!(app_tile_labels(false), ("RMB PNG", "C FLSH", "Q EMP"));
+        assert_eq!(app_tile_labels(true), ("LT PNG", "UP FLS", "RB EMP"));
+        assert_eq!((punch_label(false), punch_label(true)), ("V", "B"));
+        // Every label fits its 48 px tile at 1x (6 px glyphs, 4 px inset, 2 px border).
+        for pad in [false, true] {
+            let (a, b, c) = app_tile_labels(pad);
+            for l in [a, b, c] {
+                assert!(l.len() as i32 * 6 - 1 <= TILE_COLS[0].1 - 6, "{l}");
+                assert!(l.chars().all(|ch| ch == ' ' || glyph(ch) != [0; 7]), "{l}");
+            }
+        }
         let tiles = |b: &[u8]| (170..212).flat_map(|y| (5..155).map(move |x| px(b, x, y))).collect::<Vec<_>>();
         let kbm = render(&calm(3));
         let pad = render(&PhoneScreenSnapshot { pad_prompts: true, ..calm(3) });
@@ -1200,6 +1259,44 @@ mod tests {
         // Near the tower the prompt swaps [E] -> [X].
         let near = |pad_prompts| render(&PhoneScreenSnapshot { near_tower: true, pad_prompts, ..calm(5) });
         assert_ne!(near(false), near(true));
+    }
+
+    #[test]
+    fn milestone33_flash_tile_gate_and_ability_accents() {
+        let tile = |b: &[u8], col: usize| {
+            let (x0, w) = TILE_COLS[col];
+            (170..212).flat_map(|y| (x0..x0 + w).map(move |x| px(b, x as u32, y))).collect::<Vec<_>>()
+        };
+        // FLSH tile: blocked (red) under 2 bars, ready (green) at 2+, cooling down in between.
+        let one = render(&calm(1));
+        let two = render(&calm(2));
+        assert_ne!(tile(&one, 1), tile(&two, 1), "the 2-bar gate is visible");
+        assert_eq!(px(&one, 99, 200), [34, 11, 13], "blocked tile background");
+        assert_eq!(px(&two, 99, 200), [12, 48, 52], "ready tile background");
+        let cooling = render(&PhoneScreenSnapshot { flash_cd: 3.0, ..calm(3) });
+        assert_eq!(px(&cooling, 99, 200), [18, 26, 30], "cooling tile background");
+        // Ping still works at 1 bar while FLSH / EMP are blocked.
+        assert_eq!(px(&one, 50, 200), [12, 48, 52]);
+        assert_eq!(px(&one, 150, 200), [34, 11, 13]);
+        // Strobe: white-hot tile + washed screen.
+        let strobe = render(&PhoneScreenSnapshot { flash_anim: 1.0, ..calm(3) });
+        assert_eq!(px(&strobe, 99, 201), [250, 246, 228]);
+        assert_ne!(px(&strobe, 80, 60), px(&render(&calm(3)), 80, 60), "washed out");
+        // Punch: orange frame on a hit, dim on a whiff; parry: gold frame + banner.
+        let base = render(&calm(3));
+        let swing = render(&PhoneScreenSnapshot { punch_anim: 0.8, ..calm(3) });
+        let hit = render(&PhoneScreenSnapshot { punch_anim: 0.8, punch_hit: true, ..calm(3) });
+        assert_eq!(px(&hit, 0, 120), [255, 128, 40]);
+        assert_eq!(px(&swing, 0, 120), [150, 96, 60]);
+        assert_ne!(hit, swing);
+        let hit_pad = render(&PhoneScreenSnapshot { punch_anim: 0.8, punch_hit: true, pad_prompts: true, ..calm(3) });
+        assert_ne!(hit[..], hit_pad[..], "punch hint follows the input mode");
+        let parry = render(&PhoneScreenSnapshot { parry_flash: 0.5, punch_anim: 0.8, punch_hit: true, ..calm(3) });
+        assert_eq!(px(&parry, 0, 120), [255, 214, 70]);
+        assert_ne!(px(&parry, 60, 10), px(&base, 60, 10), "PARRY banner over the status bar");
+        // Signal bars / dBm panel untouched by a punch accent.
+        let panel = |b: &[u8]| (30..80).flat_map(|y| (10..150).map(move |x| px(b, x, y))).collect::<Vec<_>>();
+        assert_eq!(panel(&hit), panel(&base));
     }
 
     #[test]
@@ -1212,8 +1309,8 @@ mod tests {
         assert_eq!(px(&call, 150, 200), [40, 34, 6]);
         let zero = render(&calm(0));
         let decoy = render(&PhoneScreenSnapshot { decoy_ready: true, ..calm(0) });
-        assert_eq!(px(&decoy, 70, 200), [44, 26, 4], "DECOY tile is amber");
-        assert_ne!(px(&zero, 70, 200), [44, 26, 4]);
+        assert_eq!(px(&decoy, 30, 200), [44, 26, 4], "DECOY tile is amber");
+        assert_ne!(px(&zero, 30, 200), [44, 26, 4]);
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::leaderboard::{spawn_account_pill, submit_badge_bundle, LeaderboardSta
 use crate::gamepad::{pad_edit_text, DefaultFocus, DualPrompt, GamepadFocus, GamepadInput, InputMode, PadFocusLock, PAD_TEXT_HINT};
 use crate::meta::{live_settings, record_game_over, record_victory, start_run_with_loadout, CrosshairColor, CrosshairStyle, ProfileStore, RunLoadout};
 use crate::meta_ui::{
-    end_loadout_line, loadout_summary_line, loadout_tag_parts, unlock_reward_lines, MetaBox, MetaUiPlugin, NO_UNLOCKS_LINE,
+    end_loadout_line, loadout_tag_parts, unlock_reward_lines, MetaBox, MetaUiPlugin, NO_UNLOCKS_LINE,
 };
 use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::SignalState;
@@ -56,10 +56,11 @@ use crate::upgrades::{draft_upgrades, next_rank_preview, pick_upgrade, UpgradeCh
 use crate::weapons::{doppler_active, Weapon, WeaponState};
 
 pub const COLOR_BG: Color = INK_BLACK;
-/// Main menu root scrim alpha over the live 3D vista (Milestone 30).
-pub const MENU_ROOT_SCRIM: f32 = 0.74;
+/// Main menu root scrim alpha over the live 3D vista (Milestone 30; lowered
+/// for the Milestone 35 showcase so the bunker reads clearly).
+pub const MENU_ROOT_SCRIM: f32 = 0.44;
 /// Grunge backdrop strength on the main menu (kept faint over the vista).
-pub const MENU_BACKDROP_ALPHA: f32 = 0.22;
+pub const MENU_BACKDROP_ALPHA: f32 = 0.10;
 pub const COLOR_TITLE: Color = PUNK_RED;
 pub const COLOR_TEXT: Color = BONE_TEXT;
 pub const COLOR_DIM: Color = ASH_DIM;
@@ -126,6 +127,10 @@ pub enum MenuAction {
     /// Leaderboard: previous / next page of the Top 25.
     LbPrevPage,
     LbNextPage,
+    /// Main menu / pause: open or close the controls overlay (`H`).
+    ToggleControls,
+    /// Controls overlay CLOSE switch (`H` / `Esc` / controller `B`).
+    CloseControls,
 }
 
 /// A clickable menu switch (see [`crate::ui_kit::punk_button`]).
@@ -237,7 +242,7 @@ pub fn pad_prompt(state: AppState, label: &str, action: MenuAction) -> String {
         MenuAction::BackToMenu if matches!(state, AppState::Loadout | AppState::ContractsFeats | AppState::GameOver | AppState::Victory | AppState::Leaderboard) => {
             Some("B")
         }
-        MenuAction::CloseSettings => Some("B"),
+        MenuAction::CloseSettings | MenuAction::CloseControls => Some("B"),
         MenuAction::RetryTimeTrial => Some("X"),
         _ => None,
     };
@@ -319,7 +324,11 @@ impl Plugin for HudPlugin {
             .init_resource::<InputMode>()
             .add_systems(Startup, init_style_emblem)
             .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
-            .add_systems(OnExit(AppState::MainMenu), release_seed_pad_lock)
+            .add_systems(OnExit(AppState::MainMenu), (release_seed_pad_lock, close_controls_overlay))
+            .init_resource::<ControlsOverlayOpen>()
+            .add_systems(OnEnter(AppState::MainMenu), close_controls_overlay)
+            .add_systems(OnEnter(AppState::Paused), close_controls_overlay)
+            .add_systems(OnExit(AppState::Paused), close_controls_overlay)
             .add_systems(OnEnter(AppState::Playing), spawn_hud)
             .add_systems(OnEnter(AppState::Paused), spawn_pause_menu)
             .add_systems(OnEnter(AppState::UpgradeSelect), spawn_app_store.after(draft_upgrades))
@@ -330,7 +339,11 @@ impl Plugin for HudPlugin {
             .add_systems(Update, seed_entry_keys.after(menu_keys).after(menu_buttons).run_if(in_state(AppState::MainMenu)))
             .add_systems(Update, seed_entry_pad.after(seed_entry_keys).run_if(in_state(AppState::MainMenu)))
             .add_systems(Update, refresh_seed_ui.after(seed_entry_pad).run_if(not(in_state(AppState::Playing))))
-            .add_systems(Update, refresh_field_manual.run_if(in_state(AppState::MainMenu)))
+            .add_systems(
+                Update,
+                (refresh_field_manual, refresh_controls_overlay.after(menu_keys).after(menu_buttons))
+                    .run_if(in_state(AppState::MainMenu).or_else(in_state(AppState::Paused))),
+            )
             .init_resource::<UiScale>()
             .add_systems(PreUpdate, fit_ui_scale)
             .add_systems(Update, upgrade_cards.run_if(in_state(AppState::UpgradeSelect)))
@@ -408,7 +421,16 @@ pub type KeyBind = (&'static [&'static str], &'static str);
 pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("MOVE", &[(&["WASD"], "move"), (&["MOUSE"], "look"), (&["SPACE"], "jump / hold to bhop"), (&["SHIFT"], "airplane-mode dash")]),
     ("FIGHT", &[(&["LMB"], "fire"), (&["1", "2", "3", "TAB", "WHEEL"], "shotgun / plasma / mortar")]),
-    ("PHONE", &[(&["RMB"], "ping scan (1+ bar)"), (&["Q"], "5G overload EMP (3+ bars)"), (&["E"], "SOS uplink at the tower")]),
+    (
+        "PHONE",
+        &[
+            (&["V", "MMB"], "phone punch / parry (0 bars)"),
+            (&["RMB"], "ping scan (1+ bar)"),
+            (&["C"], "camera flash strobe (2+ bars)"),
+            (&["Q"], "5G overload EMP (3+ bars)"),
+            (&["E"], "SOS uplink at the tower"),
+        ],
+    ),
     ("SYSTEM", &[(&["CLICK"], "capture mouse"), (&["ESC", "P"], "pause")]),
 ];
 
@@ -416,7 +438,16 @@ pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
 pub const PAD_CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("MOVE", &[(&["LS"], "move"), (&["RS"], "look"), (&["A", "L3"], "jump / hold to bhop"), (&["LB"], "airplane-mode dash")]),
     ("FIGHT", &[(&["RT"], "fire"), (&["Y", "DPAD"], "shotgun / plasma / mortar")]),
-    ("PHONE", &[(&["LT"], "ping scan (1+ bar)"), (&["RB"], "5G overload EMP (3+ bars)"), (&["X"], "SOS uplink at the tower")]),
+    (
+        "PHONE",
+        &[
+            (&["B"], "phone punch / parry (0 bars)"),
+            (&["LT"], "ping scan (1+ bar)"),
+            (&["D-UP"], "camera flash strobe (2+ bars)"),
+            (&["RB"], "5G overload EMP (3+ bars)"),
+            (&["X"], "SOS uplink at the tower"),
+        ],
+    ),
     ("SYSTEM", &[(&["START"], "pause"), (&["A"], "select"), (&["B"], "back")]),
 ];
 
@@ -457,146 +488,81 @@ fn spawn_main_menu(
         Camera { clear_color: ClearColorConfig::None, ..default() },
         msaa,
     ));
-    // Translucent dark scrim: the vista shines through behind every block
-    // while text, keycaps and buttons keep full contrast.
+    // Light scrim: the 3D bunker vista owns the middle of the screen; only
+    // the header, the title and the action dock sit on ink.
     let root = punk_screen_root(&mut commands, AppState::MainMenu, tex, INK_BLACK.with_alpha(MENU_ROOT_SCRIM), MENU_BACKDROP_ALPHA);
     screen_rails(&mut commands, root, tex, 12.0, false);
 
-    // One poster column, exactly as wide as the wordmark: every block below
-    // the title shares its left and right edges.
-    let column = commands
-        .spawn((ChildOf(root), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(6.0), ..default() }))
-        .id();
-
-    // Hero lockup: firmware stamp + a dying 1-bar signal above the wordmark,
-    // the caution tape tag + genre line below it.
-    let lockup = commands
-        .spawn((ChildOf(column), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, row_gap: Val::Px(4.0), ..default() }))
-        .id();
-    let stamp_row = commands
-        .spawn((ChildOf(lockup), Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::FlexEnd, ..default() }))
-        .id();
-    commands.spawn((
-        ChildOf(stamp_row),
-        Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() },
-        children![stamped_tag(OS_STAMP, STEEL_BORDER, BONE_TEXT, 12.0), text("// BUNKER 7 // FIELD TERMINAL", 12.0, ASH_DIM)],
-    ));
-    commands.spawn((ChildOf(stamp_row), Node { flex_grow: 1.0, ..default() }));
-    spawn_account_pill(&mut commands, stamp_row, &lb, &store.profile.callsign);
-    commands.spawn((ChildOf(stamp_row), Node { width: Val::Px(14.0), ..default() }));
-    let weak = commands.spawn((ChildOf(stamp_row), Node { column_gap: Val::Px(10.0), align_items: AlignItems::FlexEnd, ..default() })).id();
-    commands.spawn((ChildOf(weak), text("SIGNAL 1/5", 12.0, PUNK_RED)));
-    signal_bars(&mut commands, weak, 1, PUNK_RED, 6.0);
-    hero_title(&mut commands, lockup, "SEGNALE DEBOLE", 84.0, BONE_TEXT, PUNK_RED);
-    commands.spawn((
-        ChildOf(lockup),
-        Node { margin: UiRect::top(Val::Px(2.0)), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
-        children![
-            stamped_tag("// WEAK SIGNAL // MARS BUNKER 7 //", HAZARD_YELLOW, INK_BLACK, 16.0),
-            text("ROGUELIKE BOOMER SHOOTER  //  5 FLOORS  //  1 PHONE", 12.0, ASH_DIM),
-        ],
-    ));
-
-    // Briefing on a spray-red margin rule; the objective line is the loud one.
-    commands.spawn((
-        ChildOf(column),
-        Node { padding: UiRect::left(Val::Px(14.0)), border: UiRect::left(Val::Px(3.0)), flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() },
-        BorderColor::all(PUNK_RED),
-        children![
-            text(
-                "Mars Research Bunker 7 has gone dark. Hell came through the server racks.\n\
-                 Your left hand grips a cracked phone hunting for a single bar.\n\
-                 Your right hand grips a pump shotgun.",
-                16.0,
-                BONE_TEXT.with_alpha(0.82)
-            ),
-            text("> Find the 5-bar Signal Tower, destroy the Demon Jammers, hold the SOS uplink. Get out.", 16.0, HAZARD_YELLOW),
-        ],
-    ));
-
-    // Field manual: keycap chips on a brushed-steel plate.
-    let (manual, manual_head) = section_crate(&mut commands, column, "FIELD MANUAL // CONTROLS", ASH_DIM, Node::default());
-    if let Some(t) = tex {
-        commands.entity(manual).insert(tiled_image(t.plate_bg.clone(), Color::WHITE.with_alpha(0.4), 2.0));
-    }
-    commands.spawn((ChildOf(manual_head), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(manual_head), DualPrompt::new("KEYBOARD & MOUSE", "CONTROLLER"), text("KEYBOARD & MOUSE", 11.0, ARC_CYAN.with_alpha(0.8))));
-    commands.spawn((ChildOf(manual_head), text("REV 10", 11.0, ASH_DIM.with_alpha(0.75))));
-    // Both manuals are built once; the active input mode picks which shows
-    // (switching devices mid-screen swaps them live).
-    for (mode, rows) in [(InputMode::KeyboardMouse, CONTROLS), (InputMode::Gamepad, PAD_CONTROLS)] {
-        let body = commands
-            .spawn((
-                ChildOf(manual),
-                FieldManual(mode),
-                Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(6.0), display: if mode == InputMode::KeyboardMouse { Display::Flex } else { Display::None }, ..default() },
-            ))
-            .id();
-        for (category, binds) in rows {
-            let row = commands.spawn((ChildOf(body), Node { align_items: AlignItems::Center, column_gap: Val::Px(16.0), ..default() })).id();
-            commands.spawn((ChildOf(row), Node { width: Val::Px(52.0), flex_shrink: 0.0, ..default() }, children![text(category, 11.0, HAZARD_YELLOW)]));
-            for (keys, what) in binds {
-                let bind = commands.spawn((ChildOf(row), Node { align_items: AlignItems::Center, column_gap: Val::Px(4.0), ..default() })).id();
-                for key in *keys {
-                    commands.spawn((ChildOf(bind), keycap(key, 12.0)));
-                }
-                commands.spawn((ChildOf(bind), Node { margin: UiRect::left(Val::Px(3.0)), ..default() }, children![text(*what, 13.0, BONE_TEXT.with_alpha(0.72))]));
-            }
-        }
-    }
-
-    // Active loadout telemetry crate (+ JAM DEMO caution tag in its header).
-    let (loadout, loadout_head) = section_crate(&mut commands, column, "ACTIVE LOADOUT", ARC_CYAN, Node::default());
-    commands.spawn((ChildOf(loadout_head), Node { flex_grow: 1.0, ..default() }));
-    if store.profile.jam_demo_unlock_all {
-        commands.spawn((ChildOf(loadout_head), MetaBox::JamPill, stamped_tag("JAM DEMO: ALL UNLOCKED", HAZARD_YELLOW, INK_BLACK, 11.0)));
-    }
-    commands.spawn((ChildOf(loadout), text(loadout_summary_line(&store.profile), 14.0, ARC_CYAN)));
-
-    // PLAY is the slab that fills the column; the two side doors stay small.
-    let actions = commands
-        .spawn((ChildOf(column), Node { margin: UiRect::top(Val::Px(3.0)), column_gap: Val::Px(12.0), align_items: AlignItems::Center, ..default() }))
-        .id();
-    commands.spawn((
-        ChildOf(actions),
-        Node { flex_grow: 1.0, flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, ..default() },
-        children![(prompt_button(AppState::MainMenu, "PLAY  [ENTER]", MenuAction::StartRun, 30.0, ButtonStyle::HeroAcid), DefaultFocus)],
-    ));
-    for (label, action, style) in [
-        ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::HazardAmber),
-        ("CONTRACTS & FEATS  [C]", MenuAction::OpenContractsFeats, ButtonStyle::DangerRed),
-        ("SETTINGS  [O]", MenuAction::OpenSettings, ButtonStyle::ScrapSteel),
-        ("LEADERBOARD  [K]", MenuAction::OpenLeaderboard, ButtonStyle::PrimaryAcid),
-    ] {
-        commands.spawn((ChildOf(actions), prompt_button(AppState::MainMenu, label, action, 17.0, style)));
-    }
-
-    // Alternate modes: one compact strip of two doors, each with its live subtitle.
-    let modes = commands.spawn((ChildOf(column), Node { column_gap: Val::Px(14.0), align_items: AlignItems::Center, ..default() })).id();
-    let today = DailyDate::today_utc();
-    let (daily_sub, trial_sub) = mode_subtitles(&store.profile, today);
-    for (label, action, style, sub, color) in [
-        ("DAILY RUN  [D]", MenuAction::StartDaily, ButtonStyle::HazardAmber, daily_sub, HAZARD_YELLOW),
-        ("TIME TRIAL  [T]", MenuAction::StartTimeTrial, ButtonStyle::PrimaryAcid, trial_sub, ARC_CYAN),
-    ] {
-        commands.spawn((ChildOf(modes), prompt_button(AppState::MainMenu, label, action, 16.0, style)));
-        commands.spawn((
-            ChildOf(modes),
-            Node { flex_grow: 1.0, ..default() },
-            children![text(sub, 12.0, color.with_alpha(0.9))],
-        ));
-    }
-    commands.spawn((ChildOf(modes), prompt_button(AppState::MainMenu, "BESTIARY & ARMORY  [B]", MenuAction::OpenCompendium, 16.0, ButtonStyle::DangerRed)));
-    spawn_input_hint(&mut commands, column);
-
-    // Run seed: compact selector strip (armed code or RANDOM) + RND / CLR.
-    let seed_row = commands
+    // Showcase body: header + title pinned to the top, the action dock to
+    // the bottom, nothing in between but the vista.
+    let body = commands
         .spawn((
-            ChildOf(column),
+            ChildOf(root),
+            ShowcaseBody,
+            HiddenByControls,
             Node {
-                column_gap: Val::Px(10.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
+                justify_content: JustifyContent::SpaceBetween,
+                // Top clears the corner chrome stamps (`UAC-B7 // SEC-07`, `RF-LINK`)
+                // of `punk_screen_root`; bottom lifts the telemetry line off the tape.
+                padding: UiRect { left: Val::Px(40.0), right: Val::Px(40.0), top: Val::Px(52.0), bottom: Val::Px(30.0) },
+                ..default()
+            },
+        ))
+        .id();
+    let top = commands
+        .spawn((ChildOf(body), Node { width: Val::Percent(100.0), flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(6.0), ..default() }))
+        .id();
+
+    // Header strip: firmware stamp + the dying 1/5 signal | account (+ JAM DEMO).
+    let header = commands
+        .spawn((ChildOf(top), Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() }))
+        .id();
+    let stamp = commands.spawn((ChildOf(header), Node { column_gap: Val::Px(10.0), align_items: AlignItems::FlexEnd, ..default() })).id();
+    commands.spawn((ChildOf(stamp), stamped_tag(OS_STAMP, STEEL_BORDER, BONE_TEXT, 12.0)));
+    signal_bars(&mut commands, stamp, 1, PUNK_RED, 5.0);
+    commands.spawn((ChildOf(stamp), text("1/5", 12.0, PUNK_RED)));
+    let right = commands.spawn((ChildOf(header), Node { column_gap: Val::Px(10.0), align_items: AlignItems::Center, ..default() })).id();
+    if store.profile.jam_demo_unlock_all {
+        commands.spawn((ChildOf(right), MetaBox::JamPill, stamped_tag("JAM DEMO", HAZARD_YELLOW, INK_BLACK, 11.0)));
+    }
+    spawn_account_pill(&mut commands, right, &lb, &store.profile.callsign);
+
+    // Hero title: the wordmark + one tag line.
+    let hero = commands
+        .spawn((ChildOf(top), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(6.0), ..default() }))
+        .id();
+    hero_title(&mut commands, hero, "SEGNALE DEBOLE", 92.0, BONE_TEXT, PUNK_RED);
+    commands.spawn((ChildOf(hero), stamped_tag(MENU_TAGLINE, HAZARD_YELLOW, INK_BLACK, 16.0)));
+
+    // Bottom action dock: primary row, then a compact utility strip.
+    let dock = commands
+        .spawn((ChildOf(body), Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Center, row_gap: Val::Px(10.0), ..default() }))
+        .id();
+    let primary = commands.spawn((ChildOf(dock), Node { column_gap: Val::Px(10.0), align_items: AlignItems::Center, ..default() })).id();
+    commands.spawn((ChildOf(primary), prompt_button(AppState::MainMenu, "PLAY  [ENTER]", MenuAction::StartRun, 26.0, ButtonStyle::HeroAcid), DefaultFocus));
+    // Secondary nav wears one quiet steel treatment: PLAY owns the color.
+    for (label, action) in [
+        ("LOADOUT  [L]", MenuAction::OpenLoadout),
+        ("CONTRACTS  [C]", MenuAction::OpenContractsFeats),
+        ("SETTINGS  [O]", MenuAction::OpenSettings),
+        ("LEADERBOARD  [K]", MenuAction::OpenLeaderboard),
+        ("BESTIARY  [B]", MenuAction::OpenCompendium),
+    ] {
+        commands.spawn((ChildOf(primary), prompt_button(AppState::MainMenu, label, action, 15.0, ButtonStyle::ScrapSteel)));
+    }
+
+    // Utility strip on one ink rail: alternate modes | run seed | controls.
+    let utility = commands
+        .spawn((
+            ChildOf(dock),
+            Node {
+                column_gap: Val::Px(8.0),
+                align_items: AlignItems::Center,
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
                 border: plate_rect((3.0, 1.0, 1.0, 1.0)),
                 ..default()
             },
@@ -604,11 +570,186 @@ fn spawn_main_menu(
             BackgroundColor(INK_BLACK.with_alpha(0.62)),
         ))
         .id();
-    commands.spawn((ChildOf(seed_row), text("RUN SEED", 11.0, ASH_DIM)));
-    commands.spawn((ChildOf(seed_row), punk_button(&seed_button_label(&seed, *mode), MenuAction::ToggleSeedEdit, 14.0, ButtonStyle::PrimaryAcid)));
-    commands.spawn((ChildOf(seed_row), punk_button("RND", MenuAction::RollSeed, 14.0, ButtonStyle::ScrapSteel)));
-    commands.spawn((ChildOf(seed_row), punk_button("CLR", MenuAction::ClearSeed, 14.0, ButtonStyle::ScrapSteel)));
-    commands.spawn((ChildOf(seed_row), SeedStatusText, text(seed_status_line(&seed, *mode), 12.0, ARC_CYAN.with_alpha(0.85))));
+    commands.spawn((ChildOf(utility), prompt_button(AppState::MainMenu, "DAILY RUN  [D]", MenuAction::StartDaily, 13.0, ButtonStyle::HazardAmber)));
+    commands.spawn((ChildOf(utility), prompt_button(AppState::MainMenu, "TIME TRIAL  [T]", MenuAction::StartTimeTrial, 13.0, ButtonStyle::PrimaryAcid)));
+    commands.spawn((ChildOf(utility), Node { width: Val::Px(1.0), height: Val::Px(22.0), margin: UiRect::horizontal(Val::Px(4.0)), ..default() }, BackgroundColor(STEEL_BORDER)));
+    commands.spawn((ChildOf(utility), punk_button(&seed_button_label(&seed, *mode), MenuAction::ToggleSeedEdit, 13.0, ButtonStyle::PrimaryAcid)));
+    commands.spawn((ChildOf(utility), punk_button("RND", MenuAction::RollSeed, 13.0, ButtonStyle::ScrapSteel)));
+    commands.spawn((ChildOf(utility), punk_button("CLR", MenuAction::ClearSeed, 13.0, ButtonStyle::ScrapSteel)));
+    commands.spawn((ChildOf(utility), Node { width: Val::Px(1.0), height: Val::Px(22.0), margin: UiRect::horizontal(Val::Px(4.0)), ..default() }, BackgroundColor(STEEL_BORDER)));
+    commands.spawn((ChildOf(utility), prompt_button(AppState::MainMenu, CONTROLS_BUTTON, MenuAction::ToggleControls, 13.0, ButtonStyle::ScrapSteel)));
+
+    // One muted telemetry slot: the seed editor / status while active, else
+    // today's Daily rules + the Time Trial PB.
+    let (daily_sub, trial_sub) = mode_subtitles(&store.profile, DailyDate::today_utc());
+    let status_on = seed_status_visible(&seed);
+    commands.spawn((
+        ChildOf(dock),
+        SeedStatusText,
+        Node { display: if status_on { Display::Flex } else { Display::None }, margin: UiRect::top(Val::Px(2.0)), ..default() },
+        text(seed_status_line(&seed, *mode), 12.0, ARC_CYAN.with_alpha(0.85)),
+        telemetry_shadow(),
+    ));
+    commands.spawn((
+        ChildOf(dock),
+        ModeTelemetry,
+        Node { display: if status_on { Display::None } else { Display::Flex }, margin: UiRect::top(Val::Px(2.0)), ..default() },
+        text(format!("DAILY {daily_sub}   //   TRIAL {trial_sub}"), 12.0, ASH_DIM.mix(&BONE_TEXT, 0.45)),
+        telemetry_shadow(),
+    ));
+    spawn_input_hint(&mut commands, dock);
+
+    spawn_controls_overlay(&mut commands, root, AppState::MainMenu, *mode);
+}
+
+/// Hard ink drop under the main menu telemetry line (it sits straight on the
+/// red Mars terrain, no plate behind it).
+fn telemetry_shadow() -> TextShadow {
+    TextShadow { offset: Vec2::splat(1.0), color: INK_BLACK.with_alpha(0.9) }
+}
+
+/// Main menu tag line under the wordmark.
+pub const MENU_TAGLINE: &str = "WEAK SIGNAL // MARS BUNKER 7";
+
+/// Main menu / pause CONTROLS switch.
+pub const CONTROLS_BUTTON: &str = "CONTROLS  [H]";
+
+/// The showcase main menu's top-to-bottom body (hidden under the controls overlay).
+#[derive(Component)]
+pub struct ShowcaseBody;
+
+/// Daily rules + Time Trial PB line (shares its slot with [`SeedStatusText`]).
+#[derive(Component)]
+pub struct ModeTelemetry;
+
+/// Whether the `FIELD MANUAL // CONTROLS` overlay is open (Main Menu / Pause).
+/// Closed on entering and leaving either screen.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlsOverlayOpen(pub bool);
+
+/// Root of the controls overlay modal.
+#[derive(Component)]
+pub struct ControlsOverlay;
+
+/// Screen content hidden while the controls overlay is open (keeps the
+/// controller focus inside the modal).
+#[derive(Component)]
+pub struct HiddenByControls;
+
+/// `FIELD MANUAL // CONTROLS` modal: both manuals (the active [`InputMode`]
+/// picks one live) + CLOSE. Starts hidden; see [`ControlsOverlayOpen`].
+fn spawn_controls_overlay(commands: &mut Commands, root: Entity, state: AppState, mode: InputMode) {
+    let overlay = commands
+        .spawn((
+            ChildOf(root),
+            ControlsOverlay,
+            Node {
+                display: Display::None,
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(INK_BLACK.with_alpha(0.55)),
+        ))
+        .id();
+    let (manual, head) = section_crate(
+        commands,
+        overlay,
+        "FIELD MANUAL // CONTROLS",
+        HAZARD_YELLOW,
+        Node::default(),
+    );
+    commands.entity(manual).insert((BackgroundColor(INK_BLACK.with_alpha(0.92)), hard_shadow(8.0)));
+    commands.spawn((ChildOf(head), Node { flex_grow: 1.0, ..default() }));
+    commands.spawn((ChildOf(head), DualPrompt::new("KEYBOARD & MOUSE", "CONTROLLER"), text(mode.pick("KEYBOARD & MOUSE", "CONTROLLER"), 11.0, ARC_CYAN.with_alpha(0.85))));
+    // Both manuals are built once; the active input mode picks which shows
+    // (switching devices mid-screen swaps them live).
+    for (m, rows) in [(InputMode::KeyboardMouse, CONTROLS), (InputMode::Gamepad, PAD_CONTROLS)] {
+        let body = commands
+            .spawn((
+                ChildOf(manual),
+                FieldManual(m),
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(8.0),
+                    // Inset on top of the crate's own 9 px so the widest row
+                    // clears the frame evenly on both sides.
+                    padding: UiRect { left: Val::Px(9.0), right: Val::Px(9.0), top: Val::Px(4.0), bottom: Val::Px(0.0) },
+                    display: if m == mode { Display::Flex } else { Display::None },
+                    ..default()
+                },
+            ))
+            .id();
+        for (category, binds) in rows {
+            let row = commands.spawn((ChildOf(body), Node { align_items: AlignItems::FlexStart, column_gap: Val::Px(14.0), ..default() })).id();
+            commands.spawn((ChildOf(row), Node { width: Val::Px(56.0), flex_shrink: 0.0, ..default() }, children![text(category, 12.0, HAZARD_YELLOW)]));
+            let list = commands
+                .spawn((ChildOf(row), Node { max_width: Val::Px(760.0), flex_wrap: FlexWrap::Wrap, column_gap: Val::Px(16.0), row_gap: Val::Px(8.0), ..default() }))
+                .id();
+            for (keys, what) in binds {
+                let bind = commands.spawn((ChildOf(list), Node { align_items: AlignItems::Center, column_gap: Val::Px(4.0), ..default() })).id();
+                for key in *keys {
+                    commands.spawn((ChildOf(bind), keycap(key, 12.0)));
+                }
+                commands.spawn((ChildOf(bind), Node { margin: UiRect::left(Val::Px(3.0)), ..default() }, children![text(*what, 13.0, BONE_TEXT.with_alpha(0.78))]));
+            }
+        }
+    }
+    let foot = commands.spawn((ChildOf(manual), Node { width: Val::Percent(100.0), margin: UiRect { top: Val::Px(6.0), bottom: Val::Px(6.0), ..default() }, justify_content: JustifyContent::Center, ..default() })).id();
+    commands.spawn((ChildOf(foot), prompt_button(state, CONTROLS_CLOSE, MenuAction::CloseControls, 14.0, ButtonStyle::ScrapSteel), DefaultFocus));
+}
+
+/// CLOSE switch of the controls overlay.
+pub const CONTROLS_CLOSE: &str = "CLOSE  [H / ESC]";
+
+/// Show / hide the controls overlay (and the content under it).
+#[allow(clippy::type_complexity)]
+fn refresh_controls_overlay(
+    open: Res<ControlsOverlayOpen>,
+    mut overlay: Query<(Ref<ControlsOverlay>, &mut Node), Without<HiddenByControls>>,
+    mut hidden: Query<(Ref<HiddenByControls>, &mut Node), Without<ControlsOverlay>>,
+) {
+    let all = open.is_changed();
+    for (o, mut node) in &mut overlay {
+        let want = if open.0 { Display::Flex } else { Display::None };
+        if (all || o.is_added()) && node.display != want {
+            node.display = want;
+        }
+    }
+    for (h, mut node) in &mut hidden {
+        let want = if open.0 { Display::None } else { Display::Flex };
+        if (all || h.is_added()) && node.display != want {
+            node.display = want;
+        }
+    }
+}
+
+fn close_controls_overlay(mut open: ResMut<ControlsOverlayOpen>) {
+    if open.0 {
+        open.0 = false;
+    }
+}
+
+/// `H` toggles the controls overlay on `MainMenu` / `Paused`.
+pub fn controls_hotkey_action(state: AppState, h: bool) -> Option<MenuAction> {
+    (h && matches!(state, AppState::MainMenu | AppState::Paused)).then_some(MenuAction::ToggleControls)
+}
+
+/// While the controls overlay is open, `Esc` / controller `B` close it
+/// (instead of resuming from Pause).
+pub fn controls_back_closes(state: AppState, open: bool, esc: bool, back: bool) -> bool {
+    open && (esc || back) && matches!(state, AppState::MainMenu | AppState::Paused)
+}
+
+/// Whether the seed status line replaces the mode telemetry (editing, or a
+/// status message to show).
+pub fn seed_status_visible(seed: &CustomSeedState) -> bool {
+    seed.editing || seed.status_msg.is_some()
 }
 
 /// Live seed status line of the main menu.
@@ -691,6 +832,7 @@ pub fn seed_entry_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut key_events: MessageReader<bevy::input::keyboard::KeyboardInput>,
     mut seed: ResMut<CustomSeedState>,
+    controls: Option<Res<ControlsOverlayOpen>>,
 ) {
     let pressed_ordered: Vec<KeyCode> = key_events
         .read()
@@ -698,6 +840,10 @@ pub fn seed_entry_keys(
         .map(|e| e.key_code)
         .collect();
     if !seed.editing {
+        // The controls overlay covers the seed strip: `S` stays inert there.
+        if controls.is_some_and(|c| c.0) {
+            return;
+        }
         if pressed_ordered.contains(&KeyCode::KeyS) || (pressed_ordered.is_empty() && keys.just_pressed(KeyCode::KeyS)) {
             seed.toggle_edit();
         }
@@ -745,8 +891,9 @@ fn refresh_seed_ui(
     mode: Res<InputMode>,
     run: Res<RunStats>,
     buttons: Query<(&MenuAction, &Children)>,
-    mut status: Query<&mut Text, With<SeedStatusText>>,
+    mut status: Query<(&mut Text, &mut Node), With<SeedStatusText>>,
     mut labels: Query<&mut Text, Without<SeedStatusText>>,
+    mut telemetry: Query<&mut Node, (With<ModeTelemetry>, Without<SeedStatusText>)>,
 ) {
     if !seed.is_changed() && !mode.is_changed() {
         return;
@@ -766,9 +913,19 @@ fn refresh_seed_ui(
         }
     }
     let line = seed_status_line(&seed, *mode);
-    for mut t in &mut status {
+    let on = seed_status_visible(&seed);
+    let show = |on: bool| if on { Display::Flex } else { Display::None };
+    for (mut t, mut node) in &mut status {
         if t.0 != line {
             t.0 = line.clone();
+        }
+        if node.display != show(on) {
+            node.display = show(on);
+        }
+    }
+    for mut node in &mut telemetry {
+        if node.display != show(!on) {
+            node.display = show(!on);
         }
     }
 }
@@ -1222,6 +1379,7 @@ fn spawn_end_screen(
             ChildOf(root),
             Node {
                 max_width: Val::Px(1000.0),
+                min_width: Val::Px(END_PANEL_MIN_WIDTH),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
                 row_gap: Val::Px(2.0),
@@ -1261,16 +1419,14 @@ fn spawn_end_screen(
     }
 
     let summary = store.last_run_summary.clone().unwrap_or_default();
-    let (panel, header) = section_crate(
+    let (panel, _) = section_crate(
         commands,
         root,
         "RUN UNLOCKS",
         look.accent,
-        Node { max_width: Val::Px(1000.0), min_width: Val::Px(600.0), align_items: AlignItems::Center, ..default() },
+        Node { max_width: Val::Px(1000.0), min_width: Val::Px(END_PANEL_MIN_WIDTH), align_items: AlignItems::Center, ..default() },
     );
     commands.entity(panel).insert((MetaBox::UnlockPanel, hard_shadow(6.0)));
-    commands.spawn((ChildOf(header), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(header), text(if summary.is_empty() { "NO DATA" } else { "UNLOCKED" }, 11.0, ASH_DIM)));
     if let Some(reason) = &summary.skipped_reason {
         commands.spawn((ChildOf(panel), text(reason.clone(), 15.0, HAZARD_YELLOW)));
     } else if summary.is_empty() {
@@ -1322,7 +1478,7 @@ fn spawn_end_screen(
         commands.spawn((ChildOf(cta), prompt_button(state, ENDLESS_CTA, MenuAction::ContinueEndless, 24.0, ButtonStyle::HazardAmber)));
         commands.spawn((
             ChildOf(cta),
-            text("Floor 6+ // keep HP, armor, ammo & apps // boss rematch every 5th floor", 13.0, COLOR_ENDLESS),
+            text("FLOOR 6+  //  KEEP HP, ARMOR, AMMO & APPS", 12.0, COLOR_ENDLESS.with_alpha(0.9)),
         ));
     }
     let mut buttons = look.buttons.to_vec();
@@ -1335,6 +1491,10 @@ fn spawn_end_screen(
     }
     button_row_in(commands, root, state, &buttons, if compact { 18.0 } else { 21.0 }, if compact { 2.0 } else { 10.0 });
 }
+
+/// Shared minimum width of the end-card run readout and RUN UNLOCKS crate, so
+/// the two plates stack as one column instead of two ragged widths.
+pub const END_PANEL_MIN_WIDTH: f32 = 710.0;
 
 /// Marker on the end-card peak Style Rank badge.
 #[derive(Component)]
@@ -1479,9 +1639,9 @@ fn spawn_trial_finish(commands: &mut Commands, run: &RunStats, trial: &TimeTrial
     );
 }
 
-/// In-run pause overlay (`Esc` / `P`): keeps the frozen 3D scene behind a dark
-/// tactical overlay + hazard-taped terminal and lets the player resume,
-/// restart, edit loadout, or quit.
+/// In-run pause overlay (`Esc` / `P`): a slim terminal over the frozen 3D
+/// scene (light scrim) to resume, restart, tweak settings / loadout, read
+/// the controls, or quit.
 fn spawn_pause_menu(
     mut commands: Commands,
     mode: Res<InputMode>,
@@ -1491,16 +1651,12 @@ fn spawn_pause_menu(
     tex: Option<Res<UiKitTextures>>,
 ) {
     let tex = tex.as_deref();
-    let root = punk_screen_root(&mut commands, AppState::Paused, tex, Color::srgba(0.02, 0.015, 0.012, 0.74), 0.3);
-    let card = terminal_chassis(&mut commands, root, tex, 700.0, false);
-    commands.spawn((
-        ChildOf(card),
-        Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, ..default() },
-        children![text("UAC-PHONE // STANDBY", 13.0, ASH_DIM), text("SIMULATION PAUSED", 13.0, HAZARD_YELLOW)],
-    ));
+    let root = punk_screen_root(&mut commands, AppState::Paused, tex, Color::srgba(0.02, 0.015, 0.012, PAUSE_SCRIM), 0.16);
+    let card = terminal_chassis(&mut commands, root, tex, PAUSE_WIDTH, false);
+    commands.entity(card).insert(HiddenByControls);
     let title = centered(&mut commands, card);
-    stencil_title(&mut commands, title, "PAUSED", 68.0, BONE_TEXT, PUNK_RED);
-    // Run readout in a recessed slot: read, not pressed.
+    stencil_title(&mut commands, title, "PAUSED", 60.0, BONE_TEXT, PUNK_RED);
+    // Compact 2-line run readout in a recessed slot: read, not pressed.
     let readout = commands
         .spawn((
             ChildOf(card),
@@ -1508,8 +1664,8 @@ fn spawn_pause_menu(
                 margin: UiRect::top(Val::Px(4.0)),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
-                row_gap: Val::Px(4.0),
-                padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+                row_gap: Val::Px(3.0),
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
                 border: plate_rect((4.0, 2.0, 2.0, 2.0)),
                 ..default()
             },
@@ -1517,37 +1673,63 @@ fn spawn_pause_menu(
             BackgroundColor(INK_BLACK.with_alpha(0.74)),
         ))
         .id();
-    commands.spawn((ChildOf(readout), text(summary(&run), 17.0, BONE_TEXT)));
-    commands.spawn((ChildOf(readout), text(with_seed(end_loadout_line(&loadout), &run), 13.0, HAZARD_YELLOW)));
-    commands.spawn((ChildOf(readout), Node { max_width: Val::Px(620.0), ..default() }, children![text(installed_list(&run), 13.0, ASH_DIM)]));
+    commands.spawn((ChildOf(readout), text(pause_summary(&run), 16.0, BONE_TEXT)));
+    commands.spawn((ChildOf(readout), text(pause_loadout_line(&loadout, &run), 12.0, HAZARD_YELLOW.with_alpha(0.9))));
     let wrap = centered(&mut commands, card);
     let btns = commands
         .spawn((
             ChildOf(wrap),
             Node {
-                margin: UiRect { top: Val::Px(10.0), bottom: Val::Px(12.0), ..default() },
+                margin: UiRect { top: Val::Px(10.0), bottom: Val::Px(10.0), ..default() },
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Stretch,
-                row_gap: Val::Px(10.0),
-                width: Val::Px(380.0),
+                row_gap: Val::Px(8.0),
+                width: Val::Px(340.0),
                 ..default()
             },
         ))
         .id();
     // RESUME is the one loud switch; the exits step down in weight.
     for (label, action, style, font) in [
-        ("RESUME  [ESC]", MenuAction::Continue, ButtonStyle::HeroAcid, 24.0),
-        ("RESTART RUN  [R]", MenuAction::RestartRun, ButtonStyle::HazardAmber, 18.0),
-        ("SETTINGS  [O]", MenuAction::OpenSettings, ButtonStyle::ScrapSteel, 18.0),
-        ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::ScrapSteel, 18.0),
-        ("MAIN MENU  [M]", MenuAction::BackToMenu, ButtonStyle::DangerRed, 18.0),
+        ("RESUME  [ESC]", MenuAction::Continue, ButtonStyle::HeroAcid, 22.0),
+        ("RESTART RUN  [R]", MenuAction::RestartRun, ButtonStyle::HazardAmber, 16.0),
+        ("SETTINGS  [O]", MenuAction::OpenSettings, ButtonStyle::ScrapSteel, 16.0),
+        ("LOADOUT  [L]", MenuAction::OpenLoadout, ButtonStyle::ScrapSteel, 16.0),
+        (CONTROLS_BUTTON, MenuAction::ToggleControls, ButtonStyle::ScrapSteel, 16.0),
     ] {
         commands.spawn((ChildOf(btns), prompt_button(AppState::Paused, label, action, font, style)));
     }
     if shareable_code(&run).is_some() {
-        commands.spawn((ChildOf(btns), punk_button(&share_button_label(&run, &seed, *mode), MenuAction::ShareSeed, 15.0, ButtonStyle::ScrapSteel)));
+        commands.spawn((ChildOf(btns), punk_button(&share_button_label(&run, &seed, *mode), MenuAction::ShareSeed, 16.0, ButtonStyle::ScrapSteel)));
     }
+    // The red exit always closes the stack (SHARE SEED sits above it).
+    commands.spawn((ChildOf(btns), prompt_button(AppState::Paused, "MAIN MENU  [M]", MenuAction::BackToMenu, 16.0, ButtonStyle::DangerRed)));
     spawn_input_hint(&mut commands, card);
+    spawn_controls_overlay(&mut commands, root, AppState::Paused, *mode);
+}
+
+/// Pause scrim alpha: the frozen run stays readable behind the terminal.
+pub const PAUSE_SCRIM: f32 = 0.5;
+/// Pause terminal width (logical px).
+pub const PAUSE_WIDTH: f32 = 520.0;
+
+/// Pause readout line 1: `FLOOR 2/5  |  03:12  |  41 KILLS  |  2 JAMMERS`.
+pub fn pause_summary(run: &RunStats) -> String {
+    let t = run.time_elapsed as u32;
+    format!("{}  |  {:02}:{:02}  |  {} KILLS  |  {} JAMMERS", floor_label(run), t / 60, t % 60, run.kills, run.jammers_destroyed)
+}
+
+/// Pause readout line 2: chip + installed app count (+ contracts, seed code).
+pub fn pause_loadout_line(loadout: &RunLoadout, run: &RunStats) -> String {
+    let apps = run.upgrades.len();
+    let mut line = format!("CHIP {}  |  {} APP{}", crate::meta_ui::chip_label(loadout.chip), apps, if apps == 1 { "" } else { "S" });
+    if let Some(tags) = crate::meta_ui::contract_tags(loadout) {
+        line = format!("{line}  |  {tags}");
+    }
+    match shareable_code(run) {
+        Some(code) => format!("{line}  |  SEED {code}"),
+        None => line,
+    }
 }
 
 /// Android input requirement shown under the Main Menu and Pause actions.
@@ -1589,7 +1771,7 @@ fn perform(
     time: &Time,
     (state, ret): (AppState, &mut SettingsReturn),
     next: &mut NextState<AppState>,
-    lb: &mut LeaderboardState,
+    (lb, controls): (&mut LeaderboardState, &mut ControlsOverlayOpen),
 ) {
     // Abandoning an active Endless run from Pause preserves earned Endless records/deltas.
     let finalize_endless = |run: &mut RunStats, loadout: &RunLoadout, store: &mut ProfileStore| {
@@ -1680,6 +1862,8 @@ fn perform(
             }
         }
         MenuAction::OpenCompendium => next.set(AppState::Compendium),
+        MenuAction::ToggleControls => controls.0 = !controls.0,
+        MenuAction::CloseControls => controls.0 = false,
         MenuAction::ToggleSeedEdit => {
             seed.toggle_edit();
             if !seed.editing {
@@ -1732,7 +1916,7 @@ fn menu_buttons(
     time: Res<Time>,
     (state, mut ret): (Res<State<AppState>>, ResMut<SettingsReturn>),
     mut next: ResMut<NextState<AppState>>,
-    mut lb: ResMut<LeaderboardState>,
+    (mut lb, mut controls): (ResMut<LeaderboardState>, ResMut<ControlsOverlayOpen>),
     (mut gate, mut sfx): (Option<ResMut<UiSfxGate>>, Option<ResMut<SfxQueue>>),
 ) {
     let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
@@ -1773,7 +1957,7 @@ fn menu_buttons(
                 &time,
                 (*state.get(), &mut ret),
                 &mut next,
-                &mut lb,
+                (&mut lb, &mut controls),
             );
             return;
         }
@@ -1793,7 +1977,7 @@ fn menu_keys(
     mut ret: ResMut<SettingsReturn>,
     mut next: ResMut<NextState<AppState>>,
     pad: Res<GamepadInput>,
-    mut lb: ResMut<LeaderboardState>,
+    (mut lb, mut controls): (ResMut<LeaderboardState>, ResMut<ControlsOverlayOpen>),
     (mut gate, mut sfx): (Option<ResMut<UiSfxGate>>, Option<ResMut<SfxQueue>>),
 ) {
     // The leaderboard owns its keys (`leaderboard::leaderboard_input`).
@@ -1805,9 +1989,16 @@ fn menu_keys(
             g.play(q, SfxEvent::UiConfirm, now);
         }
     };
+    let pad_editing = *state.get() == AppState::MainMenu && seed.editing;
+    // An open controls overlay eats `Esc` / controller `B` first: Pause never
+    // resumes from under it.
+    if !pad_editing && controls_back_closes(*state.get(), controls.0, keys.just_pressed(KeyCode::Escape), pad.back) {
+        blip(time.elapsed_secs());
+        controls.0 = false;
+        return;
+    }
     // Controller shortcuts (never typed text). While the controller seed
     // editor is open `B` cancels the edit instead (see `seed_entry_pad`).
-    let pad_editing = *state.get() == AppState::MainMenu && seed.editing;
     let pad_action = if pad_editing { None } else { pad_menu_action(*state.get(), pad.pause, pad.back) };
     if let Some(action) = pad_action.or_else(|| pad_retry_action(*state.get(), run.mode, pad.interact)) {
         blip(time.elapsed_secs());
@@ -1821,7 +2012,7 @@ fn menu_keys(
             &time,
             (*state.get(), &mut ret),
             &mut next,
-            &mut lb,
+            (&mut lb, &mut controls),
         );
         return;
     }
@@ -1850,7 +2041,8 @@ fn menu_keys(
         )
     })
     .or_else(|| seed_hotkey_action(*state.get(), run.mode, keys.just_pressed(KeyCode::KeyB), keys.just_pressed(KeyCode::KeyS)))
-    .or_else(|| leaderboard_hotkey_action(*state.get(), keys.just_pressed(KeyCode::KeyK)));
+    .or_else(|| leaderboard_hotkey_action(*state.get(), keys.just_pressed(KeyCode::KeyK)))
+    .or_else(|| controls_hotkey_action(*state.get(), keys.just_pressed(KeyCode::KeyH)));
     if let Some(action) = action {
         blip(time.elapsed_secs());
         perform(
@@ -1863,7 +2055,7 @@ fn menu_keys(
             &time,
             (*state.get(), &mut ret),
             &mut next,
-            &mut lb,
+            (&mut lb, &mut controls),
         );
     }
 }
@@ -4316,9 +4508,51 @@ mod tests {
         assert!(seed_status_line(&seed, InputMode::KeyboardMouse).contains("ENTER"));
         // The pad field manual covers every documented binding.
         let pad: Vec<&str> = PAD_CONTROLS.iter().flat_map(|(_, b)| b.iter().flat_map(|(k, _)| k.iter().copied())).collect();
-        for k in ["LS", "RS", "A", "L3", "LB", "RT", "LT", "RB", "X", "Y", "DPAD", "START"] {
+        for k in ["LS", "RS", "A", "L3", "LB", "RT", "LT", "RB", "X", "Y", "DPAD", "START", "B", "D-UP"] {
             assert!(pad.contains(&k), "{k} missing from the controller manual");
         }
+    }
+
+    #[test]
+    fn controls_overlay_hotkeys() {
+        assert_eq!(controls_hotkey_action(AppState::MainMenu, true), Some(MenuAction::ToggleControls));
+        assert_eq!(controls_hotkey_action(AppState::Paused, true), Some(MenuAction::ToggleControls));
+        for st in [AppState::Playing, AppState::Loadout, AppState::Settings, AppState::GameOver, AppState::Victory, AppState::Leaderboard] {
+            assert_eq!(controls_hotkey_action(st, true), None, "{st:?}");
+        }
+        assert_eq!(controls_hotkey_action(AppState::MainMenu, false), None);
+        // Esc / B close an open overlay (Pause never resumes from under it).
+        assert!(controls_back_closes(AppState::Paused, true, true, false));
+        assert!(controls_back_closes(AppState::MainMenu, true, false, true));
+        assert!(!controls_back_closes(AppState::Paused, false, true, false), "closed overlay: Esc resumes as before");
+        assert!(!controls_back_closes(AppState::Loadout, true, true, false));
+        // CLOSE shows controller B; CONTROLS keeps no pad tag.
+        assert_eq!(pad_prompt(AppState::MainMenu, CONTROLS_CLOSE, MenuAction::CloseControls), "CLOSE  [B]");
+        assert_eq!(pad_prompt(AppState::Paused, CONTROLS_BUTTON, MenuAction::ToggleControls), "CONTROLS");
+    }
+
+    #[test]
+    fn seed_status_only_while_active() {
+        let mut seed = CustomSeedState::default();
+        assert!(!seed_status_visible(&seed), "idle: the mode telemetry owns the slot");
+        seed.toggle_edit();
+        assert!(seed_status_visible(&seed));
+        assert_eq!(seed_status_line(&seed, InputMode::Gamepad), PAD_TEXT_HINT);
+        seed.lock();
+        seed.status_msg = Some("SEED EDIT CANCELLED".into());
+        assert!(seed_status_visible(&seed));
+    }
+
+    #[test]
+    fn pause_readout_is_two_compact_lines() {
+        let mut run = RunStats { floor: 2, kills: 41, jammers_destroyed: 2, time_elapsed: 192.0, ..default() };
+        assert_eq!(pause_summary(&run), "FLOOR 2/5  |  03:12  |  41 KILLS  |  2 JAMMERS");
+        let loadout = RunLoadout::default();
+        assert!(pause_loadout_line(&loadout, &run).contains("|  0 APPS"), "{}", pause_loadout_line(&loadout, &run));
+        let survey = RunLoadout { chip: crate::meta::StarterChip::SurveyOs, ..default() };
+        assert!(pause_loadout_line(&survey, &run).starts_with("CHIP SURVEY OS  |"), "no doubled OS: {}", pause_loadout_line(&survey, &run));
+        run.upgrades.push(crate::state::UpgradeId::EmpOvercharge);
+        assert!(pause_loadout_line(&loadout, &run).contains("|  1 APP"));
     }
 
     #[test]

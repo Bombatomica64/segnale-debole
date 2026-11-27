@@ -13,7 +13,7 @@ use rand::seq::SliceRandom;
 
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::decals::{DecalKind, DecalQueue, DecalRequest};
-use crate::fx::{spawn_burst, spawn_death_gibs, spawn_flash_light, BurstColor, FxAssets, GibMat, HudFeed};
+use crate::fx::{needle_collar_transform, spawn_burst, spawn_death_gibs, spawn_flash_light, BurstColor, FxAssets, GibMat, HudFeed, ShotShape};
 use crate::apps::spawn_hijack_hotspot;
 use crate::level::{Cell, CullableLight, DemonJammer, LevelEntity, LevelGrid, RampDir, SignalTower, CEILING_HEIGHT};
 use crate::mesh_batch::{MaterialBatches, MeshBatch};
@@ -2200,7 +2200,7 @@ fn update_flow_field(grid: Res<LevelGrid>, mut flow: ResMut<FlowField>, player: 
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn enemy_ai(
+pub(crate) fn enemy_ai(
     mut commands: Commands,
     time: Res<Time>,
     grid: Res<LevelGrid>,
@@ -2559,31 +2559,60 @@ fn fly_move(grid: &LevelGrid, pos: Vec3, step: Vec3, radius: f32) -> Vec3 {
 }
 
 pub fn spawn_enemy_projectile(commands: &mut Commands, fx: &FxAssets, pos: Vec3, vel: Vec3, damage: f32, radius: f32, color: BurstColor) {
-    let (mat, halo) = match color {
-        BurstColor::Cyan => (fx.cyan.clone(), fx.cyan_halo.clone()),
-        BurstColor::Green => (fx.green.clone(), fx.green_halo.clone()),
-        _ => (fx.fire.clone(), fx.fire_halo.clone()),
-    };
-    let core_mat = match color {
-        BurstColor::Cyan => fx.cyan_core.clone(),
-        _ => fx.tracer_core.clone(),
-    };
+    let look = fx.shot_look(color);
     let light = match color {
         BurstColor::Gore => Color::srgb(1.0, 0.2, 0.6),
         c => FxAssets::light_color(c),
     };
-    commands.spawn((
+    let mut root = commands.spawn((
         LevelEntity,
         EnemyProjectile { vel, damage, radius, life: 5.0, color },
-        Mesh3d(fx.sphere.clone()),
-        MeshMaterial3d(core_mat),
-        Transform::from_translation(pos).with_scale(Vec3::splat(radius * 0.65)),
-        children![
-            (Mesh3d(fx.sphere.clone()), MeshMaterial3d(halo), Transform::from_scale(Vec3::splat(1.75))),
-            (Mesh3d(fx.ring.clone()), MeshMaterial3d(mat), Transform::from_scale(Vec3::new(1.85, 0.55, 1.85)).with_rotation(Quat::from_rotation_x(0.7))),
-            (PointLight { color: light, intensity: 110_000.0, range: 6.0, shadow_maps_enabled: false, ..default() }, Transform::default()),
-        ],
+        MeshMaterial3d(look.core.clone()),
+        Transform::from_translation(pos).with_rotation(enemy_shot_rotation(color, vel)).with_scale(Vec3::splat(radius * 0.65)),
     ));
+    let glow = (PointLight { color: light, intensity: 110_000.0, range: 6.0, shadow_maps_enabled: false, ..default() }, Transform::default());
+    match ShotShape::for_color(color) {
+        ShotShape::Needle => {
+            root.insert((
+                Mesh3d(fx.proj_needle_mesh.clone()),
+                children![
+                    (Mesh3d(fx.proj_needle_sheath.clone()), MeshMaterial3d(look.halo.clone()), Transform::default()),
+                    (Mesh3d(fx.ring.clone()), MeshMaterial3d(look.ring.clone()), needle_collar_transform()),
+                    glow,
+                ],
+            ));
+        }
+        ShotShape::Orb => {
+            root.insert((
+                Mesh3d(fx.proj_orb_mesh.clone()),
+                children![
+                    (Mesh3d(fx.proj_orb_mesh.clone()), MeshMaterial3d(look.halo.clone()), Transform::from_scale(Vec3::splat(1.75))),
+                    (Mesh3d(fx.ring.clone()), MeshMaterial3d(look.ring.clone()), Transform::from_scale(Vec3::new(1.85, 0.55, 1.85)).with_rotation(Quat::from_rotation_x(0.7))),
+                    glow,
+                ],
+            ));
+        }
+    }
+}
+
+/// Initial orientation of an enemy shot: rail lances point along `vel`.
+pub fn enemy_shot_rotation(color: BurstColor, vel: Vec3) -> Quat {
+    match ShotShape::for_color(color) {
+        ShotShape::Needle => Quat::from_rotation_arc(Vec3::Y, vel.normalize_or(Vec3::Y)),
+        ShotShape::Orb => Quat::IDENTITY,
+    }
+}
+
+/// Per-frame flight spin: orbs tumble/churn, rail lances spin about their
+/// (velocity-aligned) local +Y.
+pub fn spin_enemy_shot(tf: &mut Transform, color: BurstColor, dt: f32) {
+    match ShotShape::for_color(color) {
+        ShotShape::Needle => tf.rotate_local_y(dt * 14.0),
+        ShotShape::Orb => {
+            tf.rotate_local_y(dt * 5.5);
+            tf.rotate_local_x(dt * 3.8);
+        }
+    }
 }
 
 /// Enemy bolts at least this big (Hell Baron / boss hellfire) scorch walls.
@@ -2597,7 +2626,7 @@ pub fn segment_point_distance(a: Vec3, b: Vec3, p: Vec3) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn move_enemy_projectiles(
+pub(crate) fn move_enemy_projectiles(
     mut commands: Commands,
     time: Res<Time>,
     grid: Res<LevelGrid>,
@@ -2645,6 +2674,7 @@ fn move_enemy_projectiles(
             continue;
         }
         tf.translation = to;
+        spin_enemy_shot(&mut tf, p.color, dt);
     }
 }
 
@@ -3122,6 +3152,25 @@ impl Plugin for EnemiesPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enemy_shots_tumble_or_spin_along_flight_without_nans() {
+        let vel = Vec3::new(3.0, -1.0, 7.0);
+        for c in [BurstColor::Fire, BurstColor::Cyan, BurstColor::Green, BurstColor::Gore, BurstColor::Spark] {
+            let mut tf = Transform::from_rotation(enemy_shot_rotation(c, vel));
+            let r0 = tf.rotation;
+            for _ in 0..120 {
+                spin_enemy_shot(&mut tf, c, 1.0 / 60.0);
+            }
+            assert!(tf.rotation.is_finite() && tf.rotation.is_normalized(), "{c:?}");
+            assert!(r0.angle_between(tf.rotation) > 0.1, "{c:?} animates");
+            if c == BurstColor::Spark {
+                assert!((tf.rotation * Vec3::Y).dot(vel.normalize()) > 0.999, "rail lance stays on its flight axis");
+            }
+        }
+        // Degenerate velocity never yields NaNs.
+        assert!(enemy_shot_rotation(BurstColor::Spark, Vec3::ZERO).is_finite());
+    }
     use crate::level::generate_level;
     use rand::SeedableRng;
     use rand::rngs::StdRng;

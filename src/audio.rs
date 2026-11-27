@@ -90,10 +90,16 @@ pub enum SfxEvent {
     UpsDetonate,
     /// Damaged UPS rack warning hiss + spark crackle.
     UpsHiss,
+    /// Milestone 33: Phone Punch swing / impact: air whip + knuckle thud.
+    PhonePunch,
+    /// Milestone 33: projectile parry: metallic clang + rising golden ring.
+    PhoneParry,
+    /// Milestone 33: Camera Flash Strobe: shutter snap + high-voltage strobe pop.
+    CameraFlash,
 }
 
 impl SfxEvent {
-    pub const ALL: [SfxEvent; 41] = [
+    pub const ALL: [SfxEvent; 44] = [
         SfxEvent::Shotgun,
         SfxEvent::Plasma,
         SfxEvent::Dash,
@@ -135,6 +141,9 @@ impl SfxEvent {
         SfxEvent::CrtShatter,
         SfxEvent::UpsDetonate,
         SfxEvent::UpsHiss,
+        SfxEvent::PhonePunch,
+        SfxEvent::PhoneParry,
+        SfxEvent::CameraFlash,
     ];
 
     /// Warnings that must always be heard keep their direction but are pulled
@@ -178,6 +187,10 @@ impl SfxEvent {
             SfxEvent::CrtShatter => 0.17,
             SfxEvent::UpsDetonate => 0.2,
             SfxEvent::UpsHiss => 0.14,
+            // Milestone 33: phone abilities sit with the guns, under the mortar.
+            SfxEvent::PhonePunch => 0.34,
+            SfxEvent::PhoneParry => 0.3,
+            SfxEvent::CameraFlash => 0.26,
             _ => 0.75,
         }
     }
@@ -764,6 +777,46 @@ fn synth_samples(sfx: SfxEvent) -> Vec<f32> {
             let tick = if ((ts * 60.0) as u32).is_multiple_of(4) && (ts * 60.0).fract() < 0.08 { n.next() * 0.6 } else { 0.0 };
             (hiss + tick) * env(t, 0.06, 1.4)
         }),
+        SfxEvent::PhonePunch => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(0.22, move |ts, t, n| {
+                // Fast band-passed air whip sweeping up, then a punchy
+                // pitch-dropping knuckle thud and a plastic bezel tick.
+                let x = n.next();
+                let k = 0.1 + 0.5 * (ts / 0.06).min(1.0);
+                let whip = if ts < 0.07 { (lp.run(x, k) - lp2.run(x, k * 0.2)) * 1.8 * (ts / 0.07) } else { 0.0 };
+                let hit_t = (ts - 0.05).max(0.0);
+                let thud = if ts >= 0.05 { (o.step(70.0 + 160.0 * decay(hit_t, 30.0)) * TAU).sin() * decay(hit_t, 16.0) } else { 0.0 };
+                let tick = if (0.05..0.056).contains(&ts) { n.next() * 0.7 } else { 0.0 };
+                let body = tri(o2.step(240.0 - 90.0 * t)) * 0.2 * decay(hit_t, 22.0);
+                (whip + thud * 0.95 + tick + body) * env(t, 0.004, 1.1)
+            })
+        }
+        SfxEvent::PhoneParry => render(0.52, |ts, t, n| {
+            // Hard metallic clang (inharmonic partials) + a rising golden
+            // two-note ring (A5 -> E6) and a bright noise crack.
+            let clang = ((o.step(523.0) * TAU).sin() * 0.35 + (TAU * 1_391.0 * ts).sin() * 0.22 + (TAU * 2_217.0 * ts).sin() * 0.14) * decay(ts, 9.0);
+            let f = if ts < 0.09 { 880.0 } else { 1_318.5 };
+            let local = if ts < 0.09 { ts } else { ts - 0.09 };
+            let ring = (saw(o2.step(f)) * 0.18 + (TAU * f * 2.0 * ts).sin() * 0.12) * (local / 0.004).min(1.0) * decay(local, 6.0);
+            let crack = if ts < 0.014 { n.next() * 0.85 * (1.0 - ts / 0.014) } else { 0.0 };
+            (clang + ring + crack) * env(t, 0.003, 0.9)
+        }),
+        SfxEvent::CameraFlash => {
+            let mut lp2 = Lp { y: 0.0 };
+            render(0.4, move |ts, t, n| {
+                // Shutter: two tight mechanical clicks; then the strobe's
+                // capacitor whine sweeping up into a bright pop + fizz.
+                let x = n.next();
+                let click = |at: f32| if (at..at + 0.005).contains(&ts) { 1.0 - (ts - at) / 0.005 } else { 0.0 };
+                let shutter = (x - lp.run(x, 0.25)) * (click(0.0) + click(0.045) * 0.8) * 1.6;
+                let whine = if ts < 0.09 { (o.step(2_400.0 + 5_200.0 * (ts / 0.09)) * TAU).sin() * 0.16 * (ts / 0.09) } else { 0.0 };
+                let pop_t = (ts - 0.09).max(0.0);
+                let pop = if ts >= 0.09 { (o2.step(180.0 + 600.0 * decay(pop_t, 40.0)) * TAU).sin() * 0.6 * decay(pop_t, 18.0) } else { 0.0 };
+                let fizz = if ts >= 0.09 { (x - lp2.run(x, 0.4)) * 0.45 * decay(pop_t, 9.0) } else { 0.0 };
+                (shutter + whine + pop + fizz) * env(t, 0.003, 1.0)
+            })
+        }
     }
 }
 
@@ -1533,7 +1586,7 @@ mod tests {
 
     #[test]
     fn rocket_sfx_are_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 41);
+        assert_eq!(SfxEvent::ALL.len(), 44);
         let fire = synthesize_wav(SfxEvent::RocketFire);
         let boom = synthesize_wav(SfxEvent::RocketExplode);
         assert_eq!(fire, synthesize_wav(SfxEvent::RocketFire));
@@ -1547,7 +1600,7 @@ mod tests {
 
     #[test]
     fn milestone13_sfx_are_valid_distinct_and_deterministic() {
-        assert_eq!(SfxEvent::ALL.len(), 41);
+        assert_eq!(SfxEvent::ALL.len(), 44);
         let news = [SfxEvent::PhaseBlink, SfxEvent::SniperLock, SfxEvent::BossShield];
         for sfx in news {
             assert!(SfxEvent::ALL.contains(&sfx));
@@ -2140,6 +2193,44 @@ mod tests {
         assert!(SfxEvent::StylePeak.volume() > SfxEvent::StyleRankUp.volume());
         assert!(secs(SfxEvent::UpsDetonate) > secs(SfxEvent::RocketExplode) * 0.5);
         assert!(SfxEvent::UpsHiss.volume() < SfxEvent::CrtShatter.volume());
+    }
+
+    #[test]
+    fn milestone33_phone_ability_sfx_are_valid_distinct_and_keep_headroom() {
+        let news = [SfxEvent::PhonePunch, SfxEvent::PhoneParry, SfxEvent::CameraFlash];
+        let secs = |e| (synthesize_wav(e).len() - 44) as f32 / 2.0 / SAMPLE_RATE as f32;
+        assert_eq!(SfxEvent::ALL.len(), 44);
+        for sfx in news {
+            assert!(SfxEvent::ALL.contains(&sfx));
+            let w = synthesize_wav(sfx);
+            assert_eq!(w, synthesize_wav(sfx), "{sfx:?} deterministic");
+            for other in SfxEvent::ALL.into_iter().filter(|o| *o != sfx) {
+                assert_ne!(w, synthesize_wav(other), "{sfx:?} vs {other:?}");
+            }
+            let pcm: Vec<i16> = w[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            let rms = (pcm.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt();
+            assert!(rms > 800.0, "{sfx:?} rms {rms}");
+            assert!(secs(sfx) < 0.6, "{sfx:?} snappy");
+            assert!(sfx.volume() <= SfxEvent::RocketExplode.volume(), "{sfx:?} sits under the mortar");
+        }
+        // The punch is the snappiest; the parry rings longest.
+        assert!(secs(SfxEvent::PhonePunch) < secs(SfxEvent::CameraFlash));
+        assert!(secs(SfxEvent::PhoneParry) > secs(SfxEvent::PhonePunch));
+        // Worst case: a parry right as a punch lands, a flash pop and a mortar
+        // blast, over the boss overdrive bed + 6G+ layer.
+        let boss = MusicCues { state: AppState::Playing, bars: 5, boss_active: true, boss_overdrive: true, style_tier: 7, ..default() };
+        let cues = [
+            (SfxEvent::PhoneParry, false),
+            (SfxEvent::PhonePunch, false),
+            (SfxEvent::CameraFlash, false),
+            (SfxEvent::RocketExplode, false),
+            (SfxEvent::JammerHum, true),
+        ];
+        let (peak, clipped) = worst_case_mix_with(boss, &cues);
+        let dbfs = 20.0 * peak.log10();
+        println!("milestone 33 worst-case mix: peak {peak:.4} ({dbfs:.2} dBFS), clipped samples {clipped}");
+        assert_eq!(clipped, 0);
+        assert!(peak <= 0.89, "peak {peak:.4} ({dbfs:.2} dBFS) must stay <= -1 dBFS");
     }
 
     #[test]

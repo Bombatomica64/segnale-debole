@@ -6,7 +6,7 @@
 //! `extraction`, `upgrades`) read it alongside keyboard/mouse input, so the bot
 //! exercises exactly the same physics, weapons, apps and state machine a human
 //! does. Held inputs (`wish_dir`, `strafe_axes`, `fire`, `jump`) stay set until cleared;
-//! one-shot inputs (`dash`, `ping`, `overload`, `interact`, `switch_weapon`,
+//! one-shot inputs (`dash`, `ping`, `overload`, `punch`, `flash`, `interact`, `switch_weapon`,
 //! `pick_upgrade`) are consumed by the system that handles them.
 
 use bevy::prelude::*;
@@ -38,6 +38,10 @@ pub struct BotControl {
     pub ping: bool,
     /// One-shot: 5G Overload.
     pub overload: bool,
+    /// One-shot: Phone Punch (`V` / middle mouse).
+    pub punch: bool,
+    /// One-shot: Camera Flash Strobe (`C`).
+    pub flash: bool,
     /// One-shot: `E` (trigger SOS uplink at the tower).
     pub interact: bool,
     /// One-shot: App Store card to install (0..3).

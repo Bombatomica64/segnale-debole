@@ -23,7 +23,7 @@ use crate::physics::sample_floor_height;
 use crate::player::{CursorCaptured, Player};
 use crate::signal::{bars_from_strength, SignalState};
 use crate::state::PlayerModifiers;
-use crate::weapons::{damage_barrel, damage_jammer, knockback_scale, CombatDamage, BARREL_CENTER_Y, BARREL_RADIUS};
+use crate::weapons::{barrel_center, damage_barrel, damage_jammer, knockback_scale, CombatDamage, BARREL_RADIUS};
 
 pub const PING_COOLDOWN: f32 = 4.0;
 pub const PING_MIN_BARS: u8 = 1;
@@ -82,6 +82,18 @@ pub struct PhoneApps {
     pub spoof_timer: f32,
     /// Signal Spoofer: seconds until another Dead-Zone dash can spoof again.
     pub spoof_cooldown: f32,
+    /// Milestone 33 Phone Punch: seconds until the next punch.
+    pub punch_cooldown: f32,
+    /// Phone Punch viewmodel jab envelope (1 -> 0 over ~0.32 s).
+    pub punch_anim: f32,
+    /// The last punch connected (meatier viewmodel snap + screen accent).
+    pub punch_hit: bool,
+    /// Golden parry accent timer (phone OLED frame + LED).
+    pub parry_flash: f32,
+    /// Milestone 33 Camera Flash Strobe: seconds until the next flash.
+    pub flash_cooldown: f32,
+    /// Camera Flash viewmodel lift + white-hot LED envelope (1 -> 0 over ~0.35 s).
+    pub flash_anim: f32,
 }
 
 /// Jammer Hijack: a temporary 5-bar signal hotspot left by a destroyed
@@ -183,6 +195,11 @@ impl PhoneApps {
         self.callback_timer = (self.callback_timer - dt).max(0.0);
         self.spoof_timer = (self.spoof_timer - dt).max(0.0);
         self.spoof_cooldown = (self.spoof_cooldown - dt).max(0.0);
+        self.punch_cooldown = (self.punch_cooldown - dt).max(0.0);
+        self.punch_anim = (self.punch_anim - dt / crate::phone_combat::PUNCH_ANIM_SECS).max(0.0);
+        self.parry_flash = (self.parry_flash - dt).max(0.0);
+        self.flash_cooldown = (self.flash_cooldown - dt).max(0.0);
+        self.flash_anim = (self.flash_anim - dt / crate::phone_combat::FLASH_ANIM_SECS).max(0.0);
     }
 
     pub fn spoof_active(&self) -> bool {
@@ -336,7 +353,7 @@ fn reset_apps(mut apps: ResMut<PhoneApps>) {
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn phone_apps(
+pub(crate) fn phone_apps(
     mut commands: Commands,
     time: Res<Time>,
     (keys, mouse, captured): (Res<ButtonInput<KeyCode>>, Res<ButtonInput<MouseButton>>, Res<CursorCaptured>),
@@ -352,7 +369,7 @@ fn phone_apps(
     mut enemies: Query<(Entity, &mut Enemy, &GlobalTransform, Option<&mut PingMarked>)>,
     (mut jammers, mut barrels, mut pylons): (
         Query<(&mut DemonJammer, &GlobalTransform)>,
-        Query<(&mut ExplosiveBarrel, &GlobalTransform)>,
+        Query<(&mut ExplosiveBarrel, &Transform)>,
         Query<(&mut crate::boss::BossPylon, &GlobalTransform)>,
     ),
     (mut bot, pad, mut prop_hits): (Option<ResMut<BotControl>>, Option<Res<crate::gamepad::GamepadInput>>, ResMut<crate::props::PropHits>),
@@ -512,8 +529,8 @@ fn phone_apps(
                     }
                 }
                 // Volatile coolant barrels in the EMP blast cook off.
-                for (mut b, g) in &mut barrels {
-                    let c = g.translation() + Vec3::Y * BARREL_CENTER_Y;
+                for (mut b, tf) in &mut barrels {
+                    let c = barrel_center(tf);
                     if b.is_intact() && c.distance(center) <= radius + BARREL_RADIUS && damage_barrel(&mut b, dmg, false) {
                         spawn_lightning(&mut commands, &fx, center, c);
                     }

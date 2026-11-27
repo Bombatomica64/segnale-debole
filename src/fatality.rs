@@ -43,6 +43,10 @@ pub enum KillCause {
     PointBlankOverkill,
     /// Direct Signal-Mortar hit.
     MortarDirect,
+    /// Milestone 33: killing blow of a Phone Punch.
+    PhonePunch,
+    /// Milestone 33: direct hit of a parried (reflected) projectile.
+    ParryDirect,
 }
 
 impl KillCause {
