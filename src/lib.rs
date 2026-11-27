@@ -39,6 +39,8 @@ pub mod signal;
 pub mod state;
 pub mod style;
 pub mod style_emblem;
+pub mod touch;
+pub mod touch_hud;
 pub mod trials;
 pub mod upgrades;
 pub mod weapons;
@@ -92,7 +94,9 @@ impl Plugin for CoreGameplayPlugin {
             .add_plugins(props::PropsPlugin)
             .add_plugins(rumble::RumblePlugin)
             // Milestone 33: Phone Punch / parry / barrel launch + Camera Flash Strobe.
-            .add_plugins(phone_combat::PhoneCombatPlugin);
+            .add_plugins(phone_combat::PhoneCombatPlugin)
+            // Milestone 37: touch controls (Android APK + mobile web).
+            .add_plugins(touch::TouchPlugin);
     }
 }
 
@@ -125,7 +129,7 @@ impl Plugin for GamePlugin {
 
 /// Android entry point (`android_main`, called by GameActivity through
 /// `android-activity`): borderless fullscreen landscape, always vsynced.
-/// Input is a controller or mouse & keyboard; there are no touch controls.
+/// Input is touch (on-screen controls), a controller or mouse & keyboard.
 #[cfg(target_os = "android")]
 #[bevy::prelude::bevy_main]
 fn main() {

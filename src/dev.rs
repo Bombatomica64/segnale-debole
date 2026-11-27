@@ -51,6 +51,17 @@
 //!   `05_hud_demon_rush.png` (the SOS uplink block and alert) and
 //!   `03_trial_signal_ghost.png` (the PB Signal Ghost on the Time Trial with
 //!   its live delta), then exits.
+//! - `SEGNALE_TOUCH_SHOTS=<dir>`: Milestone 37 touch tour on an in-memory
+//!   profile with `touch_mode = On` (pair it with `SEGNALE_WINDOW_SIZE=915x412`
+//!   for a 20:9 phone): `01_main_menu_touch.png`, `02_settings_general.png`,
+//!   `03_settings_touch.png`, `04_touch_hud_rest.png` (stick resting, plates
+//!   idle), `05_touch_hud_action.png` (virtual fingers: stick on the bhop rim,
+//!   FIRE held and dragging), `07_touch_hud_states.png` (rising cooldown
+//!   fills on DASH / PUNCH / PING / FLASH, 5G READY glowing at 5 bars, the
+//!   contextual SOS at the tower and the AUTO-BHOP pill latched ON by a
+//!   virtual tap), `06_pause_touch.png` (the 2-column touch Pause) and
+//!   `08_leaderboard_touch_editor.png` (the touch callsign editor strip),
+//!   then exits.
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
@@ -153,6 +164,24 @@ impl Plugin for DevPlugin {
                 }
             }
             app.insert_resource(LayoutShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, layout_shots_tour.after(GameSet::Ui));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_TOUCH_SHOTS") {
+            let mut profile = PlayerProfile::default();
+            profile.settings.touch_mode = crate::meta::TouchMode::On;
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.web_storage = false;
+                    store.profile = profile;
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(profile));
+                }
+            }
+            app.insert_resource(TouchShots { dir, stage: 0, timer: 0.0 })
+                .add_systems(Update, touch_shots_tour.after(GameSet::Ui))
+                .add_systems(Update, touch_shots_force.after(GameSet::Signal).before(GameSet::Ui));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_COMPENDIUM_SHOTS") {
@@ -1049,6 +1078,180 @@ fn layout_shots_tour(
     if advance {
         cfg.stage += 1;
         cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_TOUCH_SHOTS (Milestone 37)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct TouchShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+/// Main menu -> Settings (both pages) -> a run with the touch HUD at rest,
+/// then with virtual fingers (real `TouchInput` messages through the whole
+/// router) -> Pause.
+#[allow(clippy::too_many_arguments)]
+fn touch_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<TouchShots>,
+    state: Res<State<AppState>>,
+    (mut run, mut mods, mut tab): (ResMut<RunStats>, ResMut<PlayerModifiers>, ResMut<crate::meta_ui::SettingsTab>),
+    touch: Res<crate::touch::TouchInput>,
+    windows: Query<Entity, With<bevy::window::PrimaryWindow>>,
+    mut fingers: MessageWriter<bevy::input::touch::TouchInput>,
+    mut players: Query<&mut Player>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+    mut lb: ResMut<crate::leaderboard::LeaderboardState>,
+) {
+    use crate::hud::MenuAction;
+    use bevy::input::touch::{TouchInput as Finger, TouchPhase};
+    cfg.timer += time.delta_secs();
+    for mut p in &mut players {
+        p.invuln_timer = 999.0;
+        p.hp = p.max_hp;
+    }
+    let dir = cfg.dir.clone();
+    let t = cfg.timer;
+    let window = windows.single().unwrap_or(Entity::PLACEHOLDER);
+    let mut finger = |id: u64, phase: TouchPhase, position: Vec2| {
+        fingers.write(Finger { phase, position, window, force: None, id });
+    };
+    let layout = &touch.layout;
+    let fire = layout.button(crate::touch::TouchButton::Fire).map_or(Vec2::ZERO, |b| b.center);
+    let advance = match (cfg.stage, *state.get()) {
+        (0, AppState::MainMenu) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "01_main_menu_touch.png");
+            true
+        }
+        (1, AppState::MainMenu) if t > 0.5 => {
+            next.set(AppState::Settings);
+            true
+        }
+        (2, AppState::Settings) if t > 1.2 => {
+            meta_shot(&mut commands, &dir, "02_settings_general.png");
+            true
+        }
+        (3, AppState::Settings) if t > 0.5 => {
+            *tab = crate::meta_ui::SettingsTab::Touch;
+            true
+        }
+        (4, AppState::Settings) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "03_settings_touch.png");
+            true
+        }
+        (5, AppState::Settings) if t > 0.5 => {
+            next.set(AppState::MainMenu);
+            true
+        }
+        (6, AppState::MainMenu) if t > 0.5 => {
+            crate::state::start_run(&mut run, &mut mods, &mut next, 1234);
+            true
+        }
+        (7, AppState::Playing) if t > 2.5 => {
+            meta_shot(&mut commands, &dir, "04_touch_hud_rest.png");
+            true
+        }
+        (8, AppState::Playing) if t > 0.5 => {
+            let stick = layout.stick_rest + Vec2::new(10.0, -10.0);
+            finger(1, TouchPhase::Started, stick);
+            finger(2, TouchPhase::Started, fire);
+            true
+        }
+        (9, AppState::Playing) if t > 0.1 => {
+            let stick = layout.stick_rest + Vec2::new(10.0, -10.0) + Vec2::new(0.62, -0.78) * layout.stick_radius * 0.95;
+            finger(1, TouchPhase::Moved, stick);
+            finger(2, TouchPhase::Moved, fire + Vec2::new(-14.0, -6.0));
+            true
+        }
+        (10, AppState::Playing) if t > 0.12 => {
+            meta_shot(&mut commands, &dir, "05_touch_hud_action.png");
+            true
+        }
+        (11, AppState::Playing) if t > 0.3 => {
+            finger(1, TouchPhase::Ended, layout.stick_rest);
+            finger(2, TouchPhase::Ended, fire);
+            true
+        }
+        // States frame: `touch_shots_force` holds the cooldowns / bars / tower
+        // through stages 12-13; a one-frame virtual tap latches AUTO-BHOP.
+        (12, AppState::Playing) if t > 0.3 => {
+            if let Some(pill) = layout.button(crate::touch::TouchButton::AutoBhop) {
+                finger(3, TouchPhase::Started, pill.center);
+                finger(3, TouchPhase::Ended, pill.center);
+            }
+            true
+        }
+        (13, AppState::Playing) if t > 0.6 => {
+            meta_shot(&mut commands, &dir, "07_touch_hud_states.png");
+            true
+        }
+        (14, AppState::Playing) if t > 0.3 => {
+            next.set(AppState::Paused);
+            true
+        }
+        (15, AppState::Paused) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "06_pause_touch.png");
+            true
+        }
+        (16, AppState::Paused) if t > 0.4 => {
+            next.set(AppState::Leaderboard);
+            true
+        }
+        (17, AppState::Leaderboard) if t > 0.8 => {
+            // Open the callsign editor and grow the callsign by one character
+            // (the strip's NEXT / `>` switches, as a tap would).
+            lb.pending.push(MenuAction::LbCallsign);
+            true
+        }
+        (18, AppState::Leaderboard) if t > 0.3 => {
+            lb.pending.push(MenuAction::LbEdit(crate::leaderboard::CallsignEdit::Add));
+            lb.pending.push(MenuAction::LbEdit(crate::leaderboard::CallsignEdit::Next));
+            true
+        }
+        (19, AppState::Leaderboard) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "08_leaderboard_touch_editor.png");
+            true
+        }
+        (20, _) if t > 1.0 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+/// Touch tour states frame (stages 12-13): mid-cooldown DASH / PUNCH / PING /
+/// FLASH, 5 bars (5G READY), and the tower in reach (SOS), held every frame
+/// after the signal systems so the touch HUD draws them.
+fn touch_shots_force(
+    cfg: Res<TouchShots>,
+    mods: Res<PlayerModifiers>,
+    mut signal: ResMut<crate::signal::SignalState>,
+    mut apps: ResMut<PhoneApps>,
+    mut players: Query<&mut Player>,
+) {
+    if !(12..=13).contains(&cfg.stage) {
+        return;
+    }
+    signal.bars = 5;
+    signal.near_tower = true;
+    apps.overload_cooldown = 0.0;
+    apps.ping_cooldown = crate::apps::ping_cooldown(&mods) * 0.7;
+    apps.flash_cooldown = crate::phone_combat::flash_cooldown(&mods) * 0.35;
+    apps.punch_cooldown = crate::phone_combat::PUNCH_COOLDOWN * 0.55;
+    for mut p in &mut players {
+        p.dash_cooldown = crate::player::DASH_COOLDOWN * mods.dash_cooldown_mult * 0.45;
     }
 }
 

@@ -322,10 +322,14 @@ pub fn mouse_look_active(captured: CursorCaptured, browser: Option<&BrowserPoint
 pub fn sync_browser_pointer_lock(
     In(now_locked): In<bool>,
     state: Res<State<AppState>>,
+    mode: Option<Res<crate::gamepad::InputMode>>,
     mut lock: ResMut<BrowserPointerLock>,
     mut next: ResMut<NextState<AppState>>,
 ) {
-    let playing = *state.get() == AppState::Playing;
+    // Touch mode never holds the lock: releasing it ourselves (a tap switched
+    // to touch mid-run) is never an external unlock.
+    let touch = mode.is_some_and(|m| m.is_touch());
+    let playing = *state.get() == AppState::Playing && !touch;
     if browser_unlock_should_pause(lock.locked, now_locked, playing) && matches!(*next, NextState::Unchanged) {
         info!("pointer lock released by the browser - pausing");
         next.set(AppState::Paused);
@@ -493,7 +497,19 @@ fn set_cursor(cursor: &mut CursorOptions, captured: bool) {
     }
 }
 
-fn capture_cursor(mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>, mut captured: ResMut<CursorCaptured>) {
+/// Whether the cursor may be captured now (never in touch mode).
+fn capture_allowed(mode: Option<&crate::gamepad::InputMode>, store: Option<&ProfileStore>) -> bool {
+    crate::touch::wants_cursor_capture(mode.copied().unwrap_or_default(), live_settings(store).touch_mode)
+}
+
+fn capture_cursor(
+    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    mut captured: ResMut<CursorCaptured>,
+    (mode, store): (Option<Res<crate::gamepad::InputMode>>, Option<Res<ProfileStore>>),
+) {
+    if !capture_allowed(mode.as_deref(), store.as_deref()) {
+        return;
+    }
     if let Ok(mut c) = cursor.single_mut() {
         set_cursor(&mut c, true);
         captured.0 = true;
@@ -509,13 +525,24 @@ fn release_cursor(mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>, mu
 
 /// Click to recapture the cursor while playing (Esc pauses via `hud::pause_input`;
 /// in the browser also via [`sync_browser_pointer_lock`]). In the browser a
-/// click also re-requests a lock that was never granted.
+/// click also re-requests a lock that was never granted. Touch mode never
+/// captures (a tap is not a "click to capture") and frees a held cursor.
 fn cursor_capture_input(
     mouse: Res<ButtonInput<MouseButton>>,
     browser: Option<Res<BrowserPointerLock>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut captured: ResMut<CursorCaptured>,
+    (mode, store): (Option<Res<crate::gamepad::InputMode>>, Option<Res<ProfileStore>>),
 ) {
+    if !capture_allowed(mode.as_deref(), store.as_deref()) {
+        if captured.0 {
+            if let Ok(mut c) = cursor.single_mut() {
+                set_cursor(&mut c, false);
+            }
+            captured.0 = false;
+        }
+        return;
+    }
     let Ok(mut c) = cursor.single_mut() else { return };
     if mouse.just_pressed(MouseButton::Left) && !mouse_look_active(*captured, browser.as_deref()) {
         set_cursor(&mut c, true);

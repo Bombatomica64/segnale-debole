@@ -620,6 +620,53 @@ fn default_true() -> bool {
     true
 }
 
+/// Touch look multiplier (see `touch::touch_look_delta`).
+pub const TOUCH_SENS_RANGE: (f32, f32) = (0.3, 3.0);
+/// Touch HUD opacity (never fully invisible: the buttons must stay findable).
+pub const TOUCH_OPACITY_RANGE: (f32, f32) = (0.25, 1.0);
+/// Touch button size multiplier.
+pub const TOUCH_BUTTON_SCALE_RANGE: (f32, f32) = (0.75, 1.35);
+
+/// When the on-screen touch controls are live (Milestone 37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum TouchMode {
+    /// Follow the last device: a touch shows the touch HUD, a controller or a
+    /// real key / mouse input hides it again.
+    #[default]
+    Auto,
+    /// Always touch (even on a desktop: preview it with the mouse).
+    On,
+    /// Never show the touch HUD, even on a touchscreen.
+    Off,
+}
+
+impl TouchMode {
+    pub const ALL: [TouchMode; 3] = [TouchMode::Auto, TouchMode::On, TouchMode::Off];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TouchMode::Auto => "AUTO",
+            TouchMode::On => "ON",
+            TouchMode::Off => "OFF",
+        }
+    }
+}
+
+/// Serde default of [`UserSettings::touch_sensitivity`].
+fn default_touch_sensitivity() -> f32 {
+    1.0
+}
+
+/// Serde default of [`UserSettings::touch_opacity`].
+fn default_touch_opacity() -> f32 {
+    0.70
+}
+
+/// Serde default of [`UserSettings::touch_button_scale`].
+fn default_touch_button_scale() -> f32 {
+    1.0
+}
+
 /// Player-facing options persisted inside the profile (never gameplay power).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -653,6 +700,24 @@ pub struct UserSettings {
     /// Controller rumble / haptics (only ever on an active controller).
     #[serde(default = "default_true")]
     pub rumble: bool,
+    /// Milestone 37: when the touch HUD is live.
+    #[serde(default)]
+    pub touch_mode: TouchMode,
+    /// Touch-drag look multiplier ([`TOUCH_SENS_RANGE`]).
+    #[serde(default = "default_touch_sensitivity")]
+    pub touch_sensitivity: f32,
+    /// Touch HUD opacity ([`TOUCH_OPACITY_RANGE`]).
+    #[serde(default = "default_touch_opacity")]
+    pub touch_opacity: f32,
+    /// Touch button size ([`TOUCH_BUTTON_SCALE_RANGE`]).
+    #[serde(default = "default_touch_button_scale")]
+    pub touch_button_scale: f32,
+    /// Pushing the touch stick to its rim holds jump (chained bhops).
+    #[serde(default = "default_true")]
+    pub touch_auto_bhop: bool,
+    /// Fire automatically while the crosshair rests on a visible target.
+    #[serde(default)]
+    pub touch_auto_fire: bool,
 }
 
 impl Default for UserSettings {
@@ -673,6 +738,12 @@ impl Default for UserSettings {
             gamepad_invert_y: false,
             gamepad_aim_friction: default_aim_friction(),
             rumble: default_true(),
+            touch_mode: TouchMode::Auto,
+            touch_sensitivity: default_touch_sensitivity(),
+            touch_opacity: default_touch_opacity(),
+            touch_button_scale: default_touch_button_scale(),
+            touch_auto_bhop: default_true(),
+            touch_auto_fire: false,
         }
     }
 }
@@ -692,6 +763,9 @@ impl UserSettings {
         self.strafe_roll_scale = sane(self.strafe_roll_scale, EFFECT_SCALE_RANGE, d.strafe_roll_scale);
         self.audio_master_volume = sane(self.audio_master_volume, VOLUME_RANGE, d.audio_master_volume);
         self.gamepad_sensitivity = sane(self.gamepad_sensitivity, GAMEPAD_SENS_RANGE, d.gamepad_sensitivity);
+        self.touch_sensitivity = sane(self.touch_sensitivity, TOUCH_SENS_RANGE, d.touch_sensitivity);
+        self.touch_opacity = sane(self.touch_opacity, TOUCH_OPACITY_RANGE, d.touch_opacity);
+        self.touch_button_scale = sane(self.touch_button_scale, TOUCH_BUTTON_SCALE_RANGE, d.touch_button_scale);
     }
 
     /// Sanitized copy.
@@ -1651,6 +1725,27 @@ mod tests {
         assert_eq!(s.sanitized().gamepad_sensitivity, 1.0);
         s.gamepad_sensitivity = 0.0;
         assert_eq!(s.sanitized().gamepad_sensitivity, GAMEPAD_SENS_RANGE.0);
+    }
+
+    #[test]
+    fn touch_settings_default_on_old_profiles_and_clamp() {
+        // A pre-Milestone 37 profile.json (no touch fields at all).
+        let old = parse_profile(r#"{"settings":{"mouse_sensitivity":1.5,"rumble":false}}"#).unwrap();
+        let s = &old.settings;
+        assert_eq!(s.touch_mode, TouchMode::Auto);
+        assert_eq!((s.touch_sensitivity, s.touch_opacity, s.touch_button_scale), (1.0, 0.70, 1.0), "missing floats are not 0.0");
+        assert!(s.touch_auto_bhop && !s.touch_auto_fire);
+        assert!(!s.rumble && s.mouse_sensitivity == 1.5, "existing fields survive");
+        // Round trip.
+        let t = UserSettings { touch_mode: TouchMode::On, touch_sensitivity: 2.0, touch_opacity: 0.4, touch_button_scale: 1.2, touch_auto_bhop: false, touch_auto_fire: true, ..default() };
+        let back: UserSettings = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
+        let off: UserSettings = serde_json::from_str(r#"{"touch_mode":"Off"}"#).unwrap();
+        assert_eq!(off.touch_mode, TouchMode::Off);
+        // Clamping + NaN fallback.
+        let wild = UserSettings { touch_sensitivity: 99.0, touch_opacity: 0.0, touch_button_scale: f32::NAN, ..default() }.sanitized();
+        assert_eq!((wild.touch_sensitivity, wild.touch_opacity, wild.touch_button_scale), (TOUCH_SENS_RANGE.1, TOUCH_OPACITY_RANGE.0, 1.0));
+        assert_eq!(TouchMode::ALL.map(TouchMode::name), ["AUTO", "ON", "OFF"]);
     }
 
     #[test]

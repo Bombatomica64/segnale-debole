@@ -79,6 +79,8 @@ pub struct PhoneScreenSnapshot {
     /// Controller is the active input: tiles read `LT PNG` / `RB EMP` and the
     /// tower prompt `PRESS [X]` instead of `RMB` / `Q` / `[E]`.
     pub pad_prompts: bool,
+    /// Touch prompts (Milestone 37: on-screen button names, wins over `pad_prompts`).
+    pub touch_prompts: bool,
     /// Active diegetic notification banner (drawn over the radar panel).
     pub notif: Option<(NotifKind, &'static str)>,
 }
@@ -116,6 +118,7 @@ impl Default for PhoneScreenSnapshot {
             spoof_active: false,
             hijack_boost: false,
             pad_prompts: false,
+            touch_prompts: false,
             notif: None,
         }
     }
@@ -129,6 +132,25 @@ pub const fn app_tile_labels(pad: bool) -> (&'static str, &'static str, &'static
 /// Phone Punch key hint drawn in the status bar while the punch accent is on.
 pub const fn punch_label(pad: bool) -> &'static str {
     if pad { "B" } else { "V" }
+}
+
+/// App tile captions in touch mode (the on-screen button names).
+pub const TOUCH_TILE_LABELS: (&str, &str, &str) = ("PING", "FLASH", "5G EMP");
+
+/// Tile captions for the snapshot's prompt mode.
+pub fn tile_labels_for(s: &PhoneScreenSnapshot) -> (&'static str, &'static str, &'static str) {
+    if s.touch_prompts { TOUCH_TILE_LABELS } else { app_tile_labels(s.pad_prompts) }
+}
+
+/// SOS prompt on the OLED at the tower.
+pub fn tower_prompt(s: &PhoneScreenSnapshot) -> &'static str {
+    if s.touch_prompts {
+        "TAP [SOS]"
+    } else if s.pad_prompts {
+        "PRESS [X]"
+    } else {
+        "PRESS [E]"
+    }
 }
 
 /// App tile columns `(x, width)`: Ping, Camera Flash, 5G Overload.
@@ -228,7 +250,8 @@ fn update_phone_screen(
         decoy_ready: signal.bars == 0 && mods.missed_call && apps.ping_cooldown <= 0.0,
         spoof_active: apps.spoof_active(),
         hijack_boost: signal.hotspot_boosted,
-        pad_prompts: mode.is_some_and(|m| m.is_pad()),
+        pad_prompts: mode.as_deref().is_some_and(|m| m.is_pad()),
+        touch_prompts: mode.as_deref().is_some_and(|m| m.is_touch()),
         notif: notifs.banner(),
     };
     // Render off-texture; only touch the image (which marks it for GPU
@@ -936,7 +959,7 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
     }
 
     // ---- 5. Chunky At-a-Glance App Tiles (y = 170..212): PNG / FLSH / EMP ----
-    let (ping_lbl, flash_lbl, emp_lbl) = app_tile_labels(s.pad_prompts);
+    let (ping_lbl, flash_lbl, emp_lbl) = tile_labels_for(s);
     let [(px0, tw), (px1, _), (px2, _)] = TILE_COLS;
     if s.decoy_ready {
         draw_special_tile(&mut g, px0, 170, tw, 42, ping_lbl, "DECOY", [44, 26, 4], [255, 196, 48], [255, 214, 90], s.time);
@@ -981,7 +1004,7 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
         let _ = if s.sos_jammed { write!(lbl, "JAM! {pct}%") } else { write!(lbl, "SOS {pct}%") };
         g.text(28, 219, lbl.as_str(), 2, bright);
     } else {
-        let (msg, col) = if s.near_tower { (if s.pad_prompts { "PRESS [X]" } else { "PRESS [E]" }, green) } else { ("FIND 5-BAR", amber) };
+        let (msg, col) = if s.near_tower { (tower_prompt(s), green) } else { ("FIND 5-BAR", amber) };
         g.text(22, 219, msg, 2, col);
     }
 
@@ -1028,7 +1051,7 @@ pub fn render_phone_screen(rgba: &mut [u8], s: &PhoneScreenSnapshot) {
             // Double impact frame + the punch key tag on the SOS bar's right end.
             g.rect_outline(3, 3, SCREEN_W as i32 - 6, SCREEN_H as i32 - 6, [255, 200, 120]);
             g.rect(140, 218, 13, 16, c);
-            g.text(144, 222, punch_label(s.pad_prompts), 1, [30, 12, 4]);
+            g.text(144, 222, if s.touch_prompts { "TAP" } else { punch_label(s.pad_prompts) }, 1, [30, 12, 4]);
         }
     }
 }
@@ -1259,6 +1282,17 @@ mod tests {
         // Near the tower the prompt swaps [E] -> [X].
         let near = |pad_prompts| render(&PhoneScreenSnapshot { near_tower: true, pad_prompts, ..calm(5) });
         assert_ne!(near(false), near(true));
+        // Milestone 37 touch prompts: on-screen button names, all drawable.
+        let (a, b, c) = TOUCH_TILE_LABELS;
+        for l in [a, b, c, "TAP [SOS]", "TAP"] {
+            assert!(l.len() as i32 * 6 - 1 <= TILE_COLS[0].1 - 6 || l.starts_with("TAP"), "{l}");
+            assert!(l.chars().all(|ch| ch == ' ' || glyph(ch) != [0; 7]), "{l}");
+        }
+        let touch = render(&PhoneScreenSnapshot { touch_prompts: true, ..calm(3) });
+        assert_ne!(tiles(&touch), tiles(&kbm), "tile labels redraw for touch");
+        let near_touch = render(&PhoneScreenSnapshot { near_tower: true, touch_prompts: true, ..calm(5) });
+        assert_ne!(near_touch, near(false));
+        assert_eq!(tower_prompt(&PhoneScreenSnapshot { touch_prompts: true, pad_prompts: true, ..calm(5) }), "TAP [SOS]", "touch wins");
     }
 
     #[test]

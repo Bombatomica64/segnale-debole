@@ -8,17 +8,18 @@
 //! [`MetaCard`] / [`MetaStatus`] / [`MetaName`] and restyled in place every
 //! frame from the live profile, so nothing is respawned on click.
 //!
-//! Buttons use the same manual cursor hit test as `hud.rs`
-//! (`ComputedNode::contains_point` + `Window::physical_cursor_position`).
+//! Buttons use the same manual hit test as `hud.rs`
+//! (`ComputedNode::contains_point` + the shared `touch::UiPointer`: the mouse
+//! or a finger, Milestone 37).
 //! Footer buttons are ordinary `hud` menu buttons; keyboard shortcuts live in
 //! `hud::menu_key_action`.
 
 use bevy::prelude::*;
 use bevy::ui::UiGlobalTransform;
-use bevy::window::PrimaryWindow;
 
 use crate::audio::{SfxEvent, SfxQueue};
-use crate::gamepad::{GamepadFocus, GamepadFocusable, GamepadInput};
+use crate::gamepad::{DualPrompt, GamepadFocus, GamepadFocusable, GamepadInput};
+use crate::touch::UiPointer;
 use crate::hud::{spawn_crosshair, text, MenuAction, MenuButton, CROSSHAIR_BOX, COLOR_BG, COLOR_CYAN, COLOR_DIM, COLOR_GOLD, COLOR_SIGNAL_AMBER, COLOR_SIGNAL_GREEN, COLOR_SIGNAL_RED};
 use crate::ui_kit::{
     hard_shadow, inset_border, plate_border, plate_rect, punk_screen_root, rivet_card, section_crate, set_strip_tape, stamped_tag,
@@ -28,8 +29,8 @@ use crate::ui_kit::{
 };
 use crate::meta::{
     default_catalog, CarrierContract, CrosshairColor, CrosshairStyle, FeatId, HandsetSkin, LifetimeStats, PlayerProfile, ProfileStore,
-    RunLoadout, RunUnlockSummary, StarterChip, UserSettings, ACTIVE_CATALOG_SIZE, BASE_FOV_RANGE, EFFECT_SCALE_RANGE, GAMEPAD_SENS_RANGE, MOUSE_SENS_RANGE,
-    VOLUME_RANGE,
+    RunLoadout, RunUnlockSummary, StarterChip, TouchMode, UserSettings, ACTIVE_CATALOG_SIZE, BASE_FOV_RANGE, EFFECT_SCALE_RANGE, GAMEPAD_SENS_RANGE,
+    MOUSE_SENS_RANGE, TOUCH_BUTTON_SCALE_RANGE, TOUCH_OPACITY_RANGE, TOUCH_SENS_RANGE, VOLUME_RANGE,
 };
 use crate::player::PlayerCamera;
 use crate::state::{AppState, SettingsReturn, UpgradeId, FINAL_FLOOR};
@@ -591,8 +592,7 @@ fn reset_feedback(store: Res<ProfileStore>, mut fb: ResMut<MetaFeedback>, mut ho
 
 #[allow(clippy::too_many_arguments)]
 fn meta_card_clicks(
-    window: Query<&Window, With<PrimaryWindow>>,
-    mouse: Res<ButtonInput<MouseButton>>,
+    ptr: Res<UiPointer>,
     cards: Query<(Entity, &ComputedNode, &UiGlobalTransform, &MetaCard)>,
     mut store: ResMut<ProfileStore>,
     mut fb: ResMut<MetaFeedback>,
@@ -601,15 +601,15 @@ fn meta_card_clicks(
     (pad, focus): (Res<GamepadInput>, Res<GamepadFocus>),
 ) {
     let card_of = |e: Option<Entity>| e.and_then(|e| cards.get(e).ok()).map(|(_, _, _, card)| card.0);
-    let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
-    let pointer_card = cursor.and_then(|c| cards.iter().find(|(_, n, tf, _)| n.contains_point(**tf, c)).map(|(_, _, _, card)| card.0));
+    let pointer_card = ptr.nearest_over(cards.iter().map(|(_, n, tf, card)| (card.0, n, tf)), None);
+    let clicked_card = ptr.nearest_click(cards.iter().map(|(_, n, tf, card)| (card.0, n, tf)), None);
     hover.0 = if pad.active {
         // Controller navigation owns the highlight until the mouse moves.
         card_of(focus.focused)
     } else {
         pointer_card
     };
-    let clicked = pointer_card.filter(|_| mouse.just_released(MouseButton::Left)).or_else(|| card_of(focus.activate));
+    let clicked = clicked_card.or_else(|| card_of(focus.activate));
     if let Some(t) = clicked {
         *fb = edit_feedback(commit_meta_edit(&mut store, t), &mut sfx);
     }
@@ -1223,16 +1223,25 @@ pub enum SettingKnob {
     Volume,
     /// Right Stick look multiplier.
     GamepadSensitivity,
+    /// Touch-drag look multiplier (Milestone 37).
+    TouchSensitivity,
+    /// Touch HUD opacity.
+    TouchOpacity,
+    /// Touch button size.
+    TouchButtonScale,
 }
 
 impl SettingKnob {
-    pub const ALL: [SettingKnob; 6] = [
+    pub const ALL: [SettingKnob; 9] = [
         SettingKnob::Sensitivity,
         SettingKnob::BaseFov,
         SettingKnob::SpeedFov,
         SettingKnob::StrafeRoll,
         SettingKnob::Volume,
         SettingKnob::GamepadSensitivity,
+        SettingKnob::TouchSensitivity,
+        SettingKnob::TouchOpacity,
+        SettingKnob::TouchButtonScale,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1243,6 +1252,9 @@ impl SettingKnob {
             SettingKnob::StrafeRoll => "STRAFE ROLL INTENSITY",
             SettingKnob::Volume => "MASTER VOLUME",
             SettingKnob::GamepadSensitivity => "GAMEPAD SENSITIVITY",
+            SettingKnob::TouchSensitivity => "TOUCH LOOK SENSITIVITY",
+            SettingKnob::TouchOpacity => "TOUCH HUD OPACITY",
+            SettingKnob::TouchButtonScale => "TOUCH BUTTON SIZE",
         }
     }
 
@@ -1254,6 +1266,9 @@ impl SettingKnob {
             SettingKnob::StrafeRoll => "camera lean amount",
             SettingKnob::Volume => "all sound effects",
             SettingKnob::GamepadSensitivity => "right-stick look speed",
+            SettingKnob::TouchSensitivity => "right-thumb drag speed",
+            SettingKnob::TouchOpacity => "on-screen control alpha",
+            SettingKnob::TouchButtonScale => "thumb target size",
         }
     }
 
@@ -1265,6 +1280,9 @@ impl SettingKnob {
             SettingKnob::SpeedFov | SettingKnob::StrafeRoll => (EFFECT_SCALE_RANGE.0, EFFECT_SCALE_RANGE.1, 0.25),
             SettingKnob::Volume => (VOLUME_RANGE.0, VOLUME_RANGE.1, 0.1),
             SettingKnob::GamepadSensitivity => (GAMEPAD_SENS_RANGE.0, GAMEPAD_SENS_RANGE.1, 0.1),
+            SettingKnob::TouchSensitivity => (TOUCH_SENS_RANGE.0, TOUCH_SENS_RANGE.1, 0.1),
+            SettingKnob::TouchOpacity => (TOUCH_OPACITY_RANGE.0, TOUCH_OPACITY_RANGE.1, 0.05),
+            SettingKnob::TouchButtonScale => (TOUCH_BUTTON_SCALE_RANGE.0, TOUCH_BUTTON_SCALE_RANGE.1, 0.05),
         }
     }
 
@@ -1276,6 +1294,9 @@ impl SettingKnob {
             SettingKnob::StrafeRoll => s.strafe_roll_scale,
             SettingKnob::Volume => s.audio_master_volume,
             SettingKnob::GamepadSensitivity => s.gamepad_sensitivity,
+            SettingKnob::TouchSensitivity => s.touch_sensitivity,
+            SettingKnob::TouchOpacity => s.touch_opacity,
+            SettingKnob::TouchButtonScale => s.touch_button_scale,
         }
     }
 
@@ -1287,6 +1308,9 @@ impl SettingKnob {
             SettingKnob::StrafeRoll => &mut s.strafe_roll_scale,
             SettingKnob::Volume => &mut s.audio_master_volume,
             SettingKnob::GamepadSensitivity => &mut s.gamepad_sensitivity,
+            SettingKnob::TouchSensitivity => &mut s.touch_sensitivity,
+            SettingKnob::TouchOpacity => &mut s.touch_opacity,
+            SettingKnob::TouchButtonScale => &mut s.touch_button_scale,
         }
     }
 
@@ -1296,7 +1320,12 @@ impl SettingKnob {
             SettingKnob::SpeedFov => Some(SettingToggle::SpeedFov),
             SettingKnob::StrafeRoll => Some(SettingToggle::StrafeRoll),
             SettingKnob::Volume => Some(SettingToggle::Mute),
-            SettingKnob::Sensitivity | SettingKnob::BaseFov | SettingKnob::GamepadSensitivity => None,
+            SettingKnob::Sensitivity
+            | SettingKnob::BaseFov
+            | SettingKnob::GamepadSensitivity
+            | SettingKnob::TouchSensitivity
+            | SettingKnob::TouchOpacity
+            | SettingKnob::TouchButtonScale => None,
         }
     }
 
@@ -1304,9 +1333,13 @@ impl SettingKnob {
     pub fn value_text(self, s: &UserSettings) -> String {
         let v = self.get(s);
         match self {
-            SettingKnob::Sensitivity | SettingKnob::GamepadSensitivity => format!("{v:.2}x"),
+            SettingKnob::Sensitivity | SettingKnob::GamepadSensitivity | SettingKnob::TouchSensitivity => format!("{v:.2}x"),
             SettingKnob::BaseFov => format!("{v:.0} DEG"),
-            SettingKnob::SpeedFov | SettingKnob::StrafeRoll | SettingKnob::Volume => format!("{:.0}%", v * 100.0),
+            SettingKnob::SpeedFov
+            | SettingKnob::StrafeRoll
+            | SettingKnob::Volume
+            | SettingKnob::TouchOpacity
+            | SettingKnob::TouchButtonScale => format!("{:.0}%", v * 100.0),
         }
     }
 
@@ -1331,6 +1364,10 @@ pub enum SettingToggle {
     AimFriction,
     /// Controller rumble / haptics.
     Rumble,
+    /// Touch stick rim holds jump (Milestone 37).
+    TouchAutoBhop,
+    /// Touch auto-fire on a visible target.
+    TouchAutoFire,
 }
 
 impl SettingToggle {
@@ -1343,6 +1380,8 @@ impl SettingToggle {
             SettingToggle::GamepadInvertY => "GAMEPAD INVERT Y",
             SettingToggle::AimFriction => "AIM FRICTION",
             SettingToggle::Rumble => "RUMBLE",
+            SettingToggle::TouchAutoBhop => "AUTO-BHOP",
+            SettingToggle::TouchAutoFire => "AUTO-FIRE",
         }
     }
 
@@ -1355,6 +1394,8 @@ impl SettingToggle {
             SettingToggle::GamepadInvertY => &mut s.gamepad_invert_y,
             SettingToggle::AimFriction => &mut s.gamepad_aim_friction,
             SettingToggle::Rumble => &mut s.rumble,
+            SettingToggle::TouchAutoBhop => &mut s.touch_auto_bhop,
+            SettingToggle::TouchAutoFire => &mut s.touch_auto_fire,
         }
     }
 
@@ -1367,6 +1408,8 @@ impl SettingToggle {
             SettingToggle::GamepadInvertY => s.gamepad_invert_y,
             SettingToggle::AimFriction => s.gamepad_aim_friction,
             SettingToggle::Rumble => s.rumble,
+            SettingToggle::TouchAutoBhop => s.touch_auto_bhop,
+            SettingToggle::TouchAutoFire => s.touch_auto_fire,
         }
     }
 
@@ -1394,6 +1437,42 @@ pub enum SettingsTarget {
     Style(CrosshairStyle),
     Color(CrosshairColor),
     ResetDefaults,
+    /// Touch HUD mode picker (Milestone 37).
+    TouchMode(TouchMode),
+    /// Settings page tab (navigation, never a settings edit).
+    Tab(SettingsTab),
+}
+
+/// Settings pages (Milestone 37): the original screen, and touch controls.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SettingsTab {
+    #[default]
+    General,
+    Touch,
+}
+
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 2] = [SettingsTab::General, SettingsTab::Touch];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::General => "GENERAL",
+            SettingsTab::Touch => "TOUCH CONTROLS",
+        }
+    }
+
+    /// Controller / keyboard stops of this page.
+    pub fn rows(self) -> &'static [SettingsRow] {
+        match self {
+            SettingsTab::General => &SETTINGS_ROWS,
+            SettingsTab::Touch => &TOUCH_SETTINGS_ROWS,
+        }
+    }
+
+    /// The neighbouring tab (`dx` = -1 / +1, wrapping).
+    pub fn step(self, dx: i32) -> Self {
+        cycle(&Self::ALL, self, dx)
+    }
 }
 
 /// Apply a Settings click (no saving; see [`commit_settings_edit`]).
@@ -1435,6 +1514,15 @@ pub fn apply_settings_edit(s: &mut UserSettings, t: SettingsTarget) -> EditOutco
                 EditOutcome::Changed(format!("Reticle color -> {}", c.name()))
             }
         }
+        SettingsTarget::TouchMode(m) => {
+            if s.touch_mode == m {
+                EditOutcome::Unchanged(format!("Touch controls already {}", m.name()))
+            } else {
+                s.touch_mode = m;
+                EditOutcome::Changed(format!("Touch controls -> {}", m.name()))
+            }
+        }
+        SettingsTarget::Tab(t) => EditOutcome::Unchanged(format!("{} page", t.label())),
         SettingsTarget::ResetDefaults => {
             if *s == UserSettings::default() {
                 EditOutcome::Unchanged("Settings already at factory defaults".to_string())
@@ -1498,11 +1586,13 @@ pub fn lit_settings_pips(k: SettingKnob, s: &UserSettings) -> u8 {
 struct SettingsHover(Option<SettingsTarget>);
 
 /// Whether a control currently reads "selected / on".
-fn control_active(s: &UserSettings, t: SettingsTarget) -> bool {
+fn control_active(s: &UserSettings, tab: SettingsTab, t: SettingsTarget) -> bool {
     match t {
         SettingsTarget::Toggle(g) => g.get(s),
         SettingsTarget::Style(st) => s.crosshair_style == st,
         SettingsTarget::Color(c) => s.crosshair_color == c,
+        SettingsTarget::TouchMode(m) => s.touch_mode == m,
+        SettingsTarget::Tab(x) => x == tab,
         SettingsTarget::Down(_) | SettingsTarget::Up(_) | SettingsTarget::ResetDefaults => false,
     }
 }
@@ -1513,7 +1603,8 @@ fn control_look(t: SettingsTarget, active: bool, hovered: bool) -> (Color, Color
         SettingsTarget::ResetDefaults => PUNK_RED,
         SettingsTarget::Toggle(SettingToggle::Mute) => PUNK_RED,
         SettingsTarget::Toggle(_) => ACID_GREEN,
-        SettingsTarget::Style(_) => ARC_CYAN,
+        SettingsTarget::Style(_) | SettingsTarget::Tab(_) => ARC_CYAN,
+        SettingsTarget::TouchMode(_) => ACID_GREEN,
         SettingsTarget::Color(c) => c.color().with_alpha(1.0),
         SettingsTarget::Down(_) | SettingsTarget::Up(_) => HAZARD_YELLOW,
     };
@@ -1541,6 +1632,8 @@ pub enum SettingsRow {
     Color,
     Reset,
     Back,
+    /// Touch HUD mode picker (AUTO / ON / OFF).
+    TouchMode,
 }
 
 /// Controller order: the left column top to bottom, then the right column,
@@ -1565,12 +1658,29 @@ pub const SETTINGS_ROWS: [SettingsRow; 17] = [
     SettingsRow::Back,
 ];
 
-/// Number of controller stops.
+/// Controller order of the TOUCH CONTROLS page.
+pub const TOUCH_SETTINGS_ROWS: [SettingsRow; 8] = [
+    SettingsRow::TouchMode,
+    SettingsRow::Knob(SettingKnob::TouchSensitivity),
+    SettingsRow::Knob(SettingKnob::TouchOpacity),
+    SettingsRow::Knob(SettingKnob::TouchButtonScale),
+    SettingsRow::Toggle(SettingToggle::TouchAutoBhop),
+    SettingsRow::Toggle(SettingToggle::TouchAutoFire),
+    SettingsRow::Reset,
+    SettingsRow::Back,
+];
+
+/// Number of controller stops (GENERAL page).
 pub const SETTINGS_ROW_COUNT: usize = SETTINGS_ROWS.len();
 
-/// Index of `row` in [`SETTINGS_ROWS`].
+/// Index of `row` in [`SETTINGS_ROWS`] (the GENERAL page).
 pub fn settings_row_index(row: SettingsRow) -> usize {
-    SETTINGS_ROWS.iter().position(|r| *r == row).unwrap_or(0)
+    settings_row_index_in(SettingsTab::General, row)
+}
+
+/// Index of `row` on `tab`'s page.
+pub fn settings_row_index_in(tab: SettingsTab, row: SettingsRow) -> usize {
+    tab.rows().iter().position(|r| *r == row).unwrap_or(0)
 }
 
 /// What a controller input does on a Settings row.
@@ -1599,6 +1709,7 @@ pub fn settings_pad_edit(row: SettingsRow, dx: i32, confirm: bool, s: &UserSetti
         SettingsRow::Toggle(g) => Edit(SettingsTarget::Toggle(g)),
         SettingsRow::Style => Edit(SettingsTarget::Style(cycle(&CrosshairStyle::ALL, s.crosshair_style, step))),
         SettingsRow::Color => Edit(SettingsTarget::Color(cycle(&CrosshairColor::ALL, s.crosshair_color, step))),
+        SettingsRow::TouchMode => Edit(SettingsTarget::TouchMode(cycle(&TouchMode::ALL, s.touch_mode, step))),
         SettingsRow::Reset if confirm => Edit(SettingsTarget::ResetDefaults),
         SettingsRow::Back if confirm => Back,
         SettingsRow::Reset | SettingsRow::Back => return None,
@@ -1618,16 +1729,32 @@ pub struct SettingsPadFocus(pub usize);
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SettingsKeyFocus(pub bool);
 
-fn reset_settings_pad_focus(mut focus: ResMut<SettingsPadFocus>, mut key_focus: ResMut<SettingsKeyFocus>) {
+fn reset_settings_pad_focus(mut focus: ResMut<SettingsPadFocus>, mut key_focus: ResMut<SettingsKeyFocus>, mut tab: ResMut<SettingsTab>) {
     focus.0 = 0;
     key_focus.0 = false;
+    if *tab != SettingsTab::General {
+        *tab = SettingsTab::General;
+    }
 }
 
-/// Controller + keyboard Settings navigation: Up / Down walk [`SETTINGS_ROWS`],
-/// Left / Right / `A` / `Enter` edit (see [`settings_pad_edit`]), `B` / `Esc`
-/// goes back. Mirrors the focused stop into [`GamepadFocus`] so the BACK
-/// switch lights like any punk button.
-#[allow(clippy::too_many_arguments)]
+/// Switch the Settings page: focus returns to the page's first row and the
+/// screen body is rebuilt (see [`rebuild_settings_body`]).
+fn switch_settings_tab(tab: &mut SettingsTab, want: SettingsTab, idx: &mut SettingsPadFocus, sfx: &mut SfxQueue) -> bool {
+    if *tab == want {
+        return false;
+    }
+    *tab = want;
+    idx.0 = 0;
+    sfx.play(SfxEvent::UiTick);
+    true
+}
+
+/// Controller + keyboard Settings navigation: Up / Down walk the page's rows
+/// ([`SettingsTab::rows`]), Left / Right / `A` / `Enter` edit (see
+/// [`settings_pad_edit`]), `LB` / `RB` (`Q` / `E` / `Tab`) switch pages,
+/// `B` / `Esc` goes back. Mirrors the focused stop into [`GamepadFocus`] so
+/// the BACK switch lights like any punk button.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn settings_pad_nav(
     pad: Res<GamepadInput>,
     keys: Option<Res<ButtonInput<KeyCode>>>,
@@ -1639,9 +1766,20 @@ pub fn settings_pad_nav(
     mut store: ResMut<ProfileStore>,
     mut fb: ResMut<MetaFeedback>,
     mut sfx: ResMut<SfxQueue>,
-    (ret, mut next): (Res<SettingsReturn>, ResMut<NextState<AppState>>),
+    (ret, mut next, mut tab, ptr): (Res<SettingsReturn>, ResMut<NextState<AppState>>, ResMut<SettingsTab>, Option<Res<UiPointer>>),
 ) {
     let k = keys.as_deref();
+    let k_tab = i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::KeyE) || k.just_pressed(KeyCode::Tab)))
+        - i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::KeyQ)));
+    let tab_dx = if pad.connected && (pad.tab_next || pad.tab_prev) { pad.tab_next as i32 - pad.tab_prev as i32 } else { k_tab };
+    if tab_dx != 0 {
+        let want = tab.step(tab_dx);
+        if switch_settings_tab(&mut tab, want, &mut idx, &mut sfx) {
+            return;
+        }
+    }
+    let page = tab.rows();
+    let count = page.len();
     let k_dy = i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::ArrowDown) || k.just_pressed(KeyCode::KeyS)))
         - i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::ArrowUp) || k.just_pressed(KeyCode::KeyW)));
     let k_dx = i32::from(k.is_some_and(|k| k.just_pressed(KeyCode::ArrowRight) || k.just_pressed(KeyCode::KeyD)))
@@ -1650,7 +1788,9 @@ pub fn settings_pad_nav(
     let k_used = k_dy != 0 || k_dx != 0 || k_confirm;
     if k_used {
         key_focus.0 = true;
-    } else if pad.active || motion.is_some_and(|m| m.delta != Vec2::ZERO) {
+    } else if pad.active || motion.is_some_and(|m| m.delta != Vec2::ZERO) || ptr.is_some_and(|p| p.just_pressed) {
+        // The mouse (moved, or a stationary click), the pad or a finger
+        // takes the highlight back.
         key_focus.0 = false;
     }
     if !pad.connected && !k_used && !key_focus.0 {
@@ -1660,12 +1800,12 @@ pub fn settings_pad_nav(
     let dx = if pad.connected && pad.nav_x() != 0 { pad.nav_x() } else { k_dx };
     let confirm = (pad.connected && pad.confirm) || k_confirm;
     if dy != 0 {
-        idx.0 = (idx.0.min(SETTINGS_ROW_COUNT - 1) as i32 + dy).rem_euclid(SETTINGS_ROW_COUNT as i32) as usize;
+        idx.0 = (idx.0.min(count - 1) as i32 + dy).rem_euclid(count as i32) as usize;
         if k_dy != 0 {
             sfx.play(SfxEvent::UiTick);
         }
     }
-    let row = SETTINGS_ROWS[idx.0.min(SETTINGS_ROW_COUNT - 1)];
+    let row = page[idx.0.min(count - 1)];
     let want = rows.iter().find(|(_, t)| t.0 == idx.0).map(|(e, _)| e);
     if focus.focused != want {
         focus.focused = want;
@@ -1686,37 +1826,87 @@ fn add_settings_systems(app: &mut App) {
     app.init_resource::<SettingsHover>()
         .init_resource::<SettingsPadFocus>()
         .init_resource::<SettingsKeyFocus>()
+        .init_resource::<SettingsTab>()
         .add_systems(OnEnter(AppState::Settings), (reset_feedback, reset_settings_pad_focus, spawn_settings_screen).chain())
-        .add_systems(Update, (settings_pad_nav, settings_clicks, refresh_settings_ui).chain().run_if(in_state(AppState::Settings)));
+        .add_systems(
+            Update,
+            (settings_pad_nav, settings_clicks, rebuild_settings_body, refresh_settings_ui).chain().run_if(in_state(AppState::Settings)),
+        );
 }
 
 #[allow(clippy::too_many_arguments)]
 fn settings_clicks(
-    window: Query<&Window, With<PrimaryWindow>>,
-    mouse: Res<ButtonInput<MouseButton>>,
+    ptr: Res<UiPointer>,
     controls: Query<(Entity, &ComputedNode, &UiGlobalTransform, &SettingsControl)>,
     mut store: ResMut<ProfileStore>,
     mut fb: ResMut<MetaFeedback>,
     mut hover: ResMut<SettingsHover>,
     mut sfx: ResMut<SfxQueue>,
     (pad, focus, key_focus): (Res<GamepadInput>, Res<GamepadFocus>, Res<SettingsKeyFocus>),
+    (mut tab, mut idx): (ResMut<SettingsTab>, ResMut<SettingsPadFocus>),
 ) {
+    let items = || controls.iter().map(|(_, n, tf, ctl)| (ctl.0, n, tf));
     let now = if pad.active || key_focus.0 {
         // Controller / keyboard navigation owns the highlight (RESET DEFAULTS is a control).
         focus.focused.and_then(|e| controls.get(e).ok()).map(|(_, _, _, ctl)| ctl.0)
     } else {
-        let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
-        cursor.and_then(|c| controls.iter().find(|(_, n, tf, _)| n.contains_point(**tf, c)).map(|(_, _, _, ctl)| ctl.0))
+        ptr.nearest_over(items(), Some(SETTINGS_FINGER_SLOP))
     };
     if hover.0 != now {
         hover.0 = now;
     }
-    if let Some(t) = hover.0
-        && !pad.active
+    if !pad.active
         && !key_focus.0
-        && mouse.just_released(MouseButton::Left)
+        && let Some(t) = ptr.nearest_click(items(), Some(SETTINGS_FINGER_SLOP))
     {
-        *fb = edit_feedback(commit_settings_edit(&mut store, t), &mut sfx);
+        match t {
+            SettingsTarget::Tab(want) => {
+                switch_settings_tab(&mut tab, want, &mut idx, &mut sfx);
+            }
+            _ => *fb = edit_feedback(commit_settings_edit(&mut store, t), &mut sfx),
+        }
+    }
+}
+
+/// Finger slop around Settings controls (logical px): wide sideways, tight
+/// vertically, so GENERAL's small `-` / `+` / `TOGGLE` switches are easy to
+/// hit without grabbing the row above or below (nearest center wins).
+pub const SETTINGS_FINGER_SLOP: Vec2 = Vec2::new(14.0, 8.0);
+
+/// The Settings chassis body (header, page, footer), rebuilt on a tab switch.
+#[derive(Component)]
+struct SettingsBody;
+
+/// Rebuild the chassis body when the page changes (the root, its camera and
+/// the chassis stay).
+#[allow(clippy::too_many_arguments)]
+fn rebuild_settings_body(
+    mut commands: Commands,
+    tab: Res<SettingsTab>,
+    mut built: Local<Option<SettingsTab>>,
+    bodies: Query<Entity, With<SettingsBody>>,
+    fresh: Query<(), Added<SettingsBody>>,
+    (store, fb, ret): (Res<ProfileStore>, Res<MetaFeedback>, Res<SettingsReturn>),
+    mut hover: ResMut<SettingsHover>,
+) {
+    if bodies.is_empty() {
+        *built = None;
+        return;
+    }
+    // A freshly spawned screen is built for the default page.
+    if !fresh.is_empty() {
+        *built = Some(SettingsTab::General);
+    }
+    let current = built.get_or_insert(SettingsTab::General);
+    if *current == *tab {
+        return;
+    }
+    *current = *tab;
+    hover.0 = None;
+    let s = store.profile.settings.sanitized();
+    for body in &bodies {
+        commands.entity(body).despawn_children();
+        build_settings_body(&mut commands, body, *tab, &s, &fb, ret.0 == AppState::Paused);
     }
 }
 
@@ -1739,8 +1929,10 @@ fn refresh_settings_ui(
         Res<SettingsPadFocus>,
         Query<(Entity, &SettingsRowTag, &mut BackgroundColor, &mut BorderColor), (Without<SettingsControl>, Without<SettingsPip>, Without<MenuButton>)>,
     ),
+    tab: Res<SettingsTab>,
 ) {
     let s = store.profile.settings.sanitized();
+    let tab = *tab;
     for (e, tag, mut bg, mut border) in &mut rows {
         let lit = focus.shows(&pad, e) || (key_focus.0 && tag.0 == idx.0);
         let (want_bg, want_border) = settings_row_look(tag.1, lit);
@@ -1752,7 +1944,7 @@ fn refresh_settings_ui(
         }
     }
     for (ctl, mut bg, mut border) in &mut controls {
-        let (fill, rail, edge, _) = control_look(ctl.0, control_active(&s, ctl.0), hover.0 == Some(ctl.0));
+        let (fill, rail, edge, _) = control_look(ctl.0, control_active(&s, tab, ctl.0), hover.0 == Some(ctl.0));
         if bg.0 != fill {
             bg.0 = fill;
         }
@@ -1785,7 +1977,7 @@ fn refresh_settings_ui(
                 let on = g.effect_live(&s);
                 (retext.then(|| g.state_text(&s).to_string()), if on { ACID_GREEN } else { PUNK_RED })
             }
-            SettingsLabel::Control(t) => (None, control_look(t, control_active(&s, t), hover.0 == Some(t)).3),
+            SettingsLabel::Control(t) => (None, control_look(t, control_active(&s, tab, t), hover.0 == Some(t)).3),
             SettingsLabel::PreviewCaption => {
                 (retext.then(|| format!("{} // {}", s.crosshair_style.name(), s.crosshair_color.name())), s.crosshair_color.color().with_alpha(1.0))
             }
@@ -1855,15 +2047,29 @@ fn settings_row_look(rail: Color, focused: bool) -> (Color, BorderColor) {
     }
 }
 
+/// Index of a page row (GENERAL rows, else TOUCH CONTROLS rows; the shared
+/// footer stops are tagged by their page explicitly).
+fn page_row_index(row: SettingsRow) -> usize {
+    SETTINGS_ROWS.iter().position(|r| *r == row).unwrap_or_else(|| settings_row_index_in(SettingsTab::Touch, row))
+}
+
 /// Recessed settings row (rail on the left), a controller stop for `row`.
 fn setting_row(commands: &mut Commands, parent: Entity, rail: Color, row: SettingsRow) -> Entity {
+    setting_row_sized(commands, parent, rail, row, GENERAL_ROWS)
+}
+
+/// [`setting_row`] at a page's [`RowSizing`].
+fn setting_row_sized(commands: &mut Commands, parent: Entity, rail: Color, row: SettingsRow, size: RowSizing) -> Entity {
     let (bg, border) = settings_row_look(rail, false);
+    let (grow, min_h) = if size.tall { (1.0, Val::Px(TOUCH_ROW_MIN_H)) } else { (0.0, Val::Auto) };
     commands
         .spawn((
             ChildOf(parent),
-            SettingsRowTag(settings_row_index(row), rail),
+            SettingsRowTag(page_row_index(row), rail),
             Node {
                 width: Val::Percent(100.0),
+                flex_grow: grow,
+                min_height: min_h,
                 align_items: AlignItems::Center,
                 column_gap: Val::Px(8.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
@@ -1878,9 +2084,15 @@ fn setting_row(commands: &mut Commands, parent: Entity, rail: Color, row: Settin
 
 /// `[-] [pip meter + value] [+]` row of a knob.
 fn knob_row(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSettings) {
-    let r = setting_row(commands, parent, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Knob(k));
+    knob_row_sized(commands, parent, k, s, GENERAL_ROWS);
+}
+
+/// [`knob_row`] at a page's [`RowSizing`].
+fn knob_row_sized(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSettings, size: RowSizing) {
+    let r = setting_row_sized(commands, parent, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Knob(k), size);
     setting_name(commands, r, k.label(), k.hint());
-    settings_button(commands, r, SettingsTarget::Down(k), "-", 18.0, (11.0, 0.0));
+    let (step_font, step_pad) = size.step;
+    settings_button(commands, r, SettingsTarget::Down(k), "-", step_font, step_pad);
     let meter = commands
         .spawn((
             ChildOf(r),
@@ -1906,19 +2118,25 @@ fn knob_row(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSet
     for i in 0..SETTINGS_PIPS {
         commands.spawn((ChildOf(track), SettingsPip(k, i), Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() }, BackgroundColor(Color::NONE)));
     }
-    settings_button(commands, r, SettingsTarget::Up(k), "+", 18.0, (11.0, 0.0));
+    settings_button(commands, r, SettingsTarget::Up(k), "+", step_font, step_pad);
 }
 
 /// Toggle row: name | live state | switch.
 fn toggle_row(commands: &mut Commands, parent: Entity, g: SettingToggle, hint: &str, s: &UserSettings) {
-    let r = setting_row(commands, parent, ACID_GREEN.with_alpha(0.8), SettingsRow::Toggle(g));
+    toggle_row_sized(commands, parent, g, hint, s, GENERAL_ROWS);
+}
+
+/// [`toggle_row`] at a page's [`RowSizing`].
+fn toggle_row_sized(commands: &mut Commands, parent: Entity, g: SettingToggle, hint: &str, s: &UserSettings, size: RowSizing) {
+    let r = setting_row_sized(commands, parent, ACID_GREEN.with_alpha(0.8), SettingsRow::Toggle(g), size);
     setting_name(commands, r, g.label(), hint);
     commands.spawn((
         ChildOf(r),
         Node { width: Val::Px(70.0), justify_content: JustifyContent::Center, flex_shrink: 0.0, ..default() },
         children![(SettingsLabel::Toggle(g), text(g.state_text(s), 15.0, ACID_GREEN))],
     ));
-    settings_button(commands, r, SettingsTarget::Toggle(g), "TOGGLE", 13.0, (10.0, 3.0));
+    let (font, pad) = size.switch;
+    settings_button(commands, r, SettingsTarget::Toggle(g), "TOGGLE", font, pad);
 }
 
 fn spawn_settings_screen(
@@ -1942,38 +2160,154 @@ fn spawn_settings_screen(
         punk_screen_root(&mut commands, AppState::Settings, tex, Color::srgba(0.02, 0.015, 0.012, 0.8), 0.3)
     };
     let phone = terminal_chassis(&mut commands, root, tex, SETTINGS_WIDTH, false);
+    commands.entity(phone).insert(SettingsBody);
+    build_settings_body(&mut commands, phone, SettingsTab::General, &s, &fb, mid_run);
+}
 
-    let header = screen_header(&mut commands, phone, "UAC-PHONE // SYSTEM SETTINGS", &fb);
+/// Fill the Settings chassis body for `tab`: header (title + page tabs),
+/// the page's two columns, and the RESET / BACK footer.
+fn build_settings_body(commands: &mut Commands, phone: Entity, tab: SettingsTab, s: &UserSettings, fb: &MetaFeedback, mid_run: bool) {
+    let header = screen_header(commands, phone, "UAC-PHONE // SYSTEM SETTINGS", fb);
     if mid_run {
         commands.spawn((ChildOf(header), stamped_tag("MID-RUN // SIM PAUSED", HAZARD_YELLOW, INK_BLACK, 11.0)));
     } else {
         commands.spawn((ChildOf(header), hollow_stamp("SAVED TO PROFILE", ASH_DIM, 11.0)));
     }
+    // Page tabs (Milestone 37): click / tap, LB / RB, or Q / E.
+    let tabs = commands.spawn((ChildOf(header), Node { column_gap: Val::Px(10.0), align_items: AlignItems::Center, flex_shrink: 0.0, ..default() })).id();
+    let hint = DualPrompt::new("Q / E", "LB / RB").with_touch("");
+    commands.spawn((ChildOf(tabs), text(hint.kbm.clone(), 11.0, ASH_DIM), hint));
+    for t in SettingsTab::ALL {
+        settings_button(commands, tabs, SettingsTarget::Tab(t), t.label(), 15.0, (16.0, 9.0));
+    }
 
+    // Locked height: switching GENERAL <-> TOUCH CONTROLS never moves the tabs.
     let split = commands
-        .spawn((ChildOf(phone), Node { width: Val::Percent(100.0), column_gap: Val::Px(10.0), align_items: AlignItems::Stretch, ..default() }))
+        .spawn((
+            ChildOf(phone),
+            Node { width: Val::Percent(100.0), min_height: Val::Px(SETTINGS_PAGE_MIN_H), column_gap: Val::Px(10.0), align_items: AlignItems::Stretch, ..default() },
+        ))
         .id();
 
+    if tab == SettingsTab::Touch {
+        build_touch_settings_page(commands, split, s);
+    } else {
+        build_general_settings_page(commands, split, s);
+    }
+
+    // Footer.
+    let f = commands
+        .spawn((ChildOf(phone), Node { margin: UiRect { top: Val::Px(2.0), bottom: Val::Px(4.0), ..default() }, ..row(JustifyContent::Center, 24.0) }))
+        .id();
+    let reset = settings_button(commands, f, SettingsTarget::ResetDefaults, "RESET DEFAULTS", 17.0, (16.0, 7.0));
+    commands.entity(reset).insert(SettingsRowTag(settings_row_index_in(tab, SettingsRow::Reset), PUNK_RED));
+    let back = if mid_run { "BACK TO PAUSE  [ESC]" } else { "BACK  [ESC]" };
+    commands.spawn((
+        ChildOf(f),
+        crate::hud::prompt_button(AppState::Settings, back, MenuAction::CloseSettings, 19.0, ButtonStyle::HeroAcid),
+        SettingsRowTag(settings_row_index_in(tab, SettingsRow::Back), ACID_GREEN),
+    ));
+}
+
+/// Minimum height of the Settings page body (both tabs), in UI px.
+pub const SETTINGS_PAGE_MIN_H: f32 = 500.0;
+
+/// Size of a settings row's switches: GENERAL keeps its compact mouse
+/// metrics, TOUCH CONTROLS gets finger-sized rows and switches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RowSizing {
+    /// `-` / `+` font and padding.
+    step: (f32, (f32, f32)),
+    /// `TOGGLE` / mode switch font and padding.
+    switch: (f32, (f32, f32)),
+    /// Rows grow to share the column (min 84 px tall).
+    tall: bool,
+}
+
+const GENERAL_ROWS: RowSizing = RowSizing { step: (18.0, (11.0, 0.0)), switch: (13.0, (10.0, 3.0)), tall: false };
+const TOUCH_ROWS: RowSizing = RowSizing { step: (22.0, (22.0, 8.0)), switch: (15.0, (18.0, 14.0)), tall: true };
+/// Minimum TOUCH CONTROLS row height (UI px).
+pub const TOUCH_ROW_MIN_H: f32 = 84.0;
+
+/// Touch page legend: what each thumb does.
+pub const TOUCH_LEGEND: [(&str, &str); 6] = [
+    ("L-THUMB", "floating stick // rim = auto-bhop"),
+    ("R-DRAG", "look // slow drags get aim friction"),
+    ("FIRE", "hold to shoot // drag it to aim"),
+    ("JUMP DASH PUNCH", "right-thumb arc"),
+    ("PING FLASH 5G", "phone apps: 1 / 2 / 3 bars"),
+    ("DECK  ||  BACK", "tap a weapon slot // pause"),
+];
+
+/// TOUCH CONTROLS page: HUD mode + feel on the left, thumb assists and the
+/// layout legend on the right.
+fn build_touch_settings_page(commands: &mut Commands, split: Entity, s: &UserSettings) {
+    let (left, _) = section_crate(commands, split, "TOUCH CONTROLS", ACID_GREEN, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
+    let mode_row = setting_row_sized(commands, left, ACID_GREEN.with_alpha(0.8), SettingsRow::TouchMode, TOUCH_ROWS);
+    setting_name(commands, mode_row, "TOUCH HUD", "auto: shows on your first touch");
+    let (font, pad) = TOUCH_ROWS.switch;
+    for m in TouchMode::ALL {
+        settings_button(commands, mode_row, SettingsTarget::TouchMode(m), m.name(), font, pad);
+    }
+    knob_row_sized(commands, left, SettingKnob::TouchSensitivity, s, TOUCH_ROWS);
+    knob_row_sized(commands, left, SettingKnob::TouchOpacity, s, TOUCH_ROWS);
+    knob_row_sized(commands, left, SettingKnob::TouchButtonScale, s, TOUCH_ROWS);
+
+    let (right, _) = section_crate(commands, split, "THUMB ASSISTS", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
+    toggle_row_sized(commands, right, SettingToggle::TouchAutoBhop, "stick rim holds jump", s, TOUCH_ROWS);
+    toggle_row_sized(commands, right, SettingToggle::TouchAutoFire, "fire on a visible target", s, TOUCH_ROWS);
+    let well = commands
+        .spawn((
+            ChildOf(right),
+            Node {
+                width: Val::Percent(100.0),
+                flex_grow: 1.0,
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                row_gap: Val::Px(4.0),
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            inset_border(),
+            BackgroundColor(INK_BLACK.with_alpha(0.6)),
+        ))
+        .id();
+    commands.spawn((ChildOf(well), text("LAYOUT // LEFT THUMB MOVES, RIGHT THUMB AIMS", 12.0, ASH_DIM)));
+    for (k, v) in TOUCH_LEGEND {
+        commands.spawn((
+            ChildOf(well),
+            Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() },
+            children![
+                (Node { width: Val::Px(150.0), flex_shrink: 0.0, ..default() }, children![text(k, 15.0, ACID_GREEN)]),
+                text(v, 15.0, BONE_TEXT.with_alpha(0.8)),
+            ],
+        ));
+    }
+}
+
+/// GENERAL page: the original input & camera / audio & reticle columns.
+fn build_general_settings_page(commands: &mut Commands, split: Entity, s: &UserSettings) {
     // Left: input & camera.
     let (input, _) =
-        section_crate(&mut commands, split, "INPUT & CAMERA", ARC_CYAN, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
-    knob_row(&mut commands, input, SettingKnob::Sensitivity, &s);
-    knob_row(&mut commands, input, SettingKnob::BaseFov, &s);
-    toggle_row(&mut commands, input, SettingToggle::SpeedFov, "widen view at speed", &s);
-    knob_row(&mut commands, input, SettingKnob::SpeedFov, &s);
-    toggle_row(&mut commands, input, SettingToggle::StrafeRoll, "lean into strafes", &s);
-    knob_row(&mut commands, input, SettingKnob::StrafeRoll, &s);
-    knob_row(&mut commands, input, SettingKnob::GamepadSensitivity, &s);
-    toggle_row(&mut commands, input, SettingToggle::GamepadInvertY, "stick up looks down", &s);
-    toggle_row(&mut commands, input, SettingToggle::AimFriction, "slow over targets", &s);
+        section_crate(commands, split, "INPUT & CAMERA", ARC_CYAN, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
+    knob_row(commands, input, SettingKnob::Sensitivity, s);
+    knob_row(commands, input, SettingKnob::BaseFov, s);
+    toggle_row(commands, input, SettingToggle::SpeedFov, "widen view at speed", s);
+    knob_row(commands, input, SettingKnob::SpeedFov, s);
+    toggle_row(commands, input, SettingToggle::StrafeRoll, "lean into strafes", s);
+    knob_row(commands, input, SettingKnob::StrafeRoll, s);
+    knob_row(commands, input, SettingKnob::GamepadSensitivity, s);
+    toggle_row(commands, input, SettingToggle::GamepadInvertY, "stick up looks down", s);
+    toggle_row(commands, input, SettingToggle::AimFriction, "slow over targets", s);
 
     // Right: audio & reticle.
     let (audio, _) =
-        section_crate(&mut commands, split, "AUDIO & RETICLE", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
-    knob_row(&mut commands, audio, SettingKnob::Volume, &s);
-    toggle_row(&mut commands, audio, SettingToggle::Mute, "silence all sfx", &s);
-    toggle_row(&mut commands, audio, SettingToggle::SpeedrunSplits, "HUD timer + PB deltas", &s);
-    toggle_row(&mut commands, audio, SettingToggle::Rumble, "controller haptics", &s);
+        section_crate(commands, split, "AUDIO & RETICLE", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
+    knob_row(commands, audio, SettingKnob::Volume, s);
+    toggle_row(commands, audio, SettingToggle::Mute, "silence all sfx", s);
+    toggle_row(commands, audio, SettingToggle::SpeedrunSplits, "HUD timer + PB deltas", s);
+    toggle_row(commands, audio, SettingToggle::Rumble, "controller haptics", s);
 
     // Reticle block: style pills + color swatches beside the live preview.
     let reticle = commands
@@ -1986,7 +2320,7 @@ fn spawn_settings_screen(
     let pickers = commands
         .spawn((ChildOf(reticle), Node { flex_direction: FlexDirection::Column, flex_grow: 1.0, flex_basis: Val::Px(0.0), row_gap: Val::Px(6.0), ..default() }))
         .id();
-    let style_row = setting_row(&mut commands, pickers, ARC_CYAN.with_alpha(0.8), SettingsRow::Style);
+    let style_row = setting_row(commands, pickers, ARC_CYAN.with_alpha(0.8), SettingsRow::Style);
     commands.entity(style_row).insert(Node {
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Column,
@@ -2001,9 +2335,9 @@ fn spawn_settings_screen(
     commands.spawn((ChildOf(style_row), text("CROSSHAIR STYLE", 14.0, BONE_TEXT)));
     let pills = commands.spawn((ChildOf(style_row), Node { column_gap: Val::Px(6.0), flex_wrap: FlexWrap::Wrap, row_gap: Val::Px(6.0), ..default() })).id();
     for st in CrosshairStyle::ALL {
-        settings_button(&mut commands, pills, SettingsTarget::Style(st), st.name(), 12.0, (8.0, 3.0));
+        settings_button(commands, pills, SettingsTarget::Style(st), st.name(), 12.0, (8.0, 3.0));
     }
-    let color_row = setting_row(&mut commands, pickers, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Color);
+    let color_row = setting_row(commands, pickers, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Color);
     commands.entity(color_row).insert(Node {
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Column,
@@ -2055,21 +2389,9 @@ fn spawn_settings_screen(
             Node { width: Val::Px(side), height: Val::Px(side), flex_shrink: 0.0, ..default() },
         ))
         .id();
-    spawn_crosshair(&mut commands, box_e, s.crosshair_style, s.crosshair_color.color(), PREVIEW_SCALE);
+    spawn_crosshair(commands, box_e, s.crosshair_style, s.crosshair_color.color(), PREVIEW_SCALE);
     commands.spawn((ChildOf(well), SettingsLabel::PreviewCaption, text("", 11.0, BONE_TEXT)));
 
-    // Footer.
-    let f = commands
-        .spawn((ChildOf(phone), Node { margin: UiRect { top: Val::Px(2.0), bottom: Val::Px(4.0), ..default() }, ..row(JustifyContent::Center, 24.0) }))
-        .id();
-    let reset = settings_button(&mut commands, f, SettingsTarget::ResetDefaults, "RESET DEFAULTS", 17.0, (16.0, 7.0));
-    commands.entity(reset).insert(SettingsRowTag(settings_row_index(SettingsRow::Reset), PUNK_RED));
-    let back = if mid_run { "BACK TO PAUSE  [ESC]" } else { "BACK  [ESC]" };
-    commands.spawn((
-        ChildOf(f),
-        crate::hud::prompt_button(AppState::Settings, back, MenuAction::CloseSettings, 19.0, ButtonStyle::HeroAcid),
-        SettingsRowTag(settings_row_index(SettingsRow::Back), ACID_GREEN),
-    ));
 }
 
 #[cfg(test)]
@@ -2101,7 +2423,8 @@ mod tests {
         assert_eq!(settings_pad_edit(SettingsRow::Back, 0, false, &s), None);
         // Every knob and toggle on the screen is a controller stop, exactly once.
         for k in SettingKnob::ALL {
-            assert_eq!(SETTINGS_ROWS.iter().filter(|r| **r == SettingsRow::Knob(k)).count(), 1, "{k:?}");
+            let both = SETTINGS_ROWS.iter().chain(TOUCH_SETTINGS_ROWS.iter());
+            assert_eq!(both.filter(|r| **r == SettingsRow::Knob(k)).count(), 1, "{k:?}");
         }
         assert_eq!(SETTINGS_ROWS.iter().filter(|r| matches!(r, SettingsRow::Toggle(_))).count(), 7);
         // Milestone 28: AIM FRICTION toggles like any switch, right after INVERT Y.
@@ -2386,5 +2709,52 @@ mod tests {
             // icon + space + short name at 13px mono must fit a ~210px tile.
             assert!(id.icon().len() + 1 + app_short_name(id).len() <= 26, "{id:?}");
         }
+    }
+
+    #[test]
+    fn touch_settings_page_rows_edit_and_tabs_wrap() {
+        use SettingsPadAction::*;
+        let s = UserSettings::default();
+        // Every touch knob / toggle is a stop on the TOUCH page only.
+        for k in [SettingKnob::TouchSensitivity, SettingKnob::TouchOpacity, SettingKnob::TouchButtonScale] {
+            assert!(TOUCH_SETTINGS_ROWS.contains(&SettingsRow::Knob(k)) && !SETTINGS_ROWS.contains(&SettingsRow::Knob(k)));
+            assert_eq!(k.gate(), None);
+        }
+        for g in [SettingToggle::TouchAutoBhop, SettingToggle::TouchAutoFire] {
+            assert!(TOUCH_SETTINGS_ROWS.contains(&SettingsRow::Toggle(g)));
+            assert_eq!(settings_pad_edit(SettingsRow::Toggle(g), 0, true, &s), Some(Edit(SettingsTarget::Toggle(g))));
+        }
+        // Both pages end on RESET / BACK; the touch page opens on the mode picker.
+        for tab in SettingsTab::ALL {
+            let rows = tab.rows();
+            assert_eq!(&rows[rows.len() - 2..], &[SettingsRow::Reset, SettingsRow::Back]);
+            assert_eq!(settings_row_index_in(tab, SettingsRow::Back), rows.len() - 1);
+        }
+        assert_eq!(TOUCH_SETTINGS_ROWS[0], SettingsRow::TouchMode);
+        assert_eq!(SETTINGS_ROWS[0], SettingsRow::Knob(SettingKnob::Sensitivity), "the GENERAL page is unchanged");
+        // The mode picker cycles AUTO -> ON -> OFF and wraps.
+        assert_eq!(settings_pad_edit(SettingsRow::TouchMode, 1, false, &s), Some(Edit(SettingsTarget::TouchMode(TouchMode::On))));
+        assert_eq!(settings_pad_edit(SettingsRow::TouchMode, -1, false, &s), Some(Edit(SettingsTarget::TouchMode(TouchMode::Off))));
+        let mut e = UserSettings::default();
+        assert!(matches!(apply_settings_edit(&mut e, SettingsTarget::TouchMode(TouchMode::Off)), EditOutcome::Changed(_)));
+        assert_eq!(e.touch_mode, TouchMode::Off);
+        assert!(matches!(apply_settings_edit(&mut e, SettingsTarget::TouchMode(TouchMode::Off)), EditOutcome::Unchanged(_)));
+        // Knobs step on their grid and clamp; tabs never edit settings.
+        let before = e.clone();
+        assert!(matches!(apply_settings_edit(&mut e, SettingsTarget::Tab(SettingsTab::Touch)), EditOutcome::Unchanged(_)));
+        assert_eq!(e, before);
+        for _ in 0..40 {
+            apply_settings_edit(&mut e, SettingsTarget::Up(SettingKnob::TouchButtonScale));
+            apply_settings_edit(&mut e, SettingsTarget::Down(SettingKnob::TouchOpacity));
+        }
+        assert_eq!((e.touch_button_scale, e.touch_opacity), (TOUCH_BUTTON_SCALE_RANGE.1, TOUCH_OPACITY_RANGE.0));
+        apply_settings_edit(&mut e, SettingsTarget::Up(SettingKnob::TouchSensitivity));
+        assert!((e.touch_sensitivity - 1.1).abs() < 1e-4);
+        assert_eq!(SettingKnob::TouchOpacity.value_text(&UserSettings::default()), "70%");
+        assert_eq!(SettingsTab::General.step(1), SettingsTab::Touch);
+        assert_eq!(SettingsTab::General.step(-1), SettingsTab::Touch, "wraps");
+        assert!(control_active(&s, SettingsTab::Touch, SettingsTarget::Tab(SettingsTab::Touch)));
+        assert!(control_active(&s, SettingsTab::Touch, SettingsTarget::TouchMode(TouchMode::Auto)));
+        assert!(!control_active(&s, SettingsTab::General, SettingsTarget::Tab(SettingsTab::Touch)));
     }
 }

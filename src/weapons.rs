@@ -2491,6 +2491,9 @@ fn fire_weapons(
         want = Some(ws.current.next());
     } else if scroll.delta.y > 0.0 {
         want = Some(ws.current.prev());
+    } else if let Some(w) = pad.as_ref().and_then(|g| g.weapon_slot).and_then(|i| Weapon::ALL.get(i).copied()) {
+        // Milestone 37: a tapped touch weapon-deck slot.
+        want = Some(w);
     } else if pad.as_ref().is_some_and(|g| g.weapon_next) {
         want = Some(ws.current.next());
     } else if pad.as_ref().is_some_and(|g| g.weapon_prev) {

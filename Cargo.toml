@@ -94,7 +94,7 @@ bevy = { version = "0.20.1", default-features = false, features = ["webgl2", "we
 getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
-    "Window", "Storage", "Document", "Element", "Location",
+    "Window", "Storage", "Document", "Element", "Location", "CssStyleDeclaration",
     # Leaderboard / Authentik session client (`fetch`).
     "Request", "RequestInit", "RequestCredentials", "RequestMode", "Response", "Headers",
 ] }
