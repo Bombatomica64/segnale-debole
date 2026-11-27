@@ -27,7 +27,8 @@
 //! which deliver them as Bevy `Touches` (see `src/touch.rs`). Kotlin also
 //! forwards the system Back gesture ([`AndroidInputEvent::BackPressed`] ->
 //! `touch::BackRequest`) and the display-cutout insets
-//! ([`AndroidInputEvent::SafeArea`] -> `touch::SafeAreaInsets`).
+//! ([`AndroidInputEvent::SafeArea`] -> `touch::SafeAreaInsets`); `ResetAll`
+//! also interrupts every touch contact (`touch::TouchInterrupt`).
 //!
 //! Everything except the JNI exports is platform-neutral and unit-tested on
 //! the desktop.
@@ -490,12 +491,17 @@ impl BridgeWriters<'_> {
 }
 
 /// Turn queued Android events into Bevy input messages (see module docs).
+#[allow(clippy::type_complexity)]
 pub fn drain_android_input(
     mut commands: Commands,
     mut bridge: ResMut<AndroidInputBridge>,
     mut out: BridgeWriters,
     mut windows: Query<(Entity, &mut Window), With<PrimaryWindow>>,
-    (mut back, mut insets): (Option<ResMut<crate::touch::BackRequest>>, Option<ResMut<crate::touch::SafeAreaInsets>>),
+    (mut back, mut insets, mut touch_reset): (
+        Option<ResMut<crate::touch::BackRequest>>,
+        Option<ResMut<crate::touch::SafeAreaInsets>>,
+        Option<ResMut<crate::touch::TouchInterrupt>>,
+    ),
 ) {
     let mut events = std::mem::take(&mut bridge.scratch);
     take_events(&mut events);
@@ -641,6 +647,11 @@ pub fn drain_android_input(
                 b.triggers.clear();
                 b.hats.clear();
                 b.held_buttons.clear();
+                // Touch: every contact is stale (bindings, the merged pad
+                // contribution and armed menu taps are dropped).
+                if let Some(t) = touch_reset.as_deref_mut() {
+                    t.request();
+                }
                 let before = std::mem::replace(&mut b.mouse_state, 0);
                 if before != 0
                     && let Some((entity, _)) = window.as_ref()
@@ -1040,7 +1051,8 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::input::InputPlugin, AndroidInputPlugin))
             .init_resource::<crate::touch::BackRequest>()
-            .init_resource::<crate::touch::SafeAreaInsets>();
+            .init_resource::<crate::touch::SafeAreaInsets>()
+            .init_resource::<crate::touch::TouchInterrupt>();
         app.world_mut().spawn((Window::default(), PrimaryWindow));
         app.update();
         push_event(AndroidInputEvent::SafeArea { left: 10.0, top: 0.0, right: 0.0, bottom: 0.0 });
@@ -1051,6 +1063,7 @@ mod tests {
         app.update();
         let w = app.world();
         assert!(w.resource::<crate::touch::BackRequest>().pending, "Back queued for the touch layer");
+        assert!(w.resource::<crate::touch::TouchInterrupt>().pending, "ResetAll interrupts every touch contact");
         assert_eq!(*w.resource::<crate::touch::SafeAreaInsets>(), crate::touch::SafeAreaInsets::new(96.0, 0.0, 48.0, 0.0), "newest insets win");
     }
 

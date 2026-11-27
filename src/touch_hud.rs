@@ -1,14 +1,18 @@
 //! Milestone 37: the on-screen touch HUD (drawing only; `touch.rs` routes).
 //!
-//! Industrial-punk plates in the `ui_kit` language: translucent ink fills,
-//! hard square corners, a thick accent rail on the left / bottom edges, press
-//! flashes in the accent color, and live cooldown fills that drain from the
-//! top. The floating thumbstick is the one round element (a ring, the 85%
-//! auto-bhop rim and a puck) and rests dimmed until a thumb lands. Everything
-//! is placed from [`TouchInput::layout`] (logical px) divided by [`UiScale`],
-//! scaled by `touch_button_scale` and faded by `touch_opacity`. The layout
-//! keeps every plate off the reticle, the vitals / velocity cluster, the boss
-//! bar and the style meter (which `hud.rs` moves aside in touch mode).
+//! Industrial-punk plates in the `ui_kit` grammar: accent-tinted ink fills,
+//! hard square corners, a thick accent rail on the left / bottom edges with
+//! hairline steel top / right edges (border widths fixed in logical px, so
+//! they stay crisp at any `UiScale`), press flashes in the accent color, and
+//! live cooldown fills that rise from the bottom in the accent. Labels and
+//! readouts use a design type scale (never below 9 / 8 logical px) with hard
+//! ink shadows. The floating thumbstick is the one round element (a ring, the
+//! 85% auto-bhop rim and a puck) and rests dimmed until a thumb lands.
+//! Everything is placed from [`TouchInput::layout`] (logical px) divided by
+//! [`UiScale`], scaled by `touch_button_scale` and faded by `touch_opacity`.
+//! The layout keeps every plate off the reticle, the vitals / velocity
+//! cluster, the boss bar and the style meter (which `hud.rs` moves aside in
+//! touch mode).
 
 use bevy::prelude::*;
 use bevy::text::FontSize;
@@ -21,7 +25,7 @@ use crate::player::{Player, DASH_COOLDOWN};
 use crate::signal::SignalState;
 use crate::state::{AppState, GameSet, PlayerModifiers};
 use crate::touch::{overlay_visible, TouchButton, TouchInput, AUTO_BHOP_RIM};
-use crate::ui_kit::{plate_rect, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_YELLOW, INK_BLACK, PUNK_RED, STEEL_LIGHT};
+use crate::ui_kit::{plate_border, plate_rect, ACID_GREEN, ARC_CYAN, ASH_DIM, BONE_TEXT, HAZARD_YELLOW, INK_BLACK, IRON_DARK, PUNK_RED, STEEL_BORDER, STEEL_LIGHT};
 
 /// Laid-out parts of the touch HUD.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +36,7 @@ pub enum TouchHudPart {
     StickRim,
     StickPuck,
     Plate(TouchButton),
-    /// Cooldown fill of a plate (drains from the top).
+    /// Cooldown fill of a plate (rises from the bottom while cooling).
     Fill(TouchButton),
 }
 
@@ -74,8 +78,15 @@ pub struct PlateLook {
     pub glow: bool,
     /// Remaining cooldown fraction (drawn as the fill).
     pub cooldown: f32,
+    /// Locked behind a signal-bar gate (`3 BARS`).
+    pub locked: bool,
+    /// A primary right-thumb action (FIRE / JUMP / DASH / PUNCH): accent-tinted fill.
+    pub primary: bool,
     pub readout: String,
 }
+
+/// Readout tags that mean "usable / active" (drawn in the accent).
+const ACTIVE_TAGS: [&str; 5] = ["READY", "BHOP", "AUTO", "UPLINK", "ON"];
 
 fn cooldown_text(cd: (f32, f32)) -> Option<String> {
     (cd.1 > 0.05).then(|| format!("{:.1}", cd.1))
@@ -83,8 +94,10 @@ fn cooldown_text(cd: (f32, f32)) -> Option<String> {
 
 /// A plate's look from the game state (pure; unit-tested).
 pub fn plate_look(b: TouchButton, c: &PlateContext) -> PlateLook {
-    let gated = |gate: bool, need: u8, cd: (f32, f32)| -> (bool, f32, String) {
+    let mut locked = false;
+    let mut gated = |gate: bool, need: u8, cd: (f32, f32)| -> (bool, f32, String) {
         if !gate {
+            locked = true;
             (false, 0.0, format!("{need} BAR{}", if need == 1 { "" } else { "S" }))
         } else if let Some(t) = cooldown_text(cd) {
             (false, cd.0, t)
@@ -118,22 +131,82 @@ pub fn plate_look(b: TouchButton, c: &PlateContext) -> PlateLook {
         TouchButton::Swap => (STEEL_LIGHT, true, false, 0.0, String::new()),
         TouchButton::Sos => (ACID_GREEN, true, true, 0.0, "UPLINK".to_string()),
         TouchButton::Pause | TouchButton::Reset => (BONE_TEXT, true, false, 0.0, String::new()),
-        TouchButton::AutoBhop => (ACID_GREEN, c.auto_bhop_latched, c.auto_bhop_latched, 0.0, String::new()),
+        // Always tappable: the pill toggles the latch, glowing while on.
+        TouchButton::AutoBhop => (ACID_GREEN, true, c.auto_bhop_latched, 0.0, if c.auto_bhop_latched { "ON" } else { "OFF" }.to_string()),
         TouchButton::Slot(_) => (STEEL_LIGHT, true, false, 0.0, String::new()),
     };
-    PlateLook { accent, ready, glow, cooldown: cooldown.clamp(0.0, 1.0), readout }
+    let primary = matches!(b, TouchButton::Fire | TouchButton::Jump | TouchButton::Dash | TouchButton::Punch);
+    PlateLook { accent, ready, glow, cooldown: cooldown.clamp(0.0, 1.0), locked, primary, readout }
 }
 
-/// `(fill, border, label)` colors of a plate at `opacity`.
-pub fn plate_colors(look: &PlateLook, pressed: bool, opacity: f32) -> (Color, Color, Color) {
+/// `(fill, border, label)` colors of a plate at `opacity`: the bolted-plate
+/// grammar (accent rail left / bottom, steel top / right, ink bevel).
+pub fn plate_colors(look: &PlateLook, pressed: bool, opacity: f32) -> (Color, BorderColor, Color) {
     let op = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 0.7 };
+    let a = (0.8 * op).clamp(0.35, 0.8);
     if pressed {
-        return (look.accent.with_alpha(0.78), BONE_TEXT, INK_BLACK);
+        return (look.accent.with_alpha(0.85), BorderColor::all(BONE_TEXT), INK_BLACK);
     }
-    let fill = if look.glow { look.accent.mix(&INK_BLACK, 0.7).with_alpha(0.7 * op) } else { INK_BLACK.with_alpha(0.55 * op) };
-    let border = if look.ready { look.accent.with_alpha(0.95 * op) } else { ASH_DIM.with_alpha(0.7 * op) };
-    let label = if look.glow { look.accent.with_alpha(op.max(0.6)) } else if look.ready { BONE_TEXT.with_alpha(op.max(0.5)) } else { ASH_DIM.with_alpha(op.max(0.45)) };
-    (fill, border, label)
+    if look.glow {
+        return (look.accent.mix(&INK_BLACK, 0.70).with_alpha(a), BorderColor::all(look.accent.with_alpha(0.95)), look.accent);
+    }
+    if look.ready {
+        let strong = (op + 0.25).min(1.0);
+        let fill = if look.primary { look.accent.mix(&INK_BLACK, 0.84).with_alpha(a) } else { IRON_DARK.with_alpha(a) };
+        return (fill, plate_border(look.accent.with_alpha(strong), STEEL_LIGHT.with_alpha(0.6)), BONE_TEXT.with_alpha(strong));
+    }
+    (INK_BLACK.with_alpha(a * 0.8), plate_border(ASH_DIM.with_alpha(0.8), STEEL_BORDER.with_alpha(0.6)), ASH_DIM.with_alpha(0.85))
+}
+
+/// Readout color: a bar lock in red, cooldown seconds in bone, usable /
+/// active tags in the accent.
+pub fn readout_color(look: &PlateLook) -> Color {
+    if look.locked {
+        PUNK_RED.mix(&BONE_TEXT, 0.3)
+    } else if ACTIVE_TAGS.contains(&look.readout.as_str()) {
+        look.accent
+    } else {
+        BONE_TEXT
+    }
+}
+
+/// Label design size (design px at unit 1).
+pub fn label_design_px(b: TouchButton) -> f32 {
+    match b {
+        TouchButton::Fire => 16.0,
+        TouchButton::Jump => 13.0,
+        TouchButton::Pause => 14.0,
+        TouchButton::Overload | TouchButton::Sos => 12.0,
+        TouchButton::Dash | TouchButton::Punch => 11.0,
+        _ => 10.0,
+    }
+}
+
+/// Readout design size (design px at unit 1).
+pub fn readout_design_px(b: TouchButton) -> f32 {
+    if matches!(b, TouchButton::Fire | TouchButton::Jump) { 10.0 } else { 9.0 }
+}
+
+/// UI font size of a design size at layout `unit` under `UiScale` `k`, never
+/// below `floor` logical px.
+pub fn touch_font_px(design: f32, unit: f32, k: f32, floor: f32) -> f32 {
+    let k = if k.is_finite() && k > 0.0 { k } else { 1.0 };
+    let u = if unit.is_finite() && unit > 0.0 { unit } else { 1.0 };
+    ((design * u).max(floor) / k).round()
+}
+
+/// Plate border widths (UI px) under `UiScale` `k`: a hairline of one
+/// logical px on top / right, a 3-4 design px accent rail on left / bottom.
+pub fn plate_edges(b: TouchButton, unit: f32, k: f32) -> UiRect {
+    let k = k.max(0.01);
+    let hair = (1.0 / k).max(1.0);
+    let rail = if matches!(b, TouchButton::Fire | TouchButton::Jump) { 4.0 } else { 3.0 } * unit / k;
+    plate_rect((rail, hair, hair, rail))
+}
+
+/// Cooldown fill height (% of the plate): rises 0 -> 100 while cooling, 0 when ready.
+pub fn fill_percent(look: &PlateLook) -> f32 {
+    if look.cooldown > 0.0 { ((1.0 - look.cooldown) * 100.0).clamp(0.0, 100.0) } else { 0.0 }
 }
 
 fn abs_node(width: f32, height: f32) -> Node {
@@ -182,21 +255,23 @@ fn spawn_touch_hud(mut commands: Commands) {
                 Node {
                     display: Display::None,
                     border: plate_rect((3.0, 1.0, 1.0, 3.0)),
-                    flex_direction: FlexDirection::Column,
+                    // The AUTO-BHOP pill reads `AUTO-BHOP  ON` on one line.
+                    flex_direction: if b == TouchButton::AutoBhop { FlexDirection::Row } else { FlexDirection::Column },
+                    column_gap: Val::Px(6.0),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     overflow: Overflow::clip(),
                     ..abs_node(60.0, 60.0)
                 },
-                BorderColor::all(ASH_DIM),
+                plate_border(ASH_DIM, STEEL_BORDER),
                 BackgroundColor(INK_BLACK.with_alpha(0.5)),
             ))
             .id();
         commands.spawn((
             ChildOf(plate),
             TouchHudPart::Fill(b),
-            Node { left: Val::Px(0.0), top: Val::Px(0.0), width: Val::Percent(100.0), height: Val::Percent(0.0), ..abs_node(0.0, 0.0) },
-            BackgroundColor(INK_BLACK.with_alpha(0.6)),
+            Node { left: Val::Px(0.0), top: Val::Auto, bottom: Val::Px(0.0), width: Val::Percent(100.0), height: Val::Percent(0.0), ..abs_node(0.0, 0.0) },
+            BackgroundColor(ACID_GREEN.with_alpha(0.25)),
         ));
         commands.spawn((
             ChildOf(plate),
@@ -205,7 +280,7 @@ fn spawn_touch_hud(mut commands: Commands) {
             TextFont::from_font_size(14.0),
             TextColor(BONE_TEXT),
             TextLayout::no_wrap(),
-            TextShadow { offset: Vec2::splat(1.5), color: Color::BLACK.with_alpha(0.8) },
+            TextShadow { offset: Vec2::splat(2.0), color: Color::BLACK.with_alpha(0.8) },
         ));
         commands.spawn((
             ChildOf(plate),
@@ -214,6 +289,7 @@ fn spawn_touch_hud(mut commands: Commands) {
             TextFont::from_font_size(9.0),
             TextColor(ASH_DIM),
             TextLayout::no_wrap(),
+            TextShadow { offset: Vec2::splat(2.0), color: Color::BLACK.with_alpha(0.8) },
         ));
     }
 }
@@ -288,11 +364,17 @@ fn update_touch_hud(
     let stick_active = frame.stick.is_some();
     let (base_c, puck_c) = frame.stick.unwrap_or((layout.stick_rest, layout.stick_rest));
     let r = layout.stick_radius;
+    // Ring edges in logical px (crisp at any UiScale).
+    let (ring_w, rim_w) = ((2.0 / k).max(1.0), (1.0 / k).max(1.0));
     for (part, mut node, mut bg, mut border) in &mut parts {
         match *part {
             TouchHudPart::Root => set_display(&mut node, on),
             TouchHudPart::StickBase => {
                 place(&mut node, base_c, Vec2::splat(r), k);
+                let edge = UiRect::all(Val::Px(ring_w));
+                if node.border != edge {
+                    node.border = edge;
+                }
                 let (b, f) = if stick_active { (ARC_CYAN.with_alpha(0.9 * op.max(0.6)), INK_BLACK.with_alpha(0.35 * op)) } else { (ARC_CYAN.with_alpha(0.35 * op), INK_BLACK.with_alpha(0.2 * op)) };
                 if bg.0 != f {
                     bg.0 = f;
@@ -304,7 +386,11 @@ fn update_touch_hud(
             TouchHudPart::StickRim => {
                 // Relative to the base (its child): centered, 85% of its size.
                 let side = r * 2.0 * AUTO_BHOP_RIM / k;
-                let off = (r * 2.0 / k - side) * 0.5 - 2.0;
+                let off = (r * 2.0 / k - side) * 0.5 - ring_w;
+                let edge = UiRect::all(Val::Px(rim_w));
+                if node.border != edge {
+                    node.border = edge;
+                }
                 set_px(&mut node.left, off);
                 set_px(&mut node.top, off);
                 set_px(&mut node.width, side);
@@ -316,6 +402,10 @@ fn update_touch_hud(
             }
             TouchHudPart::StickPuck => {
                 place(&mut node, puck_c, Vec2::splat(r * 0.42), k);
+                let edge = UiRect::all(Val::Px(ring_w));
+                if node.border != edge {
+                    node.border = edge;
+                }
                 let (f, b) = if stick_active { (BONE_TEXT.with_alpha(0.55), BONE_TEXT.with_alpha(0.95)) } else { (ASH_DIM.with_alpha(0.25 * op), BONE_TEXT.with_alpha(0.35 * op)) };
                 if bg.0 != f {
                     bg.0 = f;
@@ -331,20 +421,28 @@ fn update_touch_hud(
                 };
                 set_display(&mut node, true);
                 place(&mut node, rect.center, rect.half, k);
+                let edges = plate_edges(b, layout.unit, k);
+                if node.border != edges {
+                    node.border = edges;
+                }
                 let look = plate_look(b, &ctx);
                 let (fill, edge, _) = plate_colors(&look, frame.is_pressed(b), op);
                 if bg.0 != fill {
                     bg.0 = fill;
                 }
-                if border.top != edge {
-                    *border = BorderColor::all(edge);
+                if *border != edge {
+                    *border = edge;
                 }
             }
             TouchHudPart::Fill(b) => {
-                let pct = plate_look(b, &ctx).cooldown * 100.0;
-                let want = Val::Percent(pct.round());
+                let look = plate_look(b, &ctx);
+                let want = Val::Percent(fill_percent(&look).round());
                 if node.height != want {
                     node.height = want;
+                }
+                let c = look.accent.with_alpha(0.25);
+                if bg.0 != c {
+                    bg.0 = c;
                 }
             }
         }
@@ -357,8 +455,7 @@ fn update_touch_hud(
                 if color.0 != c {
                     color.0 = c;
                 }
-                let half = layout.button(b).map_or(20.0, |r| r.half.y.min(r.half.x * 0.6)) / k;
-                let size = (half * 0.5).clamp(9.0, 26.0).round();
+                let size = touch_font_px(label_design_px(b), layout.unit, k, 9.0);
                 if font.font_size != FontSize::Px(size) {
                     font.font_size = FontSize::Px(size);
                 }
@@ -368,12 +465,11 @@ fn update_touch_hud(
                 if text.0 != look.readout {
                     text.0.clone_from(&look.readout);
                 }
-                let c = if look.glow { look.accent } else { BONE_TEXT.with_alpha(0.8) };
+                let c = readout_color(&look);
                 if color.0 != c {
                     color.0 = c;
                 }
-                let half = layout.button(b).map_or(20.0, |r| r.half.y) / k;
-                let size = (half * 0.3).clamp(8.0, 15.0).round();
+                let size = touch_font_px(readout_design_px(b), layout.unit, k, 8.0);
                 if font.font_size != FontSize::Px(size) {
                     font.font_size = FontSize::Px(size);
                 }
@@ -416,8 +512,35 @@ mod tests {
         // Fire / jump / latch status.
         assert_eq!(plate_look(TouchButton::Fire, &PlateContext { auto_fire: true, ..default() }).readout, "AUTO");
         assert!(plate_look(TouchButton::Jump, &PlateContext { bhop_rim: true, ..default() }).glow);
-        assert!(plate_look(TouchButton::AutoBhop, &PlateContext { auto_bhop_latched: true, ..default() }).glow);
-        assert!(!plate_look(TouchButton::AutoBhop, &PlateContext::default()).ready);
+        let on = plate_look(TouchButton::AutoBhop, &PlateContext { auto_bhop_latched: true, ..default() });
+        assert!(on.glow && on.ready && on.readout == "ON" && readout_color(&on) == ACID_GREEN);
+        let off = plate_look(TouchButton::AutoBhop, &PlateContext::default());
+        assert!(off.ready && !off.glow && off.readout == "OFF", "always tappable");
+        // Readout colors: bar locks red, seconds bone, active tags in the accent.
+        let locked = plate_look(TouchButton::Overload, &weak);
+        assert!(locked.locked && readout_color(&locked) == PUNK_RED.mix(&BONE_TEXT, 0.3));
+        assert_eq!(readout_color(&d), BONE_TEXT);
+        assert_eq!(readout_color(&plate_look(TouchButton::Overload, &ready)), ACID_GREEN);
+        assert!(!plate_look(TouchButton::Dash, &cooling).locked && plate_look(TouchButton::Dash, &cooling).primary);
+        assert!(!plate_look(TouchButton::Ping, &ready).primary);
+    }
+
+    #[test]
+    fn cooldown_fill_rises_and_type_scale_has_floors() {
+        let cooling = PlateContext { dash: (0.75, 1.5), ..default() };
+        let d = plate_look(TouchButton::Dash, &cooling);
+        assert!((fill_percent(&d) - 25.0).abs() < 1e-3, "a fresh cooldown starts low and rises");
+        assert_eq!(fill_percent(&plate_look(TouchButton::Dash, &PlateContext::default())), 0.0, "empty when ready");
+        // Design sizes x unit / UiScale, floored in logical px.
+        assert_eq!(touch_font_px(label_design_px(TouchButton::Fire), 1.0, 0.5, 9.0), 32.0);
+        assert_eq!(touch_font_px(label_design_px(TouchButton::Swap), 0.7, 0.5, 9.0), 18.0, "10 x 0.7 = 7 -> floored at 9 logical");
+        assert_eq!(touch_font_px(readout_design_px(TouchButton::Ping), 0.8, 1.0, 8.0), 8.0);
+        assert!(label_design_px(TouchButton::Fire) > label_design_px(TouchButton::Jump) && label_design_px(TouchButton::Dash) > label_design_px(TouchButton::Swap));
+        // Hairlines stay >= 1 UI px; rails scale with the unit, FIRE / JUMP thicker.
+        let e = plate_edges(TouchButton::Fire, 1.0, 0.5);
+        assert_eq!((e.left, e.top, e.right, e.bottom), (Val::Px(8.0), Val::Px(2.0), Val::Px(2.0), Val::Px(8.0)));
+        let e = plate_edges(TouchButton::Ping, 1.0, 2.0);
+        assert_eq!((e.left, e.top), (Val::Px(1.5), Val::Px(1.0)));
     }
 
     #[test]
@@ -425,9 +548,20 @@ mod tests {
         let look = plate_look(TouchButton::Fire, &PlateContext::default());
         let (fill_lo, edge_lo, _) = plate_colors(&look, false, 0.25);
         let (fill_hi, edge_hi, _) = plate_colors(&look, false, 1.0);
-        assert!(fill_lo.alpha() < fill_hi.alpha() && edge_lo.alpha() < edge_hi.alpha());
+        assert!(fill_lo.alpha() < fill_hi.alpha() && edge_lo.left.alpha() < edge_hi.left.alpha());
+        assert!(fill_lo.alpha() >= 0.35 - 1e-6 && fill_hi.alpha() <= 0.8 + 1e-6, "fill alpha clamped to 0.35..0.8");
+        // Bolted plate: accent rail, steel edges, ink bevel.
+        assert_eq!(edge_hi.left, PUNK_RED);
+        assert!(edge_hi.bottom == INK_BLACK && edge_hi.top == STEEL_LIGHT.with_alpha(0.6));
         let (fill_p, edge_p, label_p) = plate_colors(&look, true, 0.25);
-        assert!(fill_p.alpha() > fill_hi.alpha() && edge_p == BONE_TEXT && label_p == INK_BLACK, "a press flashes at full strength");
+        assert!(fill_p.alpha() > fill_hi.alpha() && edge_p == BorderColor::all(BONE_TEXT) && label_p == INK_BLACK, "a press flashes at full strength");
         assert!(plate_colors(&look, false, f32::NAN).0.alpha() > 0.0);
+        // Not ready: ink fill, ash rail; glowing: accent everywhere.
+        let weak = plate_look(TouchButton::Flash, &PlateContext::default());
+        let (_, e, l) = plate_colors(&weak, false, 1.0);
+        assert!(e.left == ASH_DIM.with_alpha(0.8) && l == ASH_DIM.with_alpha(0.85));
+        let glow = plate_look(TouchButton::Overload, &PlateContext { bars: 5, overload_gate: true, ..default() });
+        let (_, e, l) = plate_colors(&glow, false, 1.0);
+        assert!(e == BorderColor::all(ACID_GREEN.with_alpha(0.95)) && l == ACID_GREEN);
     }
 }

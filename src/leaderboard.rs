@@ -933,6 +933,49 @@ fn toggle_callsign_edit(lb: &mut LeaderboardState, store: &mut ProfileStore, cli
 
 /// Keyboard callsign editor controls (see [`PAD_TEXT_HINT`] for the pad).
 pub const CALLSIGN_KBM_HINT: &str = "TYPE A-Z 0-9 _ -  //  ENTER SAVE  //  ESC CANCEL";
+/// Touch callsign editor controls (the strip under the callsign plate).
+pub const CALLSIGN_TOUCH_HINT: &str = "< > CYCLE THE LAST CHARACTER  //  NEXT ADDS ONE  //  DEL  //  DONE SAVES";
+
+/// One switch of the touch callsign editor strip: the controller's
+/// character wheel ([`pad_edit_text`]) as tappable switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallsignEdit {
+    /// Previous character of the wheel (controller Down).
+    Prev,
+    /// Next character of the wheel (controller Up).
+    Next,
+    /// Append a character (controller Right).
+    Add,
+    /// Delete the last character (controller Left).
+    Del,
+    /// Save (controller A).
+    Done,
+}
+
+impl CallsignEdit {
+    pub const ALL: [CallsignEdit; 5] = [CallsignEdit::Prev, CallsignEdit::Next, CallsignEdit::Add, CallsignEdit::Del, CallsignEdit::Done];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CallsignEdit::Prev => "<",
+            CallsignEdit::Next => ">",
+            CallsignEdit::Add => "NEXT",
+            CallsignEdit::Del => "DEL",
+            CallsignEdit::Done => "DONE",
+        }
+    }
+}
+
+/// Apply a touch editor switch to the callsign buffer (same wheel and limits
+/// as the controller). `Done` never edits. Returns whether `buf` changed.
+pub fn touch_edit_callsign(buf: &mut String, e: CallsignEdit) -> bool {
+    let mut pad = GamepadInput::default();
+    pad.nav_up = e == CallsignEdit::Next;
+    pad.nav_down = e == CallsignEdit::Prev;
+    pad.nav_right = e == CallsignEdit::Add;
+    pad.nav_left = e == CallsignEdit::Del;
+    pad_edit_text(buf, &pad, PAD_CHARSET, CALLSIGN_MAX)
+}
 
 /// Character set cycled by the controller in the callsign editor.
 const PAD_CHARSET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
@@ -992,6 +1035,12 @@ fn leaderboard_input(
             MenuAction::LbNextPage => lb.turn_page(1),
             MenuAction::LbRefresh => request_boards(&mut client, &mut lb),
             MenuAction::LbCallsign => toggle_callsign_edit(&mut lb, &mut store, &mut client),
+            MenuAction::LbEdit(CallsignEdit::Done) if lb.editing.is_some() => commit_callsign(&mut lb, &mut store, &mut client),
+            MenuAction::LbEdit(e) => {
+                if let Some(buf) = lb.editing.as_mut() {
+                    touch_edit_callsign(buf, e);
+                }
+            }
             _ => {}
         }
     }
@@ -1121,6 +1170,13 @@ enum LbLabel {
     LocalSummary,
     Page,
     Guest,
+    /// The touch callsign editor strip (shown while editing in touch mode).
+    TouchEditor,
+}
+
+/// Whether the touch callsign editor strip shows.
+pub fn touch_editor_visible(lb: &LeaderboardState, mode: InputMode) -> bool {
+    lb.editing.is_some() && mode.is_touch()
 }
 
 /// Table column header `i`.
@@ -1221,18 +1277,19 @@ pub fn local_summary(p: &PlayerProfile, today: DailyDate) -> String {
 pub fn callsign_plate_label(lb: &LeaderboardState, callsign: &str, mode: InputMode) -> String {
     match &lb.editing {
         Some(buf) => format!("CALLSIGN: {buf}_"),
-        None => format!("CALLSIGN: {callsign}{}", mode.pick("  [C]", "")),
+        None => format!("CALLSIGN: {callsign}{}", mode.pick3("  [C]", "", "")),
     }
 }
 
 /// Label of the tab switch (names the board on screen).
 pub fn tab_label(lb: &LeaderboardState, mode: InputMode) -> String {
     let date = if lb.daily_date.is_empty() { DailyDate::today_utc().format_iso() } else { lb.daily_date.clone() };
-    let key = mode.pick("[TAB]", "[LB/RB]");
-    match lb.tab {
+    let key = mode.pick3("[TAB]", "[LB/RB]", "");
+    let label = match lb.tab {
         LbTab::Daily => format!("BOARD: DAILY {date}  {key}"),
         LbTab::TimeTrial => format!("BOARD: TIME TRIAL  {key}"),
-    }
+    };
+    label.trim_end().to_string()
 }
 
 /// Account switch label (`None` = hidden).
@@ -1250,14 +1307,16 @@ pub fn account_switch_label(account: &Account) -> Option<&'static str> {
 pub const LB_HINTS: &str = "TAB: SWITCH BOARD  //  [ ] OR ARROWS: PAGE  //  C: EDIT CALLSIGN  //  R: REFRESH";
 /// Key hints of the leaderboard (controller).
 pub const LB_PAD_HINTS: &str = "LB / RB: SWITCH BOARD  //  LT / RT: PAGE  //  Y: REFRESH  //  A: SELECT  //  B: BACK";
+/// Hints of the leaderboard (touch).
+pub const LB_TOUCH_HINTS: &str = "TAP BOARD TO SWITCH  //  TAP CALLSIGN TO EDIT";
 
 /// Notice line: the callsign editor's controls while typing (per input
 /// mode), else the live notice, else the key hints.
 pub fn footer_line(lb: &LeaderboardState, mode: InputMode) -> (&str, Color) {
     match (&lb.editing, &lb.notice) {
-        (Some(_), _) => (mode.pick(CALLSIGN_KBM_HINT, PAD_TEXT_HINT), HAZARD_YELLOW),
+        (Some(_), _) => (mode.pick3(CALLSIGN_KBM_HINT, PAD_TEXT_HINT, CALLSIGN_TOUCH_HINT), HAZARD_YELLOW),
         (None, Some(n)) => (n.as_str(), HAZARD_YELLOW),
-        (None, None) => (mode.pick(LB_HINTS, LB_PAD_HINTS), ASH_DIM),
+        (None, None) => (mode.pick3(LB_HINTS, LB_PAD_HINTS, LB_TOUCH_HINTS), ASH_DIM),
     }
 }
 
@@ -1352,6 +1411,29 @@ fn spawn_leaderboard_screen(
         punk_button("REFRESH  [R]", MenuAction::LbRefresh, 14.0, ButtonStyle::ScrapSteel),
         DualPrompt::new("REFRESH  [R]", "REFRESH  [Y]"),
     ));
+    // Touch callsign editor: the controller's character wheel as switches.
+    let strip = commands
+        .spawn((
+            ChildOf(body),
+            LbLabel::TouchEditor,
+            Node {
+                display: if touch_editor_visible(&lb, mode) { Display::Flex } else { Display::None },
+                column_gap: Val::Px(8.0),
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .id();
+    for e in CallsignEdit::ALL {
+        let style = match e {
+            CallsignEdit::Done => ButtonStyle::PrimaryAcid,
+            CallsignEdit::Del => ButtonStyle::DangerRed,
+            _ => ButtonStyle::HazardAmber,
+        };
+        let b = commands.spawn((ChildOf(strip), punk_button(e.label(), MenuAction::LbEdit(e), 16.0, style))).id();
+        // Never a controller stop (the pad has its own wheel).
+        commands.entity(b).remove::<crate::gamepad::GamepadFocusable>();
+    }
 
     // Table: one page of LB_PAGE_SIZE rows.
     let (table, table_head) = section_crate(&mut commands, body, "TOP 25", HAZARD_YELLOW, Node { width: Val::Percent(100.0), row_gap: Val::Px(1.0), ..default() });
@@ -1527,11 +1609,14 @@ fn refresh_leaderboard_ui(
                 set_color(&mut c, msg_color);
             }
             LbLabel::LocalSummary => set_text(&mut t, &if message.is_empty() { String::new() } else { local_summary(&store.profile, DailyDate::today_utc()) }),
+            LbLabel::TouchEditor => {}
         }
     }
     for (label, mut n) in &mut label_nodes {
-        if *label == LbLabel::Guest {
-            set_display(&mut n, guest_note(&lb.account).is_some());
+        match label {
+            LbLabel::Guest => set_display(&mut n, guest_note(&lb.account).is_some()),
+            LbLabel::TouchEditor => set_display(&mut n, touch_editor_visible(&lb, mode)),
+            _ => {}
         }
     }
     for (action, children) in &buttons {
@@ -1798,6 +1883,34 @@ mod tests {
         assert_eq!(lb.current_page(), 1);
         lb.daily = Board::Offline;
         assert_eq!(page_label(&lb), "PAGE 1/1");
+    }
+
+    #[test]
+    fn touch_callsign_editor_uses_the_controller_wheel() {
+        let mut buf = String::from("AC");
+        assert!(touch_edit_callsign(&mut buf, CallsignEdit::Next));
+        assert_eq!(buf, "AD", "> cycles the last character forward");
+        touch_edit_callsign(&mut buf, CallsignEdit::Prev);
+        touch_edit_callsign(&mut buf, CallsignEdit::Prev);
+        assert_eq!(buf, "AB");
+        touch_edit_callsign(&mut buf, CallsignEdit::Add);
+        assert_eq!(buf, "ABA", "NEXT appends the wheel's first character");
+        touch_edit_callsign(&mut buf, CallsignEdit::Del);
+        assert_eq!(buf, "AB");
+        assert!(!touch_edit_callsign(&mut buf, CallsignEdit::Done), "DONE never edits");
+        let mut full = "X".repeat(CALLSIGN_MAX);
+        assert!(!touch_edit_callsign(&mut full, CallsignEdit::Add), "never past the limit");
+        // Touch labels: no keycaps, touch hints, and the strip while editing.
+        let mut lb = LeaderboardState::default();
+        assert_eq!(callsign_plate_label(&lb, "ACE", InputMode::Touch), "CALLSIGN: ACE");
+        let tab = tab_label(&lb, InputMode::Touch);
+        assert!(!tab.contains('[') && tab == tab.trim_end(), "{tab}");
+        assert_eq!(footer_line(&lb, InputMode::Touch).0, LB_TOUCH_HINTS);
+        assert!(!touch_editor_visible(&lb, InputMode::Touch));
+        lb.editing = Some("AB".into());
+        assert!(touch_editor_visible(&lb, InputMode::Touch) && !touch_editor_visible(&lb, InputMode::KeyboardMouse));
+        assert_eq!(footer_line(&lb, InputMode::Touch).0, CALLSIGN_TOUCH_HINT);
+        assert_eq!(CallsignEdit::ALL.map(CallsignEdit::label), ["<", ">", "NEXT", "DEL", "DONE"]);
     }
 
     #[test]

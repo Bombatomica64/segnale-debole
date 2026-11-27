@@ -465,3 +465,408 @@ fn settings_touch_page_switches_with_keys_and_edits_touch_options() {
     step(&mut app, 3);
     assert_eq!(app_state(&app), AppState::MainMenu);
 }
+
+// ---------------------------------------------------------------------------
+// M37 follow-up: edge cases (cancel, id reuse, interruptions, assists, menus)
+// ---------------------------------------------------------------------------
+
+fn pad(app: &App) -> segnale_debole::gamepad::GamepadInput {
+    app.world().resource::<segnale_debole::gamepad::GamepadInput>().clone()
+}
+
+fn cancel(app: &mut App, id: u64, at: Vec2) {
+    finger(app, id, TouchPhase::Canceled, at);
+}
+
+/// Spawn a frozen demon of `kind` at `offset` from the player's feet; returns it.
+fn spawn_demon(app: &mut App, kind: EnemyKind, offset: Vec3) -> Entity {
+    app.world_mut().insert_resource(segnale_debole::dev::DevFreezeAi);
+    let pos = feet(app) + offset;
+    let before: Vec<Entity> = app.world_mut().query_filtered::<Entity, With<Enemy>>().iter(app.world()).collect();
+    app.world_mut()
+        .run_system_once(move |mut commands: Commands, ea: Res<EnemyAssets>, mut mats: ResMut<Assets<StandardMaterial>>, run: Res<RunStats>| {
+            spawn_enemy(&mut commands, &ea, &mut mats, kind, pos, run.floor, false);
+        })
+        .unwrap();
+    app.update();
+    app.world_mut().query_filtered::<Entity, With<Enemy>>().iter(app.world()).find(|e| !before.contains(e)).expect("spawned")
+}
+
+/// Freeze the view on `target` (world point) through the bot look override.
+fn aim_at(app: &mut App, target: Vec3) {
+    let eye = feet(app) + Vec3::Y * PLAYER_EYE_HEIGHT;
+    let d = target - eye;
+    let mut bot = app.world_mut().resource_mut::<BotControl>();
+    bot.look_yaw = Some((-d.x).atan2(-d.z));
+    bot.look_pitch = Some(d.y.atan2(Vec2::new(d.x, d.z).length()));
+}
+
+#[test]
+fn canceled_touches_never_fire_and_a_reused_finger_id_rebinds_in_order() {
+    let mut app = playing_app(70);
+    let fire = button(&app, TouchButton::Fire);
+    let jump = button(&app, TouchButton::Jump);
+    let shells = player(&mut app).ammo_shells;
+    // Down + Canceled on FIRE before the next frame: never a tap.
+    down(&mut app, 1, fire);
+    cancel(&mut app, 1, fire);
+    step(&mut app, 3);
+    assert_eq!(player(&mut app).ammo_shells, shells, "a canceled contact never shoots");
+    assert!(!pad(&app).fire && !app.world().resource::<TouchInput>().frame.fire);
+    // A held FIRE canceled by the OS lets go without a new edge.
+    down(&mut app, 2, fire);
+    step(&mut app, 1);
+    assert!(app.world().resource::<TouchInput>().frame.fire);
+    cancel(&mut app, 2, fire);
+    step(&mut app, 1);
+    assert!(!app.world().resource::<TouchInput>().frame.fire && !pad(&app).fire);
+    // FIRE lifts and the same id lands on JUMP within one frame: the lift
+    // retires FIRE first, then the press binds JUMP.
+    down(&mut app, 3, fire);
+    step(&mut app, 2);
+    up(&mut app, 3, fire);
+    down(&mut app, 3, jump);
+    step(&mut app, 1);
+    let f = app.world().resource::<TouchInput>().frame.clone();
+    assert!(f.is_pressed(TouchButton::Jump) && !f.is_pressed(TouchButton::Fire) && !f.fire, "{f:?}");
+    step(&mut app, 2);
+    assert!(player(&mut app).velocity.y > 0.0 || !player(&mut app).grounded, "the reused id jumped");
+    up(&mut app, 3, jump);
+    step(&mut app, 1);
+    assert_eq!(app.world().resource::<TouchInput>().router.finger_count(), 0);
+}
+
+#[test]
+fn a_thumb_landing_in_the_corner_starts_the_stick_neutral() {
+    let mut app = playing_app(71);
+    let start = feet(&mut app);
+    // Bottom-left corner of the 1280x720 fallback viewport.
+    let corner = Vec2::new(2.0, 718.0);
+    down(&mut app, 9, corner);
+    step(&mut app, 20);
+    let f = app.world().resource::<TouchInput>().frame.clone();
+    assert_eq!(f.stick_anchor, Some(corner), "the input anchor is the touch point");
+    assert!(f.move_axes == Vec2::ZERO && !f.jump, "no phantom strafe or auto-bhop: {f:?}");
+    let ring = f.stick.unwrap().0;
+    assert!(ring.x > corner.x && ring.y < corner.y, "the drawn ring is clamped inside the safe area: {ring}");
+    assert!((feet(&mut app) - start).length() < 0.05 && player(&mut app).grounded);
+    // Pushing up from there walks forward.
+    drag(&mut app, 9, corner + Vec2::new(0.0, -60.0));
+    step(&mut app, 20);
+    assert!((feet(&mut app) - start).length() > 0.5);
+    up(&mut app, 9, corner);
+}
+
+#[test]
+fn focus_loss_suspension_and_android_reset_drop_every_touch() {
+    use bevy::window::{AppLifecycle, WindowFocused};
+    use segnale_debole::touch::TouchInterrupt;
+    let mut app = playing_app(72);
+    // Stick held forward and FIRE held.
+    let fire = button(&app, TouchButton::Fire);
+    down(&mut app, 1, STICK_AT);
+    down(&mut app, 2, fire);
+    step(&mut app, 1);
+    drag(&mut app, 1, STICK_AT + Vec2::new(0.0, -80.0));
+    step(&mut app, 2);
+    assert!(pad(&app).move_axes.y > 0.5 && pad(&app).fire);
+    // The window loses focus: nothing stays held, stale moves are ignored.
+    app.world_mut().write_message(WindowFocused { window: Entity::PLACEHOLDER, focused: false });
+    step(&mut app, 1);
+    let t = app.world().resource::<TouchInput>();
+    assert!(t.frame.move_axes == Vec2::ZERO && !t.frame.fire && t.router.finger_count() == 0 && t.stale.suspended);
+    assert!(pad(&app).move_axes == Vec2::ZERO && !pad(&app).fire, "the merged pad contribution is gone");
+    drag(&mut app, 1, STICK_AT + Vec2::new(30.0, -80.0));
+    step(&mut app, 2);
+    assert_eq!(pad(&app).move_axes, Vec2::ZERO, "a stale contact never moves the player");
+    // Focus back + a fresh touch-down works again; the stale finger's lift is not a tap.
+    app.world_mut().write_message(WindowFocused { window: Entity::PLACEHOLDER, focused: true });
+    up(&mut app, 2, fire);
+    step(&mut app, 1);
+    assert!(!app.world().resource::<TouchInput>().frame.fire_just_pressed);
+    up(&mut app, 1, STICK_AT);
+    down(&mut app, 5, STICK_AT);
+    step(&mut app, 1);
+    drag(&mut app, 5, STICK_AT + Vec2::new(0.0, -80.0));
+    step(&mut app, 1);
+    assert!(pad(&app).move_axes.y > 0.5, "a fresh touch drives again");
+    // Android ResetAll (via the bridge resource) cuts it off too.
+    app.world_mut().resource_mut::<TouchInterrupt>().request();
+    step(&mut app, 1);
+    assert_eq!(pad(&app).move_axes, Vec2::ZERO);
+    assert!(app.world().resource::<TouchInput>().stale.is_stale(5));
+    drag(&mut app, 5, STICK_AT + Vec2::new(0.0, -90.0));
+    step(&mut app, 1);
+    assert_eq!(pad(&app).move_axes, Vec2::ZERO);
+    up(&mut app, 5, STICK_AT);
+    // App suspension pauses the run and drops the contacts as well.
+    down(&mut app, 6, STICK_AT);
+    step(&mut app, 1);
+    app.world_mut().write_message(AppLifecycle::Suspended);
+    step(&mut app, 2);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert!(app.world().resource::<TouchInput>().stale.is_stale(6));
+    up(&mut app, 6, STICK_AT);
+    step(&mut app, 1);
+    assert!(!app.world().resource::<UiPointer>().released, "the interrupted finger's lift never clicks a pause switch");
+}
+
+#[test]
+fn a_menu_finger_interrupted_by_focus_loss_never_clicks() {
+    use bevy::window::WindowFocused;
+    let mut app = App::new();
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    let at = Vec2::new(400.0, 300.0);
+    down(&mut app, 80, at);
+    step(&mut app, 1);
+    assert!(app.world().resource::<UiPointer>().pressed);
+    app.world_mut().write_message(WindowFocused { window: Entity::PLACEHOLDER, focused: false });
+    step(&mut app, 1);
+    up(&mut app, 80, at);
+    step(&mut app, 1);
+    assert!(!app.world().resource::<UiPointer>().released, "disarmed by the focus loss");
+    // A Canceled menu finger never clicks either.
+    down(&mut app, 81, at);
+    step(&mut app, 1);
+    cancel(&mut app, 81, at);
+    step(&mut app, 1);
+    let p = *app.world().resource::<UiPointer>();
+    assert!(!p.released && !p.pressed);
+    // A screen change disarms a finger that is still down.
+    down(&mut app, 82, at);
+    step(&mut app, 1);
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Loadout);
+    step(&mut app, 2);
+    up(&mut app, 82, at);
+    step(&mut app, 1);
+    assert!(!app.world().resource::<UiPointer>().released, "armed on the previous screen");
+}
+
+#[test]
+fn the_auto_bhop_latch_never_carries_into_a_new_run() {
+    let mut app = playing_app(73);
+    tap(&mut app, 11, TouchButton::AutoBhop);
+    assert!(app.world().resource::<TouchInput>().frame.auto_bhop_latched);
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::MainMenu);
+    step(&mut app, 2);
+    begin_run(&mut app, 74);
+    step(&mut app, 1);
+    let t = app.world().resource::<TouchInput>();
+    assert!(!t.frame.auto_bhop_latched, "a new run starts unlatched");
+}
+
+#[test]
+fn auto_fire_tests_this_frames_aim_and_skips_shielded_demons() {
+    let mut app = playing_app(75);
+    set_settings(&mut app, |s| s.touch_auto_fire = true);
+    let demon = spawn_demon(&mut app, EnemyKind::Imp, Vec3::new(0.0, 0.0, -8.0));
+    // Sturdy enough to survive the shots below.
+    app.world_mut().get_mut::<Enemy>(demon).unwrap().hp = 1.0e6;
+    let chest = feet(&mut app) + Vec3::new(0.0, 1.0, -8.0);
+    // Touch mode on, aimed away from the demon: nothing fires.
+    down(&mut app, 40, LOOK_AT);
+    aim_at(&mut app, chest + Vec3::new(0.0, 0.0, 16.0));
+    step(&mut app, 5);
+    let shells = player(&mut app).ammo_shells;
+    step(&mut app, 5);
+    assert_eq!(player(&mut app).ammo_shells, shells);
+    // Turn onto it: the very frame the eye lands on it fires (auto-fire runs
+    // after the look, on the pose that fires).
+    aim_at(&mut app, chest);
+    step(&mut app, 1);
+    assert!(player(&mut app).ammo_shells < shells, "fired on the post-look pose");
+    // A shielded (immune) demon is never a target.
+    app.world_mut().get_mut::<Enemy>(demon).unwrap().shielded = true;
+    step(&mut app, 40);
+    let shells = player(&mut app).ammo_shells;
+    step(&mut app, 90);
+    assert_eq!(player(&mut app).ammo_shells, shells, "never wastes ammo on a shield");
+    assert!(!app.world().resource::<TouchInput>().auto_fire);
+    up(&mut app, 40, LOOK_AT);
+}
+
+#[test]
+fn auto_fire_targets_live_shield_pylons() {
+    use segnale_debole::boss::{spawn_pylon, BossPylon};
+    let mut app = playing_app(76);
+    set_settings(&mut app, |s| s.touch_auto_fire = true);
+    // The Carrier Daemon behind the player keeps its pylon alive.
+    let boss = spawn_demon(&mut app, EnemyKind::CarrierDaemon, Vec3::new(0.0, 0.0, 12.0));
+    let pos = feet(&mut app) + Vec3::new(0.0, 0.0, -9.0);
+    app.world_mut()
+        .run_system_once(move |mut commands: Commands, ea: Res<EnemyAssets>| {
+            spawn_pylon(&mut commands, &ea, pos, boss, 5);
+        })
+        .unwrap();
+    app.update();
+    assert_eq!(app.world_mut().query::<&BossPylon>().iter(app.world()).count(), 1);
+    let shells = player(&mut app).ammo_shells;
+    aim_at(&mut app, pos + Vec3::Y * 1.45);
+    down(&mut app, 41, LOOK_AT);
+    step(&mut app, 30);
+    assert!(player(&mut app).ammo_shells < shells, "auto-fire shoots a live pylon");
+    up(&mut app, 41, LOOK_AT);
+}
+
+#[test]
+fn rocket_auto_fire_never_self_blasts_but_manual_fire_still_rocket_jumps() {
+    let mut app = playing_app(77);
+    set_settings(&mut app, |s| s.touch_auto_fire = true);
+    app.world_mut().resource_mut::<WeaponState>().switch_to(Weapon::Rocket);
+    step(&mut app, 60);
+    assert_eq!(app.world().resource::<WeaponState>().current, Weapon::Rocket);
+    let near = spawn_demon(&mut app, EnemyKind::Imp, Vec3::new(0.0, 0.0, -3.0));
+    let at = feet(&mut app) + Vec3::new(0.0, 1.0, -3.0);
+    aim_at(&mut app, at);
+    down(&mut app, 42, LOOK_AT);
+    step(&mut app, 2);
+    let rockets = player(&mut app).ammo_rockets;
+    step(&mut app, 60);
+    assert_eq!(player(&mut app).ammo_rockets, rockets, "point-blank: the Signal-Mortar holds fire");
+    assert!(!app.world().resource::<TouchInput>().auto_fire);
+    // Far enough past the splash: it fires.
+    app.world_mut().entity_mut(near).despawn();
+    spawn_demon(&mut app, EnemyKind::Imp, Vec3::new(0.0, 0.0, -14.0));
+    let at = feet(&mut app) + Vec3::new(0.0, 1.0, -14.0);
+    aim_at(&mut app, at);
+    step(&mut app, 30);
+    assert!(player(&mut app).ammo_rockets < rockets, "a distant target is fair game");
+    // Manual FIRE stays unrestricted (rocket jumps at your feet).
+    let rockets = player(&mut app).ammo_rockets;
+    set_settings(&mut app, |s| s.touch_auto_fire = false);
+    app.world_mut().resource_mut::<BotControl>().look_pitch = Some(-1.4);
+    step(&mut app, 60);
+    let fire = button(&app, TouchButton::Fire);
+    down(&mut app, 43, fire);
+    step(&mut app, 3);
+    up(&mut app, 43, fire);
+    step(&mut app, 2);
+    assert!(player(&mut app).ammo_rockets < rockets, "manual FIRE never checks the splash");
+    up(&mut app, 42, LOOK_AT);
+}
+
+#[test]
+fn bestiary_drag_released_over_a_button_never_clicks() {
+    use bevy::window::PrimaryWindow;
+    let mut app = App::new();
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.world_mut().spawn((Window::default(), PrimaryWindow));
+    app.update();
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Compendium);
+    step(&mut app, 3);
+    assert_eq!(app_state(&app), AppState::Compendium);
+    // A finger spins the turntable from the left half and lifts far away
+    // (e.g. over BACK or an entry button).
+    let from = Vec2::new(200.0, 400.0);
+    down(&mut app, 90, from);
+    step(&mut app, 1);
+    drag(&mut app, 90, from + Vec2::new(60.0, 0.0));
+    step(&mut app, 1);
+    assert!(app.world().resource::<UiPointer>().drag_claimed, "the turntable owns the drag");
+    drag(&mut app, 90, Vec2::new(1100.0, 650.0));
+    step(&mut app, 1);
+    up(&mut app, 90, Vec2::new(1100.0, 650.0));
+    step(&mut app, 1);
+    let p = *app.world().resource::<UiPointer>();
+    assert!(!p.released, "a claimed drag never clicks on lift");
+    assert_eq!(app_state(&app), AppState::Compendium);
+    // A plain tap is still a click.
+    down(&mut app, 91, Vec2::new(1100.0, 650.0));
+    step(&mut app, 1);
+    up(&mut app, 91, Vec2::new(1100.0, 650.0));
+    step(&mut app, 1);
+    assert!(app.world().resource::<UiPointer>().released);
+}
+
+#[test]
+fn settings_stationary_click_takes_the_highlight_back_from_the_keyboard() {
+    use segnale_debole::meta_ui::SettingsKeyFocus;
+    let mut app = App::new();
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Settings);
+    step(&mut app, 2);
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::ArrowDown,
+            logical_key: Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
+            state,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        step(&mut app, 1);
+    }
+    assert!(app.world().resource::<SettingsKeyFocus>().0, "arrows own the row focus");
+    // A click without any mouse motion.
+    app.world_mut().write_message(MouseButtonInput { button: MouseButton::Left, state: ButtonState::Pressed, window: Entity::PLACEHOLDER });
+    step(&mut app, 1);
+    assert!(!app.world().resource::<SettingsKeyFocus>().0, "a stationary press hands the highlight to the pointer");
+    app.world_mut().write_message(MouseButtonInput { button: MouseButton::Left, state: ButtonState::Released, window: Entity::PLACEHOLDER });
+    step(&mut app, 1);
+}
+
+#[test]
+fn android_back_returns_from_game_over_and_the_time_trial_finish() {
+    let mut app = App::new();
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    let back = |app: &mut App| {
+        app.world_mut().resource_mut::<BackRequest>().request();
+        step(app, 3);
+    };
+    begin_run(&mut app, 78);
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::GameOver);
+    step(&mut app, 2);
+    assert_eq!(app_state(&app), AppState::GameOver);
+    back(&mut app);
+    assert_eq!(app_state(&app), AppState::MainMenu, "Back = controller B on NO SERVICE");
+    begin_run(&mut app, 79);
+    app.world_mut().resource_mut::<RunStats>().mode = segnale_debole::state::RunMode::TimeTrial;
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Victory);
+    step(&mut app, 2);
+    assert_eq!(app_state(&app), AppState::Victory);
+    back(&mut app);
+    assert_eq!(app_state(&app), AppState::MainMenu, "Back leaves the Time Trial finish card");
+}
+
+#[test]
+fn touch_players_can_edit_and_save_their_callsign() {
+    use segnale_debole::hud::MenuAction;
+    use segnale_debole::leaderboard::{CallsignEdit, LeaderboardState};
+    let mut app = App::new();
+    app.add_plugins(HeadlessGamePlugin).add_plugins(HudPlugin).init_resource::<BotControl>();
+    app.update();
+    set_settings(&mut app, |s| s.touch_mode = TouchMode::On);
+    app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Leaderboard);
+    step(&mut app, 3);
+    assert_eq!(*app.world().resource::<InputMode>(), InputMode::Touch);
+    let push = |app: &mut App, a: MenuAction| {
+        app.world_mut().resource_mut::<LeaderboardState>().pending.push(a);
+        step(app, 1);
+    };
+    // The strip exists, hidden until the editor opens.
+    let strip_shown = |app: &mut App| {
+        let mut q = app.world_mut().query::<(&MenuAction, &ChildOf)>();
+        let parent = q.iter(app.world()).find(|(a, _)| **a == MenuAction::LbEdit(CallsignEdit::Done)).map(|(_, c)| c.parent()).expect("touch editor strip");
+        app.world().get::<Node>(parent).unwrap().display == Display::Flex
+    };
+    assert!(!strip_shown(&mut app));
+    push(&mut app, MenuAction::LbCallsign);
+    step(&mut app, 1);
+    assert!(strip_shown(&mut app), "the strip shows while editing in touch mode");
+    assert_eq!(app.world().resource::<LeaderboardState>().editing.as_deref(), Some("MARINE"));
+    push(&mut app, MenuAction::LbEdit(CallsignEdit::Add));
+    push(&mut app, MenuAction::LbEdit(CallsignEdit::Next));
+    push(&mut app, MenuAction::LbEdit(CallsignEdit::Next));
+    assert_eq!(app.world().resource::<LeaderboardState>().editing.as_deref(), Some("MARINEC"));
+    push(&mut app, MenuAction::LbEdit(CallsignEdit::Del));
+    push(&mut app, MenuAction::LbEdit(CallsignEdit::Add));
+    push(&mut app, MenuAction::LbEdit(CallsignEdit::Prev));
+    push(&mut app, MenuAction::LbEdit(CallsignEdit::Done));
+    assert!(app.world().resource::<LeaderboardState>().editing.is_none());
+    assert_eq!(app.world().resource::<ProfileStore>().profile.callsign, "MARINE-");
+    step(&mut app, 1);
+    assert!(!strip_shown(&mut app));
+}

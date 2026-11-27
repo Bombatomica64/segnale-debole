@@ -601,14 +601,15 @@ fn meta_card_clicks(
     (pad, focus): (Res<GamepadInput>, Res<GamepadFocus>),
 ) {
     let card_of = |e: Option<Entity>| e.and_then(|e| cards.get(e).ok()).map(|(_, _, _, card)| card.0);
-    let pointer_card = cards.iter().find(|(_, n, tf, _)| ptr.over(n, tf)).map(|(_, _, _, card)| card.0);
+    let pointer_card = ptr.nearest_over(cards.iter().map(|(_, n, tf, card)| (card.0, n, tf)), None);
+    let clicked_card = ptr.nearest_click(cards.iter().map(|(_, n, tf, card)| (card.0, n, tf)), None);
     hover.0 = if pad.active {
         // Controller navigation owns the highlight until the mouse moves.
         card_of(focus.focused)
     } else {
         pointer_card
     };
-    let clicked = pointer_card.filter(|_| ptr.released).or_else(|| card_of(focus.activate));
+    let clicked = clicked_card.or_else(|| card_of(focus.activate));
     if let Some(t) = clicked {
         *fb = edit_feedback(commit_meta_edit(&mut store, t), &mut sfx);
     }
@@ -1787,8 +1788,9 @@ pub fn settings_pad_nav(
     let k_used = k_dy != 0 || k_dx != 0 || k_confirm;
     if k_used {
         key_focus.0 = true;
-    } else if pad.active || motion.is_some_and(|m| m.delta != Vec2::ZERO) || ptr.is_some_and(|p| p.touch && p.just_pressed) {
-        // The mouse, the pad or a finger takes the highlight back.
+    } else if pad.active || motion.is_some_and(|m| m.delta != Vec2::ZERO) || ptr.is_some_and(|p| p.just_pressed) {
+        // The mouse (moved, or a stationary click), the pad or a finger
+        // takes the highlight back.
         key_focus.0 = false;
     }
     if !pad.connected && !k_used && !key_focus.0 {
@@ -1843,19 +1845,19 @@ fn settings_clicks(
     (pad, focus, key_focus): (Res<GamepadInput>, Res<GamepadFocus>, Res<SettingsKeyFocus>),
     (mut tab, mut idx): (ResMut<SettingsTab>, ResMut<SettingsPadFocus>),
 ) {
+    let items = || controls.iter().map(|(_, n, tf, ctl)| (ctl.0, n, tf));
     let now = if pad.active || key_focus.0 {
         // Controller / keyboard navigation owns the highlight (RESET DEFAULTS is a control).
         focus.focused.and_then(|e| controls.get(e).ok()).map(|(_, _, _, ctl)| ctl.0)
     } else {
-        controls.iter().find(|(_, n, tf, _)| ptr.over(n, tf)).map(|(_, _, _, ctl)| ctl.0)
+        ptr.nearest_over(items(), Some(SETTINGS_FINGER_SLOP))
     };
     if hover.0 != now {
         hover.0 = now;
     }
-    if let Some(t) = hover.0
-        && !pad.active
+    if !pad.active
         && !key_focus.0
-        && ptr.released
+        && let Some(t) = ptr.nearest_click(items(), Some(SETTINGS_FINGER_SLOP))
     {
         match t {
             SettingsTarget::Tab(want) => {
@@ -1865,6 +1867,11 @@ fn settings_clicks(
         }
     }
 }
+
+/// Finger slop around Settings controls (logical px): wide sideways, tight
+/// vertically, so GENERAL's small `-` / `+` / `TOGGLE` switches are easy to
+/// hit without grabbing the row above or below (nearest center wins).
+pub const SETTINGS_FINGER_SLOP: Vec2 = Vec2::new(14.0, 8.0);
 
 /// The Settings chassis body (header, page, footer), rebuilt on a tab switch.
 #[derive(Component)]
@@ -2048,13 +2055,21 @@ fn page_row_index(row: SettingsRow) -> usize {
 
 /// Recessed settings row (rail on the left), a controller stop for `row`.
 fn setting_row(commands: &mut Commands, parent: Entity, rail: Color, row: SettingsRow) -> Entity {
+    setting_row_sized(commands, parent, rail, row, GENERAL_ROWS)
+}
+
+/// [`setting_row`] at a page's [`RowSizing`].
+fn setting_row_sized(commands: &mut Commands, parent: Entity, rail: Color, row: SettingsRow, size: RowSizing) -> Entity {
     let (bg, border) = settings_row_look(rail, false);
+    let (grow, min_h) = if size.tall { (1.0, Val::Px(TOUCH_ROW_MIN_H)) } else { (0.0, Val::Auto) };
     commands
         .spawn((
             ChildOf(parent),
             SettingsRowTag(page_row_index(row), rail),
             Node {
                 width: Val::Percent(100.0),
+                flex_grow: grow,
+                min_height: min_h,
                 align_items: AlignItems::Center,
                 column_gap: Val::Px(8.0),
                 padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
@@ -2069,9 +2084,15 @@ fn setting_row(commands: &mut Commands, parent: Entity, rail: Color, row: Settin
 
 /// `[-] [pip meter + value] [+]` row of a knob.
 fn knob_row(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSettings) {
-    let r = setting_row(commands, parent, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Knob(k));
+    knob_row_sized(commands, parent, k, s, GENERAL_ROWS);
+}
+
+/// [`knob_row`] at a page's [`RowSizing`].
+fn knob_row_sized(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSettings, size: RowSizing) {
+    let r = setting_row_sized(commands, parent, HAZARD_YELLOW.with_alpha(0.8), SettingsRow::Knob(k), size);
     setting_name(commands, r, k.label(), k.hint());
-    settings_button(commands, r, SettingsTarget::Down(k), "-", 18.0, (11.0, 0.0));
+    let (step_font, step_pad) = size.step;
+    settings_button(commands, r, SettingsTarget::Down(k), "-", step_font, step_pad);
     let meter = commands
         .spawn((
             ChildOf(r),
@@ -2097,19 +2118,25 @@ fn knob_row(commands: &mut Commands, parent: Entity, k: SettingKnob, s: &UserSet
     for i in 0..SETTINGS_PIPS {
         commands.spawn((ChildOf(track), SettingsPip(k, i), Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() }, BackgroundColor(Color::NONE)));
     }
-    settings_button(commands, r, SettingsTarget::Up(k), "+", 18.0, (11.0, 0.0));
+    settings_button(commands, r, SettingsTarget::Up(k), "+", step_font, step_pad);
 }
 
 /// Toggle row: name | live state | switch.
 fn toggle_row(commands: &mut Commands, parent: Entity, g: SettingToggle, hint: &str, s: &UserSettings) {
-    let r = setting_row(commands, parent, ACID_GREEN.with_alpha(0.8), SettingsRow::Toggle(g));
+    toggle_row_sized(commands, parent, g, hint, s, GENERAL_ROWS);
+}
+
+/// [`toggle_row`] at a page's [`RowSizing`].
+fn toggle_row_sized(commands: &mut Commands, parent: Entity, g: SettingToggle, hint: &str, s: &UserSettings, size: RowSizing) {
+    let r = setting_row_sized(commands, parent, ACID_GREEN.with_alpha(0.8), SettingsRow::Toggle(g), size);
     setting_name(commands, r, g.label(), hint);
     commands.spawn((
         ChildOf(r),
         Node { width: Val::Px(70.0), justify_content: JustifyContent::Center, flex_shrink: 0.0, ..default() },
         children![(SettingsLabel::Toggle(g), text(g.state_text(s), 15.0, ACID_GREEN))],
     ));
-    settings_button(commands, r, SettingsTarget::Toggle(g), "TOGGLE", 13.0, (10.0, 3.0));
+    let (font, pad) = size.switch;
+    settings_button(commands, r, SettingsTarget::Toggle(g), "TOGGLE", font, pad);
 }
 
 fn spawn_settings_screen(
@@ -2147,15 +2174,19 @@ fn build_settings_body(commands: &mut Commands, phone: Entity, tab: SettingsTab,
         commands.spawn((ChildOf(header), hollow_stamp("SAVED TO PROFILE", ASH_DIM, 11.0)));
     }
     // Page tabs (Milestone 37): click / tap, LB / RB, or Q / E.
-    let tabs = commands.spawn((ChildOf(header), Node { column_gap: Val::Px(6.0), align_items: AlignItems::Center, flex_shrink: 0.0, ..default() })).id();
-    let hint = DualPrompt::new("Q / E", "LB / RB").with_touch("TAP");
+    let tabs = commands.spawn((ChildOf(header), Node { column_gap: Val::Px(10.0), align_items: AlignItems::Center, flex_shrink: 0.0, ..default() })).id();
+    let hint = DualPrompt::new("Q / E", "LB / RB").with_touch("");
     commands.spawn((ChildOf(tabs), text(hint.kbm.clone(), 11.0, ASH_DIM), hint));
     for t in SettingsTab::ALL {
-        settings_button(commands, tabs, SettingsTarget::Tab(t), t.label(), 13.0, (10.0, 4.0));
+        settings_button(commands, tabs, SettingsTarget::Tab(t), t.label(), 15.0, (16.0, 9.0));
     }
 
+    // Locked height: switching GENERAL <-> TOUCH CONTROLS never moves the tabs.
     let split = commands
-        .spawn((ChildOf(phone), Node { width: Val::Percent(100.0), column_gap: Val::Px(10.0), align_items: AlignItems::Stretch, ..default() }))
+        .spawn((
+            ChildOf(phone),
+            Node { width: Val::Percent(100.0), min_height: Val::Px(SETTINGS_PAGE_MIN_H), column_gap: Val::Px(10.0), align_items: AlignItems::Stretch, ..default() },
+        ))
         .id();
 
     if tab == SettingsTab::Touch {
@@ -2178,13 +2209,33 @@ fn build_settings_body(commands: &mut Commands, phone: Entity, tab: SettingsTab,
     ));
 }
 
+/// Minimum height of the Settings page body (both tabs), in UI px.
+pub const SETTINGS_PAGE_MIN_H: f32 = 500.0;
+
+/// Size of a settings row's switches: GENERAL keeps its compact mouse
+/// metrics, TOUCH CONTROLS gets finger-sized rows and switches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RowSizing {
+    /// `-` / `+` font and padding.
+    step: (f32, (f32, f32)),
+    /// `TOGGLE` / mode switch font and padding.
+    switch: (f32, (f32, f32)),
+    /// Rows grow to share the column (min 84 px tall).
+    tall: bool,
+}
+
+const GENERAL_ROWS: RowSizing = RowSizing { step: (18.0, (11.0, 0.0)), switch: (13.0, (10.0, 3.0)), tall: false };
+const TOUCH_ROWS: RowSizing = RowSizing { step: (22.0, (22.0, 8.0)), switch: (15.0, (18.0, 14.0)), tall: true };
+/// Minimum TOUCH CONTROLS row height (UI px).
+pub const TOUCH_ROW_MIN_H: f32 = 84.0;
+
 /// Touch page legend: what each thumb does.
 pub const TOUCH_LEGEND: [(&str, &str); 6] = [
     ("L-THUMB", "floating stick // rim = auto-bhop"),
     ("R-DRAG", "look // slow drags get aim friction"),
     ("FIRE", "hold to shoot // drag it to aim"),
     ("JUMP DASH PUNCH", "right-thumb arc"),
-    ("PING 5G FLASH", "phone apps // cooldown fill"),
+    ("PING FLASH 5G", "phone apps: 1 / 2 / 3 bars"),
     ("DECK  ||  BACK", "tap a weapon slot // pause"),
 ];
 
@@ -2192,18 +2243,19 @@ pub const TOUCH_LEGEND: [(&str, &str); 6] = [
 /// layout legend on the right.
 fn build_touch_settings_page(commands: &mut Commands, split: Entity, s: &UserSettings) {
     let (left, _) = section_crate(commands, split, "TOUCH CONTROLS", ACID_GREEN, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
-    let mode_row = setting_row(commands, left, ACID_GREEN.with_alpha(0.8), SettingsRow::TouchMode);
+    let mode_row = setting_row_sized(commands, left, ACID_GREEN.with_alpha(0.8), SettingsRow::TouchMode, TOUCH_ROWS);
     setting_name(commands, mode_row, "TOUCH HUD", "auto: shows on your first touch");
+    let (font, pad) = TOUCH_ROWS.switch;
     for m in TouchMode::ALL {
-        settings_button(commands, mode_row, SettingsTarget::TouchMode(m), m.name(), 13.0, (10.0, 3.0));
+        settings_button(commands, mode_row, SettingsTarget::TouchMode(m), m.name(), font, pad);
     }
-    knob_row(commands, left, SettingKnob::TouchSensitivity, s);
-    knob_row(commands, left, SettingKnob::TouchOpacity, s);
-    knob_row(commands, left, SettingKnob::TouchButtonScale, s);
+    knob_row_sized(commands, left, SettingKnob::TouchSensitivity, s, TOUCH_ROWS);
+    knob_row_sized(commands, left, SettingKnob::TouchOpacity, s, TOUCH_ROWS);
+    knob_row_sized(commands, left, SettingKnob::TouchButtonScale, s, TOUCH_ROWS);
 
     let (right, _) = section_crate(commands, split, "THUMB ASSISTS", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
-    toggle_row(commands, right, SettingToggle::TouchAutoBhop, "stick rim holds jump", s);
-    toggle_row(commands, right, SettingToggle::TouchAutoFire, "fire on a visible target", s);
+    toggle_row_sized(commands, right, SettingToggle::TouchAutoBhop, "stick rim holds jump", s, TOUCH_ROWS);
+    toggle_row_sized(commands, right, SettingToggle::TouchAutoFire, "fire on a visible target", s, TOUCH_ROWS);
     let well = commands
         .spawn((
             ChildOf(right),
@@ -2221,14 +2273,14 @@ fn build_touch_settings_page(commands: &mut Commands, split: Entity, s: &UserSet
             BackgroundColor(INK_BLACK.with_alpha(0.6)),
         ))
         .id();
-    commands.spawn((ChildOf(well), text("LAYOUT // LEFT THUMB MOVES, RIGHT THUMB AIMS", 10.0, ASH_DIM)));
+    commands.spawn((ChildOf(well), text("LAYOUT // LEFT THUMB MOVES, RIGHT THUMB AIMS", 12.0, ASH_DIM)));
     for (k, v) in TOUCH_LEGEND {
         commands.spawn((
             ChildOf(well),
             Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() },
             children![
-                (Node { width: Val::Px(124.0), flex_shrink: 0.0, ..default() }, children![text(k, 12.0, ACID_GREEN)]),
-                text(v, 12.0, BONE_TEXT.with_alpha(0.8)),
+                (Node { width: Val::Px(150.0), flex_shrink: 0.0, ..default() }, children![text(k, 15.0, ACID_GREEN)]),
+                text(v, 15.0, BONE_TEXT.with_alpha(0.8)),
             ],
         ));
     }

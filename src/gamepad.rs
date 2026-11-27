@@ -553,8 +553,20 @@ impl DualPrompt {
     pub fn get(&self, mode: InputMode) -> &str {
         match (&self.touch, mode) {
             (Some(t), InputMode::Touch) => t,
+            // Touch without its own label: the mouse & keyboard text minus
+            // its keycap (a finger has no `[ESC]`).
+            (None, InputMode::Touch) => strip_keycap(&self.kbm),
             _ => mode.pick(&self.kbm, &self.pad),
         }
+    }
+}
+
+/// `LABEL  [KEY]` -> `LABEL` (a trailing two-space keycap is dropped; any
+/// other text is returned unchanged).
+pub fn strip_keycap(label: &str) -> &str {
+    match label.rsplit_once("  [") {
+        Some((base, cap)) if cap.ends_with(']') && !cap.contains("  ") => base.trim_end(),
+        _ => label,
     }
 }
 
@@ -1076,8 +1088,13 @@ mod tests {
         assert_eq!(InputMode::KeyboardMouse.pick("[E]", "[X]"), "[E]");
         let p = DualPrompt::new("BACK  [ESC]", "BACK  [B]");
         assert_eq!((p.get(InputMode::KeyboardMouse), p.get(InputMode::Gamepad)), ("BACK  [ESC]", "BACK  [B]"));
-        // Touch: the mouse & keyboard text unless a touch label exists.
-        assert_eq!(p.get(InputMode::Touch), "BACK  [ESC]");
+        // Touch: the mouse & keyboard text minus its keycap unless a touch label exists.
+        assert_eq!(p.get(InputMode::Touch), "BACK");
+        assert_eq!(DualPrompt::new("SETTINGS", "SETTINGS").get(InputMode::Touch), "SETTINGS");
+        assert_eq!(strip_keycap("PLAY  [ENTER]"), "PLAY");
+        assert_eq!(strip_keycap("[TAB] SWITCH"), "[TAB] SWITCH", "only a trailing keycap goes");
+        assert_eq!(strip_keycap("A  [B]  C"), "A  [B]  C");
+        assert_eq!(strip_keycap(""), "");
         assert_eq!(p.clone().with_touch("BACK").get(InputMode::Touch), "BACK");
         assert_eq!(InputMode::Touch.pick("[E]", "[X]"), "[E]");
         assert_eq!(InputMode::Touch.pick3("[E]", "[X]", "TAP SOS"), "TAP SOS");

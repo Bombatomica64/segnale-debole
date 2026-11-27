@@ -67,6 +67,13 @@
       letter-spacing: 0.12em; text-transform: uppercase; user-select: none;
     }
     #sound.show { display: block; }
+    /* Zero-size probe: the game reads its computed padding as the CSS
+       env(safe-area-inset-*) (notch / home indicator) for the touch HUD. */
+    #safe-area-probe {
+      position: fixed; top: 0; left: 0; width: 0; height: 0;
+      visibility: hidden; pointer-events: none;
+      padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+    }
     @keyframes rf { 0%, 100% { opacity: .2; } 50% { opacity: 1; } }
     @media (prefers-reduced-motion: reduce) { #boot .bars i { animation: none; } }
   </style>
@@ -81,6 +88,7 @@
     <div class="hint">Touch: left thumb moves, right thumb aims &amp; fires. Mouse: click to capture. Or use a controller. Esc / Start / || pauses.</div>
   </div>
   <div id="sound" role="button" aria-live="polite">Tap, click or press a key to enable sound</div>
+  <div id="safe-area-probe" aria-hidden="true"></div>
   <script>
     (function () {
       var boot = document.getElementById("boot");
