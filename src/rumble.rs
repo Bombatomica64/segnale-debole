@@ -42,10 +42,14 @@ pub enum RumblePulse {
     JammerDestroy,
     BossRoar,
     StyleRankUp,
+    /// Milestone 33: Phone Punch landing a hit (short meaty knock).
+    PhonePunch,
+    /// Milestone 33: projectile parry (sharp, satisfying double kick).
+    Parry,
 }
 
 impl RumblePulse {
-    pub const ALL: [RumblePulse; 9] = [
+    pub const ALL: [RumblePulse; 11] = [
         RumblePulse::Shotgun,
         RumblePulse::Rocket,
         RumblePulse::MortarHit,
@@ -55,6 +59,8 @@ impl RumblePulse {
         RumblePulse::JammerDestroy,
         RumblePulse::BossRoar,
         RumblePulse::StyleRankUp,
+        RumblePulse::PhonePunch,
+        RumblePulse::Parry,
     ];
 
     /// `(strong motor, weak motor, duration ms)`.
@@ -69,6 +75,8 @@ impl RumblePulse {
             RumblePulse::JammerDestroy => (0.6, 0.5, 260),
             RumblePulse::BossRoar => (0.85, 0.25, 520),
             RumblePulse::StyleRankUp => (0.15, 0.6, 90),
+            RumblePulse::PhonePunch => (0.5, 0.35, 90),
+            RumblePulse::Parry => (0.75, 0.8, 170),
         };
         RumbleMix { strong, weak, duration_ms }
     }

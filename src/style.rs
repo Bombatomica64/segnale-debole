@@ -206,6 +206,12 @@ pub enum StyleSource {
     Barrel,
     /// CRT / UPS rack (props.rs).
     Prop,
+    /// Milestone 33: left-hand Phone Punch (and the barrels it launches).
+    PhonePunch,
+    /// Milestone 33: parried enemy projectile (return to sender).
+    Parry,
+    /// Milestone 33: Camera Flash Strobe burn.
+    CameraFlash,
 }
 
 impl StyleSource {
@@ -241,6 +247,25 @@ pub enum StyleAction {
     CrtShatter,
     /// A Lithium UPS rack detonated (`chain`: set off by another rack's blast).
     UpsDetonation { chain: bool },
+    /// Milestone 33: an enemy projectile parried back with a Phone Punch.
+    Parry,
+    /// Milestone 33: Camera Flash Strobe that blinded demons / cleared shots.
+    CameraFlash { blinded: u32, cleared: u32 },
+}
+
+/// Base points of a projectile parry (before freshness).
+pub const PARRY_POINTS: f32 = 140.0;
+/// Camera Flash points per blinded demon / per cleared shot (capped).
+pub const FLASH_POINTS_PER_BLIND: f32 = 14.0;
+pub const FLASH_POINTS_PER_CLEAR: f32 = 10.0;
+pub const FLASH_POINTS_CAP: f32 = 110.0;
+
+/// Camera Flash style points for `blinded` demons and `cleared` shots.
+pub fn camera_flash_points(blinded: u32, cleared: u32) -> f32 {
+    if blinded == 0 && cleared == 0 {
+        return 0.0;
+    }
+    (18.0 + blinded as f32 * FLASH_POINTS_PER_BLIND + cleared as f32 * FLASH_POINTS_PER_CLEAR).min(FLASH_POINTS_CAP)
 }
 
 /// Frame queue of style actions (drained by [`style_update`]).
@@ -425,6 +450,14 @@ impl StyleMeter {
                 if source == StyleSource::Prop {
                     label = label.or(Some("PROP KILL"));
                 }
+                if source == StyleSource::PhonePunch {
+                    pts += 30.0;
+                    label = label.or(Some("PHONE PUNCH"));
+                }
+                if source == StyleSource::Parry {
+                    pts += 40.0;
+                    label = label.or(Some("RETURN TO SENDER"));
+                }
                 let (fresh, switch) = self.freshness(source);
                 self.gain(pts * fresh);
                 if let Some(l) = switch {
@@ -449,6 +482,27 @@ impl StyleMeter {
                     self.feed_line(l);
                 }
                 self.feed_line(if chain { "CHAIN REACTION" } else { "UPS CHAIN BLAST" });
+            }
+            StyleAction::Parry => {
+                // A parry is always a style switch-up worthy move: never
+                // penalised below 1x by freshness.
+                let (fresh, switch) = self.freshness(StyleSource::Parry);
+                self.gain(PARRY_POINTS * fresh.max(1.0));
+                if let Some(l) = switch {
+                    self.feed_line(l);
+                }
+                self.feed_line("PARRY");
+            }
+            StyleAction::CameraFlash { blinded, cleared } => {
+                let pts = camera_flash_points(blinded, cleared);
+                if pts > 0.0 {
+                    let (fresh, switch) = self.freshness(StyleSource::CameraFlash);
+                    self.gain(pts * fresh);
+                    if let Some(l) = switch {
+                        self.feed_line(l);
+                    }
+                    self.feed_line(if cleared > 0 && blinded == 0 { "SHOTS CLEARED" } else { "FLASHBANGED" });
+                }
             }
         }
         self.points - before
@@ -714,6 +768,41 @@ mod tests {
         assert_eq!(labels, vec!["CHAIN REACTION", "UPS CHAIN BLAST", "CRT SHATTERED"]);
         let boss = StyleMeter::default().award(kill(EnemyKind::CarrierDaemon, StyleSource::Rocket));
         assert!(StyleRank::from_points(boss) >= Some(StyleRank::B), "boss kill is huge: {boss}");
+    }
+
+    #[test]
+    fn milestone33_parry_flash_and_punch_feed_the_meter() {
+        let mut m = StyleMeter::default();
+        let parry = m.award(StyleAction::Parry);
+        assert!((parry - PARRY_POINTS).abs() < 1e-3, "{parry}");
+        assert_eq!(m.feed[0].map(|f| f.0), Some("PARRY"));
+        // Back-to-back parries never fall below the base award.
+        m.tick(1.0);
+        assert!(m.award(StyleAction::Parry) >= PARRY_POINTS - 1e-3);
+        // Camera Flash scales with what it did, capped; a whiff scores nothing.
+        let mut f = StyleMeter::default();
+        assert_eq!(f.award(StyleAction::CameraFlash { blinded: 0, cleared: 0 }), 0.0);
+        assert!(f.feed.iter().all(|l| l.is_none()), "a whiff adds no feed line");
+        let one = StyleMeter::default().award(StyleAction::CameraFlash { blinded: 1, cleared: 0 });
+        let many = StyleMeter::default().award(StyleAction::CameraFlash { blinded: 4, cleared: 3 });
+        let huge = StyleMeter::default().award(StyleAction::CameraFlash { blinded: 40, cleared: 40 });
+        assert!(one > 0.0 && many > one && (huge - FLASH_POINTS_CAP).abs() < 1e-3, "{one} {many} {huge}");
+        f.award(StyleAction::CameraFlash { blinded: 0, cleared: 2 });
+        assert_eq!(f.feed[0].map(|l| l.0), Some("SHOTS CLEARED"));
+        // Punch / parry kills carry their own bonus + callout, and mixing a
+        // gun kill with a punch kill is a STYLE MIX.
+        let plain = StyleMeter::default().award(kill(EnemyKind::Imp, StyleSource::Other));
+        let mut k = StyleMeter::default();
+        let punch = k.award(kill(EnemyKind::Imp, StyleSource::PhonePunch));
+        assert!(punch > plain, "{punch} vs {plain}");
+        assert_eq!(k.feed[0].map(|l| l.0), Some("PHONE PUNCH"));
+        k.tick(2.0);
+        let mix = k.award(kill(EnemyKind::Imp, StyleSource::Shotgun));
+        assert!((mix - kill_points(EnemyKind::Imp) * FRESH_SWITCH_BONUS).abs() < 1e-3, "{mix}");
+        assert!(k.feed.iter().flatten().any(|(l, _)| *l == "STYLE MIX"));
+        let parried = StyleMeter::default().award(kill(EnemyKind::Imp, StyleSource::Parry));
+        assert!(parried > punch);
+        assert!(!StyleSource::PhonePunch.is_weapon() && !StyleSource::Parry.is_weapon() && !StyleSource::CameraFlash.is_weapon());
     }
 
     #[test]

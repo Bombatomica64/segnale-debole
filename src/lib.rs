@@ -26,6 +26,7 @@ pub mod perf;
 pub mod meta;
 pub mod menu_scene;
 pub mod meta_ui;
+pub mod phone_combat;
 pub mod phone_screen;
 pub mod physics;
 pub mod player;
@@ -89,7 +90,9 @@ impl Plugin for CoreGameplayPlugin {
             // Milestone 31: style rank, shootable props, controller rumble.
             .add_plugins(style::StylePlugin)
             .add_plugins(props::PropsPlugin)
-            .add_plugins(rumble::RumblePlugin);
+            .add_plugins(rumble::RumblePlugin)
+            // Milestone 33: Phone Punch / parry / barrel launch + Camera Flash Strobe.
+            .add_plugins(phone_combat::PhoneCombatPlugin);
     }
 }
 

@@ -294,6 +294,10 @@ pub struct GamepadInput {
     pub trial_reset: bool,
     /// D-Pad Down: weapon inspect flourish.
     pub inspect: bool,
+    /// `B` / Circle (gameplay): Phone Punch / parry.
+    pub punch: bool,
+    /// D-Pad Up (gameplay): Camera Flash Strobe.
+    pub flash: bool,
 
     // One-shots (menus; directions repeat while held).
     pub nav_up: bool,
@@ -388,6 +392,8 @@ impl GamepadInput {
         self.pause = hit(bits::START);
         self.trial_reset = hit(bits::SELECT | bits::RTHUMB);
         self.inspect = hit(bits::DPAD_DOWN);
+        self.punch = hit(bits::EAST);
+        self.flash = hit(bits::DPAD_UP);
 
         self.confirm = hit(bits::SOUTH);
         self.back = hit(bits::EAST);

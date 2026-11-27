@@ -2200,7 +2200,7 @@ fn update_flow_field(grid: Res<LevelGrid>, mut flow: ResMut<FlowField>, player: 
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn enemy_ai(
+pub(crate) fn enemy_ai(
     mut commands: Commands,
     time: Res<Time>,
     grid: Res<LevelGrid>,
@@ -2597,7 +2597,7 @@ pub fn segment_point_distance(a: Vec3, b: Vec3, p: Vec3) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn move_enemy_projectiles(
+pub(crate) fn move_enemy_projectiles(
     mut commands: Commands,
     time: Res<Time>,
     grid: Res<LevelGrid>,

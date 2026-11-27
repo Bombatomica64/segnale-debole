@@ -408,7 +408,16 @@ pub type KeyBind = (&'static [&'static str], &'static str);
 pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("MOVE", &[(&["WASD"], "move"), (&["MOUSE"], "look"), (&["SPACE"], "jump / hold to bhop"), (&["SHIFT"], "airplane-mode dash")]),
     ("FIGHT", &[(&["LMB"], "fire"), (&["1", "2", "3", "TAB", "WHEEL"], "shotgun / plasma / mortar")]),
-    ("PHONE", &[(&["RMB"], "ping scan (1+ bar)"), (&["Q"], "5G overload EMP (3+ bars)"), (&["E"], "SOS uplink at the tower")]),
+    (
+        "PHONE",
+        &[
+            (&["V", "MMB"], "phone punch / parry (0 bars)"),
+            (&["RMB"], "ping scan (1+ bar)"),
+            (&["C"], "camera flash strobe (2+ bars)"),
+            (&["Q"], "5G overload EMP (3+ bars)"),
+            (&["E"], "SOS uplink at the tower"),
+        ],
+    ),
     ("SYSTEM", &[(&["CLICK"], "capture mouse"), (&["ESC", "P"], "pause")]),
 ];
 
@@ -416,7 +425,16 @@ pub const CONTROLS: [(&str, &[KeyBind]); 4] = [
 pub const PAD_CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("MOVE", &[(&["LS"], "move"), (&["RS"], "look"), (&["A", "L3"], "jump / hold to bhop"), (&["LB"], "airplane-mode dash")]),
     ("FIGHT", &[(&["RT"], "fire"), (&["Y", "DPAD"], "shotgun / plasma / mortar")]),
-    ("PHONE", &[(&["LT"], "ping scan (1+ bar)"), (&["RB"], "5G overload EMP (3+ bars)"), (&["X"], "SOS uplink at the tower")]),
+    (
+        "PHONE",
+        &[
+            (&["B"], "phone punch / parry (0 bars)"),
+            (&["LT"], "ping scan (1+ bar)"),
+            (&["D-UP"], "camera flash strobe (2+ bars)"),
+            (&["RB"], "5G overload EMP (3+ bars)"),
+            (&["X"], "SOS uplink at the tower"),
+        ],
+    ),
     ("SYSTEM", &[(&["START"], "pause"), (&["A"], "select"), (&["B"], "back")]),
 ];
 
@@ -4316,7 +4334,7 @@ mod tests {
         assert!(seed_status_line(&seed, InputMode::KeyboardMouse).contains("ENTER"));
         // The pad field manual covers every documented binding.
         let pad: Vec<&str> = PAD_CONTROLS.iter().flat_map(|(_, b)| b.iter().flat_map(|(k, _)| k.iter().copied())).collect();
-        for k in ["LS", "RS", "A", "L3", "LB", "RT", "LT", "RB", "X", "Y", "DPAD", "START"] {
+        for k in ["LS", "RS", "A", "L3", "LB", "RT", "LT", "RB", "X", "Y", "DPAD", "START", "B", "D-UP"] {
             assert!(pad.contains(&k), "{k} missing from the controller manual");
         }
     }
