@@ -553,6 +553,8 @@ pub struct CompendiumState {
     pub yaw: f32,
     /// Last cursor position of a left-drag on the viewport (logical px).
     drag_last: Option<Vec2>,
+    /// Where that drag started (logical px).
+    drag_start: Option<Vec2>,
     /// Bumped by every `ATTACK` request (the exhibit animator plays the
     /// current demon's wind-up -> attack cycle when it changes).
     pub attack_preview: u32,
@@ -560,8 +562,17 @@ pub struct CompendiumState {
 
 impl Default for CompendiumState {
     fn default() -> Self {
-        CompendiumState { category: Category::Bestiary, index: 0, yaw: DEFAULT_YAW, drag_last: None, attack_preview: 0 }
+        CompendiumState { category: Category::Bestiary, index: 0, yaw: DEFAULT_YAW, drag_last: None, drag_start: None, attack_preview: 0 }
     }
+}
+
+/// A turntable drag travelling farther than this (logical px) owns its press:
+/// lifting it over BACK or an entry button never clicks.
+pub const DRAG_CLAIM_PX: f32 = 8.0;
+
+/// Whether a drag from `start` to `now` (logical px) is a real spin (not a tap).
+pub fn turntable_drag_claims(start: Option<Vec2>, now: Vec2) -> bool {
+    start.is_some_and(|s| s.distance(now) > DRAG_CLAIM_PX)
 }
 
 /// Starting yaw: three-quarter view of the demon's face.
@@ -676,7 +687,9 @@ impl Plugin for CompendiumPlugin {
             .add_systems(OnExit(AppState::Compendium), despawn_compendium)
             .add_systems(
                 Update,
-                (compendium_input, compendium_clicks, spin_turntable, refresh_compendium, animate_exhibits, refresh_preview_bar).chain().run_if(in_state(AppState::Compendium)),
+                (compendium_input, spin_turntable, compendium_clicks, refresh_compendium, animate_exhibits, refresh_preview_bar)
+                    .chain()
+                    .run_if(in_state(AppState::Compendium)),
             );
         #[cfg(target_arch = "wasm32")]
         app.add_systems(Startup, arm_seed_from_url);
@@ -847,6 +860,7 @@ fn spawn_compendium(
 ) {
     state.yaw = DEFAULT_YAW;
     state.drag_last = None;
+    state.drag_start = None;
     let overlay = RenderLayers::layer(OVERLAY_LAYER);
     let msaa = msaa.map(|m| m.0).unwrap_or(Msaa::Sample2);
     let aspect = window.single().ok().filter(|w| w.height() > 0.0).map_or(16.0 / 9.0, |w| w.width() / w.height());
@@ -1182,19 +1196,20 @@ fn compendium_input(
 
 #[allow(clippy::type_complexity)]
 fn compendium_clicks(
-    window: Query<&Window, With<PrimaryWindow>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut buttons: Query<(&ComputedNode, &UiGlobalTransform, &CompAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>)>,
+    ptr: Res<crate::touch::UiPointer>,
+    mut buttons: Query<(Entity, &ComputedNode, &UiGlobalTransform, &CompAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>)>,
     mut labels: Query<&mut TextColor>,
     anims: Query<&ExhibitAnim>,
     mut state: ResMut<CompendiumState>,
     mut next: ResMut<NextState<AppState>>,
 ) {
-    let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
+    // A claimed turntable drag never clicks (see `spin_turntable`); grown
+    // finger plates resolve to the nearest center.
     let playing = anims.iter().any(|a| a.preview.is_some());
-    let mut clicked = None;
-    for (node, tf, action, colors, mut bg, mut border, children) in &mut buttons {
-        let hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
+    let clicked = ptr.nearest_click(buttons.iter().map(|(_, n, tf, a, ..)| (*a, n, tf)), None);
+    let lit = ptr.nearest_over(buttons.iter().map(|(e, n, tf, ..)| (e, n, tf)), None).filter(|_| !ptr.drag_claimed);
+    for (e, _, _, action, colors, mut bg, mut border, children) in &mut buttons {
+        let hovered = lit == Some(e);
         let selected = match *action {
             CompAction::Tab(c) => c == state.category,
             CompAction::Select(id) => id == state.current(),
@@ -1219,20 +1234,22 @@ fn compendium_clicks(
                 }
             }
         }
-        if hovered && mouse.just_released(MouseButton::Left) {
-            clicked = Some(*action);
-        }
     }
     if let Some(a) = clicked {
         apply_action(a, &mut state, &mut next);
     }
 }
 
+/// Turntable spin (radians) of a pointer drag from `last` to `now` (logical px).
+pub fn turntable_drag_spin(last: Option<Vec2>, now: Vec2) -> f32 {
+    last.map_or(0.0, |l| (now.x - l.x) * DRAG_SPIN)
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn spin_turntable(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
+    mut ptr: ResMut<crate::touch::UiPointer>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut state: ResMut<CompendiumState>,
     mut table: Query<&mut Transform, (With<TurntableRoot>, Without<CompendiumCamera>)>,
@@ -1265,16 +1282,30 @@ fn spin_turntable(
         spin += x * MANUAL_SPIN * dt;
         manual = true;
     }
-    let cursor = window.single().ok().and_then(|w| w.cursor_position().map(|c| (c, w.width())));
-    match cursor {
-        Some((c, w)) if mouse.pressed(MouseButton::Left) && (c.x < w * 0.5 || state.drag_last.is_some()) => {
-            if let Some(last) = state.drag_last {
-                spin += (c.x - last.x) * DRAG_SPIN;
-            }
+    // Mouse drag or a finger drag (Milestone 37) on the turntable half.
+    let width = window.single().map_or(0.0, |w| w.width());
+    match ptr.logical {
+        Some(c) if ptr.pressed && (c.x < width * 0.5 || state.drag_last.is_some()) => {
+            spin += turntable_drag_spin(state.drag_last, c);
             state.drag_last = Some(c);
+            let start = *state.drag_start.get_or_insert(c);
             manual = true;
+            // A real spin owns the press: its lift never clicks a button.
+            if !ptr.drag_claimed && turntable_drag_claims(Some(start), c) {
+                ptr.claim_drag();
+            }
         }
-        _ => state.drag_last = None,
+        lift => {
+            // A flick that lifts on the frame it crossed the threshold.
+            if let Some(c) = lift
+                && ptr.released
+                && turntable_drag_claims(state.drag_start, c)
+            {
+                ptr.claim_drag();
+            }
+            state.drag_last = None;
+            state.drag_start = None;
+        }
     }
     if !manual {
         spin += AUTO_SPIN * dt;

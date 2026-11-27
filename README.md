@@ -60,6 +60,7 @@ Mars Research Bunker 7 has gone dark. Your **left hand grips a cracked tactical 
 - Performance: `F3` toggles the FPS / frame-time overlay | `F4` toggles VSync
 - **Controller** (no mouse click needed): Left Stick move | Right Stick look | `RT` fire | `A` or `L3` jump (hold to bunny hop) | `LB` dash | `LT` Ping Scan | `RB` 5G Overload | `X` SOS uplink | `Y` / D-Pad Right next weapon, D-Pad Left previous | D-Pad Down inspect | `Start` pause | `Select` / `R3` Time Trial reset
 - Controller menus: D-Pad / Left Stick move the focus, `A` select, `B` back, `Start` play / deploy; Settings: Up/Down pick a row, Left/Right adjust; Bestiary: Left/Right or `LB`/`RB` cycle, `Y` switch archive, Right Stick spins. Gamepad sensitivity and Invert Y live in Settings.
+- **Touch (Android APK & mobile web):** activates automatically on first touch (or force `ON` / `OFF` in `Settings -> Touch Controls`). Left-half floating stick moves (outer rim or `AUTO-BHOP` pill chains bunny hops); right-half drag aims (with light aim friction); `FIRE` shoots and drag-aims simultaneously; right thumb arc provides `JUMP`, `DASH`, `PUNCH`, `SWAP`, and the `PING` / `FLASH` / `5G` phone app row; tap the weapon deck slots directly to switch weapons, `SOS` when near the tower, and `||` (or Android Back) to pause. Optional **Auto-Fire**, sensitivity, HUD opacity, and button scale live in `Settings -> Touch Controls`. Every menu, upgrade card, leaderboard callsign editor, and Bestiary 3D turntable supports touch directly.
 
 ## Build & Run
 ```bash
@@ -181,13 +182,16 @@ See [DESIGN.md](DESIGN.md) for the full game design and architecture notes.
 ## Android
 
 Native arm64 Android build (GameActivity, Vulkan / GLES 3.2, landscape,
-immersive fullscreen). **A controller (Bluetooth / USB) or a mouse & keyboard
-is required: there are no touch controls.** Controllers and the mouse reach
-Bevy through a small JNI bridge (`src/android_input.rs` +
-`android/app/src/main/java/.../MainActivity.kt`), because Bevy 0.20.1 has no
-Android gamepad backend and winit reports mice as touches. In a run the mouse
-uses Android pointer capture. Backgrounding the app pauses the run and
-suspends audio. The profile is stored in the app's internal storage.
+immersive fullscreen). **Playable with on-screen touch controls, a Bluetooth /
+USB controller, or a mouse & keyboard** — switching seamlessly on input.
+Touchscreen fingers flow directly into Bevy `Touches` (`src/touch.rs`), while
+controllers, mouse, system Back gestures, and display-cutout safe-area insets
+bridge through `src/android_input.rs` +
+`android/app/src/main/java/.../MainActivity.kt` (because Bevy 0.20.1 has no
+Android gamepad backend and winit reports mice as touches). In a run the mouse
+uses Android pointer capture (never requested while touch mode is active).
+Backgrounding the app pauses the run and suspends audio. The profile is stored
+in the app's internal storage.
 
 ```bash
 # Needs JDK 17, the Android SDK (platform 35) + NDK, and:

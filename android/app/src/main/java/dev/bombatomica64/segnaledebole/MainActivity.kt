@@ -13,6 +13,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.activity.OnBackPressedCallback
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -22,12 +23,15 @@ import com.google.androidgamesdk.GameActivity
  * SEGNALE DEBOLE on Android: GameActivity hosts `libsegnale_debole.so`
  * (Bevy's `android_main`, named by the `android.app.lib_name` meta-data).
  *
- * Input is a controller or mouse & keyboard; there are no touch controls.
- * Keyboards reach Bevy through GameActivity + winit as usual. Controllers and
- * the mouse do not (GameActivity forwards only touchscreen motion, winit turns
- * mouse input into touches and has no gamepads), so this activity intercepts
- * them and forwards them to the JNI bridge in `src/android_input.rs`, and
- * mirrors the game's cursor capture as Android pointer capture.
+ * Input is touch (Milestone 37 on-screen controls), a controller or mouse &
+ * keyboard. Touchscreen fingers and keyboards reach Bevy through GameActivity
+ * + winit as usual (fingers become Bevy `Touches`, see `src/touch.rs`).
+ * Controllers and the mouse do not (GameActivity forwards only touchscreen
+ * motion, winit turns mouse input into touches and has no gamepads), so this
+ * activity intercepts them and forwards them to the JNI bridge in
+ * `src/android_input.rs`, and mirrors the game's cursor capture as Android
+ * pointer capture (never requested while touch mode is active). It also
+ * forwards the system Back gesture and the display-cutout safe-area insets.
  */
 class MainActivity : GameActivity(), InputManager.InputDeviceListener {
 
@@ -104,6 +108,8 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
     private external fun nativeWantsPointerCapture(): Boolean
     private external fun nativeTakeRumble(): Long
     private external fun nativeActiveRumbleDevice(): Int
+    private external fun nativeBackPressed()
+    private external fun nativeSafeAreaInsets(left: Float, top: Float, right: Float, bottom: Float)
 
     /** Fallback device id of the controller that last sent deliberate input. */
     private var activePadDeviceId = -1
@@ -141,9 +147,11 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
         enterImmersiveMode()
 
         // Back (gesture, nav bar, or a controller / mouse fallback) must never
-        // kill a run: Esc / Start pause in-game. Home leaves the app.
+        // kill the app: it is forwarded to Rust, which pauses a run, closes
+        // the controls overlay or backs out of a submenu (and does nothing on
+        // the main menu). Home leaves the app.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() = Unit
+            override fun handleOnBackPressed() = nativeBackPressed()
         })
 
         mSurfaceView?.let { view ->
@@ -151,6 +159,14 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
             view.isFocusableInTouchMode = true
             view.setOnCapturedPointerListener { _, event -> onCapturedPointer(event) }
         }
+
+        // Display cutout / rounded corners: the touch HUD keeps its controls
+        // out of these insets (physical px, like the surface).
+        ViewCompat.setOnApplyWindowInsetsListener(window.decorView) { view, insets ->
+            sendSafeArea(insets)
+            ViewCompat.onApplyWindowInsets(view, insets)
+        }
+        ViewCompat.getRootWindowInsets(window.decorView)?.let { sendSafeArea(it) }
 
         inputManager = (getSystemService(INPUT_SERVICE) as InputManager).also {
             it.registerInputDeviceListener(this, handler)
@@ -289,6 +305,12 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
         }
     }
 
+    /** Forward the display-cutout insets (left, top, right, bottom; physical px). */
+    private fun sendSafeArea(insets: WindowInsetsCompat) {
+        val cut = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
+        nativeSafeAreaInsets(cut.left.toFloat(), cut.top.toFloat(), cut.right.toFloat(), cut.bottom.toFloat())
+    }
+
     /** Sticky immersive fullscreen: system bars hidden, swipe shows them briefly. */
     private fun enterImmersiveMode() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -358,6 +380,16 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // System Back (pre-Android 13 gesture / nav bar, keyboard Back, a mouse
+        // back button): forward once on release, never let it finish the
+        // activity. Consuming the key here means `onBackPressed` (and the
+        // dispatcher callback above) never fires for the same press.
+        if (event.keyCode == KeyEvent.KEYCODE_BACK && !isGamepadSource(event.source)) {
+            if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
+                nativeBackPressed()
+            }
+            return true
+        }
         if (isGamepadKey(event)) {
             activePadDeviceId = event.deviceId
             when (event.action) {
@@ -448,6 +480,8 @@ class MainActivity : GameActivity(), InputManager.InputDeviceListener {
             sendMouse(event)
             return true
         }
+        // Real fingers (and styluses) flow untouched to GameActivity -> winit
+        // -> Bevy `Touches`, which drive the touch HUD and menu taps.
         return super.dispatchTouchEvent(event)
     }
 }

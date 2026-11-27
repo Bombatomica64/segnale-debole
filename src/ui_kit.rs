@@ -585,6 +585,9 @@ impl PunkButtonColors {
 /// Angular industrial switch: heavy left rail + bottom bevel on a hard ink
 /// shadow, punk hover snap. Carries [`MenuButton`] + the [`MenuAction`] so
 /// `hud::menu_buttons` hit-tests and restyles it.
+/// Minimum width of a hero switch, in multiples of its font size.
+pub const HERO_MIN_WIDTH_EM: f32 = 8.0;
+
 pub fn punk_button(label: &str, action: MenuAction, font: f32, style: ButtonStyle) -> impl Bundle {
     let colors = PunkButtonColors::of(style);
     let hero = style == ButtonStyle::HeroAcid;
@@ -596,6 +599,9 @@ pub fn punk_button(label: &str, action: MenuAction, font: f32, style: ButtonStyl
         Node {
             padding: UiRect::axes(Val::Px(font * if hero { 1.3 } else { 1.0 }), Val::Px(font * 0.4)),
             border: plate_rect(if hero { (8.0, 2.0, 2.0, 5.0) } else { (6.0, 1.0, 1.0, 4.0) }),
+            // A hero switch keeps its proportions without a keycap (`PLAY` /
+            // `BACK` in touch mode, where `[ENTER]` / `[ESC]` are stripped).
+            min_width: if hero { Val::Px(font * HERO_MIN_WIDTH_EM) } else { Val::Auto },
             justify_content: JustifyContent::Center,
             align_items: AlignItems::Center,
             ..default()
@@ -1389,5 +1395,14 @@ mod tests {
         assert_eq!(tex.tape(Tape::Caution, 5.0).1, 6);
         assert!(matches!(tape_image(&tex, 5.0, false).image_mode, NodeImageMode::Tiled { stretch_value, .. } if (stretch_value - 5.0 / 6.0).abs() < 1e-6));
         assert_eq!(tex.tape(Tape::Caution, 40.0).1, 16);
+    }
+
+    #[test]
+    fn hero_switch_keeps_its_proportions_without_a_keycap() {
+        let mut world = World::new();
+        let hero = world.spawn(punk_button("PLAY", MenuAction::StartRun, 22.0, ButtonStyle::HeroAcid)).id();
+        let plain = world.spawn(punk_button("BACK", MenuAction::BackToMenu, 16.0, ButtonStyle::ScrapSteel)).id();
+        assert_eq!(world.get::<Node>(hero).unwrap().min_width, Val::Px(22.0 * HERO_MIN_WIDTH_EM));
+        assert_eq!(world.get::<Node>(plain).unwrap().min_width, Val::Auto);
     }
 }

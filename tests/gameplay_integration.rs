@@ -2981,8 +2981,12 @@ fn settings_open_from_main_menu_and_mid_run_pause_and_apply_live() {
     tap(&mut app, KeyCode::KeyO);
     assert_eq!(app_state(&app), AppState::Settings);
     assert_eq!(app.world().resource::<SettingsReturn>().0, AppState::MainMenu);
-    // 6 knobs x (-/+), 7 toggles (incl. SPEEDRUN SPLITS, GAMEPAD INVERT Y, AIM FRICTION, RUMBLE), the style pills, the color swatches, RESET.
-    assert_eq!(count::<SettingsControl>(&mut app), 6 * 2 + 7 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1);
+    // 6 knobs x (-/+), 7 toggles (incl. SPEEDRUN SPLITS, GAMEPAD INVERT Y, AIM FRICTION, RUMBLE), the style pills, the color swatches, RESET,
+    // and the Milestone 37 page tabs (GENERAL / TOUCH CONTROLS).
+    assert_eq!(
+        count::<SettingsControl>(&mut app),
+        6 * 2 + 7 + CrosshairStyle::ALL.len() + CrosshairColor::ALL.len() + 1 + segnale_debole::meta_ui::SettingsTab::ALL.len()
+    );
     assert!(ui_texts(&mut app).iter().any(|t| t == "AIM FRICTION"), "aim friction toggle row");
     assert!(ui_texts(&mut app).iter().any(|t| t == "RUMBLE"), "Milestone 31 rumble toggle row");
     assert!(ui_texts(&mut app).iter().any(|t| t == "SPEEDRUN SPLITS"), "speedrun splits toggle row");
