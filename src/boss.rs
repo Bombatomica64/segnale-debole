@@ -152,6 +152,15 @@ pub enum BossAttack {
     EmpVolley,
 }
 
+/// Barrage telegraph length outside / inside Overdrive (seconds).
+pub const BOSS_TELEGRAPH_SECS: f32 = 0.6;
+pub const BOSS_OVERDRIVE_TELEGRAPH_SECS: f32 = 0.35;
+
+/// Barrage telegraph length of a phase.
+pub fn boss_telegraph_secs(phase: BossPhase) -> f32 {
+    if phase == BossPhase::Overdrive { BOSS_OVERDRIVE_TELEGRAPH_SECS } else { BOSS_TELEGRAPH_SECS }
+}
+
 /// Carrier Daemon fight state (on the boss's root entity).
 #[derive(Component, Debug, Clone)]
 pub struct BossState {
@@ -677,7 +686,7 @@ pub fn carrier_daemon_system(
                         st.next_attack = BossAttack::EmpVolley;
                     }
                     st.attack_timer = st.phase.attack_cooldown() * rng.random_range(0.9..1.15);
-                    st.telegraph = if st.phase == BossPhase::Overdrive { 0.35 } else { 0.6 };
+                    st.telegraph = boss_telegraph_secs(st.phase);
                     let tip = core + (chest - core).normalize_or_zero() * 1.4;
                     if st.phase == BossPhase::Overdrive {
                         spawn_burst(&mut commands, &fx, tip, BurstColor::Gold, 10, 3.5, 0.14);

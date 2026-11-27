@@ -65,7 +65,13 @@
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
-//!   on the turntable) and `03_armory_mortar.png` (3D Signal-Mortar), then exits.
+//!   on the turntable), `02b_bestiary_attack_preview.png` (Milestone 36: the
+//!   `ATTACK` preview bar live, mid barrage telegraph) and
+//!   `03_armory_mortar.png` (3D Signal-Mortar), then exits.
+//! - `SEGNALE_POSE_SHOTS=<dir>`: Milestone 36 animation pose sheet: every
+//!   demon frozen on the Bestiary turntable at idle, wind-up peak, release,
+//!   melee / slash, stun slump and enraged stride, front 3/4 + side view
+//!   (`<n>_<demon>_<pose>_<front|side>.png`), then exits.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -164,6 +170,13 @@ impl Plugin for DevPlugin {
                 }
             }
             app.insert_resource(LayoutShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, layout_shots_tour.after(GameSet::Ui));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_POSE_SHOTS") {
+            if let Some(mut store) = app.world_mut().get_resource_mut::<ProfileStore>() {
+                store.path = None;
+            }
+            app.insert_resource(PoseShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, pose_shots_tour);
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_TOUCH_SHOTS") {
@@ -1266,7 +1279,7 @@ struct CompendiumShots {
     timer: f32,
 }
 
-/// Main menu with `MARS7` armed -> Bestiary (Carrier Daemon) -> Armory (Mortar).
+/// Main menu with `MARS7` armed -> Bestiary (Carrier Daemon, idle + attack preview) -> Armory (Mortar).
 #[allow(clippy::too_many_arguments)]
 fn compendium_shots_tour(
     mut commands: Commands,
@@ -1305,19 +1318,29 @@ fn compendium_shots_tour(
             meta_shot(&mut commands, &dir, "02_bestiary_boss.png");
             true
         }
-        (5, AppState::Compendium) if t > 0.7 => {
+        (5, AppState::Compendium) if t > 0.5 => {
+            // Milestone 36: the live attack-preview bar mid barrage telegraph.
+            comp.yaw = 0.35;
+            comp.request_attack_preview();
+            true
+        }
+        (6, AppState::Compendium) if t > 0.4 => {
+            meta_shot(&mut commands, &dir, "02b_bestiary_attack_preview.png");
+            true
+        }
+        (7, AppState::Compendium) if t > 1.6 => {
             comp.select(ExhibitId::Mortar);
             true
         }
-        (6, AppState::Compendium) if t > 2.0 => {
+        (8, AppState::Compendium) if t > 2.0 => {
             comp.yaw = 1.2;
             true
         }
-        (7, AppState::Compendium) if t > 0.15 => {
+        (9, AppState::Compendium) if t > 0.15 => {
             meta_shot(&mut commands, &dir, "03_armory_mortar.png");
             true
         }
-        (8, _) if t > 1.5 => {
+        (10, _) if t > 1.5 => {
             exit.write(AppExit::Success);
             true
         }
@@ -1326,6 +1349,96 @@ fn compendium_shots_tour(
     if advance {
         cfg.stage += 1;
         cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_POSE_SHOTS (Milestone 36): Bestiary animation pose sheet
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct PoseShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+/// The held poses of one demon on the pose sheet: `(file tag, animation input)`.
+pub fn pose_sheet(kind: EnemyKind) -> Vec<(&'static str, crate::enemies::EnemyAnimInput)> {
+    use crate::enemies::{apply_attack_preview, attack_preview_lead, EnemyAnimInput, ATTACK_ANIM_SECS};
+    let lead = attack_preview_lead(kind);
+    let at = |t: f32| {
+        let mut a = EnemyAnimInput::default();
+        apply_attack_preview(kind, t, &mut a);
+        a
+    };
+    let mut poses = vec![("idle", EnemyAnimInput::default()), ("windup", at(lead * 0.98))];
+    if kind == EnemyKind::PhaseStalker {
+        // Blink coil (above), then the ranged wind-up and both halves of the slash.
+        poses.push(("ranged_windup", EnemyAnimInput { windup: 1.0, ..default() }));
+        poses.push(("slash_raise", at(lead + ATTACK_ANIM_SECS * 0.2)));
+        poses.push(("slash_sweep", at(lead + ATTACK_ANIM_SECS * 0.45)));
+    } else {
+        poses.push(("release", at(lead + ATTACK_ANIM_SECS * 0.14)));
+    }
+    if matches!(kind, EnemyKind::Imp | EnemyKind::HellBaron) {
+        poses.push(("melee_raise", EnemyAnimInput { attack_anim: 0.8, attack_lunge: true, ..default() }));
+        poses.push(("melee_sweep", EnemyAnimInput { attack_anim: 0.55, attack_lunge: true, ..default() }));
+    }
+    poses.push(("stun", EnemyAnimInput { stunned: true, ..default() }));
+    poses.push(("stride", EnemyAnimInput { speed_ratio: 1.0, stride_phase: std::f32::consts::FRAC_PI_2, enraged: true, ..default() }));
+    poses
+}
+
+/// Every demon on the Bestiary turntable, frozen at each pose of
+/// [`pose_sheet`] from a front 3/4 and a side view:
+/// `<n>_<demon>_<pose>_<front|side>.png`, then exits.
+#[allow(clippy::too_many_arguments)]
+fn pose_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<PoseShots>,
+    state: Res<State<AppState>>,
+    mut comp: ResMut<crate::compendium::CompendiumState>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use crate::compendium::{ExhibitId, ExhibitPoseOverride};
+    cfg.timer += time.delta_secs();
+    if *state.get() != AppState::Compendium {
+        if cfg.timer > 1.0 {
+            comp.select(ExhibitId::Imp);
+            next.set(AppState::Compendium);
+            cfg.timer = 0.0;
+        }
+        return;
+    }
+    // Flat shot list: demon x pose x view.
+    let mut n = cfg.stage as usize;
+    for id in ExhibitId::BESTIARY {
+        let Some(kind) = id.enemy_kind() else { continue };
+        let poses = pose_sheet(kind);
+        if n >= poses.len() * 2 {
+            n -= poses.len() * 2;
+            continue;
+        }
+        let (tag, input) = poses[n / 2];
+        let (view, yaw) = if n.is_multiple_of(2) { ("front", 0.3) } else { ("side", 1.25) };
+        if comp.current() != id {
+            comp.select(id);
+        }
+        comp.yaw = yaw;
+        commands.insert_resource(ExhibitPoseOverride(input));
+        if cfg.timer > 0.9 {
+            let name = format!("{}_{}_{tag}_{view}.png", kind.index() + 1, id.short().to_lowercase());
+            meta_shot(&mut commands, &cfg.dir, &name);
+            cfg.stage += 1;
+            cfg.timer = 0.0;
+        }
+        return;
+    }
+    if cfg.timer > 1.5 {
+        exit.write(AppExit::Success);
     }
 }
 

@@ -20,7 +20,10 @@ use bevy::prelude::*;
 use bevy::ui::UiGlobalTransform;
 use bevy::window::PrimaryWindow;
 
-use crate::enemies::{EnemyAssets, EnemyKind, KIND_COUNT};
+use crate::enemies::{
+    apply_attack_preview, apply_rig_pose, attack_preview_len, attack_preview_phase, exhibit_body_pose, EnemyAnimInput, EnemyAssets, EnemyKind, RigPivot, KIND_COUNT,
+    MAX_RIGS,
+};
 use crate::fx::OVERLAY_LAYER;
 use crate::gamepad::{DualPrompt, GamepadInput};
 use crate::hud::text;
@@ -552,11 +555,14 @@ pub struct CompendiumState {
     drag_last: Option<Vec2>,
     /// Where that drag started (logical px).
     drag_start: Option<Vec2>,
+    /// Bumped by every `ATTACK` request (the exhibit animator plays the
+    /// current demon's wind-up -> attack cycle when it changes).
+    pub attack_preview: u32,
 }
 
 impl Default for CompendiumState {
     fn default() -> Self {
-        CompendiumState { category: Category::Bestiary, index: 0, yaw: DEFAULT_YAW, drag_last: None, drag_start: None }
+        CompendiumState { category: Category::Bestiary, index: 0, yaw: DEFAULT_YAW, drag_last: None, drag_start: None, attack_preview: 0 }
     }
 }
 
@@ -595,6 +601,15 @@ impl CompendiumState {
     pub fn toggle_category(&mut self) {
         self.category = self.category.other();
         self.index = 0;
+    }
+
+    /// Request the current demon's attack preview (no-op on the Armory).
+    pub fn request_attack_preview(&mut self) -> bool {
+        if self.category != Category::Bestiary {
+            return false;
+        }
+        self.attack_preview = self.attack_preview.wrapping_add(1);
+        true
     }
 
     pub fn select(&mut self, id: ExhibitId) {
@@ -672,7 +687,9 @@ impl Plugin for CompendiumPlugin {
             .add_systems(OnExit(AppState::Compendium), despawn_compendium)
             .add_systems(
                 Update,
-                (compendium_input, spin_turntable, compendium_clicks, refresh_compendium).chain().run_if(in_state(AppState::Compendium)),
+                (compendium_input, spin_turntable, compendium_clicks, refresh_compendium, animate_exhibits, refresh_preview_bar)
+                    .chain()
+                    .run_if(in_state(AppState::Compendium)),
             );
         #[cfg(target_arch = "wasm32")]
         app.add_systems(Startup, arm_seed_from_url);
@@ -687,6 +704,54 @@ impl Plugin for CompendiumPlugin {
 #[derive(Component)]
 pub struct ExhibitModel(pub ExhibitId);
 
+/// Live animation of a demon exhibit: its articulated rig pivots play the
+/// same [`crate::enemies::limb_pose`] idle loop as in-game, and an `ATTACK`
+/// request plays the full wind-up -> attack cycle.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ExhibitAnim {
+    pub kind: EnemyKind,
+    /// Body pivot (parent of every part and rig): breathing, weight shift and
+    /// the wind-up coil / recoil / lunge of the torso.
+    pub body: Option<Entity>,
+    pub pivots: [Option<Entity>; MAX_RIGS],
+    /// Seconds into the running attack preview (`None` = idle loop).
+    pub preview: Option<f32>,
+    /// Per-exhibit phase offset (desyncs breathing / sway).
+    pub phase: f32,
+}
+
+impl ExhibitAnim {
+    /// The animation input at clock `t` (idle, or the attack preview overlay).
+    pub fn input(&self, t: f32) -> EnemyAnimInput {
+        let mut a = EnemyAnimInput { time: t, phase: self.phase, ..default() };
+        if let Some(p) = self.preview {
+            apply_attack_preview(self.kind, p, &mut a);
+        }
+        a
+    }
+}
+
+/// Body pivot of a demon exhibit (see [`ExhibitAnim::body`]).
+#[derive(Component)]
+pub struct ExhibitBody;
+
+/// Dev pose sheet (`SEGNALE_POSE_SHOTS`): pins the visible demon exhibit to
+/// one fixed animation input (clock and phase stay live).
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct ExhibitPoseOverride(pub EnemyAnimInput);
+
+/// The Bestiary attack-preview bar (caption + `ATTACK` button + progress rail).
+#[derive(Component)]
+struct PreviewPanel;
+
+/// Live status caption of the attack preview (`READY` / `PLAYING // ...`).
+#[derive(Component)]
+struct PreviewStatus;
+
+/// Progress fill of the attack preview rail.
+#[derive(Component)]
+struct PreviewFill;
+
 /// What a Compendium switch does.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompAction {
@@ -695,6 +760,8 @@ pub enum CompAction {
     Back,
     Tab(Category),
     Select(ExhibitId),
+    /// Play the current demon's wind-up -> attack cycle on the turntable.
+    PreviewAttack,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
@@ -849,17 +916,22 @@ fn spawn_compendium(
                     vis(id),
                 ))
                 .id();
+            // Everything hangs off one body pivot, exactly like a live demon.
+            let body = commands.spawn((ChildOf(holder), ExhibitBody, Transform::IDENTITY, Visibility::default())).id();
             for part in &ea.models[kind.index()] {
                 let mat = showcase_material(&part.material, &mut materials, &mut fwd_cache);
-                commands.spawn((ChildOf(holder), overlay.clone(), Mesh3d(part.mesh.clone()), MeshMaterial3d(mat), Transform::IDENTITY));
+                commands.spawn((ChildOf(body), overlay.clone(), Mesh3d(part.mesh.clone()), MeshMaterial3d(mat), Transform::IDENTITY));
             }
-            for rig in &ea.rigs[kind.index()] {
-                let pivot = commands.spawn((ChildOf(holder), rig.rest, Visibility::default())).id();
+            let mut anim = ExhibitAnim { kind, body: Some(body), pivots: [None; MAX_RIGS], preview: None, phase: kind.index() as f32 * 1.7 };
+            for (slot, rig) in anim.pivots.iter_mut().zip(&ea.rigs[kind.index()]) {
+                let pivot = commands.spawn((ChildOf(body), RigPivot { kind: rig.kind, rest: rig.rest, angle: 0.0 }, rig.rest, Visibility::default())).id();
+                *slot = Some(pivot);
                 for part in &rig.parts {
                     let mat = showcase_material(&part.material, &mut materials, &mut fwd_cache);
                     commands.spawn((ChildOf(pivot), overlay.clone(), Mesh3d(part.mesh.clone()), MeshMaterial3d(mat), Transform::IDENTITY));
                 }
             }
+            commands.entity(holder).insert(anim);
         }
     }
     // Guns: the real sculpted viewmodels, built by the viewmodel code itself.
@@ -1001,6 +1073,24 @@ fn spawn_dossier_ui(commands: &mut Commands, tex: Option<&UiKitTextures>) {
         children![(DossierText::Tip, text("", 13.0, ACID_GREEN))],
     ));
     commands.spawn((ChildOf(card), Node { flex_grow: 1.0, ..default() }));
+    // Bestiary-only attack preview bar (hidden on the Armory in `refresh_compendium`):
+    // live status caption, a full-width action button flush with the nav row
+    // below, and a progress rail that fills through the wind-up -> strike cycle.
+    let preview = commands.spawn((ChildOf(card), PreviewPanel, Node { flex_direction: FlexDirection::Column, align_items: AlignItems::Stretch, ..default() })).id();
+    commands.spawn((
+        ChildOf(preview),
+        Node { justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, margin: UiRect::bottom(Val::Px(5.0)), ..default() },
+        children![text("ATTACK PREVIEW", 11.0, ASH_DIM), (PreviewStatus, text(PREVIEW_READY, 11.0, ASH_DIM))],
+    ));
+    commands.spawn((
+        ChildOf(preview),
+        comp_button(ATTACK_PROMPT_KBM, CompAction::PreviewAttack, 15.0, ButtonStyle::HazardAmber),
+        DualPrompt::new(ATTACK_PROMPT_KBM, ATTACK_PROMPT_PAD),
+    ));
+    let rail = commands
+        .spawn((ChildOf(preview), Node { height: Val::Px(4.0), margin: UiRect::top(Val::Px(4.0)), ..default() }, BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.07))))
+        .id();
+    commands.spawn((ChildOf(rail), PreviewFill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(HAZARD_YELLOW)));
     let nav = commands.spawn((ChildOf(card), Node { column_gap: Val::Px(10.0), justify_content: JustifyContent::SpaceBetween, ..default() })).id();
     // Keycaps follow the active input mode (LB / RB also cycle exhibits).
     for (kbm, pad, action, style) in [
@@ -1010,6 +1100,30 @@ fn spawn_dossier_ui(commands: &mut Commands, tex: Option<&UiKitTextures>) {
     ] {
         commands.spawn((ChildOf(nav), comp_button(kbm, action, 15.0, style), DualPrompt::new(kbm, pad)));
     }
+}
+
+/// Footer prompt of the Bestiary attack preview.
+pub const ATTACK_PROMPT_KBM: &str = "ATTACK  [SPACE]";
+pub const ATTACK_PROMPT_PAD: &str = "ATTACK  [X]";
+/// Status caption of the attack preview bar while nothing plays.
+pub const PREVIEW_READY: &str = "READY";
+
+/// Status caption of a running attack preview (`t` seconds in), its rail
+/// fill (`0..1`) and whether the strike has landed (rail turns red).
+pub fn preview_status(kind: EnemyKind, t: f32) -> Option<(String, f32, bool)> {
+    use crate::enemies::PreviewPhase;
+    let phase = attack_preview_phase(kind, t)?;
+    let label = match (phase, kind) {
+        (PreviewPhase::Charge, EnemyKind::RelaySniper) => "LOCK-ON",
+        (PreviewPhase::Charge, EnemyKind::CarrierDaemon) => "TELEGRAPH",
+        (PreviewPhase::Charge, EnemyKind::PhaseStalker) => "BLINK COIL",
+        (PreviewPhase::Charge, _) => "WIND-UP",
+        (PreviewPhase::Strike, EnemyKind::PhaseStalker) => "SLASH",
+        (PreviewPhase::Strike, EnemyKind::RelaySniper | EnemyKind::CarrierDaemon) => "FIRE",
+        (PreviewPhase::Strike, _) => "RELEASE",
+        (PreviewPhase::Recover, _) => "RECOVER",
+    };
+    Some((format!("PLAYING // {label}"), (t / attack_preview_len(kind)).clamp(0.0, 1.0), phase != PreviewPhase::Charge))
 }
 
 fn despawn_compendium(mut commands: Commands, q: Query<Entity, With<CompendiumEntity>>) {
@@ -1029,6 +1143,8 @@ pub fn compendium_key_action(keys: &ButtonInput<KeyCode>, category: Category) ->
         Some(CompAction::Next)
     } else if keys.just_pressed(KeyCode::Tab) {
         Some(CompAction::Tab(category.other()))
+    } else if keys.just_pressed(KeyCode::Space) && category == Category::Bestiary {
+        Some(CompAction::PreviewAttack)
     } else {
         None
     }
@@ -1042,6 +1158,9 @@ fn apply_action(action: CompAction, state: &mut CompendiumState, next: &mut Next
         CompAction::Tab(cat) if cat != state.category => state.toggle_category(),
         CompAction::Tab(_) => {}
         CompAction::Select(id) => state.select(id),
+        CompAction::PreviewAttack => {
+            state.request_attack_preview();
+        }
     }
 }
 
@@ -1056,6 +1175,8 @@ pub fn compendium_pad_action(pad: &GamepadInput, category: Category) -> Option<C
         Some(CompAction::Next)
     } else if pad.alt_action {
         Some(CompAction::Tab(category.other()))
+    } else if pad.interact && category == Category::Bestiary {
+        Some(CompAction::PreviewAttack)
     } else {
         None
     }
@@ -1078,11 +1199,13 @@ fn compendium_clicks(
     ptr: Res<crate::touch::UiPointer>,
     mut buttons: Query<(Entity, &ComputedNode, &UiGlobalTransform, &CompAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>)>,
     mut labels: Query<&mut TextColor>,
+    anims: Query<&ExhibitAnim>,
     mut state: ResMut<CompendiumState>,
     mut next: ResMut<NextState<AppState>>,
 ) {
     // A claimed turntable drag never clicks (see `spin_turntable`); grown
     // finger plates resolve to the nearest center.
+    let playing = anims.iter().any(|a| a.preview.is_some());
     let clicked = ptr.nearest_click(buttons.iter().map(|(_, n, tf, a, ..)| (*a, n, tf)), None);
     let lit = ptr.nearest_over(buttons.iter().map(|(e, n, tf, ..)| (e, n, tf)), None).filter(|_| !ptr.drag_claimed);
     for (e, _, _, action, colors, mut bg, mut border, children) in &mut buttons {
@@ -1090,6 +1213,8 @@ fn compendium_clicks(
         let selected = match *action {
             CompAction::Tab(c) => c == state.category,
             CompAction::Select(id) => id == state.current(),
+            // Stays lit for the whole wind-up -> strike cycle.
+            CompAction::PreviewAttack => playing,
             _ => false,
         };
         let lit = hovered || selected;
@@ -1206,6 +1331,7 @@ fn refresh_compendium(
     mut fills: Query<(&StatFill, &mut Node), Without<StatTrack>>,
     mut tracks: Query<(&StatTrack, &mut Node), Without<StatFill>>,
     mut chips: Query<(&CompAction, &mut Node), (Without<StatTrack>, Without<StatFill>)>,
+    mut panels: Query<&mut Node, (With<PreviewPanel>, Without<CompAction>, Without<StatTrack>, Without<StatFill>)>,
 ) {
     let key = (state.category, state.index);
     if *last == Some(key) && !texts.iter().any(|(_, t)| t.0.is_empty()) {
@@ -1243,11 +1369,105 @@ fn refresh_compendium(
         n.display = if rows[t.0 as usize].fill.is_some() { Display::Flex } else { Display::None };
     }
     for (a, mut n) in &mut chips {
-        if let CompAction::Select(e) = *a {
-            let want = if e.category() == state.category { Display::Flex } else { Display::None };
-            if n.display != want {
-                n.display = want;
+        let want = match *a {
+            CompAction::Select(e) => e.category() == state.category,
+            CompAction::PreviewAttack => state.category == Category::Bestiary,
+            _ => continue,
+        };
+        let want = if want { Display::Flex } else { Display::None };
+        if n.display != want {
+            n.display = want;
+        }
+    }
+    for mut n in &mut panels {
+        let want = if state.category == Category::Bestiary { Display::Flex } else { Display::None };
+        if n.display != want {
+            n.display = want;
+        }
+    }
+}
+
+/// Animate the visible demon exhibit (idle loop or attack preview): the body
+/// pivot breathes / coils / recoils and every rig plays its limb pose.
+/// Allocation-free, the same pure pose math as live demons.
+#[allow(clippy::type_complexity)]
+fn animate_exhibits(
+    time: Res<Time>,
+    state: Res<CompendiumState>,
+    pose: Option<Res<ExhibitPoseOverride>>,
+    mut seen: Local<Option<u32>>,
+    mut exhibits: Query<(&ExhibitModel, &mut ExhibitAnim)>,
+    mut rigs: Query<(&mut Transform, &mut RigPivot), Without<ExhibitBody>>,
+    mut bodies: Query<&mut Transform, (With<ExhibitBody>, Without<RigPivot>)>,
+) {
+    let (t, dt) = (time.elapsed_secs(), time.delta_secs().min(0.1));
+    let requested = seen.is_some_and(|s| s != state.attack_preview);
+    *seen = Some(state.attack_preview);
+    let current = state.current();
+    for (model, mut anim) in &mut exhibits {
+        if model.0 != current {
+            if anim.preview.is_some() {
+                anim.preview = None;
             }
+            continue;
+        }
+        if requested {
+            anim.preview = Some(0.0);
+        } else if let Some(p) = anim.preview {
+            let p = p + dt;
+            anim.preview = (p < attack_preview_len(anim.kind)).then_some(p);
+        }
+        let input = match pose.as_deref() {
+            Some(o) => EnemyAnimInput { time: t, phase: anim.phase, ..o.0 },
+            None => anim.input(t),
+        };
+        for pe in anim.pivots.iter().flatten() {
+            if let Ok((mut tf, mut rp)) = rigs.get_mut(*pe) {
+                apply_rig_pose(&mut tf, &mut rp, anim.kind, &input, dt);
+            }
+        }
+        if let Some(mut tf) = anim.body.and_then(|b| bodies.get_mut(b).ok()) {
+            let target = exhibit_body_pose(anim.kind, &input);
+            // Phase Stalker blink shimmer (as in-game): glitch jitter + stretch.
+            let k = if input.blink > 0.0 { input.blink.clamp(0.0, 1.0) } else { 0.0 };
+            let jitter = if k > 0.0 { (t * 70.0).sin() * 0.12 * (0.4 + k) } else { 0.0 };
+            let f = 1.0 - (-24.0 * dt).exp();
+            tf.translation = tf.translation.lerp(target.offset + Vec3::X * jitter, f);
+            tf.rotation = tf.rotation.slerp(target.rotation(), f).normalize();
+            tf.scale = Vec3::new(1.0 - 0.25 * k, 1.0 + 0.2 * k, 1.0 - 0.25 * k);
+        }
+    }
+}
+
+/// Live feedback of the attack preview bar: status caption + progress rail.
+fn refresh_preview_bar(
+    exhibits: Query<&ExhibitAnim>,
+    mut status: Query<(&mut Text, &mut TextColor), With<PreviewStatus>>,
+    mut fill: Query<(&mut Node, &mut BackgroundColor), With<PreviewFill>>,
+) {
+    let live = exhibits.iter().find_map(|a| a.preview.and_then(|p| preview_status(a.kind, p)));
+    let (label, frac, struck) = match &live {
+        Some((label, frac, struck)) => (label.as_str(), *frac, *struck),
+        None => (PREVIEW_READY, 0.0, false),
+    };
+    let hot = if struck { PUNK_RED } else { HAZARD_YELLOW };
+    for (mut t, mut c) in &mut status {
+        if t.0 != label {
+            t.0.clear();
+            t.0.push_str(label);
+        }
+        let want = if live.is_some() { hot } else { ASH_DIM };
+        if c.0 != want {
+            c.0 = want;
+        }
+    }
+    for (mut n, mut bg) in &mut fill {
+        let want = Val::Percent(frac * 100.0);
+        if n.width != want {
+            n.width = want;
+        }
+        if bg.0 != hot {
+            bg.0 = hot;
         }
     }
 }
@@ -1276,6 +1496,57 @@ mod tests {
             p.nav_right = true;
         });
         assert_eq!(compendium_pad_action(&pad, Category::Armory), Some(CompAction::Back), "B wins");
+    }
+
+    #[test]
+    fn attack_preview_maps_space_and_pad_x_only_on_the_bestiary() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::Space);
+        assert_eq!(compendium_key_action(&keys, Category::Bestiary), Some(CompAction::PreviewAttack));
+        assert_eq!(compendium_key_action(&keys, Category::Armory), None, "no attack preview on weapon exhibits");
+        let mut pad = GamepadInput::default();
+        pad.interact = true;
+        assert_eq!(compendium_pad_action(&pad, Category::Bestiary), Some(CompAction::PreviewAttack));
+        assert_eq!(compendium_pad_action(&pad, Category::Armory), None);
+        let mut st = CompendiumState::default();
+        assert!(st.request_attack_preview());
+        assert_eq!(st.attack_preview, 1);
+        st.toggle_category();
+        assert!(!st.request_attack_preview());
+        assert_eq!(st.attack_preview, 1);
+    }
+
+    #[test]
+    fn preview_bar_reports_ready_then_each_stage_with_a_filling_rail() {
+        for kind in EnemyKind::ALL {
+            let (lead, len) = (crate::enemies::attack_preview_lead(kind), attack_preview_len(kind));
+            let (charge, f0, struck0) = preview_status(kind, lead * 0.5).unwrap();
+            let (strike, f1, struck1) = preview_status(kind, lead + 0.02).unwrap();
+            let (recover, f2, struck2) = preview_status(kind, len - 0.02).unwrap();
+            for label in [&charge, &strike, &recover] {
+                assert!(label.starts_with("PLAYING // ") && label.is_ascii() && label.len() <= 24, "{kind:?}: {label}");
+            }
+            assert!(charge != strike && strike != recover && recover.ends_with("RECOVER"), "{kind:?}: {charge} / {strike} / {recover}");
+            assert!(0.0 < f0 && f0 < f1 && f1 < f2 && f2 < 1.0, "{kind:?}: rail fills monotonically");
+            assert_eq!((struck0, struck1, struck2), (false, true, true), "{kind:?}: rail turns red at the strike");
+            assert_eq!(preview_status(kind, len + 0.1), None, "{kind:?}: back to READY");
+        }
+        assert!(preview_status(EnemyKind::RelaySniper, 0.1).unwrap().0.ends_with("LOCK-ON"));
+        assert!(preview_status(EnemyKind::PhaseStalker, 0.1).unwrap().0.ends_with("BLINK COIL"));
+    }
+
+    #[test]
+    fn exhibit_anim_idles_then_plays_the_attack_preview() {
+        for kind in EnemyKind::ALL {
+            let mut anim = ExhibitAnim { kind, body: None, pivots: [None; MAX_RIGS], preview: None, phase: 0.3 };
+            let idle = anim.input(1.0);
+            assert_eq!((idle.windup, idle.attack_anim, idle.sniper_lock, idle.boss_telegraph, idle.blink), (0.0, 0.0, 0.0, 0.0, 0.0));
+            anim.preview = Some(crate::enemies::attack_preview_lead(kind) * 0.5);
+            let charge = anim.input(1.0);
+            assert!(charge.windup + charge.sniper_lock + charge.boss_telegraph + charge.blink > 0.3, "{kind:?} charges");
+            anim.preview = Some(crate::enemies::attack_preview_lead(kind) + 0.02);
+            assert!(anim.input(1.0).attack_anim > 0.8, "{kind:?} releases");
+        }
     }
 
     #[test]

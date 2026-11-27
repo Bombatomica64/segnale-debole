@@ -287,6 +287,11 @@ pub struct Enemy {
     pub kill_cause: crate::fatality::KillCause,
     /// What last damaged this demon (Milestone 31 style freshness).
     pub style_source: crate::style::StyleSource,
+    /// Remaining ranged-attack wind-up telegraph (> 0 while coiling a shot;
+    /// Imp / Cacodemon / Jammer Fiend / Hell Baron / Phase Stalker).
+    pub attack_windup: f32,
+    /// Full length of the current wind-up (for [`Enemy::windup_progress`]).
+    pub attack_windup_total: f32,
 }
 
 impl Enemy {
@@ -328,7 +333,32 @@ impl Enemy {
             stride_phase: rng.random_range(0.0..TAU),
             kill_cause: crate::fatality::KillCause::Generic,
             style_source: crate::style::StyleSource::Other,
+            attack_windup: 0.0,
+            attack_windup_total: 0.0,
         }
+    }
+
+    /// Wind-up progress in `0..=1` (0 when no wind-up is running).
+    pub fn windup_progress(&self) -> f32 {
+        if !self.attack_windup.is_finite()
+            || !self.attack_windup_total.is_finite()
+            || self.attack_windup <= 0.0
+            || self.attack_windup_total <= 0.0
+        {
+            return 0.0;
+        }
+        (1.0 - self.attack_windup / self.attack_windup_total).clamp(0.0, 1.0)
+    }
+
+    /// Start the pre-fire wind-up telegraph of this demon kind.
+    pub fn start_windup(&mut self) {
+        self.attack_windup = attack_windup_secs(self.kind);
+        self.attack_windup_total = self.attack_windup;
+    }
+
+    /// Abort a running wind-up (stun, melee, lost sight).
+    pub fn cancel_windup(&mut self) {
+        self.attack_windup = 0.0;
     }
 
     /// Record a directional hit (`dir` = travel direction of the hit / push,
@@ -531,6 +561,32 @@ pub const ATTACK_ANIM_SECS: f32 = 0.32;
 /// Largest body pivot tilt any pose combination may produce (radians).
 pub const MAX_BODY_TILT: f32 = 0.6;
 
+/// Pre-fire wind-up telegraph length of a demon kind (seconds). The Relay
+/// Sniper's equivalent is its laser lock-on, the Carrier Daemon's its barrage
+/// telegraph (both driven by their own timers).
+pub fn attack_windup_secs(kind: EnemyKind) -> f32 {
+    match kind {
+        EnemyKind::Imp => 0.28,
+        EnemyKind::Cacodemon => 0.32,
+        EnemyKind::JammerFiend => 0.34,
+        EnemyKind::HellBaron => 0.42,
+        EnemyKind::PhaseStalker => 0.26,
+        EnemyKind::RelaySniper => SNIPER_LOCK_SECS,
+        EnemyKind::CarrierDaemon => crate::boss::BOSS_TELEGRAPH_SECS,
+    }
+}
+
+/// Kinds whose ranged shot goes through the generic [`Enemy::attack_windup`].
+pub fn uses_generic_windup(kind: EnemyKind) -> bool {
+    !matches!(kind, EnemyKind::RelaySniper | EnemyKind::CarrierDaemon)
+}
+
+/// Smoothstep over `0..1` (clamped, NaN-safe).
+pub fn smooth01(x: f32) -> f32 {
+    let x = if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 };
+    x * x * (3.0 - 2.0 * x)
+}
+
 /// How strongly a demon reacts to hits (1 = light; heavies stagger less).
 pub fn stagger_weight(kind: EnemyKind) -> f32 {
     match kind {
@@ -578,6 +634,15 @@ impl BodyPose {
 
     fn add(self, o: BodyPose) -> BodyPose {
         BodyPose { offset: self.offset + o.offset, pitch: self.pitch + o.pitch, roll: self.roll + o.roll }
+    }
+
+    fn scaled(self, k: f32) -> BodyPose {
+        BodyPose { offset: self.offset * k, pitch: self.pitch * k, roll: self.roll * k }
+    }
+
+    /// The stronger of two rear-back coils (by pitch).
+    fn max_coil(self, o: BodyPose) -> BodyPose {
+        if o.pitch > self.pitch { o } else { self }
     }
 
     /// Clamp to the bounded tilt / offset range.
@@ -645,6 +710,71 @@ pub fn stagger_pose(kind: EnemyKind, local_dir: Vec2, timer: f32) -> BodyPose {
     BodyPose { offset: Vec3::new(d.x, 0.0, d.y) * 0.05 * stagger_weight(kind) * e, pitch: a * d.y, roll: -a * d.x }
 }
 
+/// Pre-fire wind-up coil (`progress` 0..1): the torso rears back and the
+/// chest lifts, then [`attack_pose`] snaps it forward on release.
+pub fn windup_pose(kind: EnemyKind, progress: f32) -> BodyPose {
+    if progress <= 0.0 || !progress.is_finite() {
+        return BodyPose::default();
+    }
+    let w = smooth01(progress);
+    let k = 0.55 + 0.45 * stagger_weight(kind);
+    BodyPose { offset: Vec3::new(0.0, 0.035 * w, 0.06 * w * k), pitch: 0.16 * w * k, roll: 0.0 }
+}
+
+/// Stunned slump (EMP / Camera Flash / Phone Punch / shield shatter): the
+/// torso sags forward and down, unmistakably out of the fight.
+pub fn stun_pose(kind: EnemyKind, stunned: bool) -> BodyPose {
+    if !stunned {
+        return BodyPose::default();
+    }
+    let heavy = if kind == EnemyKind::CarrierDaemon { 1.25 } else { 1.0 };
+    BodyPose { offset: Vec3::new(0.0, -0.07 * heavy, -0.03), pitch: -0.24 * heavy, roll: 0.0 }
+}
+
+/// Wind-up carry-over into a ranged release (`attack_anim` 1 -> 0): holds the
+/// coiled pose for the first instants of the shot so nothing pops upright.
+fn release_carry(attack_anim: f32, lunge: bool) -> f32 {
+    if lunge || !attack_anim.is_finite() || attack_anim <= 0.0 {
+        return 0.0;
+    }
+    let c = (1.0 - (1.0 - attack_anim.min(1.0)) / 0.14).max(0.0);
+    c * c
+}
+
+/// Body tell of the two signature charges that bypass the generic wind-up
+/// (weights `0..1`): the Relay Sniper leans in behind its cannon through the
+/// lock-on, the Carrier Daemon rears up and back into its barrage roar.
+pub fn charge_pose(kind: EnemyKind, sniper_lock: f32, boss_telegraph: f32) -> BodyPose {
+    let f = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+    match kind {
+        EnemyKind::RelaySniper => BodyPose { offset: Vec3::ZERO, pitch: -0.05 * smooth01(f(sniper_lock) * 4.0), roll: 0.0 },
+        EnemyKind::CarrierDaemon => {
+            let w = smooth01(f(boss_telegraph) * 2.5);
+            BodyPose { offset: Vec3::new(0.0, 0.0, 0.05 * w), pitch: 0.1 * w, roll: 0.0 }
+        }
+        _ => BodyPose::default(),
+    }
+}
+
+/// Standing idle life (`t` seconds, per-demon `phase`): chest-heave breathing
+/// in step with the arm idle of [`limb_pose`] plus a slow weight shift from
+/// hoof to hoof. Machines (Relay Sniper) only hum faintly; flyers bob in
+/// [`hover_pose`] instead.
+pub fn idle_breath_pose(kind: EnemyKind, t: f32, phase: f32) -> BodyPose {
+    if kind.flying() || !t.is_finite() || !phase.is_finite() {
+        return BodyPose::default();
+    }
+    let k = match kind {
+        EnemyKind::RelaySniper => 0.25,
+        EnemyKind::JammerFiend => 0.7,
+        EnemyKind::CarrierDaemon => 0.55,
+        _ => 1.0,
+    };
+    let breathe = (t * 1.6 + phase).sin();
+    let shift = (t * 0.55 + phase * 0.7).sin();
+    BodyPose { offset: Vec3::new(0.012 * shift * k, 0.014 * breathe * k, 0.0), pitch: 0.016 * breathe * k, roll: 0.02 * shift * k }
+}
+
 /// Full body pivot pose of a demon facing `root_rot`, before the stun
 /// tremor / blink jitter overlays.
 pub fn body_pose(e: &Enemy, root_rot: Quat) -> BodyPose {
@@ -653,8 +783,27 @@ pub fn body_pose(e: &Enemy, root_rot: Quat) -> BodyPose {
     let local_vel = Vec2::new(lv.x, lv.z);
     let base = if e.kind.flying() { hover_pose(local_vel, e.move_speed(), e.phase) } else { stride_pose(local_vel, e.move_speed(), e.stride_phase) };
     let ld = inv * Vec3::new(e.stagger_dir.x, 0.0, e.stagger_dir.y);
+    // The coil carries into the first instants of the release (no upright pop).
+    let carry = if uses_generic_windup(e.kind) { release_carry(e.attack_anim, e.attack_lunge) } else { 0.0 };
     base.add(attack_pose(e.kind, e.attack_anim, e.attack_lunge))
+        .add(windup_pose(e.kind, e.windup_progress()).max_coil(windup_pose(e.kind, 1.0).scaled(carry)))
+        .add(stun_pose(e.kind, e.stun_timer > 0.0 && e.is_alive()))
         .add(stagger_pose(e.kind, Vec2::new(ld.x, ld.z), e.stagger_timer))
+        .bounded()
+}
+
+/// Body pivot pose of a Bestiary exhibit: [`idle_breath_pose`] (or the hover
+/// bob) plus the SAME wind-up coil, signature charge, release and stun slump
+/// as a live demon, from the pure animation input.
+pub fn exhibit_body_pose(kind: EnemyKind, a: &EnemyAnimInput) -> BodyPose {
+    let f = |v: f32| if v.is_finite() { v } else { 0.0 };
+    let (t, ph) = (f(a.time), f(a.phase));
+    let base = if kind.flying() { hover_pose(Vec2::ZERO, 1.0, ph + t) } else { idle_breath_pose(kind, t, ph) };
+    let carry = if uses_generic_windup(kind) && a.blink <= 0.0 { release_carry(a.attack_anim, a.attack_lunge) } else { 0.0 };
+    base.add(attack_pose(kind, a.attack_anim, a.attack_lunge))
+        .add(windup_pose(kind, a.windup).max_coil(windup_pose(kind, 1.0).scaled(carry)))
+        .add(charge_pose(kind, a.sniper_lock, a.boss_telegraph))
+        .add(stun_pose(kind, a.stunned))
         .bounded()
 }
 
@@ -685,11 +834,38 @@ pub struct EnemyBody;
 
 /// The demon's tintable baked parts (their `MeshMaterial3d` handles are
 /// swapped between the shared per-kind state materials) and its aura light.
-#[derive(Component)]
+/// Every `PartRole::Body` entity is tracked (torso AND each articulated limb /
+/// jaw / tendril rig) so hit-flash, enrage, Ping and stun tint the whole demon.
+#[derive(Component, Debug, Clone, Copy)]
 pub struct EnemyLook {
-    pub body_part: Entity,
+    /// Tintable body parts (stack array, no heap; `None` = unused slot).
+    pub body_parts: [Option<Entity>; MAX_BODY_PARTS],
     pub eye_part: Entity,
     pub aura: Entity,
+}
+
+/// Body-part slots per demon (torso + up to 7 articulated rigs).
+pub const MAX_BODY_PARTS: usize = 8;
+
+impl EnemyLook {
+    pub fn new(eye_part: Entity, aura: Entity) -> Self {
+        EnemyLook { body_parts: [None; MAX_BODY_PARTS], eye_part, aura }
+    }
+
+    /// Register a tintable body entity (ignored once every slot is full).
+    pub fn push_body(&mut self, e: Entity) -> bool {
+        match self.body_parts.iter_mut().find(|s| s.is_none()) {
+            Some(slot) => {
+                *slot = Some(e);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn bodies(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.body_parts.iter().flatten().copied()
+    }
 }
 
 #[derive(Component)]
@@ -906,6 +1082,37 @@ pub enum RigKind {
     BossHalo,
     BossCannon,
     PylonRing,
+    /// Shoulder-pivoted arm (demon's own left = -X).
+    ArmLeft,
+    ArmRight,
+    /// Hip-pivoted leg.
+    LegLeft,
+    LegRight,
+    /// Cacodemon lower jaw lip + lower fangs on the jaw hinge.
+    CacoJaw,
+    /// Cacodemon underside tendril clusters (undulate out of phase).
+    CacoTendrilsLeft,
+    CacoTendrilsRight,
+    /// Relay Sniper shoulder-mounted twin-rail cannon.
+    SniperCannon,
+}
+
+impl RigKind {
+    /// +1 for right-side / unsided rigs, -1 for the demon's left (mirrored) side.
+    pub fn side(self) -> f32 {
+        match self {
+            RigKind::ArmLeft | RigKind::LegLeft | RigKind::CacoTendrilsLeft => -1.0,
+            _ => 1.0,
+        }
+    }
+
+    pub fn is_arm(self) -> bool {
+        matches!(self, RigKind::ArmLeft | RigKind::ArmRight)
+    }
+
+    pub fn is_leg(self) -> bool {
+        matches!(self, RigKind::LegLeft | RigKind::LegRight)
+    }
 }
 
 /// An animated sub-pivot (child of a demon's [`EnemyBody`], or of a pylon).
@@ -928,8 +1135,11 @@ pub struct SniperDishPivot;
 /// A demon's articulated pivots (for the per-frame animation).
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct EnemyRig {
-    pub pivots: [Option<Entity>; 2],
+    pub pivots: [Option<Entity>; MAX_RIGS],
 }
+
+/// Articulated pivots per demon (Carrier Daemon: cannon + halo + 4 limbs).
+pub const MAX_RIGS: usize = 8;
 
 /// Pre-baked articulated sub-model. The pivot entity carries the first baked
 /// part itself (saves an entity); any further materials are its children.
@@ -940,24 +1150,44 @@ pub struct RigModel {
     pub parts: Vec<EnemyPart>,
 }
 
-/// Spawn a pre-baked rig under `parent` (no asset allocation).
-pub fn spawn_rig(commands: &mut Commands, parent: Entity, rig: &RigModel) -> Entity {
+/// Spawn a pre-baked rig under `parent` (no asset allocation). Returns the
+/// pivot and, if the rig carries `PartRole::Body` geometry, the entity holding
+/// it (for [`EnemyLook::push_body`]).
+pub fn spawn_rig(commands: &mut Commands, parent: Entity, rig: &RigModel) -> (Entity, Option<Entity>) {
     let mut ec = commands.spawn((ChildOf(parent), RigPivot { kind: rig.kind, rest: rig.rest, angle: 0.0 }, rig.rest, Visibility::default()));
     match rig.kind {
-        RigKind::FiendEmitter => ec.insert(FiendEmitterPivot),
-        RigKind::SniperDish => ec.insert(SniperDishPivot),
-        RigKind::BossHalo => ec.insert(crate::boss::BossHaloPivot),
-        RigKind::BossCannon => ec.insert(crate::boss::BossCannonPivot),
-        RigKind::PylonRing => ec.insert(crate::boss::PylonRingPivot),
-    };
+        RigKind::FiendEmitter => {
+            ec.insert(FiendEmitterPivot);
+        }
+        RigKind::SniperDish => {
+            ec.insert(SniperDishPivot);
+        }
+        RigKind::BossHalo => {
+            ec.insert(crate::boss::BossHaloPivot);
+        }
+        RigKind::BossCannon => {
+            ec.insert(crate::boss::BossCannonPivot);
+        }
+        RigKind::PylonRing => {
+            ec.insert(crate::boss::PylonRingPivot);
+        }
+        _ => {}
+    }
+    let mut body = None;
     if let Some(first) = rig.parts.first() {
         ec.insert((Mesh3d(first.mesh.clone()), MeshMaterial3d(first.material.clone())));
     }
     let id = ec.id();
-    for part in rig.parts.iter().skip(1) {
-        commands.spawn((ChildOf(id), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY));
+    if rig.parts.first().is_some_and(|p| p.role == PartRole::Body) {
+        body = Some(id);
     }
-    id
+    for part in rig.parts.iter().skip(1) {
+        let c = commands.spawn((ChildOf(id), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY)).id();
+        if part.role == PartRole::Body && body.is_none() {
+            body = Some(c);
+        }
+    }
+    (id, body)
 }
 
 type Mat = Handle<StandardMaterial>;
@@ -1029,15 +1259,32 @@ fn bbox(x: f32, y: f32, z: f32, bevel: f32) -> Mesh {
 struct Sculptor {
     batches: MaterialBatches,
     parts: usize,
+    /// Joint pivot (model space) subtracted from every placed part, so rigs
+    /// are baked in joint-local coordinates.
+    origin: Vec3,
+    /// Mirror every placed part across YZ (left-side limbs reuse the right
+    /// side's sculpt code; the batcher flips winding).
+    mirror: bool,
 }
 
 impl Sculptor {
-    fn tf(&mut self, mesh: &Mesh, mat: &Mat, tf: Transform, sym: bool) {
-        self.batches.add(mesh, mat, tf);
+    /// Rig sculptor in joint-local space around model-space `pivot`
+    /// (`mirror`: sculpt code is written for the right side, placed on the left).
+    fn rig(pivot: Vec3, mirror: bool) -> Self {
+        Sculptor { origin: pivot, mirror, ..default() }
+    }
+
+    fn push(&mut self, mesh: &Mesh, mat: &Mat, tf: Transform) {
+        let mut t = if self.mirror { mirror_x(tf) } else { tf };
+        t.translation -= self.origin;
+        self.batches.add(mesh, mat, t);
         self.parts += 1;
+    }
+
+    fn tf(&mut self, mesh: &Mesh, mat: &Mat, tf: Transform, sym: bool) {
+        self.push(mesh, mat, tf);
         if sym {
-            self.batches.add(mesh, mat, mirror_x(tf));
-            self.parts += 1;
+            self.push(mesh, mat, mirror_x(tf));
         }
     }
 
@@ -1338,10 +1585,10 @@ fn sculpt_model(kind: EnemyKind, a: &EnemyAssets, body: &Mat, eye_m: &Mat) -> (S
     let id = Quat::IDENTITY;
     let y = Vec3::Y;
     match kind {
-        EnemyKind::Imp => sculpt_imp(&mut s, a, body, eye_m),
-        EnemyKind::Cacodemon => sculpt_cacodemon(&mut s, a, body, eye_m),
+        EnemyKind::Imp => sculpt_imp(&mut s, &mut rigs, a, body, eye_m),
+        EnemyKind::Cacodemon => sculpt_cacodemon(&mut s, &mut rigs, a, body, eye_m),
         EnemyKind::JammerFiend => {
-            sculpt_fiend(&mut s, a, body, eye_m);
+            sculpt_fiend(&mut s, &mut rigs, a, body, eye_m);
             // Rotating transceiver ring + glowing broadcast antenna (one entity, one material).
             let g = &a.fiend_green;
             let mut r = Sculptor::default();
@@ -1351,10 +1598,10 @@ fn sculpt_model(kind: EnemyKind, a: &EnemyAssets, body: &Mat, eye_m: &Mat) -> (S
             r.at(&gem(0.075), g, v3(0.0, 0.66, 0.0), id, MID);
             rigs.push((RigKind::FiendEmitter, Transform::from_xyz(0.0, 1.99, 0.44), r));
         }
-        EnemyKind::HellBaron => sculpt_baron(&mut s, a, body, eye_m),
-        EnemyKind::PhaseStalker => sculpt_stalker(&mut s, a, body, eye_m),
+        EnemyKind::HellBaron => sculpt_baron(&mut s, &mut rigs, a, body, eye_m),
+        EnemyKind::PhaseStalker => sculpt_stalker(&mut s, &mut rigs, a, body, eye_m),
         EnemyKind::RelaySniper => {
-            sculpt_sniper(&mut s, a, body);
+            sculpt_sniper(&mut s, &mut rigs, a, body);
             // Parabolic relay targeting dish (opens toward -Z) on a scanning neck pivot.
             // Bright brushed-titanium shell + rim, near-black armored concave liner,
             // ONE large deep-crimson targeting optic dead centre.
@@ -1373,7 +1620,7 @@ fn sculpt_model(kind: EnemyKind, a: &EnemyAssets, body: &Mat, eye_m: &Mat) -> (S
             rigs.push((RigKind::SniperDish, Transform::from_xyz(0.0, 2.2, 0.0), r));
         }
         EnemyKind::CarrierDaemon => {
-            sculpt_carrier(&mut s, a, body, eye_m);
+            sculpt_carrier(&mut s, &mut rigs, a, body, eye_m);
             let (gold, core, dk) = (&a.baron_gold, &a.carrier_core, &a.dark);
             // Twin shoulder plasma cannons on one breathing / recoiling pivot.
             let mut c = Sculptor::default();
@@ -1407,9 +1654,23 @@ fn sculpt_model(kind: EnemyKind, a: &EnemyAssets, body: &Mat, eye_m: &Mat) -> (S
     (s, rigs)
 }
 
+/// Bake a mirrored left / right limb pair pivoted at `pivot` (the RIGHT joint,
+/// model space). `build` sculpts the right limb in model space with `MID`
+/// parts only; the left rig re-runs it mirrored, so the rest pose reproduces
+/// the original symmetric silhouette exactly.
+fn limb_pair(rigs: &mut Vec<RigBuild>, left: RigKind, right: RigKind, pivot: Vec3, build: impl Fn(&mut Sculptor)) {
+    let mut r = Sculptor::rig(pivot, false);
+    build(&mut r);
+    rigs.push((right, Transform::from_translation(pivot), r));
+    let lp = pivot * v3(-1.0, 1.0, 1.0);
+    let mut l = Sculptor::rig(lp, true);
+    build(&mut l);
+    rigs.push((left, Transform::from_translation(lp), l));
+}
+
 /// Hunched, sinewy predatory Mars demon (height ~1.9): torso pitched forward,
 /// snarling snout thrust out, clawed arms held out and forward.
-fn sculpt_imp(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+fn sculpt_imp(s: &mut Sculptor, rigs: &mut Vec<RigBuild>, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     let (dark, horn, bone, maw) = (&a.imp_dark, &a.horn, &a.bone, &a.dark);
     let id = Quat::IDENTITY;
     let hunch = rx(-0.45);
@@ -1430,33 +1691,38 @@ fn sculpt_imp(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     }
     // Sloped predatory shoulders + arms held out and forward, spread bone talons.
     s.at(&sculpt::wedge_plate(0.2, 0.14, 0.24, 0.6, 0.8, 0.0), body, v3(0.26, 1.44, -0.2), rz(-0.4) * hunch, SYM);
-    s.at(&blob(v3(0.1, 0.1, 0.11)), body, v3(0.31, 1.39, -0.2), id, SYM);
-    let (sh, el, wr) = (v3(0.31, 1.38, -0.2), v3(0.47, 1.2, -0.34), v3(0.52, 1.12, -0.6));
-    s.limb(body, sh, el, (0.078, 0.062), 10, SYM);
-    s.at(&blob(Vec3::splat(0.058)), dark, el, id, SYM);
-    s.horn(bone, el, v3(0.3, 0.1, 1.0), Vec3::Y, (0.026, 0.005), 0.14, 0.03, SYM);
-    s.limb(dark, el, wr, (0.062, 0.05), 8, SYM);
-    s.at(&bbox(0.12, 0.07, 0.12, 0.02), dark, wr + v3(0.0, -0.01, -0.04), rx(-0.2), SYM);
+    // Clawed arms (shoulder rigs).
     let talon = sculpt::curved_horn(0.022, 0.004, 0.22, 0.0, -0.09, 8, 6);
-    for c in [-0.05f32, -0.017, 0.017, 0.05] {
-        s.at(&talon, bone, wr + v3(c, -0.02, -0.09), orient(v3(c * 5.0, -0.12, -1.0), Vec3::NEG_Y), SYM);
-    }
-    // Bent digitigrade legs: thick umber thighs, bone kneecaps, charred shins + hooves, bone toe talons.
-    let (hip, knee, hock, foot) = (v3(0.15, 0.88, 0.05), v3(0.21, 0.56, -0.2), v3(0.21, 0.26, 0.12), v3(0.21, 0.07, -0.04));
-    s.limb(body, hip, knee, (0.115, 0.08), 10, SYM);
-    s.at(&blob(v3(0.12, 0.18, 0.13)), body, hip.lerp(knee, 0.42), along(knee - hip), SYM);
-    s.at(&blob(Vec3::splat(0.07)), bone, knee + v3(0.0, 0.0, -0.03), id, SYM);
-    s.limb(horn, knee, hock, (0.065, 0.05), 8, SYM);
-    s.limb(horn, hock, foot, (0.05, 0.044), 8, SYM);
-    s.at(&blob(Vec3::splat(0.05)), horn, hock, id, SYM);
+    limb_pair(rigs, RigKind::ArmLeft, RigKind::ArmRight, v3(0.31, 1.38, -0.2), |r| {
+        r.at(&blob(v3(0.1, 0.1, 0.11)), body, v3(0.31, 1.39, -0.2), id, MID);
+        let (sh, el, wr) = (v3(0.31, 1.38, -0.2), v3(0.47, 1.2, -0.34), v3(0.52, 1.12, -0.6));
+        r.limb(body, sh, el, (0.078, 0.062), 10, MID);
+        r.at(&blob(Vec3::splat(0.058)), dark, el, id, MID);
+        r.horn(bone, el, v3(0.3, 0.1, 1.0), Vec3::Y, (0.026, 0.005), 0.14, 0.03, MID);
+        r.limb(dark, el, wr, (0.062, 0.05), 8, MID);
+        r.at(&bbox(0.12, 0.07, 0.12, 0.02), dark, wr + v3(0.0, -0.01, -0.04), rx(-0.2), MID);
+        for c in [-0.05f32, -0.017, 0.017, 0.05] {
+            r.at(&talon, bone, wr + v3(c, -0.02, -0.09), orient(v3(c * 5.0, -0.12, -1.0), Vec3::NEG_Y), MID);
+        }
+    });
+    // Bent digitigrade legs (hip rigs): thick umber thighs, bone kneecaps, charred shins + hooves, bone toe talons.
     let hoof = sculpt::wedge_plate(0.07, 0.08, 0.16, 0.7, 0.75, -0.02);
-    for dx in [-0.038f32, 0.038] {
-        s.at(&hoof, horn, v3(0.21 + dx, 0.04, -0.08), id, SYM);
-    }
     let toe = sculpt::curved_horn(0.018, 0.003, 0.11, 0.0, -0.04, 6, 6);
-    for dx in [-0.045f32, 0.0, 0.045] {
-        s.at(&toe, bone, v3(0.21 + dx, 0.035, -0.15), orient(v3(dx * 3.0, -0.05, -1.0), Vec3::NEG_Y), SYM);
-    }
+    limb_pair(rigs, RigKind::LegLeft, RigKind::LegRight, v3(0.15, 0.88, 0.05), |r| {
+        let (hip, knee, hock, foot) = (v3(0.15, 0.88, 0.05), v3(0.21, 0.56, -0.2), v3(0.21, 0.26, 0.12), v3(0.21, 0.07, -0.04));
+        r.limb(body, hip, knee, (0.115, 0.08), 10, MID);
+        r.at(&blob(v3(0.12, 0.18, 0.13)), body, hip.lerp(knee, 0.42), along(knee - hip), MID);
+        r.at(&blob(Vec3::splat(0.07)), bone, knee + v3(0.0, 0.0, -0.03), id, MID);
+        r.limb(horn, knee, hock, (0.065, 0.05), 8, MID);
+        r.limb(horn, hock, foot, (0.05, 0.044), 8, MID);
+        r.at(&blob(Vec3::splat(0.05)), horn, hock, id, MID);
+        for dx in [-0.038f32, 0.038] {
+            r.at(&hoof, horn, v3(0.21 + dx, 0.04, -0.08), id, MID);
+        }
+        for dx in [-0.045f32, 0.0, 0.045] {
+            r.at(&toe, bone, v3(0.21 + dx, 0.035, -0.15), orient(v3(dx * 3.0, -0.05, -1.0), Vec3::NEG_Y), MID);
+        }
+    });
     // Snarling head thrust forward: dark brow, snout, open fanged jaw, ember eyes.
     s.limb(body, v3(0.0, 1.46, -0.14), v3(0.0, 1.55, -0.2), (0.08, 0.07), 10, MID);
     s.at(&sculpt::ridged_sphere(v3(0.14, 0.13, 0.16), 8, 10, 0.04, 5.0, true), body, v3(0.0, 1.6, -0.22), id, MID);
@@ -1472,7 +1738,7 @@ fn sculpt_imp(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
 }
 
 /// Fierce ridged floating carapace with a cyclops eye and a fanged maw (radius ~0.9).
-fn sculpt_cacodemon(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+fn sculpt_cacodemon(s: &mut Sculptor, rigs: &mut Vec<RigBuild>, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     let (maw, iris, horn, bone) = (&a.caco_maw, &a.caco_iris, &a.horn, &a.bone);
     let id = Quat::IDENTITY;
     s.at(&sculpt::ridged_sphere(v3(0.92, 0.86, 0.90), 12, 18, 0.085, 7.0, true), body, Vec3::ZERO, id, MID);
@@ -1488,19 +1754,22 @@ fn sculpt_cacodemon(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) 
     // Cavernous maw: dark glowing crimson throat, beveled gum ridges, huge interlocking curved fangs.
     s.at(&blob(v3(0.54, 0.22, 0.3)), maw, v3(0.0, -0.38, -0.64), id, MID);
     s.at(&sculpt::angled_shield(0.92, 0.07, 0.12, 0.12), body, v3(0.0, -0.24, -0.78), id, MID);
-    s.at(&sculpt::angled_shield(0.86, 0.07, 0.12, 0.12), body, v3(0.0, -0.53, -0.72), id, MID);
     let (fang_big, fang_small) = (sculpt::curved_horn(0.08, 0.006, 0.38, 0.0, -0.07, 8, 7), sculpt::curved_horn(0.055, 0.005, 0.24, 0.0, -0.045, 8, 7));
     for k in 0..5 {
         let x = -0.32 + k as f32 * 0.16;
         let z = -0.84 - 0.12 * (1.0 - x.abs() / 0.46) + 0.03;
         s.at(if k % 2 == 0 { &fang_big } else { &fang_small }, bone, v3(x, -0.25, z), orient(v3(x * 0.25, -1.0, 0.08), Vec3::Z), MID);
     }
+    // Hinged lower jaw: gum ridge + lower fangs swing open around the jaw hinge.
+    let mut jaw = Sculptor::rig(CACO_JAW_HINGE, false);
+    jaw.at(&sculpt::angled_shield(0.86, 0.07, 0.12, 0.12), body, v3(0.0, -0.53, -0.72), id, MID);
     let lower_big = sculpt::curved_horn(0.07, 0.006, 0.3, 0.0, -0.06, 8, 7);
     for k in 0..4 {
         let x = -0.24 + k as f32 * 0.16;
         let z = -0.78 - 0.12 * (1.0 - x.abs() / 0.43) + 0.03;
-        s.at(if k % 3 == 0 { &fang_small } else { &lower_big }, bone, v3(x, -0.52, z), orient(v3(x * 0.25, 1.0, -0.05), Vec3::Z), MID);
+        jaw.at(if k % 3 == 0 { &fang_small } else { &lower_big }, bone, v3(x, -0.52, z), orient(v3(x * 0.25, 1.0, -0.05), Vec3::Z), MID);
     }
+    rigs.push((RigKind::CacoJaw, Transform::from_translation(CACO_JAW_HINGE), jaw));
     // Sweeping crown of curved charred horns with bone tips: primary, dorsal, cheek, jowl + crest.
     s.sweep(horn, bone, v3(0.42, 0.64, -0.08), (0.13, 0.012), [v3(0.22, 0.2, 0.05), v3(0.52, 0.5, 0.02), v3(0.46, 0.82, -0.36)], 0.62, SYM);
     s.sweep(horn, bone, v3(0.3, 0.7, 0.32), (0.085, 0.01), [v3(0.1, 0.18, 0.1), v3(0.26, 0.38, 0.3), v3(0.2, 0.48, 0.56)], 0.6, SYM);
@@ -1510,16 +1779,23 @@ fn sculpt_cacodemon(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) 
         let kf = k as f32;
         s.horn(horn, v3(0.0, 0.84 - kf * 0.12, 0.12 + kf * 0.22), v3(0.0, 0.7, 0.7), Vec3::Y, (0.07, 0.01), 0.32 - kf * 0.04, 0.1, MID);
     }
-    // Tapered fleshy underside tendrils.
-    for k in 0..5 {
-        let ang = -0.9 + k as f32 * 0.45;
-        let (sx, cz) = (ang.sin(), ang.cos());
-        s.horn(body, v3(sx * 0.38, -0.7, cz * 0.25 + 0.05), v3(sx * 0.3, -1.0, cz * 0.25 + 0.15), Vec3::Z, (0.065, 0.008), 0.45, 0.16, MID);
+    // Tapered fleshy underside tendrils in two clusters that undulate out of phase.
+    for (kind, pivot, ks) in [(RigKind::CacoTendrilsLeft, v3(-0.23, -0.7, 0.24), 0..2), (RigKind::CacoTendrilsRight, v3(0.15, -0.7, 0.26), 2..5)] {
+        let mut t = Sculptor::rig(pivot, false);
+        for k in ks {
+            let ang = -0.9 + k as f32 * 0.45;
+            let (sx, cz) = (ang.sin(), ang.cos());
+            t.horn(body, v3(sx * 0.38, -0.7, cz * 0.25 + 0.05), v3(sx * 0.3, -1.0, cz * 0.25 + 0.15), Vec3::Z, (0.065, 0.008), 0.45, 0.16, MID);
+        }
+        rigs.push((kind, Transform::from_translation(pivot), t));
     }
 }
 
+/// Cacodemon jaw hinge (model space, hover-centered).
+pub const CACO_JAW_HINGE: Vec3 = Vec3::new(0.0, -0.42, -0.45);
+
 /// Heavy cyber-armored industrial demon with a router backpack (height ~2.4).
-fn sculpt_fiend(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+fn sculpt_fiend(s: &mut Sculptor, rigs: &mut Vec<RigBuild>, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     let (mp, g, hz, horn) = (&a.metal_plate, &a.fiend_green, &a.hazard, &a.horn);
     let id = Quat::IDENTITY;
     // Hips, hazard waist band, beveled torso.
@@ -1539,22 +1815,27 @@ fn sculpt_fiend(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     s.at(&sculpt::wedge_plate(0.42, 0.26, 0.52, 0.55, 0.75, 0.0), mp, v3(0.6, 1.95, 0.0), rz(-0.42), SYM);
     s.at(&sculpt::wedge_plate(0.46, 0.05, 0.56, 0.92, 0.95, 0.0), hz, v3(0.57, 1.8, 0.0), rz(-0.42), SYM);
     s.at(&bbox(0.18, 0.05, 0.04, 0.01), g, v3(0.6, 1.9, -0.27), rz(-0.42), SYM);
-    // Hydraulic armored arms with glowing energy knuckles.
-    let (sh, el, wr) = (v3(0.62, 1.78, 0.0), v3(0.7, 1.36, -0.04), v3(0.72, 1.0, -0.16));
-    s.limb(body, sh, el, (0.13, 0.11), 8, SYM);
-    s.limb(mp, v3(0.76, 1.72, 0.1), v3(0.78, 1.4, 0.06), (0.035, 0.03), 6, SYM);
-    s.at(&sculpt::armored_ring(0.11, 0.03, 0.05, 10, true), mp, el, along(sh - el), SYM);
-    s.at(&bbox(0.24, 0.4, 0.26, 0.05), mp, (el + wr) * 0.5, along(el - wr), SYM);
-    s.at(&bbox(0.26, 0.2, 0.26, 0.05), body, v3(0.72, 0.88, -0.2), rx(0.25), SYM);
-    s.at(&bbox(0.22, 0.05, 0.06, 0.012), g, v3(0.72, 0.9, -0.33), rx(0.25), SYM);
-    // Hydraulic piston legs + beveled stomper boots (hazard toe caps) at y = 0.
-    let (hip, knee, ank) = (v3(0.27, 0.96, 0.0), v3(0.29, 0.56, -0.07), v3(0.29, 0.16, 0.02));
-    s.limb(body, hip, knee, (0.17, 0.14), 8, SYM);
-    s.at(&sculpt::wedge_plate(0.24, 0.26, 0.12, 0.7, 0.8, -0.03), mp, knee + v3(0.0, 0.02, -0.13), id, SYM);
-    s.limb(mp, knee, ank, (0.12, 0.1), 8, SYM);
-    s.limb(g, v3(0.29, 0.5, 0.1), v3(0.29, 0.2, 0.1), (0.025, 0.025), 6, SYM);
-    s.at(&bbox(0.34, 0.16, 0.46, 0.04), body, v3(0.29, 0.08, -0.06), id, SYM);
-    s.at(&bbox(0.35, 0.07, 0.1, 0.015), hz, v3(0.29, 0.1, -0.27), id, SYM);
+    // Hydraulic armored arms with glowing energy knuckles (shoulder rigs).
+    limb_pair(rigs, RigKind::ArmLeft, RigKind::ArmRight, v3(0.62, 1.78, 0.0), |r| {
+        let (sh, el, wr) = (v3(0.62, 1.78, 0.0), v3(0.7, 1.36, -0.04), v3(0.72, 1.0, -0.16));
+        r.limb(body, sh, el, (0.13, 0.11), 8, MID);
+        r.limb(mp, v3(0.76, 1.72, 0.1), v3(0.78, 1.4, 0.06), (0.035, 0.03), 6, MID);
+        r.at(&sculpt::armored_ring(0.11, 0.03, 0.05, 10, true), mp, el, along(sh - el), MID);
+        r.at(&bbox(0.24, 0.4, 0.26, 0.05), mp, (el + wr) * 0.5, along(el - wr), MID);
+        r.at(&bbox(0.26, 0.2, 0.26, 0.05), body, v3(0.72, 0.88, -0.2), rx(0.25), MID);
+        r.at(&bbox(0.22, 0.05, 0.06, 0.012), g, v3(0.72, 0.9, -0.33), rx(0.25), MID);
+    });
+    // Hydraulic piston legs + beveled stomper boots (hazard toe caps) at y = 0 (hip rigs;
+    // the rear shin piston is gunmetal so each leg stays at 3 baked materials).
+    limb_pair(rigs, RigKind::LegLeft, RigKind::LegRight, v3(0.27, 0.96, 0.0), |r| {
+        let (hip, knee, ank) = (v3(0.27, 0.96, 0.0), v3(0.29, 0.56, -0.07), v3(0.29, 0.16, 0.02));
+        r.limb(body, hip, knee, (0.17, 0.14), 8, MID);
+        r.at(&sculpt::wedge_plate(0.24, 0.26, 0.12, 0.7, 0.8, -0.03), mp, knee + v3(0.0, 0.02, -0.13), id, MID);
+        r.limb(mp, knee, ank, (0.12, 0.1), 8, MID);
+        r.limb(mp, v3(0.29, 0.5, 0.1), v3(0.29, 0.2, 0.1), (0.025, 0.025), 6, MID);
+        r.at(&bbox(0.34, 0.16, 0.46, 0.04), body, v3(0.29, 0.08, -0.06), id, MID);
+        r.at(&bbox(0.35, 0.07, 0.1, 0.015), hz, v3(0.29, 0.1, -0.27), id, MID);
+    });
     // Horned cyber-skull: DARK face plate + jaw grille so the twin green optics pop.
     s.limb(body, v3(0.0, 1.82, -0.02), v3(0.0, 1.95, -0.05), (0.1, 0.09), 8, MID);
     s.at(&bbox(0.36, 0.3, 0.36, 0.06), body, v3(0.0, 2.08, -0.05), id, MID);
@@ -1583,7 +1864,7 @@ fn sculpt_fiend(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
 }
 
 /// Towering muscular bruiser in engraved molten-gold armor (height ~3.3).
-fn sculpt_baron(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+fn sculpt_baron(s: &mut Sculptor, rigs: &mut Vec<RigBuild>, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     let (gold, horn, bone, fire) = (&a.baron_gold, &a.horn, &a.bone, &a.baron_hellfire);
     let id = Quat::IDENTITY;
     // Charred waist, engraved belt with demonic buckle + hellfire gem.
@@ -1608,32 +1889,37 @@ fn sculpt_baron(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     for (dz, up, len) in [(-0.2f32, v3(0.3, 1.0, -0.25), 0.42f32), (0.0, v3(0.55, 0.9, 0.0), 0.55), (0.2, v3(0.3, 1.0, 0.25), 0.42)] {
         s.blade(gold, v3(0.9, 2.72, dz), up, Vec3::X, len, 0.14, 0.05, 0.12, SYM);
     }
-    // Muscular arms, gold wrist bracers, blazing molten-ember gauntlets with splayed claws.
-    let (sh, el, wr) = (v3(0.94, 2.32, 0.0), v3(1.02, 1.8, -0.02), v3(1.05, 1.38, -0.2));
-    s.at(&blob(v3(0.24, 0.22, 0.25)), body, v3(0.92, 2.36, 0.0), id, SYM);
-    s.limb(body, sh, el, (0.2, 0.16), 10, SYM);
-    s.at(&blob(v3(0.16, 0.22, 0.16)), body, v3(0.99, 2.05, -0.07), rz(0.1), SYM);
-    s.limb(body, el, wr, (0.16, 0.13), 10, SYM);
-    s.at(&sculpt::armored_ring(0.15, 0.04, 0.09, 10, true), gold, wr.lerp(el, 0.18), along(el - wr), SYM);
-    s.at(&bbox(0.3, 0.26, 0.3, 0.06), fire, v3(1.05, 1.22, -0.25), rx(0.25), SYM);
+    // Muscular arms, gold wrist bracers, blazing molten-ember gauntlets with splayed
+    // hellfire claws (shoulder rigs, 3 baked materials each).
     let claw = sculpt::curved_horn(0.03, 0.006, 0.2, 0.0, -0.07, 8, 6);
-    for c in [-0.09f32, -0.03, 0.03, 0.09] {
-        s.at(&claw, horn, v3(1.05 + c, 1.12, -0.36), orient(v3(c * 2.0, -0.6, -1.0), v3(0.0, -1.0, 0.3)), SYM);
-    }
-    for (dx, dz) in [(-0.1f32, 0.05f32), (0.1, -0.05), (0.0, 0.1)] {
-        s.blade(fire, v3(1.05 + dx, 1.3, -0.25 + dz), v3(dx * 2.0, 1.0, dz), Vec3::NEG_Z, 0.32, 0.1, 0.03, 0.08, SYM);
-    }
-    // Digitigrade satyr legs: thick haunches, shaggy charred shins, cloven hooves at y = 0.
-    let (hip, knee, hock, foot) = (v3(0.38, 1.32, 0.0), v3(0.42, 0.84, -0.22), v3(0.42, 0.38, 0.14), v3(0.42, 0.12, -0.04));
-    s.at(&blob(v3(0.28, 0.36, 0.32)), body, v3(0.38, 1.12, 0.02), id, SYM);
-    s.limb(body, hip, knee, (0.25, 0.18), 10, SYM);
-    s.at(&sculpt::ridged_sphere(v3(0.17, 0.22, 0.17), 6, 8, 0.18, 9.0, true), horn, v3(0.42, 0.66, -0.06), id, SYM);
-    s.limb(horn, knee, hock, (0.15, 0.1), 8, SYM);
-    s.limb(horn, hock, foot, (0.1, 0.09), 8, SYM);
+    limb_pair(rigs, RigKind::ArmLeft, RigKind::ArmRight, v3(0.94, 2.32, 0.0), |r| {
+        let (sh, el, wr) = (v3(0.94, 2.32, 0.0), v3(1.02, 1.8, -0.02), v3(1.05, 1.38, -0.2));
+        r.at(&blob(v3(0.24, 0.22, 0.25)), body, v3(0.92, 2.36, 0.0), id, MID);
+        r.limb(body, sh, el, (0.2, 0.16), 10, MID);
+        r.at(&blob(v3(0.16, 0.22, 0.16)), body, v3(0.99, 2.05, -0.07), rz(0.1), MID);
+        r.limb(body, el, wr, (0.16, 0.13), 10, MID);
+        r.at(&sculpt::armored_ring(0.15, 0.04, 0.09, 10, true), gold, wr.lerp(el, 0.18), along(el - wr), MID);
+        r.at(&bbox(0.3, 0.26, 0.3, 0.06), fire, v3(1.05, 1.22, -0.25), rx(0.25), MID);
+        for c in [-0.09f32, -0.03, 0.03, 0.09] {
+            r.at(&claw, fire, v3(1.05 + c, 1.12, -0.36), orient(v3(c * 2.0, -0.6, -1.0), v3(0.0, -1.0, 0.3)), MID);
+        }
+        for (dx, dz) in [(-0.1f32, 0.05f32), (0.1, -0.05), (0.0, 0.1)] {
+            r.blade(fire, v3(1.05 + dx, 1.3, -0.25 + dz), v3(dx * 2.0, 1.0, dz), Vec3::NEG_Z, 0.32, 0.1, 0.03, 0.08, MID);
+        }
+    });
+    // Digitigrade satyr legs: thick haunches, shaggy charred shins, cloven hooves at y = 0 (hip rigs).
     let hoof = sculpt::wedge_plate(0.12, 0.14, 0.28, 0.72, 0.78, -0.03);
-    for dx in [-0.065f32, 0.065] {
-        s.at(&hoof, bone, v3(0.42 + dx, 0.07, -0.1), id, SYM);
-    }
+    limb_pair(rigs, RigKind::LegLeft, RigKind::LegRight, v3(0.38, 1.32, 0.0), |r| {
+        let (hip, knee, hock, foot) = (v3(0.38, 1.32, 0.0), v3(0.42, 0.84, -0.22), v3(0.42, 0.38, 0.14), v3(0.42, 0.12, -0.04));
+        r.at(&blob(v3(0.28, 0.36, 0.32)), body, v3(0.38, 1.12, 0.02), id, MID);
+        r.limb(body, hip, knee, (0.25, 0.18), 10, MID);
+        r.at(&sculpt::ridged_sphere(v3(0.17, 0.22, 0.17), 6, 8, 0.18, 9.0, true), horn, v3(0.42, 0.66, -0.06), id, MID);
+        r.limb(horn, knee, hock, (0.15, 0.1), 8, MID);
+        r.limb(horn, hock, foot, (0.1, 0.09), 8, MID);
+        for dx in [-0.065f32, 0.065] {
+            r.at(&hoof, bone, v3(0.42 + dx, 0.07, -0.1), id, MID);
+        }
+    });
     // Bull-demon skull: DARK face mask + muzzle so the two molten eyes and the angular
     // brow / jaw pop; glowing maw, gold fangs + tusks.
     s.limb(body, v3(0.0, 2.62, 0.0), v3(0.0, 2.82, -0.08), (0.2, 0.17), 10, MID);
@@ -1655,7 +1941,7 @@ fn sculpt_baron(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
 
 /// Razor-sharp hunched obsidian-violet cyber-wraith (height ~2.1) with giant
 /// raised crescent scythes splayed outward in a mantis slash posture.
-fn sculpt_stalker(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+fn sculpt_stalker(s: &mut Sculptor, rigs: &mut Vec<RigBuild>, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     let (ob, core, horn) = (&a.phase_obsidian, &a.phase_core, &a.horn);
     let id = Quat::IDENTITY;
     let hunch = rx(-0.45);
@@ -1677,27 +1963,32 @@ fn sculpt_stalker(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
         let kf = k as f32;
         s.blade(ob, v3(0.0, 1.18 + kf * 0.12, 0.08 - kf * 0.07), v3(0.0, 0.6, 1.0), Vec3::Y, 0.32 + kf * 0.04, 0.12, 0.025, 0.08, MID);
     }
-    // Bent reverse-jointed raptor legs with talon-blade feet at y = 0.
-    let (hip, knee, hock, ank) = (v3(0.13, 0.96, 0.04), v3(0.18, 0.64, -0.22), v3(0.17, 0.3, 0.12), v3(0.17, 0.08, -0.02));
-    s.limb(body, hip, knee, (0.08, 0.058), 6, SYM);
-    s.horn(horn, knee, v3(0.1, 0.5, -1.0), Vec3::Y, (0.032, 0.005), 0.17, 0.05, SYM);
-    s.limb(ob, knee, hock, (0.05, 0.04), 6, SYM);
-    s.limb(ob, hock, ank, (0.04, 0.035), 6, SYM);
-    for yaw in [-0.3f32, 0.3] {
-        s.blade(ob, ank, v3(yaw.sin(), -0.12, -yaw.cos()), Vec3::NEG_Y, 0.24, 0.07, 0.03, 0.05, SYM);
-    }
-    s.blade(ob, ank, v3(0.0, -0.2, 1.0), Vec3::NEG_Y, 0.12, 0.05, 0.025, 0.03, SYM);
+    // Bent reverse-jointed raptor legs with talon-blade feet at y = 0 (hip rigs).
+    limb_pair(rigs, RigKind::LegLeft, RigKind::LegRight, v3(0.13, 0.96, 0.04), |r| {
+        let (hip, knee, hock, ank) = (v3(0.13, 0.96, 0.04), v3(0.18, 0.64, -0.22), v3(0.17, 0.3, 0.12), v3(0.17, 0.08, -0.02));
+        r.limb(body, hip, knee, (0.08, 0.058), 6, MID);
+        r.horn(horn, knee, v3(0.1, 0.5, -1.0), Vec3::Y, (0.032, 0.005), 0.17, 0.05, MID);
+        r.limb(ob, knee, hock, (0.05, 0.04), 6, MID);
+        r.limb(ob, hock, ank, (0.04, 0.035), 6, MID);
+        for yaw in [-0.3f32, 0.3] {
+            r.blade(ob, ank, v3(yaw.sin(), -0.12, -yaw.cos()), Vec3::NEG_Y, 0.24, 0.07, 0.03, 0.05, MID);
+        }
+        r.blade(ob, ank, v3(0.0, -0.2, 1.0), Vec3::NEG_Y, 0.12, 0.05, 0.025, 0.03, MID);
+    });
     // Angular shoulder plates, forearms RAISED, giant crescent scythes splayed ~45 deg
-    // outward and hooking inward over the head, with a glowing plasma cutting edge.
+    // outward and hooking inward over the head, with a glowing plasma cutting edge (shoulder rigs).
     s.at(&sculpt::wedge_plate(0.18, 0.13, 0.22, 0.55, 0.8, 0.0), ob, v3(0.23, 1.62, -0.2), rz(-0.5), SYM);
-    let (sh, el, wr) = (v3(0.25, 1.58, -0.2), v3(0.38, 1.36, -0.3), v3(0.46, 1.6, -0.42));
-    s.limb(body, sh, el, (0.052, 0.042), 6, SYM);
-    s.at(&blob(Vec3::splat(0.045)), ob, el, id, SYM);
-    s.limb(ob, el, wr, (0.048, 0.036), 6, SYM);
-    s.at(&bbox(0.08, 0.1, 0.09, 0.018), ob, wr, along(wr - el), SYM);
-    let q = orient(v3(0.66, 0.72, -0.2), v3(-1.0, 0.25, -0.15));
-    s.at(&sculpt::curved_blade(0.95, 0.24, 0.045, 0.36, 7), ob, wr, q, SYM);
-    s.at(&sculpt::curved_blade(0.93, 0.27, 0.014, 0.36, 7), core, wr + q * v3(0.0, 0.0, -0.02), q, SYM);
+    let (scythe, edge) = (sculpt::curved_blade(0.95, 0.24, 0.045, 0.36, 7), sculpt::curved_blade(0.93, 0.27, 0.014, 0.36, 7));
+    limb_pair(rigs, RigKind::ArmLeft, RigKind::ArmRight, v3(0.25, 1.58, -0.2), |r| {
+        let (sh, el, wr) = (v3(0.25, 1.58, -0.2), v3(0.38, 1.36, -0.3), v3(0.46, 1.6, -0.42));
+        r.limb(body, sh, el, (0.052, 0.042), 6, MID);
+        r.at(&blob(Vec3::splat(0.045)), ob, el, id, MID);
+        r.limb(ob, el, wr, (0.048, 0.036), 6, MID);
+        r.at(&bbox(0.08, 0.1, 0.09, 0.018), ob, wr, along(wr - el), MID);
+        let q = orient(v3(0.66, 0.72, -0.2), v3(-1.0, 0.25, -0.15));
+        r.at(&scythe, ob, wr, q, MID);
+        r.at(&edge, core, wr + q * v3(0.0, 0.0, -0.02), q, MID);
+    });
     // Blade-crested skull pulled in over the chest, faceplate, V-angled glowing visor, swept antennae.
     s.limb(body, v3(0.0, 1.6, -0.1), v3(0.0, 1.72, -0.12), (0.05, 0.045), 6, MID);
     s.at(&sculpt::ridged_sphere(v3(0.11, 0.11, 0.16), 6, 10, 0.05, 5.0, true), body, v3(0.0, 1.79, -0.14), id, MID);
@@ -1709,7 +2000,7 @@ fn sculpt_stalker(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
 
 /// High-contrast titanium tripod sentinel with a twin-rail cannon (height ~2.7;
 /// the dish head is a separate rig).
-fn sculpt_sniper(s: &mut Sculptor, a: &EnemyAssets, body: &Mat) {
+fn sculpt_sniper(s: &mut Sculptor, rigs: &mut Vec<RigBuild>, a: &EnemyAssets, body: &Mat) {
     let (mp, hz, lens, dk) = (&a.metal_plate, &a.hazard, &a.sniper_lens, &a.sniper_liner);
     let id = Quat::IDENTITY;
     // Turret hub + hazard collar.
@@ -1750,27 +2041,33 @@ fn sculpt_sniper(s: &mut Sculptor, a: &EnemyAssets, body: &Mat) {
     s.at(&sculpt::tapered_prism(6, 0.08, 0.06, 0.26, true), dk, v3(0.0, 2.08, 0.0), id, MID);
     // Bold shoulder-mounted twin-rail cannon (right): wide-set dark-steel rails, four
     // glowing crimson accelerator coils, muzzle brake; hazard counterweight (left).
-    let (cx, cy) = (0.48, 2.16);
-    s.at(&bbox(0.26, 0.24, 0.72, 0.05), mp, v3(cx, cy, -0.1), id, MID);
-    s.at(&bbox(0.27, 0.25, 0.08, 0.02), hz, v3(cx, cy, 0.2), id, MID);
-    s.at(&bbox(0.07, 0.07, 0.34, 0.012), mp, v3(cx, cy + 0.16, -0.12), id, MID);
+    // The cannon itself is a recoiling rig on its shoulder mount (the mount strut stays put).
+    let (cx, cy) = (SNIPER_CANNON_PIVOT.x, SNIPER_CANNON_PIVOT.y);
     s.limb(dk, v3(0.4, 2.0, 0.0), v3(cx, cy - 0.06, -0.05), (0.06, 0.06), 6, MID);
+    let mut c = Sculptor::rig(SNIPER_CANNON_PIVOT, false);
+    c.at(&bbox(0.26, 0.24, 0.72, 0.05), mp, v3(cx, cy, -0.1), id, MID);
+    c.at(&bbox(0.27, 0.25, 0.08, 0.02), dk, v3(cx, cy, 0.2), id, MID);
+    c.at(&bbox(0.07, 0.07, 0.34, 0.012), mp, v3(cx, cy + 0.16, -0.12), id, MID);
     let rail = bbox(0.05, 0.06, 1.34, 0.01);
     for dx in [-0.075f32, 0.075] {
-        s.at(&rail, dk, v3(cx + dx, cy, -1.08), id, MID);
+        c.at(&rail, dk, v3(cx + dx, cy, -1.08), id, MID);
     }
     let coil = sculpt::armored_ring(0.12, 0.026, 0.04, 8, true);
     for k in 0..4 {
-        s.at(&coil, lens, v3(cx, cy, -0.52 - k as f32 * 0.3), rx(FRAC_PI_2), MID);
+        c.at(&coil, lens, v3(cx, cy, -0.52 - k as f32 * 0.3), rx(FRAC_PI_2), MID);
     }
-    s.at(&bbox(0.26, 0.15, 0.1, 0.025), dk, v3(cx, cy, -1.76), id, MID);
+    c.at(&bbox(0.26, 0.15, 0.1, 0.025), dk, v3(cx, cy, -1.76), id, MID);
+    rigs.push((RigKind::SniperCannon, Transform::from_translation(SNIPER_CANNON_PIVOT), c));
     s.at(&bbox(0.16, 0.16, 0.24, 0.03), hz, v3(-cx + 0.04, 2.1, 0.08), id, MID);
 }
+
+/// Relay Sniper twin-rail cannon mount pivot (model space).
+pub const SNIPER_CANNON_PIVOT: Vec3 = Vec3::new(0.48, 2.16, -0.1);
 
 /// Doom-industrial broadcast colossus (height ~4.4; halo + cannons are rigs):
 /// long grounded legs, wedged gorget + gold ribcage around a recessed reactor,
 /// an enlarged forward-thrust dread-skull crowned by thick ram horns.
-fn sculpt_carrier(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
+fn sculpt_carrier(s: &mut Sculptor, rigs: &mut Vec<RigBuild>, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     let (gold, core, mp, horn) = (&a.baron_gold, &a.carrier_core, &a.metal_plate, &a.horn);
     let id = Quat::IDENTITY;
     // Pelvis + gold belt plate + abdomen.
@@ -1803,30 +2100,36 @@ fn sculpt_carrier(s: &mut Sculptor, a: &EnemyAssets, body: &Mat, eye_m: &Mat) {
     }
     // Long armored dread-mech legs in a wide grounded stance: gold knee guards,
     // hydraulic shins + pistons, clawed war-boots at y = 0.
-    let (hip, knee, ank) = (v3(0.74, 1.85, 0.02), v3(0.8, 1.15, -0.2), v3(0.82, 0.36, 0.0));
-    s.limb(body, hip, knee, (0.36, 0.28), 8, SYM);
-    s.at(&sculpt::wedge_plate(0.46, 0.42, 0.22, 0.7, 0.8, -0.05), gold, v3(0.8, 1.17, -0.44), id, SYM);
-    s.limb(mp, knee, ank, (0.25, 0.21), 8, SYM);
-    s.limb(mp, v3(0.8, 1.05, 0.2), v3(0.82, 0.42, 0.18), (0.055, 0.055), 6, SYM);
-    s.at(&bbox(0.66, 0.3, 0.88, 0.06), body, v3(0.82, 0.15, -0.12), id, SYM);
-    s.at(&bbox(0.68, 0.08, 0.2, 0.02), gold, v3(0.82, 0.28, -0.48), id, SYM);
+    // (Hip rigs; gold war-talons keep each leg at 3 baked materials.)
     let talon = sculpt::curved_horn(0.065, 0.01, 0.26, 0.0, -0.08, 8, 6);
-    for c in [-0.2f32, 0.0, 0.2] {
-        s.at(&talon, horn, v3(0.82 + c, 0.15, -0.54), orient(v3(0.0, -0.12, -1.0), Vec3::NEG_Y), SYM);
-    }
-    // Hunched armored arms: pauldrons, biceps, gold elbow rings + cuffs, forward-curled talon fists.
-    let (sh, el, wr) = (v3(1.18, 3.2, 0.0), v3(1.4, 2.55, 0.08), v3(1.44, 2.02, -0.42));
-    s.at(&sculpt::ridged_sphere(v3(0.42, 0.38, 0.44), 8, 10, 0.05, 5.0, true), body, v3(1.16, 3.24, 0.0), id, SYM);
-    s.limb(body, sh, el, (0.3, 0.24), 10, SYM);
-    s.at(&blob(v3(0.22, 0.3, 0.22)), body, v3(1.3, 2.85, -0.04), id, SYM);
-    s.at(&sculpt::armored_ring(0.24, 0.05, 0.07, 10, true), gold, el, along(sh - el), SYM);
-    s.limb(mp, el, wr, (0.25, 0.22), 8, SYM);
-    s.at(&bbox(0.48, 0.44, 0.5, 0.08), body, v3(1.44, 1.86, -0.52), rx(0.35), SYM);
-    s.at(&sculpt::armored_ring(0.27, 0.05, 0.12, 10, true), gold, wr, along(el - wr), SYM);
+    limb_pair(rigs, RigKind::LegLeft, RigKind::LegRight, v3(0.74, 1.85, 0.02), |r| {
+        let (hip, knee, ank) = (v3(0.74, 1.85, 0.02), v3(0.8, 1.15, -0.2), v3(0.82, 0.36, 0.0));
+        r.limb(body, hip, knee, (0.36, 0.28), 8, MID);
+        r.at(&sculpt::wedge_plate(0.46, 0.42, 0.22, 0.7, 0.8, -0.05), gold, v3(0.8, 1.17, -0.44), id, MID);
+        r.limb(mp, knee, ank, (0.25, 0.21), 8, MID);
+        r.limb(mp, v3(0.8, 1.05, 0.2), v3(0.82, 0.42, 0.18), (0.055, 0.055), 6, MID);
+        r.at(&bbox(0.66, 0.3, 0.88, 0.06), body, v3(0.82, 0.15, -0.12), id, MID);
+        r.at(&bbox(0.68, 0.08, 0.2, 0.02), gold, v3(0.82, 0.28, -0.48), id, MID);
+        for c in [-0.2f32, 0.0, 0.2] {
+            r.at(&talon, gold, v3(0.82 + c, 0.15, -0.54), orient(v3(0.0, -0.12, -1.0), Vec3::NEG_Y), MID);
+        }
+    });
+    // Hunched armored arms: pauldrons, biceps, gold elbow rings + cuffs, forward-curled
+    // gold talon fists (shoulder rigs).
     let finger = sculpt::curved_horn(0.058, 0.01, 0.38, 0.0, -0.16, 8, 6);
-    for c in [-0.15f32, -0.05, 0.05, 0.15] {
-        s.at(&finger, horn, v3(1.44 + c, 1.76, -0.74), orient(v3(0.0, -0.45, -1.0), v3(0.0, -1.0, 0.6)), SYM);
-    }
+    limb_pair(rigs, RigKind::ArmLeft, RigKind::ArmRight, v3(1.18, 3.2, 0.0), |r| {
+        let (sh, el, wr) = (v3(1.18, 3.2, 0.0), v3(1.4, 2.55, 0.08), v3(1.44, 2.02, -0.42));
+        r.at(&sculpt::ridged_sphere(v3(0.42, 0.38, 0.44), 8, 10, 0.05, 5.0, true), body, v3(1.16, 3.24, 0.0), id, MID);
+        r.limb(body, sh, el, (0.3, 0.24), 10, MID);
+        r.at(&blob(v3(0.22, 0.3, 0.22)), body, v3(1.3, 2.85, -0.04), id, MID);
+        r.at(&sculpt::armored_ring(0.24, 0.05, 0.07, 10, true), gold, el, along(sh - el), MID);
+        r.limb(mp, el, wr, (0.25, 0.22), 8, MID);
+        r.at(&bbox(0.48, 0.44, 0.5, 0.08), body, v3(1.44, 1.86, -0.52), rx(0.35), MID);
+        r.at(&sculpt::armored_ring(0.27, 0.05, 0.12, 10, true), gold, wr, along(el - wr), MID);
+        for c in [-0.15f32, -0.05, 0.05, 0.15] {
+            r.at(&finger, gold, v3(1.44 + c, 1.76, -0.74), orient(v3(0.0, -0.45, -1.0), v3(0.0, -1.0, 0.6)), MID);
+        }
+    });
     // Enlarged forward-thrust dread-skull: neck block, DARK iron face plate, gold brow,
     // blazing molten eyes + maw slit, angular jaw, gold mandible tusks, rear crest.
     s.at(&bbox(0.56, 0.3, 0.52, 0.06), body, v3(0.0, 3.5, -0.1), id, MID);
@@ -1909,7 +2212,7 @@ pub fn spawn_enemy(
         ))
         .id();
     let pivot = commands.spawn((ChildOf(root), EnemyBody, Transform::default(), Visibility::default())).id();
-    let (mut body_part, mut eye_part) = (Entity::PLACEHOLDER, Entity::PLACEHOLDER);
+    let mut look = EnemyLook::new(Entity::PLACEHOLDER, aura);
     let model = &a.models[kind.index()];
     // The body pivot carries the first static (never re-tinted) part itself:
     // one entity fewer per demon. Tintable Body / Eye parts stay children.
@@ -1921,14 +2224,20 @@ pub fn spawn_enemy(
         }
         let e = commands.spawn((ChildOf(pivot), Mesh3d(part.mesh.clone()), MeshMaterial3d(part.material.clone()), Transform::IDENTITY)).id();
         match part.role {
-            PartRole::Body => body_part = e,
-            PartRole::Eye => eye_part = e,
+            PartRole::Body => {
+                look.push_body(e);
+            }
+            PartRole::Eye => look.eye_part = e,
             PartRole::Static => {}
         }
     }
     let mut rig = EnemyRig::default();
     for (slot, model) in rig.pivots.iter_mut().zip(&a.rigs[kind.index()]) {
-        *slot = Some(spawn_rig(commands, pivot, model));
+        let (pe, body) = spawn_rig(commands, pivot, model);
+        *slot = Some(pe);
+        if let Some(b) = body {
+            look.push_body(b);
+        }
     }
     if reacts_to_dead_zones(kind) {
         // Distinct crackling electric-violet halo shown only while Static-Enraged!
@@ -1960,7 +2269,7 @@ pub fn spawn_enemy(
     if kind == EnemyKind::CarrierDaemon {
         crate::boss::attach_boss(commands, a, root, &mut enemy);
     }
-    commands.entity(root).insert((enemy, EnemyLook { body_part, eye_part, aura }));
+    commands.entity(root).insert((enemy, look));
     if rig.pivots[0].is_some() {
         commands.entity(root).insert(rig);
     }
@@ -2275,9 +2584,10 @@ pub(crate) fn enemy_ai(
 
         if e.stun_timer > 0.0 {
             e.stun_timer -= dt;
-            // Stun interrupts any active sniper lock or phase-blink windup.
+            // Stun interrupts any active sniper lock, phase-blink or shot wind-up.
             e.sniper_lock_timer = 0.0;
             e.blink_timer = 0.0;
+            e.cancel_windup();
             let mut vel = Vec3::new(kb.x, e.velocity.y, kb.z);
             if !e.kind.flying() {
                 let r = resolve_player_movement(&grid, pos, vel, dt, e.stats.radius, e.stats.height, crate::level::STEP_HEIGHT, WALKER_GLUE);
@@ -2294,6 +2604,7 @@ pub(crate) fn enemy_ai(
         // Missed Call: a ringing decoy pulls nearby Imps away from the player.
         if let Some(dpos) = decoy_lure(e.kind, pos, decoy) {
             e.alerted = true;
+            e.cancel_windup();
             let to_d = Vec3::new(dpos.x - pos.x, 0.0, dpos.z - pos.z);
             let dir = if to_d.length() > e.stats.radius + 0.4 { to_d.normalize_or_zero() } else { Vec3::ZERO };
             let face = to_d.normalize_or_zero();
@@ -2338,6 +2649,7 @@ pub(crate) fn enemy_ai(
             }
             if should_start_blink(&e, dist) {
                 e.blink_timer = PHASE_BLINK_TELEGRAPH;
+                e.cancel_windup();
                 spawn_burst(&mut commands, &fx, pos + Vec3::Y * 1.3, BurstColor::Gore, 8, 3.0, 0.1);
                 sfx.play_at(SfxEvent::PhaseBlink, pos);
                 continue;
@@ -2391,8 +2703,8 @@ pub(crate) fn enemy_ai(
                 direct
             };
             desired = desired.normalize_or_zero();
-            // Face the player (or the path).
-            let face = if e.sees_player || desired == Vec3::ZERO { dir_p } else { desired };
+            // Face the player (or the path); a wind-up always squares up to the target.
+            let face = if e.sees_player || desired == Vec3::ZERO || e.attack_windup > 0.0 { dir_p } else { desired };
             if face != Vec3::ZERO {
                 let want = Quat::from_rotation_y(crate::level::yaw_facing(Vec2::new(face.x, face.z)));
                 tf.rotation = tf.rotation.slerp(want, (dt * 8.0).min(1.0));
@@ -2413,7 +2725,8 @@ pub(crate) fn enemy_ai(
             }
         }
 
-        let speed = e.move_speed();
+        // Winding up a shot slows the demon so the telegraph silhouette reads clearly.
+        let speed = e.move_speed() * if e.attack_windup > 0.0 { 0.45 } else { 1.0 };
         let target_h = desired * speed + push * 4.0;
         let k = (dt * 8.0).min(1.0);
         let mut vel = e.velocity;
@@ -2443,6 +2756,11 @@ pub(crate) fn enemy_ai(
         let melee_reach = e.stats.radius + PLAYER_RADIUS + 0.9;
         if dist < melee_reach && (to_p.y).abs() < 2.5 && e.melee_timer <= 0.0 {
             e.melee_timer = if e.kind == EnemyKind::HellBaron { 1.4 } else { 1.0 };
+            if e.attack_windup > 0.0 {
+                // A point-blank strike replaces the coiled shot.
+                e.cancel_windup();
+                e.attack_timer = e.attack_timer.max(0.5);
+            }
             e.trigger_attack_anim(true);
             let hurt = player.invuln_timer <= 0.0;
             player.apply_damage(e.stats.melee_damage * if e.enraged { 1.3 } else { 1.0 } * incoming);
@@ -2488,8 +2806,28 @@ pub(crate) fn enemy_ai(
         }
         // The Baron's triple spread needs room to fan out: no point-blank volleys.
         let min_range = if e.kind == EnemyKind::HellBaron { 5.0 } else { 2.0 };
-        if e.attack_timer <= 0.0 && e.sees_player && dist < e.stats.range && dist > min_range {
-            e.attack_timer = e.fire_cooldown() * rng.random_range(0.8..1.25);
+        if e.attack_windup > 0.0 {
+            if dist >= e.stats.range || dist <= min_range || !has_line_of_sight(&grid, eye, p_chest) {
+                // Lost sight or range mid-coil (e.g. player ducked behind cover
+                // or closed inside Baron's 5 m spread guard): drop the shot and re-acquire soon.
+                e.cancel_windup();
+                e.attack_timer = e.attack_timer.max(0.3);
+                continue;
+            }
+            e.attack_windup -= dt;
+            if e.attack_windup > 0.0 {
+                continue;
+            }
+            e.attack_windup = 0.0;
+        } else {
+            if e.attack_timer <= 0.0 && e.sees_player && dist < e.stats.range && dist > min_range {
+                // Readable pre-fire telegraph: the shot leaves at the end of the wind-up.
+                e.start_windup();
+            }
+            continue;
+        }
+        {
+            e.attack_timer = (e.fire_cooldown() * rng.random_range(0.8..1.25) - attack_windup_secs(e.kind)).max(0.4);
             let fwd = (p_chest - eye).normalize_or_zero();
             let side = Vec3::new(-fwd.z, 0.0, fwd.x).normalize_or_zero();
             // (offset, direction) per projectile: fixed stack array, no allocation.
@@ -2526,7 +2864,13 @@ pub(crate) fn enemy_ai(
 /// Phase Stalker blink trigger: enraged (in a 0-1 bar Dead Zone), alerted,
 /// seeing the player or close, and off cooldown.
 pub fn should_start_blink(e: &Enemy, dist: f32) -> bool {
-    e.kind == EnemyKind::PhaseStalker && e.enraged && e.alerted && (e.sees_player || dist < 12.0) && e.blink_cooldown <= 0.0 && e.blink_timer <= 0.0
+    e.kind == EnemyKind::PhaseStalker
+        && e.enraged
+        && e.alerted
+        && (e.sees_player || dist < 12.0)
+        && e.blink_cooldown <= 0.0
+        && e.blink_timer <= 0.0
+        && e.attack_windup <= 0.0
 }
 
 /// Missed Call lure target for a demon at `pos`: only Imps within
@@ -2727,16 +3071,19 @@ fn enemy_visuals(
             tick_enemy_anim(&mut e, dt);
         }
         let e = &*e;
+        let input = EnemyAnimInput::from_enemy(e, boss, t);
         if let Some(rig) = rig {
             for pe in rig.pivots.iter().flatten() {
                 if let Ok((mut tf, mut rp)) = rigs.get_mut(*pe) {
-                    animate_rig(&mut tf, &mut rp, e, boss, t, dt);
+                    apply_rig_pose(&mut tf, &mut rp, e.kind, &input, dt);
                 }
             }
         }
         // Stride / hover + attack recoil + directional hit-stagger on the
-        // visual body pivot (never the root: hit spheres stay put).
-        let pose = body_pose(e, root_tf.rotation);
+        // visual body pivot (never the root: hit spheres stay put), plus the
+        // lock-on lean / barrage roar of the two signature charges.
+        let stunned = if input.stunned { 0.0 } else { 1.0 };
+        let pose = body_pose(e, root_tf.rotation).add(charge_pose(e.kind, input.sniper_lock * stunned, input.boss_telegraph * stunned)).bounded();
         for c in children.iter() {
             if let Ok(mut b) = bodies.get_mut(c) {
                 let stun = if e.stun_timer > 0.0 { (t * 40.0).sin() * 0.08 } else { 0.0 };
@@ -2786,7 +3133,9 @@ fn enemy_visuals(
             }
             &mats.body[state]
         };
-        swap(look.body_part, body);
+        for b in look.bodies() {
+            swap(b, body);
+        }
         swap(look.eye_part, if e.enraged { &mats.eye_enraged } else { &mats.eye });
         if let Ok((mut l, mut cull)) = auras.get_mut(look.aura) {
             let intensity = match e.kind {
@@ -2824,66 +3173,472 @@ fn enemy_visuals(
 
 /// Rig recoil kick strength (0..1) right after firing: snaps in, eases out.
 pub fn rig_recoil(e: &Enemy) -> f32 {
-    if e.attack_lunge || e.attack_anim <= 0.0 { 0.0 } else { snap_envelope(1.0 - e.attack_anim.min(1.0), 0.08) }
+    recoil_kick(e.attack_anim, e.attack_lunge)
 }
 
-/// Per-frame pose of one articulated sub-pivot.
-fn animate_rig(tf: &mut Transform, rp: &mut RigPivot, e: &Enemy, boss: Option<&crate::boss::BossState>, t: f32, dt: f32) {
-    let rest = rp.rest;
-    let ease = |k: f32| 1.0 - (-k * dt).exp();
-    match rp.kind {
-        RigKind::FiendEmitter => {
-            // Continuous transceiver spin + pulsing broadcast emitter.
-            let beat = (t * 6.0 + e.phase).sin() * 0.5 + 0.5;
-            tf.rotation = rest.rotation * Quat::from_rotation_y(t * 2.6 + e.phase);
-            tf.scale = Vec3::splat(1.0 + 0.08 * beat);
-            tf.translation = rest.translation + Vec3::Y * (0.025 * beat);
+fn recoil_kick(attack_anim: f32, lunge: bool) -> f32 {
+    if lunge || attack_anim <= 0.0 || !attack_anim.is_finite() { 0.0 } else { snap_envelope(1.0 - attack_anim.min(1.0), 0.08) }
+}
+
+/// Everything an articulated rig pose depends on: the pure input of
+/// [`limb_pose`], shared by live demons ([`EnemyAnimInput::from_enemy`]) and
+/// the Bestiary turntable ([`apply_attack_preview`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnemyAnimInput {
+    /// Rest transform of the rig pivot (body-pivot space).
+    pub rest: Transform,
+    /// Walk-cycle phase (radians).
+    pub stride_phase: f32,
+    /// Horizontal speed / max move speed (0 idle .. ~1.3).
+    pub speed_ratio: f32,
+    /// Generic ranged wind-up progress (0 = none, -> 1 at release).
+    pub windup: f32,
+    /// Attack envelope (1 on a shot / strike, decays to 0).
+    pub attack_anim: f32,
+    pub attack_lunge: bool,
+    pub stunned: bool,
+    pub enraged: bool,
+    /// Phase Stalker blink coil progress (0 = none).
+    pub blink: f32,
+    /// Relay Sniper lock-on progress (0 = none).
+    pub sniper_lock: f32,
+    /// Carrier Daemon barrage telegraph progress (0 = none).
+    pub boss_telegraph: f32,
+    pub boss_overdrive: bool,
+    /// Seconds (clock) and per-demon phase offset.
+    pub time: f32,
+    pub phase: f32,
+    /// Accumulated spin of spinning rigs (emitter, halo; see [`rig_spin_rate`]).
+    pub spin: f32,
+}
+
+impl Default for EnemyAnimInput {
+    fn default() -> Self {
+        EnemyAnimInput {
+            rest: Transform::IDENTITY,
+            stride_phase: 0.0,
+            speed_ratio: 0.0,
+            windup: 0.0,
+            attack_anim: 0.0,
+            attack_lunge: false,
+            stunned: false,
+            enraged: false,
+            blink: 0.0,
+            sniper_lock: 0.0,
+            boss_telegraph: 0.0,
+            boss_overdrive: false,
+            time: 0.0,
+            phase: 0.0,
+            spin: 0.0,
         }
-        RigKind::SniperDish => {
-            // Idle: slow left/right scan. Lock-on: snap straight forward and tilt aggressively.
-            let locking = e.sniper_lock_timer > 0.0;
-            let target = if locking {
-                Quat::from_euler(EulerRot::YXZ, 0.0, -0.22, (t * 45.0).sin() * 0.03)
-            } else {
-                Quat::from_euler(EulerRot::YXZ, (t * 0.6 + e.phase).sin() * 0.65, 0.05 * (t * 0.9 + e.phase).sin(), 0.0)
-            };
-            // Snappy rail-fire recoil kick (pitch up + shove back) right after the shot.
-            let kick = rig_recoil(e);
-            let rate = if kick > 0.0 { 30.0 } else if locking { 18.0 } else { 4.0 };
-            tf.rotation = tf.rotation.slerp(rest.rotation * target * Quat::from_rotation_x(0.35 * kick), ease(rate));
-            tf.translation = rest.translation + Vec3::Z * (0.08 * kick);
+    }
+}
+
+impl EnemyAnimInput {
+    /// Animation input of a live demon at clock `t` (rest / spin filled per rig).
+    pub fn from_enemy(e: &Enemy, boss: Option<&crate::boss::BossState>, t: f32) -> Self {
+        let speed = Vec2::new(e.velocity.x, e.velocity.z).length();
+        let max = e.move_speed();
+        let speed_ratio = if max > 0.01 && speed.is_finite() { (speed / max).clamp(0.0, 1.3) } else { 0.0 };
+        let alive = e.is_alive();
+        let blink = if e.blink_timer > 0.0 { (1.0 - e.blink_timer / PHASE_BLINK_TELEGRAPH).clamp(0.001, 1.0) } else { 0.0 };
+        let sniper_lock = if e.sniper_lock_timer > 0.0 { (1.0 - e.sniper_lock_timer / SNIPER_LOCK_SECS).clamp(0.001, 1.0) } else { 0.0 };
+        let (boss_telegraph, boss_overdrive) = match boss {
+            Some(st) => {
+                let tele = if st.telegraph > 0.0 { (1.0 - st.telegraph / crate::boss::boss_telegraph_secs(st.phase)).clamp(0.001, 1.0) } else { 0.0 };
+                (tele, st.phase == crate::boss::BossPhase::Overdrive)
+            }
+            None => (0.0, false),
+        };
+        EnemyAnimInput {
+            stride_phase: e.stride_phase,
+            speed_ratio,
+            windup: if e.attack_windup > 0.0 { e.windup_progress().max(0.001) } else { 0.0 },
+            attack_anim: e.attack_anim,
+            attack_lunge: e.attack_lunge,
+            stunned: alive && e.stun_timer > 0.0,
+            enraged: e.enraged,
+            blink,
+            sniper_lock,
+            boss_telegraph,
+            boss_overdrive,
+            time: t,
+            phase: e.phase,
+            ..default()
+        }
+    }
+}
+
+/// Pitch (about X: + swings a hanging limb forward / tips a muzzle up), roll
+/// (about Z: + swings a right limb outward) and yaw, all in RIGHT-side terms
+/// (mirrored for left rigs).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Pry {
+    pitch: f32,
+    roll: f32,
+    yaw: f32,
+}
+
+const fn pry(pitch: f32, roll: f32, yaw: f32) -> Pry {
+    Pry { pitch, roll, yaw }
+}
+
+impl Pry {
+    fn scale(self, k: f32) -> Pry {
+        pry(self.pitch * k, self.roll * k, self.yaw * k)
+    }
+    fn plus(self, o: Pry) -> Pry {
+        pry(self.pitch + o.pitch, self.roll + o.roll, self.yaw + o.yaw)
+    }
+}
+
+/// Shared drive signals derived once per rig from an [`EnemyAnimInput`].
+struct Drive {
+    /// Stride amount (0 idle .. 1.3 sprinting).
+    k: f32,
+    /// Charge / wind-up pose weight (incl. the brief carry-over into the release).
+    pre: f32,
+    /// Ranged release follow-through weight.
+    rel: f32,
+    /// Melee / blink lunge: raise then sweep.
+    raise: f32,
+    sweep: f32,
+    stun: f32,
+    tremor: f32,
+    breathe: f32,
+    kick: f32,
+    frenzy: f32,
+}
+
+fn drive(kind: EnemyKind, a: &EnemyAnimInput) -> Drive {
+    let f = |v: f32| if v.is_finite() { v } else { 0.0 };
+    let charge = match kind {
+        EnemyKind::RelaySniper => (f(a.sniper_lock) * 4.0).min(1.0),
+        EnemyKind::CarrierDaemon => smooth01(f(a.boss_telegraph) * 2.5),
+        _ => smooth01(f(a.windup)),
+    };
+    let anim = f(a.attack_anim).clamp(0.0, 1.0);
+    let u = 1.0 - anim;
+    let (mut carry, mut rel, mut raise, mut sweep) = (0.0, 0.0, 0.0, 0.0);
+    if anim > 0.0 {
+        if a.attack_lunge {
+            raise = smooth01(u / 0.2) * (1.0 - smooth01((u - 0.2) / 0.25));
+            sweep = smooth01((u - 0.2) / 0.25) * (1.0 - smooth01((u - 0.55) / 0.45));
+        } else {
+            let c = (1.0 - u / 0.14).max(0.0);
+            carry = c * c;
+            rel = snap_envelope(u, 0.14);
+        }
+    }
+    let stun = if a.stunned { 1.0 } else { 0.0 };
+    let (t, ph) = (f(a.time), f(a.phase));
+    Drive {
+        k: f(a.speed_ratio).clamp(0.0, 1.3) * (1.0 - 0.8 * stun),
+        pre: charge.max(carry) * (1.0 - stun),
+        rel,
+        raise,
+        sweep,
+        stun,
+        tremor: (t * 38.0 + ph * 3.0).sin(),
+        breathe: (t * 1.6 + ph).sin(),
+        kick: recoil_kick(anim, a.attack_lunge),
+        frenzy: if a.enraged { 1.3 } else { 1.0 },
+    }
+}
+
+/// `(leg swing, arm swing)` stride amplitudes (radians) of a walker kind.
+pub fn stride_amplitudes(kind: EnemyKind) -> (f32, f32) {
+    match kind {
+        EnemyKind::Imp => (0.55, 0.5),
+        EnemyKind::JammerFiend => (0.38, 0.32),
+        EnemyKind::HellBaron => (0.42, 0.36),
+        EnemyKind::PhaseStalker => (0.62, 0.18),
+        EnemyKind::CarrierDaemon => (0.3, 0.26),
+        EnemyKind::Cacodemon | EnemyKind::RelaySniper => (0.0, 0.0),
+    }
+}
+
+/// Arm pose of a walker kind (right-side terms; `right` breaks symmetry).
+fn arm_motion(kind: EnemyKind, right: bool, d: &Drive, a: &EnemyAnimInput) -> Pry {
+    let s = if right { 1.0 } else { -1.0 };
+    let (_, amp) = stride_amplitudes(kind);
+    let swing = -amp * d.frenzy * d.k.min(1.0) * a.stride_phase.sin() * s * (1.0 - d.pre);
+    let idle = 1.0 - d.k.min(1.0);
+    let mut m = pry(swing + 0.045 * d.breathe * idle, 0.025 * d.breathe * idle, 0.0);
+    if a.enraged {
+        // Static-Enraged frenzy at rest: elbows flared, claws / blades twitching.
+        let calm = idle * (1.0 - d.stun) * (1.0 - d.pre);
+        let twitch = (a.time * 27.0 + a.phase * 5.0 + s).sin();
+        m = m.plus(pry(0.045 * twitch, if kind == EnemyKind::PhaseStalker { 0.03 * twitch } else { 0.12 }, 0.0).scale(calm));
+    }
+    // (windup, release, lunge raise, lunge sweep, stun)
+    //
+    // Sign guide (right-side terms). A limb that HANGS from its joint (Imp,
+    // Fiend, Baron, Carrier arms): +pitch lifts it forward then overhead,
+    // +roll swings it outward. The Imp / Carrier forearms also reach FORWARD,
+    // so +yaw sweeps their claws toward the centreline. The Phase Stalker's
+    // scythes point UP from the shoulder, which flips the read: +roll brings
+    // the tips INWARD (crossing over the head), -pitch chops them forward and
+    // down, +yaw sweeps them across the chest.
+    let (w, r, lr, ls, st) = match kind {
+        EnemyKind::Imp => (
+            // Fireball arm reared high and wide behind the horns, balance arm out.
+            if right { pry(2.45, 0.5, 0.0) } else { pry(0.5, 0.9, 0.0) },
+            // Overhand throw: the claw whips down to point straight at the target.
+            if right { pry(0.5, -0.1, 0.3) } else { pry(-0.35, 0.3, 0.0) },
+            pry(1.4, 0.2, 0.0),
+            pry(-0.25, -0.45, 0.2),
+            pry(-0.35, -0.15, 0.0),
+        ),
+        EnemyKind::JammerFiend => (pry(2.4, 0.25, 0.0), pry(1.3, -0.1, 0.0), pry(1.6, 0.1, 0.0), pry(-0.2, -0.3, 0.0), pry(-0.2, 0.45, 0.0)),
+        EnemyKind::HellBaron => (
+            // Both gauntlets hoisted in a wide V OUTSIDE the bull horns
+            // (a narrower heave tangles the claws in the horn arc).
+            pry(2.7, 0.4, 0.0),
+            pry(1.45, -0.12, 0.0),
+            // Right-arm haymaker; the left arm counter-swings.
+            if right { pry(0.6, 1.0, 0.5) } else { pry(-0.2, 0.2, 0.0) },
+            if right { pry(1.1, -0.6, -0.6) } else { pry(-0.3, 0.1, 0.0) },
+            pry(-0.35, 0.25, 0.0),
+        ),
+        // Scythes: flung wide open and back on the wind-up / lunge raise, then
+        // scissored across in front of the visor (right blade over left, so
+        // the two never share a plane). Stunned, they droop limp to the front.
+        EnemyKind::PhaseStalker => {
+            let slash = if right { pry(-0.45, 0.75, 0.35) } else { pry(-0.7, 0.75, 0.35) };
+            (pry(0.45, -0.55, -0.25), slash, pry(0.5, -0.65, -0.3), slash, pry(-1.25, -0.15, 0.0))
+        }
+        EnemyKind::CarrierDaemon => {
+            let amp = if a.boss_overdrive { 1.25 } else { 1.0 };
+            // Barrage roar: arms flung wide and hauled back, chest thrust out.
+            (pry(-0.35, 0.9, 0.0).scale(amp), pry(0.9, 0.3, 0.0), pry(1.5, 0.2, 0.0), pry(-0.2, -0.3, 0.0), pry(0.3, -0.12, 0.0))
+        }
+        EnemyKind::Cacodemon | EnemyKind::RelaySniper => return m,
+    };
+    m = m.plus(w.scale(d.pre)).plus(r.scale(d.rel)).plus(lr.scale(d.raise)).plus(ls.scale(d.sweep));
+    if kind == EnemyKind::PhaseStalker && a.blink > 0.0 {
+        // Blink coil: scythes pulled in tight, tips crossed over the crest.
+        m = m.plus(pry(-0.2, 0.6, 0.3).scale(smooth01(a.blink) * (1.0 - d.stun)));
+    }
+    if kind == EnemyKind::CarrierDaemon && d.pre > 0.0 {
+        m.roll += 0.06 * (a.time * 30.0).sin() * d.pre * if a.boss_overdrive { 1.6 } else { 1.0 };
+    }
+    m.plus(st.scale(d.stun)).plus(pry(0.12 * d.tremor * d.stun, 0.0, 0.0))
+}
+
+/// Leg pose of a walker kind (right-side terms).
+fn leg_motion(kind: EnemyKind, right: bool, d: &Drive, a: &EnemyAnimInput) -> Pry {
+    let s = if right { 1.0 } else { -1.0 };
+    let (amp, _) = stride_amplitudes(kind);
+    let swing = amp * d.k.min(1.0) * a.stride_phase.sin() * s;
+    let mut m = pry(swing, 0.07 * d.pre, 0.0);
+    // Lunge: lead with the right leg, push off the left.
+    m.pitch += (d.raise + d.sweep) * if right { 0.3 } else { -0.2 };
+    if kind == EnemyKind::PhaseStalker && a.blink > 0.0 {
+        m = m.plus(pry(0.25, 0.1, 0.0).scale(smooth01(a.blink) * (1.0 - d.stun)));
+    }
+    m.plus(pry(0.12 + 0.04 * d.tremor, 0.12, 0.0).scale(d.stun))
+}
+
+/// Per-frame spin rate (rad/s) of spinning rigs (Fiend emitter, boss halo).
+pub fn rig_spin_rate(kind: EnemyKind, rig: RigKind, a: &EnemyAnimInput) -> f32 {
+    let d = drive(kind, a);
+    let stun = if a.stunned { 0.2 } else { 1.0 };
+    match rig {
+        // Revs hard through the wind-up, sputters when stunned.
+        RigKind::FiendEmitter => (2.6 + 14.0 * d.pre) * stun,
+        RigKind::BossHalo => {
+            let base = if a.boss_overdrive { 0.9 * 2.8 } else { 0.9 };
+            (base + if a.boss_telegraph > 0.0 { 3.0 } else { 0.0 }) * stun
+        }
+        _ => 0.0,
+    }
+}
+
+/// Pure pose of one articulated rig pivot (body-pivot space): the SAME math
+/// drives live demons ([`enemy_visuals`]) and the Bestiary turntable.
+pub fn limb_pose(kind: EnemyKind, rig: RigKind, a: &EnemyAnimInput) -> Transform {
+    let d = drive(kind, a);
+    let rest = a.rest;
+    let (t, ph) = (if a.time.is_finite() { a.time } else { 0.0 }, if a.phase.is_finite() { a.phase } else { 0.0 });
+    let spin = if a.spin.is_finite() { a.spin } else { 0.0 };
+    let side = rig.side();
+    let mut offset = Vec3::ZERO;
+    let mut scale = 1.0;
+    let m = match rig {
+        RigKind::ArmLeft | RigKind::ArmRight => arm_motion(kind, rig == RigKind::ArmRight, &d, a),
+        RigKind::LegLeft | RigKind::LegRight => leg_motion(kind, rig == RigKind::LegRight, &d, a),
+        RigKind::CacoJaw => {
+            // Breathes at idle, gapes wide on the wind-up, snaps shut on release.
+            let chatter = if a.enraged { -0.05 * (t * 22.0).sin().abs() } else { 0.0 };
+            let idle = -0.05 - 0.04 * d.breathe;
+            pry(
+                (idle + chatter) * (1.0 - d.stun) - 0.78 * d.pre + 0.06 * d.rel - 0.5 * d.raise + 0.04 * d.sweep + (-0.32 + 0.05 * d.tremor) * d.stun,
+                0.0,
+                0.0,
+            )
+        }
+        RigKind::CacoTendrilsLeft | RigKind::CacoTendrilsRight => {
+            let off = if rig == RigKind::CacoTendrilsRight { PI } else { 0.0 };
+            let freq = if a.enraged { 3.8 } else { 2.4 };
+            let sway = 1.0 - 0.75 * d.stun;
+            pry(
+                // Flare back as the maw gapes, whip forward as the orbs launch.
+                0.2 * (t * freq + ph + off).sin() * sway * (1.0 - 0.6 * d.pre) - 0.35 * d.k - 0.45 * d.pre + 0.35 * d.rel + d.stun * (0.12 * (t * 31.0 + off).sin() - 0.12),
+                0.14 * (t * 1.7 + ph * 1.3 + off).sin() * sway + 0.28 * d.pre,
+                0.0,
+            )
+        }
+        RigKind::FiendEmitter => {
+            let beat = if a.stunned { ((t * 3.0).sin() * 0.5 + 0.5) * (0.5 + 0.5 * (t * 17.0).sin().max(0.0)) } else { (t * (6.0 + 12.0 * d.pre) + ph).sin() * 0.5 + 0.5 };
+            scale = 1.0 + 0.08 * beat + 0.16 * d.pre;
+            offset = Vec3::Y * (0.025 * beat + 0.05 * d.pre);
+            let tilt = Quat::from_rotation_x(-0.3 * d.stun);
+            return Transform { translation: rest.translation + offset, rotation: rest.rotation * tilt * Quat::from_rotation_y(spin), scale: Vec3::splat(scale) };
         }
         RigKind::BossHalo => {
-            // Broadcast halo spins about its axis; faster in Overdrive and while telegraphing.
-            let mut speed = 0.9;
-            if let Some(st) = boss {
-                if st.phase == crate::boss::BossPhase::Overdrive {
-                    speed *= 2.8;
-                }
-                if st.telegraph > 0.0 {
-                    speed += 3.0;
-                }
-            }
-            if e.stun_timer > 0.0 {
-                speed *= 0.2;
-            }
-            rp.angle = (rp.angle + speed * dt) % TAU;
-            tf.rotation = rest.rotation * Quat::from_rotation_y(rp.angle);
+            let sag = Quat::from_rotation_x(0.2 * d.stun);
+            return Transform { translation: rest.translation, rotation: rest.rotation * sag * Quat::from_rotation_y(spin), scale: rest.scale };
+        }
+        RigKind::SniperDish => {
+            let target = if d.stun > 0.0 {
+                Quat::from_euler(EulerRot::YXZ, 0.15 * (t * 0.5 + ph).sin(), -0.45 + 0.02 * d.tremor, 0.0)
+            } else if a.sniper_lock > 0.0 {
+                Quat::from_euler(EulerRot::YXZ, 0.0, -0.22, (t * 45.0).sin() * 0.03)
+            } else {
+                Quat::from_euler(EulerRot::YXZ, (t * 0.6 + ph).sin() * 0.65, 0.05 * (t * 0.9 + ph).sin(), 0.0)
+            };
+            return Transform {
+                translation: rest.translation + Vec3::Z * (0.08 * d.kick),
+                rotation: rest.rotation * target * Quat::from_rotation_x(0.28 * d.kick),
+                scale: rest.scale,
+            };
+        }
+        RigKind::SniperCannon => {
+            let lk = if a.sniper_lock > 0.0 { (a.sniper_lock * 4.0).min(1.0) } else { 0.0 } * (1.0 - d.stun);
+            let charge = (t * 60.0).sin() * 0.012 * lk;
+            let idle = 1.0 - lk;
+            // Lock-on: shouldered forward and levelled. Shot: a long straight
+            // slide back along the rails with a restrained muzzle climb.
+            offset = Vec3::new(0.0, 0.02 * d.kick - 0.05 * d.stun, -0.09 * lk * (1.0 - d.kick) + 0.3 * d.kick);
+            pry(
+                0.02 * (t * 1.3 + ph).sin() * idle - 0.05 * lk + charge + 0.26 * d.kick - 0.4 * d.stun,
+                0.0,
+                0.015 * (t * 0.9 + ph).sin() * idle + charge * 0.7,
+            )
         }
         RigKind::BossCannon => {
-            // Idle breathing pitch; recoil backward (and pitch up) while charging an attack.
-            let charging = boss.is_some_and(|st| st.telegraph > 0.0);
-            let breathe = (t * 1.7 + e.phase).sin();
-            let (offset, pitch) = if charging { (Vec3::new(0.0, 0.04, 0.2), 0.12) } else { (Vec3::Y * (0.03 * breathe), 0.035 * breathe) };
-            // Hard barrel kick right after a barrage fires (decays with `attack_anim`).
-            let kick = rig_recoil(e);
-            let (offset, pitch) = (offset + Vec3::new(0.0, 0.03, 0.32) * kick, pitch + 0.28 * kick);
-            let rate = if kick > 0.0 { 32.0 } else if charging { 14.0 } else { 6.0 };
-            tf.translation = tf.translation.lerp(rest.translation + offset, ease(rate));
-            tf.rotation = tf.rotation.slerp(rest.rotation * Quat::from_rotation_x(pitch), ease(if kick > 0.0 { 32.0 } else { 8.0 }));
+            let amp = if a.boss_overdrive { 1.5 } else { 1.0 };
+            let charging = d.pre * (1.0 - d.rel.min(1.0));
+            let breathe = (t * 1.7 + ph).sin();
+            let shake = 0.02 * (t * 50.0).sin() * charging * amp;
+            offset = Vec3::new(0.0, 0.03 * breathe * (1.0 - charging), 0.0)
+                + Vec3::new(0.0, 0.04, 0.2) * charging * amp
+                + Vec3::new(0.0, 0.03, 0.32) * d.kick
+                + Vec3::new(0.0, -0.06, 0.0) * d.stun;
+            pry(0.035 * breathe * (1.0 - charging) + 0.12 * charging * amp + shake + 0.28 * d.kick - 0.4 * d.stun, 0.0, 0.0)
         }
-        RigKind::PylonRing => {}
+        RigKind::PylonRing => Pry::default(),
+    };
+    let f = |v: f32| if v.is_finite() { v.clamp(-PI, PI) } else { 0.0 };
+    let rot = Quat::from_euler(EulerRot::YXZ, f(m.yaw) * side, f(m.pitch), f(m.roll) * side);
+    let offset = if offset.is_finite() { offset * Vec3::new(side, 1.0, 1.0) } else { Vec3::ZERO };
+    Transform { translation: rest.translation + offset, rotation: rest.rotation * rot, scale: rest.scale * scale }
+}
+
+/// How fast a rig pivot chases its [`limb_pose`] target (`None` = set directly).
+pub fn rig_follow_rate(rig: RigKind, a: &EnemyAnimInput) -> Option<f32> {
+    let kick = recoil_kick(a.attack_anim, a.attack_lunge) > 0.0;
+    match rig {
+        RigKind::FiendEmitter | RigKind::BossHalo | RigKind::PylonRing => None,
+        RigKind::SniperDish => Some(if kick { 30.0 } else if a.sniper_lock > 0.0 { 18.0 } else if a.stunned { 6.0 } else { 4.0 }),
+        RigKind::SniperCannon | RigKind::BossCannon => Some(if kick { 32.0 } else if a.sniper_lock > 0.0 || a.boss_telegraph > 0.0 { 16.0 } else { 7.0 }),
+        RigKind::CacoTendrilsLeft | RigKind::CacoTendrilsRight => Some(12.0),
+        _ => Some(if a.attack_anim > 0.0 { 40.0 } else { 26.0 }),
     }
+}
+
+/// Advance one rig pivot toward its pose (spin accumulates in `rp.angle`).
+/// Allocation-free; used by live demons and the Bestiary exhibits.
+pub fn apply_rig_pose(tf: &mut Transform, rp: &mut RigPivot, kind: EnemyKind, input: &EnemyAnimInput, dt: f32) {
+    let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+    let mut a = *input;
+    a.rest = rp.rest;
+    rp.angle = (rp.angle + rig_spin_rate(kind, rp.kind, &a) * dt) % TAU;
+    a.spin = rp.angle;
+    let target = limb_pose(kind, rp.kind, &a);
+    match rig_follow_rate(rp.kind, &a) {
+        None => *tf = target,
+        Some(rate) => {
+            let k = 1.0 - (-rate * dt).exp();
+            tf.translation = tf.translation.lerp(target.translation, k);
+            tf.rotation = tf.rotation.slerp(target.rotation, k).normalize();
+            tf.scale = tf.scale.lerp(target.scale, k);
+        }
+    }
+}
+
+/// Seconds of the charge part of a Bestiary attack preview (wind-up, lock-on,
+/// barrage telegraph or blink coil).
+pub fn attack_preview_lead(kind: EnemyKind) -> f32 {
+    if kind == EnemyKind::PhaseStalker { PHASE_BLINK_TELEGRAPH } else { attack_windup_secs(kind) }
+}
+
+/// Idle hold after the follow-through of a Bestiary attack preview.
+pub const PREVIEW_TAIL_SECS: f32 = 0.45;
+
+/// Total length of a Bestiary attack preview.
+pub fn attack_preview_len(kind: EnemyKind) -> f32 {
+    attack_preview_lead(kind) + ATTACK_ANIM_SECS + PREVIEW_TAIL_SECS
+}
+
+/// Stage of a Bestiary attack preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewPhase {
+    /// Wind-up / lock-on / barrage telegraph / blink coil.
+    Charge,
+    /// The shot or slash and its follow-through.
+    Strike,
+    /// Settling back into the idle loop.
+    Recover,
+}
+
+/// Stage of the Bestiary attack preview at `t` seconds (`None` = not playing).
+pub fn attack_preview_phase(kind: EnemyKind, t: f32) -> Option<PreviewPhase> {
+    if !t.is_finite() || t < 0.0 || t >= attack_preview_len(kind) {
+        return None;
+    }
+    let lead = attack_preview_lead(kind);
+    Some(if t < lead {
+        PreviewPhase::Charge
+    } else if t < lead + ATTACK_ANIM_SECS {
+        PreviewPhase::Strike
+    } else {
+        PreviewPhase::Recover
+    })
+}
+
+/// Overlay the Bestiary attack preview at `t` seconds onto `a`: the kind's
+/// full charge (wind-up / lock-on / telegraph / blink coil) then its
+/// release follow-through. Returns `false` once the preview is over.
+pub fn apply_attack_preview(kind: EnemyKind, t: f32, a: &mut EnemyAnimInput) -> bool {
+    if !t.is_finite() || t < 0.0 || t >= attack_preview_len(kind) {
+        return false;
+    }
+    let lead = attack_preview_lead(kind);
+    if t < lead {
+        let p = (t / lead).clamp(0.001, 1.0);
+        match kind {
+            EnemyKind::RelaySniper => a.sniper_lock = p,
+            EnemyKind::CarrierDaemon => a.boss_telegraph = p,
+            EnemyKind::PhaseStalker => a.blink = p,
+            _ => a.windup = p,
+        }
+    } else {
+        a.attack_anim = (1.0 - (t - lead) / ATTACK_ANIM_SECS).max(0.0);
+        a.attack_lunge = kind == EnemyKind::PhaseStalker;
+    }
+    true
 }
 
 /// Demon death processing (drops, fatalities, style + kill telemetry).
@@ -3517,6 +4272,11 @@ mod tests {
         }
     }
 
+    /// Farthest a rig's geometry may reach from its pivot (scales with the demon).
+    fn st_reach(kind: EnemyKind) -> f32 {
+        kind.stats(1).height * 0.75 + 0.3
+    }
+
     #[test]
     fn sculpted_models_bake_few_materials_and_fit_their_hit_spheres() {
         use bevy::ecs::system::RunSystemOnce;
@@ -3536,10 +4296,24 @@ mod tests {
             assert!(a.source_part_counts[kind.index()] > 3 * model.len(), "{kind:?}: sculpted from many parts");
             let mut b = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
             grow_bounds(meshes, model, Transform::IDENTITY, &mut b);
+            let mut bodies = 1;
             for rig in &a.rigs[kind.index()] {
                 assert!(!rig.parts.is_empty() && rig.parts.len() <= 3, "{kind:?}: rig {:?} has {} parts", rig.kind, rig.parts.len());
+                let rig_bodies = rig.parts.iter().filter(|p| p.role == PartRole::Body).count();
+                assert!(rig_bodies <= 1, "{kind:?}: rig {:?} merges its body geometry into one part", rig.kind);
+                if rig.kind.is_arm() || rig.kind.is_leg() || matches!(rig.kind, RigKind::CacoJaw | RigKind::CacoTendrilsLeft | RigKind::CacoTendrilsRight) {
+                    assert_eq!(rig_bodies, 1, "{kind:?}: {:?} carries tintable hide (baked with the look)", rig.kind);
+                }
+                bodies += rig_bodies;
                 grow_bounds(meshes, &rig.parts, rig.rest, &mut b);
+                // Joint-local bake: every limb's geometry hugs its pivot.
+                let mut lb = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                grow_bounds(meshes, &rig.parts, Transform::IDENTITY, &mut lb);
+                let reach = lb.0.abs().max(lb.1.abs()).max_element();
+                assert!(reach < st_reach(kind), "{kind:?}: rig {:?} geometry reaches {reach:.2} from its pivot", rig.kind);
             }
+            assert!(bodies <= MAX_BODY_PARTS, "{kind:?}: {bodies} body parts fit EnemyLook");
+            assert!(a.rigs[kind.index()].len() <= MAX_RIGS);
             let st = kind.stats(1);
             println!("{kind:?}: {} parts -> {} materials + {} rigs, bounds {:.2} .. {:.2}", a.source_part_counts[kind.index()], model.len(), a.rigs[kind.index()].len(), b.0, b.1);
             if kind.flying() {
@@ -3552,15 +4326,47 @@ mod tests {
             let widest = st.hit_spheres.iter().map(|h| h.1).fold(0.0, f32::max);
             assert!(b.1.x.max(-b.0.x) < widest * 2.2 + 0.6, "{kind:?}: half-width {:.2}", b.1.x.max(-b.0.x));
         }
-        // Articulated rigs where the design calls for them.
-        let rig_kinds = |k: EnemyKind| a.rigs[k.index()].iter().map(|r| r.kind).collect::<Vec<_>>();
-        assert_eq!(rig_kinds(EnemyKind::JammerFiend), vec![RigKind::FiendEmitter]);
-        assert_eq!(a.rigs[EnemyKind::JammerFiend.index()][0].parts.len(), 1, "emitter is a single entity");
-        assert_eq!(rig_kinds(EnemyKind::RelaySniper), vec![RigKind::SniperDish]);
-        assert_eq!(rig_kinds(EnemyKind::CarrierDaemon), vec![RigKind::BossCannon, RigKind::BossHalo]);
-        for k in [EnemyKind::Imp, EnemyKind::Cacodemon, EnemyKind::HellBaron, EnemyKind::PhaseStalker] {
-            assert!(a.rigs[k.index()].is_empty(), "{k:?} stays rigid");
+        // Full articulated rigs for every demon.
+        let rig_kinds = |k: EnemyKind| {
+            let mut v = a.rigs[k.index()].iter().map(|r| format!("{:?}", r.kind)).collect::<Vec<_>>();
+            v.sort();
+            v
+        };
+        let names = |v: &[RigKind]| {
+            let mut v = v.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
+            v.sort();
+            v
+        };
+        use RigKind::*;
+        let limbs = [ArmLeft, ArmRight, LegLeft, LegRight];
+        for k in [EnemyKind::Imp, EnemyKind::HellBaron, EnemyKind::PhaseStalker] {
+            assert_eq!(rig_kinds(k), names(&limbs), "{k:?}");
         }
+        assert_eq!(rig_kinds(EnemyKind::Cacodemon), names(&[CacoJaw, CacoTendrilsLeft, CacoTendrilsRight]));
+        assert_eq!(rig_kinds(EnemyKind::JammerFiend), names(&[FiendEmitter, ArmLeft, ArmRight, LegLeft, LegRight]));
+        assert_eq!(rig_kinds(EnemyKind::RelaySniper), names(&[SniperDish, SniperCannon]));
+        assert_eq!(rig_kinds(EnemyKind::CarrierDaemon), names(&[BossCannon, BossHalo, ArmLeft, ArmRight, LegLeft, LegRight]));
+        let rig = |k: EnemyKind, r: RigKind| a.rigs[k.index()].iter().find(|m| m.kind == r).unwrap().clone();
+        assert_eq!(rig(EnemyKind::JammerFiend, FiendEmitter).parts.len(), 1, "emitter is a single entity");
+        // Pivots sit on the real joints, left mirrored from right.
+        for (k, sh, hip) in [
+            (EnemyKind::Imp, v3(0.31, 1.38, -0.2), v3(0.15, 0.88, 0.05)),
+            (EnemyKind::JammerFiend, v3(0.62, 1.78, 0.0), v3(0.27, 0.96, 0.0)),
+            (EnemyKind::HellBaron, v3(0.94, 2.32, 0.0), v3(0.38, 1.32, 0.0)),
+            (EnemyKind::PhaseStalker, v3(0.25, 1.58, -0.2), v3(0.13, 0.96, 0.04)),
+            (EnemyKind::CarrierDaemon, v3(1.18, 3.2, 0.0), v3(0.74, 1.85, 0.02)),
+        ] {
+            let m = v3(-1.0, 1.0, 1.0);
+            assert!(rig(k, ArmRight).rest.translation.distance(sh) < 1e-5 && rig(k, ArmLeft).rest.translation.distance(sh * m) < 1e-5, "{k:?} shoulders");
+            assert!(rig(k, LegRight).rest.translation.distance(hip) < 1e-5 && rig(k, LegLeft).rest.translation.distance(hip * m) < 1e-5, "{k:?} hips");
+            // Left limb = mirrored right limb (same extents, X flipped).
+            let (mut lb, mut rb) = ((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)));
+            grow_bounds(meshes, &rig(k, ArmLeft).parts, Transform::IDENTITY, &mut lb);
+            grow_bounds(meshes, &rig(k, ArmRight).parts, Transform::IDENTITY, &mut rb);
+            assert!((lb.0.x + rb.1.x).abs() < 1e-3 && (lb.1.x + rb.0.x).abs() < 1e-3 && (lb.0.y - rb.0.y).abs() < 1e-3, "{k:?}: mirrored arms {lb:?} vs {rb:?}");
+        }
+        assert!(rig(EnemyKind::Cacodemon, CacoJaw).rest.translation.distance(CACO_JAW_HINGE) < 1e-5);
+        assert!(rig(EnemyKind::RelaySniper, SniperCannon).rest.translation.distance(SNIPER_CANNON_PIVOT) < 1e-5);
         // Pylon obelisk: grounded, crowned above the tether origin.
         let mut b = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         grow_bounds(meshes, &a.pylon_model, Transform::IDENTITY, &mut b);
@@ -3718,6 +4524,247 @@ mod tests {
         assert_eq!(rig_recoil(&e), 0.0);
         e.trigger_attack_anim(true);
         assert_eq!(rig_recoil(&e), 0.0, "lunges never kick the cannon / dish rigs");
+    }
+
+    fn rigs_of(kind: EnemyKind) -> Vec<RigKind> {
+        use RigKind::*;
+        let limbs = vec![ArmLeft, ArmRight, LegLeft, LegRight];
+        match kind {
+            EnemyKind::Imp | EnemyKind::HellBaron | EnemyKind::PhaseStalker => limbs,
+            EnemyKind::Cacodemon => vec![CacoJaw, CacoTendrilsLeft, CacoTendrilsRight],
+            EnemyKind::JammerFiend => [vec![FiendEmitter], limbs].concat(),
+            EnemyKind::RelaySniper => vec![SniperDish, SniperCannon],
+            EnemyKind::CarrierDaemon => [vec![BossCannon, BossHalo], limbs].concat(),
+        }
+    }
+
+    fn anim_states() -> Vec<(&'static str, EnemyAnimInput)> {
+        let base = EnemyAnimInput { rest: Transform::from_xyz(0.3, 1.2, -0.1), time: 1.37, phase: 0.6, spin: 0.4, ..default() };
+        vec![
+            ("idle", base),
+            ("stride", EnemyAnimInput { speed_ratio: 1.0, stride_phase: 1.3, ..base }),
+            ("windup", EnemyAnimInput { windup: 0.95, ..base }),
+            ("release", EnemyAnimInput { attack_anim: 0.8, ..base }),
+            ("lunge", EnemyAnimInput { attack_anim: 0.75, attack_lunge: true, ..base }),
+            ("stunned", EnemyAnimInput { stunned: true, ..base }),
+            ("enraged", EnemyAnimInput { enraged: true, speed_ratio: 1.3, stride_phase: 4.0, ..base }),
+            ("lock", EnemyAnimInput { sniper_lock: 0.6, ..base }),
+            ("telegraph", EnemyAnimInput { boss_telegraph: 0.7, ..base }),
+            ("overdrive", EnemyAnimInput { boss_telegraph: 0.7, boss_overdrive: true, ..base }),
+            ("blink", EnemyAnimInput { blink: 0.9, ..base }),
+            ("spun", EnemyAnimInput { spin: 2.2, ..base }),
+            ("nan", EnemyAnimInput { time: f32::NAN, speed_ratio: f32::INFINITY, windup: f32::NAN, attack_anim: f32::NAN, ..base }),
+        ]
+    }
+
+    /// Rotation distance between two limb poses (radians) + translation delta.
+    fn pose_delta(a: Transform, b: Transform) -> f32 {
+        a.rotation.angle_between(b.rotation) + a.translation.distance(b.translation) + (a.scale - b.scale).abs().max_element()
+    }
+
+    #[test]
+    fn limb_poses_are_finite_and_bounded_for_every_demon_rig_and_state() {
+        for kind in EnemyKind::ALL {
+            for rig in rigs_of(kind) {
+                for (name, a) in anim_states() {
+                    let tf = limb_pose(kind, rig, &a);
+                    assert!(tf.is_finite(), "{kind:?} {rig:?} {name}: {tf:?}");
+                    assert!((tf.rotation.length() - 1.0).abs() < 1e-3, "{kind:?} {rig:?} {name}: normalized rotation");
+                    assert!(tf.translation.distance(a.rest.translation) < 0.45, "{kind:?} {rig:?} {name}: joint stays attached {tf:?}");
+                    assert!(tf.scale.min_element() > 0.8 && tf.scale.max_element() < 1.4, "{kind:?} {rig:?} {name}: scale {}", tf.scale);
+                }
+                // Every rig moves in some state (nothing is frozen).
+                let idle = limb_pose(kind, rig, &anim_states()[0].1);
+                let lively = anim_states().iter().any(|(_, a)| pose_delta(limb_pose(kind, rig, a), idle) > 0.15);
+                assert!(lively, "{kind:?} {rig:?} never animates");
+            }
+        }
+    }
+
+    #[test]
+    fn walker_limbs_stride_in_anti_phase_and_telegraph_their_attacks() {
+        use RigKind::*;
+        let base = EnemyAnimInput { time: 2.0, ..default() };
+        let pitch = |tf: Transform| tf.rotation.to_euler(EulerRot::YXZ).1;
+        let hand = |tf: Transform| tf.rotation * Vec3::NEG_Y;
+        for kind in [EnemyKind::Imp, EnemyKind::JammerFiend, EnemyKind::HellBaron, EnemyKind::PhaseStalker, EnemyKind::CarrierDaemon] {
+            let run = EnemyAnimInput { speed_ratio: 1.0, stride_phase: FRAC_PI_2, ..base };
+            let (lr, ll) = (pitch(limb_pose(kind, LegRight, &run)), pitch(limb_pose(kind, LegLeft, &run)));
+            assert!(lr > 0.2 && ll < -0.2, "{kind:?}: legs in anti-phase {lr} / {ll}");
+            let (ar, al) = (pitch(limb_pose(kind, ArmRight, &run)), pitch(limb_pose(kind, ArmLeft, &run)));
+            assert!(ar < 0.0 && al > 0.0, "{kind:?}: arms counter-swing the legs {ar} / {al}");
+            // Mirror symmetry at idle: left = right reflected.
+            let (r, l) = (hand(limb_pose(kind, ArmRight, &base)), hand(limb_pose(kind, ArmLeft, &base)));
+            assert!((r.x + l.x).abs() < 1e-4 && (r.y - l.y).abs() < 1e-4 && (r.z - l.z).abs() < 1e-4, "{kind:?}: {r} vs {l}");
+            // Wind-up, release, stun and frenzy are all distinct, readable silhouettes.
+            let idle = limb_pose(kind, ArmRight, &base);
+            let charge = if kind == EnemyKind::CarrierDaemon { EnemyAnimInput { boss_telegraph: 1.0, ..base } } else { EnemyAnimInput { windup: 1.0, ..base } };
+            let wind = limb_pose(kind, ArmRight, &charge);
+            let rel = limb_pose(kind, ArmRight, &EnemyAnimInput { attack_anim: 1.0 - 0.14, ..base });
+            let lunge = limb_pose(kind, ArmRight, &EnemyAnimInput { attack_anim: 0.75, attack_lunge: true, ..base });
+            let stun = limb_pose(kind, ArmRight, &EnemyAnimInput { stunned: true, ..base });
+            assert!(pose_delta(wind, idle) > 0.5, "{kind:?}: wind-up reads ({})", pose_delta(wind, idle));
+            assert!(pose_delta(rel, wind) > 0.4, "{kind:?}: release snaps out of the wind-up");
+            assert!(pose_delta(lunge, idle) > 0.3, "{kind:?}: melee lunge");
+            assert!(pose_delta(stun, idle) > 0.15, "{kind:?}: stunned slump");
+            let calm = limb_pose(kind, ArmRight, &EnemyAnimInput { speed_ratio: 1.0, stride_phase: FRAC_PI_2, ..base });
+            let frenzy = limb_pose(kind, ArmRight, &EnemyAnimInput { speed_ratio: 1.0, stride_phase: FRAC_PI_2, enraged: true, ..base });
+            assert!(pitch(frenzy).abs() > pitch(calm).abs() + 0.05, "{kind:?}: enraged frenzy swings wider");
+            // The release starts exactly where the wind-up ended (no pop).
+            let start = limb_pose(kind, ArmRight, &EnemyAnimInput { attack_anim: 1.0, ..base });
+            if kind != EnemyKind::CarrierDaemon {
+                assert!(pose_delta(start, wind) < 0.05, "{kind:?}: release carries the coiled pose");
+            }
+        }
+        // Imp: right claw cocked high, left arm out for balance.
+        let w = EnemyAnimInput { windup: 1.0, ..base };
+        assert!(hand(limb_pose(EnemyKind::Imp, ArmRight, &w)).y > 0.3, "imp fireball arm raised");
+        assert!(hand(limb_pose(EnemyKind::Imp, ArmLeft, &w)).x < -0.5, "imp balance arm out");
+        // Baron: both gauntlets heaved overhead.
+        for r in [ArmLeft, ArmRight] {
+            assert!(hand(limb_pose(EnemyKind::HellBaron, r, &w)).y > 0.7, "baron double heave");
+        }
+        // Stalker: the scythes point UP from the shoulder, so judge the blade
+        // itself (shoulder -> tip of the right crescent, rig-local).
+        let blade = |a: EnemyAnimInput| limb_pose(EnemyKind::PhaseStalker, ArmRight, &a).rotation * Vec3::new(0.6, 0.72, -0.45);
+        let (rest, coil) = (blade(base), blade(EnemyAnimInput { blink: 1.0, ..base }));
+        assert!(coil.x < rest.x - 0.3 && coil.y > 0.6, "blink coil pulls the tips in over the crest: {rest} -> {coil}");
+        let open = blade(EnemyAnimInput { windup: 1.0, ..base });
+        assert!(open.x > rest.x + 0.2, "wind-up flings the scythes wide: {open}");
+        // Slash peak (lunge sweep): tips carried across the centreline, out in front.
+        let slash = blade(EnemyAnimInput { attack_anim: 0.55, attack_lunge: true, ..base });
+        assert!(slash.x < rest.x - 0.5 && slash.z < rest.z - 0.2, "slash scissors across the visor: {slash}");
+        let limp = blade(EnemyAnimInput { stunned: true, ..base });
+        assert!(limp.y < rest.y - 0.5, "stunned scythes droop: {limp}");
+        // Imp: the throw brings the claw down from the cocked pose to point at the target.
+        let fwd = |a: EnemyAnimInput| limb_pose(EnemyKind::Imp, ArmRight, &a).rotation * Vec3::new(0.21, -0.26, -0.4);
+        assert!(fwd(w).y > 0.3 && fwd(EnemyAnimInput { attack_anim: 1.0 - 0.14, ..base }).z < -0.4, "imp overhand throw");
+        // Carrier telegraph spreads the arms wide, more in Overdrive.
+        let spread = |od: bool| hand(limb_pose(EnemyKind::CarrierDaemon, ArmRight, &EnemyAnimInput { boss_telegraph: 1.0, boss_overdrive: od, ..base })).x;
+        assert!(spread(false) > 0.6 && spread(true) > spread(false), "carrier roar spread {} / {}", spread(false), spread(true));
+    }
+
+    #[test]
+    fn exhibit_bodies_breathe_coil_and_slump_like_live_demons() {
+        for kind in EnemyKind::ALL {
+            // Idle: subtle, bounded life (a few cm / ~1 deg), never frozen for organic demons.
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for i in 0..240 {
+                let p = idle_breath_pose(kind, i as f32 / 30.0, 0.7);
+                pose_ok(p);
+                assert!(p.offset.length() < 0.03 && p.pitch.abs() < 0.03 && p.roll.abs() < 0.03, "{kind:?}: breathing stays subtle {p:?}");
+                lo = lo.min(p.offset.y);
+                hi = hi.max(p.offset.y);
+            }
+            assert_eq!(hi - lo > 0.005, !kind.flying(), "{kind:?}: walkers breathe, flyers bob in hover_pose");
+            let base = EnemyAnimInput { time: 1.0, phase: 0.4, ..default() };
+            let idle = exhibit_body_pose(kind, &base);
+            pose_ok(idle);
+            pose_ok(exhibit_body_pose(kind, &EnemyAnimInput { time: f32::NAN, phase: f32::INFINITY, windup: f32::NAN, ..base }));
+            // The exhibit torso plays the same coil / signature charge / slump as in-game.
+            let charge = match kind {
+                EnemyKind::RelaySniper => EnemyAnimInput { sniper_lock: 1.0, ..base },
+                EnemyKind::CarrierDaemon => EnemyAnimInput { boss_telegraph: 1.0, ..base },
+                _ => EnemyAnimInput { windup: 1.0, ..base },
+            };
+            let coil = exhibit_body_pose(kind, &charge).pitch - idle.pitch;
+            if kind == EnemyKind::RelaySniper {
+                assert!(coil < -0.03, "sniper leans in behind the cannon: {coil}");
+            } else {
+                assert!(coil > 0.08, "{kind:?}: torso rears back on the charge: {coil}");
+            }
+            assert!(exhibit_body_pose(kind, &EnemyAnimInput { stunned: true, ..base }).pitch < idle.pitch - 0.2, "{kind:?}: stun slump");
+            // No upright pop between the coil and the recoil of a ranged release.
+            if uses_generic_windup(kind) {
+                let end = exhibit_body_pose(kind, &EnemyAnimInput { windup: 1.0, ..base });
+                let start = exhibit_body_pose(kind, &EnemyAnimInput { attack_anim: 1.0, ..base });
+                assert!((end.pitch - start.pitch).abs() < 1e-4 && end.offset.distance(start.offset) < 1e-4, "{kind:?}: {end:?} vs {start:?}");
+                let mut e = Enemy::new(kind, 1);
+                e.trigger_attack_anim(false);
+                assert!(body_pose(&e, Quat::IDENTITY).pitch > 0.08, "{kind:?}: live release starts coiled");
+            }
+        }
+        assert_eq!(charge_pose(EnemyKind::Imp, 1.0, 1.0), BodyPose::default());
+        assert_eq!(charge_pose(EnemyKind::CarrierDaemon, 0.0, f32::NAN), BodyPose::default());
+    }
+
+    #[test]
+    fn signature_rigs_gape_lock_kick_and_droop() {
+        use RigKind::*;
+        let base = EnemyAnimInput { time: 0.5, ..default() };
+        let tip = |tf: Transform| tf.rotation * Vec3::NEG_Z;
+        // Cacodemon jaw swings wide on the wind-up (front drops), shut on release.
+        let jaw = |a: EnemyAnimInput| (limb_pose(EnemyKind::Cacodemon, CacoJaw, &a).rotation * Vec3::new(0.0, -0.1, -0.3)).y;
+        let rest_y = jaw(base);
+        assert!(jaw(EnemyAnimInput { windup: 1.0, ..base }) < rest_y - 0.12, "maw gapes on wind-up");
+        assert!(jaw(EnemyAnimInput { attack_anim: 1.0 - 0.14, ..base }) > rest_y, "snaps shut as the orbs launch");
+        assert!(jaw(EnemyAnimInput { stunned: true, ..base }) < rest_y - 0.05, "stunned jaw hangs slack");
+        // Tendril clusters undulate out of phase.
+        for t in [0.3f32, 1.1, 2.4] {
+            let a = EnemyAnimInput { time: t, ..default() };
+            let (l, r) = (limb_pose(EnemyKind::Cacodemon, CacoTendrilsLeft, &a), limb_pose(EnemyKind::Cacodemon, CacoTendrilsRight, &a));
+            let (pl, pr) = (l.rotation.to_euler(EulerRot::YXZ).1, r.rotation.to_euler(EulerRot::YXZ).1);
+            assert!((pl - pr).abs() > 0.02 || (pl + pr).abs() < 0.2, "out of phase at {t}: {pl} {pr}");
+        }
+        // Sniper: dish snaps forward, cannon braces and slides back on the shot, both droop stunned.
+        let rest = Transform::from_translation(SNIPER_CANNON_PIVOT);
+        let cannon = |a: EnemyAnimInput| limb_pose(EnemyKind::RelaySniper, SniperCannon, &EnemyAnimInput { rest, ..a });
+        let fire = cannon(EnemyAnimInput { attack_anim: 0.97, ..base });
+        assert!(fire.translation.z > rest.translation.z + 0.12 && tip(fire).y > 0.15, "railgun slide + muzzle kick {fire:?}");
+        assert!(tip(cannon(EnemyAnimInput { stunned: true, ..base })).y < -0.3, "cannon droops");
+        let dish = |a: EnemyAnimInput| tip(limb_pose(EnemyKind::RelaySniper, SniperDish, &a));
+        assert!(dish(EnemyAnimInput { sniper_lock: 0.5, ..base }).x.abs() < 0.05, "dish locks dead ahead");
+        assert!(dish(EnemyAnimInput { stunned: true, ..base }).y < -0.3, "dish droops");
+        // Spin rates: emitter revs in the wind-up, halo slows when stunned and races in Overdrive.
+        let r = |k, rig, a: EnemyAnimInput| rig_spin_rate(k, rig, &a);
+        assert!(r(EnemyKind::JammerFiend, FiendEmitter, EnemyAnimInput { windup: 1.0, ..base }) > 3.0 * r(EnemyKind::JammerFiend, FiendEmitter, base));
+        assert!(r(EnemyKind::JammerFiend, FiendEmitter, EnemyAnimInput { stunned: true, ..base }) < r(EnemyKind::JammerFiend, FiendEmitter, base));
+        assert!(r(EnemyKind::CarrierDaemon, BossHalo, EnemyAnimInput { stunned: true, ..base }) < 0.5);
+        assert!(r(EnemyKind::CarrierDaemon, BossHalo, EnemyAnimInput { boss_overdrive: true, ..base }) > 2.0);
+    }
+
+    #[test]
+    fn windups_follow_per_kind_timings_and_bestiary_previews_play_through() {
+        assert_eq!(attack_windup_secs(EnemyKind::Imp), 0.28);
+        assert_eq!(attack_windup_secs(EnemyKind::Cacodemon), 0.32);
+        assert_eq!(attack_windup_secs(EnemyKind::JammerFiend), 0.34);
+        assert_eq!(attack_windup_secs(EnemyKind::HellBaron), 0.42);
+        assert_eq!(attack_windup_secs(EnemyKind::PhaseStalker), 0.26);
+        let mut e = Enemy::new(EnemyKind::HellBaron, 1);
+        assert_eq!(e.windup_progress(), 0.0);
+        e.start_windup();
+        assert_eq!((e.attack_windup, e.attack_windup_total), (0.42, 0.42));
+        e.attack_windup = 0.21;
+        assert!((e.windup_progress() - 0.5).abs() < 1e-5);
+        assert!(windup_pose(e.kind, e.windup_progress()).pitch > 0.03, "torso coils back");
+        let a = EnemyAnimInput::from_enemy(&e, None, 1.0);
+        assert!((a.windup - 0.5).abs() < 1e-5);
+        e.cancel_windup();
+        assert_eq!(e.windup_progress(), 0.0);
+        e.stun_timer = 1.0;
+        assert!(body_pose(&e, Quat::IDENTITY).pitch < -0.15, "stunned torso slumps forward");
+        assert!(EnemyAnimInput::from_enemy(&e, None, 1.0).stunned);
+        for kind in EnemyKind::ALL {
+            let len = attack_preview_len(kind);
+            let mut charged = false;
+            let mut released = false;
+            let mut t = 0.0;
+            while t < len + 0.1 {
+                let mut a = EnemyAnimInput::default();
+                let live = apply_attack_preview(kind, t, &mut a);
+                assert_eq!(live, t < len, "{kind:?} at {t}");
+                charged |= a.windup > 0.0 || a.sniper_lock > 0.0 || a.boss_telegraph > 0.0 || a.blink > 0.0;
+                released |= a.attack_anim > 0.5;
+                t += 1.0 / 60.0;
+            }
+            assert!(charged && released, "{kind:?} preview charges then releases");
+            let lead = attack_preview_lead(kind);
+            assert_eq!(attack_preview_phase(kind, lead * 0.5), Some(PreviewPhase::Charge));
+            assert_eq!(attack_preview_phase(kind, lead + 0.01), Some(PreviewPhase::Strike));
+            assert_eq!(attack_preview_phase(kind, len - 0.01), Some(PreviewPhase::Recover));
+            assert_eq!(attack_preview_phase(kind, len), None);
+            assert_eq!(attack_preview_phase(kind, f32::NAN), None);
+        }
     }
 
     #[test]

@@ -1362,7 +1362,7 @@ pub fn profile_path_policy(
 /// `$XDG_DATA_HOME/segnale-debole/profile.json` (or `~/.local/share/...`).
 pub fn resolve_profile_path(windowed: bool) -> Option<PathBuf> {
     let var = |k: &str| std::env::var(k).ok();
-    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS", "SEGNALE_COMPENDIUM_SHOTS", "SEGNALE_LEADERBOARD_SHOTS", "SEGNALE_M31_SHOTS"].into_iter().any(|k| var(k).is_some());
+    let bot_or_shots = ["SEGNALE_BOT_TEST", "SEGNALE_SHOTS", "SEGNALE_META_SHOTS", "SEGNALE_TRIAL_SHOTS", "SEGNALE_COMPENDIUM_SHOTS", "SEGNALE_LEADERBOARD_SHOTS", "SEGNALE_M31_SHOTS", "SEGNALE_POSE_SHOTS"].into_iter().any(|k| var(k).is_some());
     profile_path_policy(var("SEGNALE_PROFILE").as_deref(), windowed, bot_or_shots, var("XDG_DATA_HOME").as_deref(), var("HOME").as_deref())
 }
 

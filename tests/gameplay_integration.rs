@@ -2357,7 +2357,9 @@ fn perf_multi_floor_budgets_and_tick_timing() {
             let (vis1, total1) = light_counts(&mut app);
             assert_eq!(material_count(&app), mats0, "floor {floor}: combat + abilities allocated StandardMaterials");
             assert!(now * 10 <= legacy, "floor {floor}: static mesh entities {now} vs legacy {legacy}");
-            assert!(avg_children <= 10.0, "floor {floor}: {avg_children} child entities per demon");
+            // Milestone 36: articulated arm / leg / jaw / tendril rigs (pivot + up to 2
+            // extra-material children each) lift the squad average to ~18.5.
+            assert!(avg_children <= 20.0, "floor {floor}: {avg_children} child entities per demon");
             assert!(vis0 < total0, "floor {floor}: far lights are culled ({vis0}/{total0})");
             ticks.sort_by(f64::total_cmp);
             let avg = ticks.iter().sum::<f64>() / ticks.len() as f64;
