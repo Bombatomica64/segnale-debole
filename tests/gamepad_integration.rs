@@ -468,24 +468,116 @@ fn main_menu_prompts_follow_the_active_input_mode() {
     use segnale_debole::gamepad::InputMode;
     use segnale_debole::hud::FieldManual;
     let (mut app, e) = menu_app();
+    // A field manual counts as shown only while the controls overlay is open.
     let shown = |app: &mut App| {
+        if !overlay_open(app) {
+            return Vec::new();
+        }
         let mut q = app.world_mut().query::<(&FieldManual, &Node)>();
         q.iter(app.world()).filter(|(_, n)| n.display != Display::None).map(|(m, _)| m.0).collect::<Vec<_>>()
     };
     assert_eq!(*app.world().resource::<InputMode>(), InputMode::KeyboardMouse);
     let t = ui_texts(&mut app);
-    assert!(t.iter().any(|s| s == "PLAY  [ENTER]") && t.iter().any(|s| s == "LEADERBOARD  [K]"));
+    assert!(t.iter().any(|s| s == "PLAY  [ENTER]") && t.iter().any(|s| s == "LEADERBOARD  [K]") && t.iter().any(|s| s == "CONTROLS  [H]"));
+    assert!(shown(&mut app).is_empty(), "the controls overlay starts hidden");
+    key_tap(&mut app, KeyCode::KeyH);
     assert_eq!(shown(&mut app), vec![InputMode::KeyboardMouse]);
     tap(&mut app, e, GamepadButton::DPadDown);
     assert_eq!(*app.world().resource::<InputMode>(), InputMode::Gamepad);
     let t = ui_texts(&mut app);
     assert!(t.iter().any(|s| s == "PLAY  [START]") && t.iter().any(|s| s == "LEADERBOARD") && t.iter().any(|s| s == "CONTROLLER"), "{t:?}");
-    assert!(t.iter().any(|s| s == "SEED: RANDOM"));
-    assert_eq!(shown(&mut app), vec![InputMode::Gamepad]);
+    assert!(t.iter().any(|s| s == "SEED: RANDOM") && t.iter().any(|s| s == "CONTROLS") && t.iter().any(|s| s == "CLOSE  [B]"));
+    assert_eq!(shown(&mut app), vec![InputMode::Gamepad], "the open manual swaps live");
     key_tap(&mut app, KeyCode::ShiftLeft);
     assert_eq!(*app.world().resource::<InputMode>(), InputMode::KeyboardMouse);
     assert!(ui_texts(&mut app).iter().any(|s| s == "PLAY  [ENTER]"));
     assert_eq!(shown(&mut app), vec![InputMode::KeyboardMouse]);
+}
+
+fn overlay_open(app: &mut App) -> bool {
+    use segnale_debole::hud::{ControlsOverlay, ControlsOverlayOpen};
+    let open = app.world().resource::<ControlsOverlayOpen>().0;
+    let mut q = app.world_mut().query_filtered::<&Node, With<ControlsOverlay>>();
+    let nodes: Vec<Display> = q.iter(app.world()).map(|n| n.display).collect();
+    assert_eq!(nodes.len(), 1, "exactly one controls overlay on screen");
+    assert_eq!(nodes[0] != Display::None, open, "overlay node follows ControlsOverlayOpen");
+    open
+}
+
+fn body_hidden(app: &mut App) -> bool {
+    use segnale_debole::hud::HiddenByControls;
+    let mut q = app.world_mut().query_filtered::<&Node, With<HiddenByControls>>();
+    q.iter(app.world()).all(|n| n.display == Display::None)
+}
+
+/// Milestone 35: `H` / CONTROLS / CLOSE / `Esc` / controller `B` drive the
+/// controls overlay on the showcase main menu, and it never launches a screen.
+#[test]
+fn controls_overlay_toggles_on_the_main_menu() {
+    use segnale_debole::hud::{ControlsOverlayOpen, MenuAction};
+    let (mut app, e) = menu_app();
+    assert!(!overlay_open(&mut app) && !body_hidden(&mut app));
+    key_tap(&mut app, KeyCode::KeyH);
+    assert!(overlay_open(&mut app) && body_hidden(&mut app), "H opens the overlay over the hidden dock");
+    key_tap(&mut app, KeyCode::KeyH);
+    assert!(!overlay_open(&mut app) && !body_hidden(&mut app), "H closes it again");
+    key_tap(&mut app, KeyCode::KeyH);
+    key_tap(&mut app, KeyCode::Escape);
+    assert!(!overlay_open(&mut app));
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    // `S` never opens the (covered) seed editor while the overlay is up.
+    key_tap(&mut app, KeyCode::KeyH);
+    key_tap(&mut app, KeyCode::KeyS);
+    assert!(!app.world().resource::<segnale_debole::compendium::CustomSeedState>().editing);
+    key_tap(&mut app, KeyCode::KeyH);
+    assert!(!overlay_open(&mut app));
+    // Controller B closes it (without leaving the menu).
+    key_tap(&mut app, KeyCode::KeyH);
+    tap(&mut app, e, GamepadButton::East);
+    assert!(!overlay_open(&mut app));
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    // Leaving the screen resets it.
+    app.world_mut().resource_mut::<ControlsOverlayOpen>().0 = true;
+    key_tap(&mut app, KeyCode::KeyL);
+    assert_eq!(app_state(&app), AppState::Loadout);
+    assert!(!app.world().resource::<ControlsOverlayOpen>().0);
+    let mut q = app.world_mut().query::<&MenuAction>();
+    assert!(!q.iter(app.world()).any(|a| *a == MenuAction::ToggleControls), "no overlay outside MainMenu / Paused");
+}
+
+/// Milestone 35: on Pause `Esc` (or `B`) closes the controls overlay first
+/// and only the next press resumes.
+#[test]
+fn esc_closes_the_pause_controls_overlay_before_resuming() {
+    use segnale_debole::hud::ControlsOverlayOpen;
+    let (mut app, e) = menu_app();
+    key_tap(&mut app, KeyCode::Enter);
+    assert_eq!(app_state(&app), AppState::Playing);
+    step(&mut app, 2);
+    key_tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert!(!overlay_open(&mut app));
+    assert!(ui_texts(&mut app).iter().any(|s| s == "CONTROLS  [H]"));
+    key_tap(&mut app, KeyCode::KeyH);
+    assert!(overlay_open(&mut app) && body_hidden(&mut app));
+    key_tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Paused, "Esc closed the overlay without unpausing");
+    assert!(!overlay_open(&mut app) && !body_hidden(&mut app));
+    // Controller B behaves the same.
+    key_tap(&mut app, KeyCode::KeyH);
+    tap(&mut app, e, GamepadButton::East);
+    assert_eq!(app_state(&app), AppState::Paused);
+    assert!(!overlay_open(&mut app));
+    tap(&mut app, e, GamepadButton::East);
+    assert_eq!(app_state(&app), AppState::Playing, "B with the overlay closed resumes");
+    assert!(!app.world().resource::<ControlsOverlayOpen>().0);
+    // Reopen, then Esc twice: close, then resume.
+    tap(&mut app, e, GamepadButton::Start);
+    assert_eq!(app_state(&app), AppState::Paused);
+    key_tap(&mut app, KeyCode::KeyH);
+    key_tap(&mut app, KeyCode::Escape);
+    key_tap(&mut app, KeyCode::Escape);
+    assert_eq!(app_state(&app), AppState::Playing);
 }
 
 /// Milestone 27: the main menu run-seed editor works from a controller

@@ -1761,7 +1761,11 @@ fn temp_profile(name: &str) -> std::path::PathBuf {
 fn menu_navigates_loadout_and_contracts_screens() {
     let mut app = build_menu_app(None);
     assert_eq!(app_state(&app), AppState::MainMenu);
-    assert!(ui_texts(&mut app).iter().any(|t| t.starts_with("OS: STOCK OS")), "loadout summary bar");
+    // Milestone 35 showcase menu: the loadout telemetry lives on the Loadout
+    // screen, not on top of the 3D vista.
+    let texts = ui_texts(&mut app);
+    assert!(texts.iter().any(|t| t == segnale_debole::hud::MENU_TAGLINE), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.starts_with("CHIP: STOCK OS")), "no ACTIVE LOADOUT crate on the main menu");
     assert_eq!(count::<Camera3d>(&mut app), 2, "menu UI camera + live 3D vista camera");
 
     tap(&mut app, KeyCode::KeyL);
@@ -1876,7 +1880,9 @@ fn victory_screen_lists_the_unlocks_recorded_on_entry() {
     assert!(!texts.contains(&NO_UNLOCKS_LINE.to_string()));
     tap(&mut app, KeyCode::Enter);
     assert_eq!(app_state(&app), AppState::MainMenu);
-    assert!(ui_texts(&mut app).iter().any(|t| t.contains("FEATS: ") && !t.contains("FEATS: 0/")), "menu strip counts the new feats");
+    tap(&mut app, KeyCode::KeyC);
+    assert_eq!(app_state(&app), AppState::ContractsFeats);
+    assert!(ui_texts(&mut app).iter().any(|t| t.ends_with(" EARNED") && !t.starts_with("0 /")), "feats manifest counts the new feats");
 }
 
 #[test]
@@ -3959,7 +3965,7 @@ fn seed_editor_mutes_menu_hotkeys_and_arms_the_run() {
     // Pause: the readout carries the seed and S re-arms it for sharing.
     tap(&mut app, KeyCode::Escape);
     assert_eq!(app_state(&app), AppState::Paused);
-    assert!(ui_texts(&mut app).iter().any(|t| t.ends_with("//  SEED DOOM-7")));
+    assert!(ui_texts(&mut app).iter().any(|t| t.ends_with("|  SEED DOOM-7")));
     // Restarting a custom-seed run rebuilds the very same bunker.
     tap(&mut app, KeyCode::KeyR);
     step(&mut app, 3);

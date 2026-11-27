@@ -94,11 +94,11 @@ pub fn risk_color(contracts: usize) -> Color {
     }
 }
 
-/// Main-menu strip: `OS: <chip> | SKIN: <skin> | CATALOG | CONTRACTS | FEATS`.
+/// Main-menu strip: `CHIP: <chip> | SKIN: <skin> | CATALOG | CONTRACTS | FEATS`.
 pub fn loadout_summary_line(p: &PlayerProfile) -> String {
     let l = p.build_loadout();
     format!(
-        "OS: {}  |  SKIN: {}  |  CATALOG: {}/{}  |  CONTRACTS: {}/{}  |  FEATS: {}/{}",
+        "CHIP: {}  |  SKIN: {}  |  CATALOG: {}/{}  |  CONTRACTS: {}/{}  |  FEATS: {}/{}",
         chip_label(l.chip),
         l.skin.name().to_uppercase(),
         p.normalized_catalog().len(),
@@ -118,10 +118,10 @@ pub fn contract_tags(l: &RunLoadout) -> Option<String> {
     (!cs.is_empty()).then(|| cs.iter().map(|c| c.short_tag()).collect::<Vec<_>>().join(" "))
 }
 
-/// End-screen loadout line: `OS: <chip> | SKIN: <skin> | CONTRACTS: <tags or NONE>`.
+/// End-screen loadout line: `CHIP: <chip> | SKIN: <skin> | CONTRACTS: <tags or NONE>`.
 pub fn end_loadout_line(l: &RunLoadout) -> String {
     format!(
-        "OS: {}  |  SKIN: {}  |  CONTRACTS: {}",
+        "CHIP: {}  |  SKIN: {}  |  CONTRACTS: {}",
         chip_label(l.chip),
         l.skin.name().to_uppercase(),
         contract_tags(l).unwrap_or_else(|| "NONE".to_string())
@@ -547,7 +547,8 @@ pub struct MetaFeedback {
 
 impl Default for MetaFeedback {
     fn default() -> Self {
-        MetaFeedback { text: "Click a card to select / toggle - changes save instantly".to_string(), color: COLOR_DIM }
+        // Blank until an edit, a denied click or a save notice has something to say.
+        MetaFeedback { text: String::new(), color: COLOR_DIM }
     }
 }
 
@@ -913,9 +914,8 @@ fn spawn_loadout_screen(
     let split = commands
         .spawn((ChildOf(phone), Node { width: Val::Percent(100.0), column_gap: Val::Px(10.0), align_items: AlignItems::Stretch, ..default() }))
         .id();
-    let (chips, chip_head) = section_crate(&mut commands, split, "STARTER OS CHIP", HAZARD_YELLOW, Node { width: Val::Percent(55.0), ..default() });
-    commands.spawn((ChildOf(chip_head), text("PICK 1 OF 4", 11.0, ASH_DIM)));
-    let chip_grid = grid(&mut commands, chips, 2, 8.0);
+    let (chips, _) = section_crate(&mut commands, split, "STARTER OS CHIP", HAZARD_YELLOW, Node { width: Val::Percent(55.0), ..default() });
+    let chip_grid = grid(&mut commands, chips, 2, 6.0);
     for chip in StarterChip::ALL {
         let t = MetaTarget::Chip(chip);
         let c = rivet_card(&mut commands, chip_grid, t, UiRect { left: Val::Px(10.0), right: Val::Px(8.0), top: Val::Px(6.0), bottom: Val::Px(7.0) }, 4.0);
@@ -937,10 +937,9 @@ fn spawn_loadout_screen(
         }
     }
 
-    let (skins, skin_head) =
+    let (skins, _) =
         section_crate(&mut commands, split, "HANDSET SKIN", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
-    commands.spawn((ChildOf(skin_head), text("PICK 1 OF 4", 11.0, ASH_DIM)));
-    let skin_grid = grid(&mut commands, skins, 2, 8.0);
+    let skin_grid = grid(&mut commands, skins, 2, 6.0);
     for skin in HandsetSkin::ALL {
         let t = MetaTarget::Skin(skin);
         let c = rivet_card(&mut commands, skin_grid, t, UiRect { left: Val::Px(10.0), right: Val::Px(8.0), top: Val::Px(7.0), bottom: Val::Px(7.0) }, 5.0);
@@ -970,7 +969,6 @@ fn spawn_loadout_screen(
 
     // App Store catalog.
     let (cat, title_row) = section_crate(&mut commands, phone, "APP STORE CATALOG", HAZARD_YELLOW, Node { width: Val::Percent(100.0), ..default() });
-    commands.spawn((ChildOf(title_row), text(format!("{ACTIVE_CATALOG_SIZE}-CARD DRAFT POOL"), 11.0, ASH_DIM)));
     let (counter, _) = catalog_counter_text(p.normalized_catalog().len());
     commands.spawn((
         ChildOf(title_row),
@@ -981,9 +979,8 @@ fn spawn_loadout_screen(
         children![(MetaLabel::CatalogCounter, text(counter, 12.0, INK_BLACK))],
     ));
     commands.spawn((ChildOf(title_row), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(title_row), text("click an app to add / bench it", 12.0, ASH_DIM)));
     toggle_button(&mut commands, title_row, MetaTarget::ResetCatalog, p);
-    let app_grid = grid(&mut commands, cat, 5, 8.0);
+    let app_grid = grid(&mut commands, cat, 5, 6.0);
     for id in UpgradeId::ALL {
         let t = MetaTarget::App(id);
         let c = rivet_card(&mut commands, app_grid, t, UiRect { left: Val::Px(8.0), right: Val::Px(7.0), top: Val::Px(4.0), bottom: Val::Px(5.0) }, 4.0);
@@ -1017,6 +1014,11 @@ fn spawn_loadout_screen(
 // CONTRACTS & FEATS screen
 // ---------------------------------------------------------------------------
 
+/// Contracts crate tag (the header Risk Badge carries the live count).
+pub const CONTRACTS_TAG: &str = "0-4 STACKABLE";
+/// Feats crate tag while JAM DEMO unlock-all is on.
+pub const JAM_FEATS_TAG: &str = "JAM DEMO ON // EARNED ONLY";
+
 fn spawn_contracts_screen(
     mut commands: Commands,
     store: Res<ProfileStore>,
@@ -1043,7 +1045,7 @@ fn spawn_contracts_screen(
 
     // Contracts.
     let (sec, title_row) = section_crate(&mut commands, phone, "CARRIER CONTRACTS", PUNK_RED, Node { width: Val::Percent(100.0), ..default() });
-    commands.spawn((ChildOf(title_row), text("STACKABLE 0-4  //  opt-in risk: click to sign / cancel - needed for prestige feats", 12.0, ASH_DIM)));
+    commands.spawn((ChildOf(title_row), text(CONTRACTS_TAG, 11.0, ASH_DIM)));
     let cgrid = grid(&mut commands, sec, 4, 8.0);
     for c in CarrierContract::ALL {
         let t = MetaTarget::Contract(c);
@@ -1087,17 +1089,17 @@ fn spawn_contracts_screen(
     // Lifetime-stats readout: a stamped tape block + eight recessed cells,
     // then the movement / Endless records strip.
     // Untouched records (0 / --:--) stay dim so real numbers carry the eye.
-    stat_strip(&mut commands, phone, ("LIFETIME", "SERVICE LOG"), HAZARD_YELLOW, lifetime_stat_cells(&p.stats), 19.0);
-    stat_strip(&mut commands, phone, ("RECORDS", "MOVEMENT // ENDLESS"), ARC_CYAN, record_stat_cells(&p.stats), 16.0);
+    stat_strip(&mut commands, phone, "LIFETIME", HAZARD_YELLOW, lifetime_stat_cells(&p.stats), 19.0);
+    stat_strip(&mut commands, phone, "RECORDS", ARC_CYAN, record_stat_cells(&p.stats), 16.0);
 
     // Feats manifest.
     let done = FeatId::ALL.iter().filter(|f| p.has_feat(**f)).count();
     let (fsec, ftitle) = section_crate(&mut commands, phone, "FEATS & UNLOCKS", ACID_GREEN, Node { width: Val::Percent(100.0), ..default() });
     commands.spawn((ChildOf(ftitle), text(format!("{done} / {} EARNED", FeatId::ALL.len()), 12.0, ACID_GREEN)));
     if p.jam_demo_unlock_all {
-        commands.spawn((ChildOf(ftitle), text("JAM DEMO is unlocking everything - feats below are what you have really earned", 12.0, HAZARD_YELLOW)));
+        commands.spawn((ChildOf(ftitle), stamped_tag(JAM_FEATS_TAG, HAZARD_YELLOW, INK_BLACK, 11.0)));
     }
-    let fgrid = grid(&mut commands, fsec, 2, 5.0);
+    let fgrid = grid(&mut commands, fsec, 2, 6.0);
     for f in FeatId::ALL {
         let earned = p.has_feat(f);
         let (rail, bg) = if earned { (ACID_GREEN, ACID_DARK.with_alpha(0.9)) } else { (STEEL_BORDER, IRON_MID.mix(&INK_BLACK, 0.35).with_alpha(0.85)) };
@@ -1144,7 +1146,7 @@ fn spawn_contracts_screen(
 /// Contracts screen: the terminal's tape strips + left rail flip to crimson
 /// danger stripes while any contract is signed.
 /// Recessed stat readout: a stamped tape block followed by equal cells.
-fn stat_strip(commands: &mut Commands, parent: Entity, (title, sub): (&str, &str), tape: Color, cells: Vec<(&'static str, String)>, font: f32) {
+fn stat_strip(commands: &mut Commands, parent: Entity, title: &str, tape: Color, cells: Vec<(&'static str, String)>, font: f32) {
     let strip = commands
         .spawn((
             ChildOf(parent),
@@ -1160,12 +1162,12 @@ fn stat_strip(commands: &mut Commands, parent: Entity, (title, sub): (&str, &str
             align_items: AlignItems::FlexStart,
             justify_content: JustifyContent::Center,
             padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-            width: Val::Px(150.0),
+            width: Val::Px(110.0),
             flex_shrink: 0.0,
             ..default()
         },
         BackgroundColor(tape),
-        children![text(title, 13.0, INK_BLACK), text(sub, 10.0, INK_BLACK.with_alpha(0.8))],
+        children![text(title, 13.0, INK_BLACK)],
     ));
     for (label, value) in cells {
         let blank = stat_is_blank(&value);
@@ -1246,11 +1248,11 @@ impl SettingKnob {
 
     pub fn hint(self) -> &'static str {
         match self {
-            SettingKnob::Sensitivity => "multiplier on mouse look",
-            SettingKnob::BaseFov => "resting vertical field of view",
-            SettingKnob::SpeedFov => "view widening at speed / dash",
-            SettingKnob::StrafeRoll => "camera lean into strafes",
-            SettingKnob::Volume => "every sound effect",
+            SettingKnob::Sensitivity => "mouse look speed",
+            SettingKnob::BaseFov => "vertical field of view",
+            SettingKnob::SpeedFov => "widening at speed",
+            SettingKnob::StrafeRoll => "camera lean amount",
+            SettingKnob::Volume => "all sound effects",
             SettingKnob::GamepadSensitivity => "right-stick look speed",
         }
     }
@@ -1839,7 +1841,7 @@ fn setting_name(commands: &mut Commands, row_e: Entity, name: &str, hint: &str) 
     commands.spawn((
         ChildOf(row_e),
         Node { flex_direction: FlexDirection::Column, flex_grow: 1.0, flex_basis: Val::Px(0.0), row_gap: Val::Px(1.0), ..default() },
-        children![text(name, 14.0, BONE_TEXT), text(hint, 11.0, ASH_DIM)],
+        children![text(name, 14.0, BONE_TEXT), text(hint, 11.0, ASH_DIM.with_alpha(0.75))],
     ));
 }
 
@@ -1953,29 +1955,25 @@ fn spawn_settings_screen(
         .id();
 
     // Left: input & camera.
-    let (input, input_head) =
+    let (input, _) =
         section_crate(&mut commands, split, "INPUT & CAMERA", ARC_CYAN, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
-    commands.spawn((ChildOf(input_head), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(input_head), text("APPLIES INSTANTLY", 11.0, ASH_DIM)));
     knob_row(&mut commands, input, SettingKnob::Sensitivity, &s);
     knob_row(&mut commands, input, SettingKnob::BaseFov, &s);
-    toggle_row(&mut commands, input, SettingToggle::SpeedFov, "widen the view at speed & on dash", &s);
+    toggle_row(&mut commands, input, SettingToggle::SpeedFov, "widen view at speed", &s);
     knob_row(&mut commands, input, SettingKnob::SpeedFov, &s);
-    toggle_row(&mut commands, input, SettingToggle::StrafeRoll, "lean the camera into strafes", &s);
+    toggle_row(&mut commands, input, SettingToggle::StrafeRoll, "lean into strafes", &s);
     knob_row(&mut commands, input, SettingKnob::StrafeRoll, &s);
     knob_row(&mut commands, input, SettingKnob::GamepadSensitivity, &s);
-    toggle_row(&mut commands, input, SettingToggle::GamepadInvertY, "right stick up looks down", &s);
-    toggle_row(&mut commands, input, SettingToggle::AimFriction, "stick slows gently over visible targets", &s);
+    toggle_row(&mut commands, input, SettingToggle::GamepadInvertY, "stick up looks down", &s);
+    toggle_row(&mut commands, input, SettingToggle::AimFriction, "slow over targets", &s);
 
     // Right: audio & reticle.
-    let (audio, audio_head) =
+    let (audio, _) =
         section_crate(&mut commands, split, "AUDIO & RETICLE", HAZARD_YELLOW, Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() });
-    commands.spawn((ChildOf(audio_head), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(audio_head), text("SFX BUS // HUD", 11.0, ASH_DIM)));
     knob_row(&mut commands, audio, SettingKnob::Volume, &s);
-    toggle_row(&mut commands, audio, SettingToggle::Mute, "silence every sound effect", &s);
-    toggle_row(&mut commands, audio, SettingToggle::SpeedrunSplits, "HUD timer + PB deltas on standard runs", &s);
-    toggle_row(&mut commands, audio, SettingToggle::Rumble, "controller haptics (pad only, never M&K)", &s);
+    toggle_row(&mut commands, audio, SettingToggle::Mute, "silence all sfx", &s);
+    toggle_row(&mut commands, audio, SettingToggle::SpeedrunSplits, "HUD timer + PB deltas", &s);
+    toggle_row(&mut commands, audio, SettingToggle::Rumble, "controller haptics", &s);
 
     // Reticle block: style pills + color swatches beside the live preview.
     let reticle = commands
@@ -2156,7 +2154,7 @@ mod tests {
         let mut p = PlayerProfile::default();
         assert_eq!(
             loadout_summary_line(&p),
-            "OS: STOCK OS  |  SKIN: UAC STANDARD ORANGE  |  CATALOG: 12/12  |  CONTRACTS: 0/4  |  FEATS: 0/10"
+            "CHIP: STOCK OS  |  SKIN: UAC STANDARD ORANGE  |  CATALOG: 12/12  |  CONTRACTS: 0/4  |  FEATS: 0/10"
         );
         p.set_jam_demo_unlock_all(true);
         p.equip_chip(StarterChip::SurveyOs);
@@ -2165,21 +2163,21 @@ mod tests {
         p.toggle_catalog_app(UpgradeId::CopperAntenna);
         p.unlocked_feats.insert(FeatId::FirstExtraction);
         let s = loadout_summary_line(&p);
-        assert!(s.starts_with("OS: SURVEY OS  |  SKIN: 5G CHROME GOLD"), "{s}");
+        assert!(s.starts_with("CHIP: SURVEY OS  |  SKIN: 5G CHROME GOLD"), "{s}");
         assert!(s.contains("CATALOG: 11/12") && s.contains("CONTRACTS: 1/4") && s.contains("FEATS: 1/10"), "{s}");
     }
 
     #[test]
     fn end_loadout_and_hud_tag_lines() {
         let mut l = RunLoadout::default();
-        assert_eq!(end_loadout_line(&l), "OS: STOCK OS  |  SKIN: UAC STANDARD ORANGE  |  CONTRACTS: NONE");
+        assert_eq!(end_loadout_line(&l), "CHIP: STOCK OS  |  SKIN: UAC STANDARD ORANGE  |  CONTRACTS: NONE");
         assert_eq!(loadout_tag_parts(&l), ("STOCK OS".to_string(), None));
         l.chip = StarterChip::SurveyOs;
         l.skin = HandsetSkin::ChromeGold;
         // Order-insensitive and deduplicated.
         l.contracts = vec![CarrierContract::PriorityJamming, CarrierContract::RoamingCharges, CarrierContract::PriorityJamming];
         assert_eq!(loadout_tag_parts(&l), ("SURVEY OS".to_string(), Some("ROAM PRIO".to_string())));
-        assert_eq!(end_loadout_line(&l), "OS: SURVEY OS  |  SKIN: 5G CHROME GOLD  |  CONTRACTS: ROAM PRIO");
+        assert_eq!(end_loadout_line(&l), "CHIP: SURVEY OS  |  SKIN: 5G CHROME GOLD  |  CONTRACTS: ROAM PRIO");
     }
 
     #[test]
