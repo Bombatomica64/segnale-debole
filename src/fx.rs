@@ -135,12 +135,9 @@ pub struct FxLight {
 pub struct FxAssets {
     pub spark: Handle<StandardMaterial>,
     pub fire: Handle<StandardMaterial>,
-    pub fire_halo: Handle<StandardMaterial>,
     pub cyan: Handle<StandardMaterial>,
     pub cyan_core: Handle<StandardMaterial>,
-    pub cyan_halo: Handle<StandardMaterial>,
     pub green: Handle<StandardMaterial>,
-    pub green_halo: Handle<StandardMaterial>,
     pub gore: Handle<StandardMaterial>,
     pub gold: Handle<StandardMaterial>,
     pub smoke: Handle<StandardMaterial>,
@@ -154,6 +151,17 @@ pub struct FxAssets {
     pub beam: Handle<Mesh>,
     pub ring: Handle<Mesh>,
     pub shell_cyl: Handle<Mesh>,
+    /// Sculpted ridged enemy orb (unit radius, UV-mapped for the orb textures).
+    pub proj_orb_mesh: Handle<Mesh>,
+    /// Double-tapered faceted rail lance along +Y (Relay Sniper shots).
+    pub proj_needle_mesh: Handle<Mesh>,
+    /// Elongated capsule sheath around the rail lance.
+    pub proj_needle_sheath: Handle<Mesh>,
+    /// Pre-allocated textured enemy shot looks (see [`FxAssets::shot_look`]).
+    pub shot_fire: EnemyShotLook,
+    pub shot_cyan: EnemyShotLook,
+    pub shot_acid: EnemyShotLook,
+    pub shot_rail: EnemyShotLook,
     /// Chunky faceted brass Signal-Mortar sleeve (sculpted, shared).
     pub mortar_sleeve: Handle<Mesh>,
     /// Sculpted faceted death gibs (unit-ish scale; see [`spawn_death_gibs`]).
@@ -205,6 +213,49 @@ pub fn gib_meshes() -> [Mesh; 4] {
 /// Faceted brass mortar sleeve (shared by every ejected Signal-Mortar casing).
 pub fn mortar_sleeve_mesh() -> Mesh {
     crate::sculpt::tapered_prism(8, 0.034, 0.03, 0.115, true)
+}
+
+/// Textured materials of one enemy shot archetype: pixel-art core, additive
+/// sheath and spinning energy ring (orbs) / shock collar (rail lances), shared
+/// by every shot of that archetype.
+#[derive(Clone)]
+pub struct EnemyShotLook {
+    pub core: Handle<StandardMaterial>,
+    pub halo: Handle<StandardMaterial>,
+    pub ring: Handle<StandardMaterial>,
+}
+
+/// Silhouette of an enemy shot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShotShape {
+    /// Tumbling ridged orb.
+    Orb,
+    /// Velocity-aligned spinning rail lance.
+    Needle,
+}
+
+impl ShotShape {
+    pub fn for_color(c: BurstColor) -> Self {
+        if c == BurstColor::Spark { ShotShape::Needle } else { ShotShape::Orb }
+    }
+}
+
+/// Local +Y of the rail lance's shoulder, its widest point (see [`needle_mesh`]).
+pub const NEEDLE_SHOULDER_Y: f32 = -0.7;
+
+/// Transform of the ionised shock collar around a rail lance: a tight flat
+/// band of [`FxAssets::ring`] just outside the sheath at the shoulder, canted
+/// off the flight axis so the lance's spin makes it wobble.
+pub fn needle_collar_transform() -> Transform {
+    Transform::from_xyz(0.0, NEEDLE_SHOULDER_Y, 0.0).with_rotation(Quat::from_rotation_x(0.22)).with_scale(Vec3::new(0.95, 4.0, 0.95))
+}
+
+/// Double-tapered six-sided rail lance along +Y (~4 long, 0.45 wide).
+pub fn needle_mesh() -> Mesh {
+    let mut b = crate::mesh_batch::MeshBatch::new();
+    b.append(&crate::sculpt::tapered_prism(6, 0.06, 0.45, 1.3, true), &Transform::from_xyz(0.0, -1.35, 0.0));
+    b.append(&crate::sculpt::tapered_prism(6, 0.45, 0.02, 2.7, true), &Transform::from_xyz(0.0, 0.65, 0.0));
+    b.build().expect("non-empty needle")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +315,16 @@ impl FxAssets {
         }
     }
 
+    /// Textured materials of the enemy shot archetype for `c`.
+    pub fn shot_look(&self, c: BurstColor) -> &EnemyShotLook {
+        match c {
+            BurstColor::Cyan => &self.shot_cyan,
+            BurstColor::Green => &self.shot_acid,
+            BurstColor::Spark => &self.shot_rail,
+            _ => &self.shot_fire,
+        }
+    }
+
     pub fn light_color(c: BurstColor) -> Color {
         match c {
             BurstColor::Spark | BurstColor::Gold => Color::srgb(1.0, 0.82, 0.42),
@@ -292,17 +353,62 @@ pub fn additive_glow(color: Color, alpha: f32) -> StandardMaterial {
     }
 }
 
-fn create_fx_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
+/// Unlit pixel-art glow: `tex` drives both base colour and emissive, tinted.
+///
+/// The raster path draws unlit surfaces as `base_color * tex` and ignores
+/// `emissive`; under ray tracing `emissive * tex` is the surface radiance (and
+/// the light it casts). Keep the peak channel around 4-6: dark texels (slag
+/// fissures, deep cells) then stay dark, mid-tones keep their hue and only the
+/// brightest texels run white-hot. Double-digit gains clip the whole 64x64
+/// texture to one flat blob.
+pub fn textured_glow(tex: &Handle<Image>, tint: Color, emissive: LinearRgba) -> StandardMaterial {
+    StandardMaterial {
+        base_color: tint,
+        base_color_texture: Some(tex.clone()),
+        emissive,
+        emissive_texture: Some(tex.clone()),
+        unlit: true,
+        ..default()
+    }
+}
+
+/// Additive pixel-art sheath: dark texels add nothing, bright ones shimmer.
+/// It is double-sided, so a sheath wrapped around a core adds up to
+/// `2 * alpha` of its tint over it: see [`SHEATH_ALPHA`].
+pub fn textured_additive(tex: &Handle<Image>, color: Color, alpha: f32) -> StandardMaterial {
+    StandardMaterial { base_color_texture: Some(tex.clone()), emissive_texture: Some(tex.clone()), ..additive_glow(color, alpha) }
+}
+
+/// Opacity of the additive sheath wrapped around a textured core. Both of its
+/// faces draw over the core, so this stays low enough that the core's dark
+/// texels survive; the sheath still reads as a halo past the silhouette.
+pub const SHEATH_ALPHA: f32 = 0.32;
+
+fn shot_look(materials: &mut Assets<StandardMaterial>, core_tex: &Handle<Image>, ring_tex: &Handle<Image>, tint: Color, emissive: LinearRgba) -> EnemyShotLook {
+    EnemyShotLook {
+        core: materials.add(textured_glow(core_tex, Color::WHITE, emissive)),
+        halo: materials.add(textured_additive(core_tex, tint, SHEATH_ALPHA)),
+        ring: materials.add(textured_additive(ring_tex, tint, 0.85)),
+    }
+}
+
+fn create_fx_assets(
+    mut commands: Commands,
+    tex: Res<crate::assets_gen::ProjectileTextures>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     let [gib_chunk, gib_horn, gib_plate, gib_shard] = gib_meshes();
+    let shot_fire = shot_look(&mut materials, &tex.hellfire_orb, &tex.energy_ring, Color::srgb(1.0, 0.45, 0.1), LinearRgba::rgb(4.4, 2.6, 1.0));
+    let shot_cyan = shot_look(&mut materials, &tex.bio_plasma_orb, &tex.energy_ring, Color::srgb(0.3, 0.9, 1.0), LinearRgba::rgb(1.8, 3.6, 4.6));
+    let shot_acid = shot_look(&mut materials, &tex.acid_orb, &tex.energy_ring, Color::srgb(0.4, 1.0, 0.22), LinearRgba::rgb(1.6, 4.2, 1.2));
+    let shot_rail = shot_look(&mut materials, &tex.sniper_rail, &tex.sniper_rail, Color::srgb(1.0, 0.85, 0.42), LinearRgba::rgb(4.8, 3.8, 1.8));
     commands.insert_resource(FxAssets {
         spark: materials.add(glow(Color::srgb(1.0, 0.9, 0.5), LinearRgba::rgb(10.0, 6.5, 2.0))),
         fire: materials.add(glow(Color::srgb(1.0, 0.48, 0.12), LinearRgba::rgb(12.0, 3.6, 0.4))),
-        fire_halo: materials.add(additive_glow(Color::srgb(1.0, 0.42, 0.08), 0.55)),
         cyan: materials.add(glow(Color::srgb(0.35, 0.98, 1.0), LinearRgba::rgb(1.5, 9.0, 12.0))),
         cyan_core: materials.add(glow(Color::srgb(0.92, 1.0, 1.0), LinearRgba::rgb(10.0, 18.0, 22.0))),
-        cyan_halo: materials.add(additive_glow(Color::srgb(0.25, 0.92, 1.0), 0.55)),
         green: materials.add(glow(Color::srgb(0.5, 1.0, 0.3), LinearRgba::rgb(2.0, 10.0, 1.2))),
-        green_halo: materials.add(additive_glow(Color::srgb(0.35, 1.0, 0.2), 0.55)),
         gore: materials.add(StandardMaterial {
             base_color: Color::srgb(0.42, 0.015, 0.015),
             emissive: LinearRgba::rgb(0.55, 0.01, 0.01),
@@ -316,8 +422,8 @@ fn create_fx_assets(mut commands: Commands, mut materials: ResMut<Assets<Standar
             perceptual_roughness: 1.0,
             ..default()
         }),
-        tracer: materials.add(additive_glow(Color::srgb(1.0, 0.72, 0.3), 0.7)),
-        tracer_core: materials.add(glow(Color::srgb(1.0, 0.96, 0.82), LinearRgba::rgb(12.0, 9.0, 4.0))),
+        tracer: materials.add(textured_additive(&tex.shotgun_tracer, Color::srgb(1.0, 0.72, 0.3), 0.55)),
+        tracer_core: materials.add(textured_glow(&tex.shotgun_tracer, Color::srgb(1.0, 0.97, 0.88), LinearRgba::rgb(5.6, 4.4, 2.2))),
         shell_red: materials.add(StandardMaterial { base_color: Color::srgb(0.75, 0.08, 0.05), perceptual_roughness: 0.45, ..default() }),
         shell_brass: materials.add(StandardMaterial { base_color: Color::srgb(0.9, 0.72, 0.25), metallic: 0.9, perceptual_roughness: 0.25, ..default() }),
         cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
@@ -326,6 +432,13 @@ fn create_fx_assets(mut commands: Commands, mut materials: ResMut<Assets<Standar
         beam: meshes.add(Cylinder::new(1.0, 1.0)),
         ring: meshes.add(Torus::new(0.94, 1.0)),
         shell_cyl: meshes.add(Cylinder::new(0.014, 0.055)),
+        proj_orb_mesh: meshes.add(crate::sculpt::ridged_sphere(Vec3::ONE, 6, 10, 0.11, 3.0, false)),
+        proj_needle_mesh: meshes.add(needle_mesh()),
+        proj_needle_sheath: meshes.add(Capsule3d::new(0.55, 3.6)),
+        shot_fire,
+        shot_cyan,
+        shot_acid,
+        shot_rail,
         mortar_sleeve: meshes.add(mortar_sleeve_mesh()),
         gib_chunk: meshes.add(gib_chunk),
         gib_horn: meshes.add(gib_horn),
@@ -862,7 +975,7 @@ impl Plugin for FxPlugin {
             .add_systems(OnEnter(AppState::Victory), clear_camera_punch)
             .add_systems(OnEnter(AppState::UpgradeSelect), clear_camera_punch)
             .add_systems(OnEnter(AppState::Playing), clear_camera_punch_on_fresh_run)
-            .add_systems(PreStartup, create_fx_assets)
+            .add_systems(PreStartup, create_fx_assets.after(crate::assets_gen::init_projectile_textures))
             .add_systems(OnEnter(AppState::MainMenu), clear_hud_feed)
             .add_systems(OnEnter(AppState::Leaderboard), clear_hud_feed)
             .add_systems(OnEnter(AppState::Compendium), clear_hud_feed)
@@ -1005,6 +1118,44 @@ fn recycle_oldest(commands: &mut Commands, live: &mut [(f32, Entity)], cap: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_uv_mapped(m: &Mesh, what: &str) {
+        let n = m.count_vertices();
+        assert!(n > 0, "{what}");
+        assert_eq!(m.attribute(Mesh::ATTRIBUTE_NORMAL).map(|a| a.len()), Some(n), "{what} normals");
+        assert_eq!(m.attribute(Mesh::ATTRIBUTE_UV_0).map(|a| a.len()), Some(n), "{what} uvs");
+        assert!(matches!(m.indices(), Some(bevy::mesh::Indices::U32(_))), "{what} u32 indices");
+    }
+
+    #[test]
+    fn projectile_meshes_are_uv_mapped_and_needle_is_an_elongated_lance() {
+        assert_uv_mapped(&crate::sculpt::ridged_sphere(Vec3::ONE, 6, 10, 0.11, 3.0, false), "orb");
+        let needle = needle_mesh();
+        assert_uv_mapped(&needle, "needle");
+        let pos = needle.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().as_float3().unwrap();
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in pos {
+            lo = lo.min(Vec3::from(*p));
+            hi = hi.max(Vec3::from(*p));
+        }
+        let size = hi - lo;
+        assert!(size.y > 3.5 && size.y > size.x * 4.0 && size.y > size.z * 4.0, "lance along +Y: {size:?}");
+        assert_eq!(ShotShape::for_color(BurstColor::Spark), ShotShape::Needle);
+        for c in [BurstColor::Fire, BurstColor::Cyan, BurstColor::Green, BurstColor::Gore] {
+            assert_eq!(ShotShape::for_color(c), ShotShape::Orb);
+        }
+    }
+
+    #[test]
+    fn textured_materials_share_one_texture_for_base_and_emissive() {
+        let h = Handle::<Image>::default();
+        let g = textured_glow(&h, Color::WHITE, LinearRgba::rgb(1.0, 2.0, 3.0));
+        assert!(g.unlit && g.base_color_texture == Some(h.clone()) && g.emissive_texture == Some(h.clone()));
+        let a = textured_additive(&h, Color::srgb(1.0, 0.5, 0.1), 0.5);
+        assert_eq!(a.alpha_mode, AlphaMode::Add);
+        assert!(a.unlit && a.base_color_texture.is_some() && a.emissive_texture.is_some());
+        assert!((a.base_color.alpha() - 0.5).abs() < 1e-6);
+    }
 
     #[test]
     fn feed_toasts_expire_and_cap() {

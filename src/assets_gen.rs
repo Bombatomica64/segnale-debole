@@ -6,6 +6,8 @@ use bevy::math::Affine2;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
+use std::f32::consts::TAU;
+
 use crate::level::CELL_SIZE;
 
 pub const TEX_SIZE: u32 = 64;
@@ -245,7 +247,7 @@ pub struct AssetsGenPlugin;
 
 impl Plugin for AssetsGenPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PreStartup, create_game_assets);
+        app.add_systems(PreStartup, (create_game_assets, init_projectile_textures));
     }
 }
 
@@ -618,6 +620,327 @@ pub fn engraved_gold_texture() -> Canvas {
     c
 }
 
+// ---------------------------------------------------------------------------
+// Projectile textures (Milestone 34)
+// ---------------------------------------------------------------------------
+
+/// Piecewise-linear colour ramp through `stops` for `t` in `[0, 1]`.
+fn ramp(stops: &[[u8; 3]], t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+    let i = (t.floor() as usize).min(stops.len() - 2);
+    mix(stops[i], stops[i + 1], t - i as f32)
+}
+
+/// Tileable Worley (cellular) noise on a `cell`-pixel grid wrapping at
+/// [`TEX_SIZE`]: `(f1, f2, cell id)` with distances in pixels.
+fn worley(x: u32, y: u32, cell: u32, salt: u32) -> (f32, f32, u32) {
+    let n = (TEX_SIZE / cell) as i32;
+    let (cx, cy) = ((x / cell) as i32, (y / cell) as i32);
+    let (mut f1, mut f2, mut id) = (f32::MAX, f32::MAX, 0);
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let (gx, gy) = (cx + dx, cy + dy);
+            let (wx, wy) = (gx.rem_euclid(n) as u32, gy.rem_euclid(n) as u32);
+            let px = gx as f32 * cell as f32 + hash_noise(wx, wy, salt) * cell as f32;
+            let py = gy as f32 * cell as f32 + hash_noise(wx, wy, salt + 1) * cell as f32;
+            let d = ((px - x as f32 - 0.5).powi(2) + (py - y as f32 - 0.5).powi(2)).sqrt();
+            if d < f1 {
+                f2 = f1;
+                f1 = d;
+                id = wy * n as u32 + wx;
+            } else if d < f2 {
+                f2 = d;
+            }
+        }
+    }
+    (f1, f2, id)
+}
+
+/// Braided arc-cyan / white-hot plasma helix with crackling electric veins
+/// (Plasma Repeater bolts; `U` wraps the bolt, `V` runs along its flight).
+pub fn plasma_bolt_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let (u, v) = (x as f32 / 64.0, y as f32 / 64.0);
+        let n = hash_noise(x, y, 131);
+        let a = ((u + v * 2.0) * TAU).sin();
+        let b = ((u - v * 2.0 + 0.5) * TAU).sin();
+        let strand = a.max(b);
+        if strand > 0.86 {
+            mix([200, 250, 255], [255, 255, 255], n)
+        } else if strand > 0.62 {
+            mix([90, 225, 255], [170, 245, 255], n)
+        } else if hash_noise(x / 2, y / 3, 132) > 0.9 || (x * 3 + y * 5) % 32 == 0 {
+            [130, 240, 255]
+        } else {
+            mix([8, 54, 96], [36, 150, 205], (strand * 0.5 + 0.5) * 0.75 + n * 0.25)
+        }
+    });
+    c
+}
+
+/// First row of the red / amber warhead band of [`rocket_body_texture`]
+/// (rows run tail -> nose along the casing cylinder's `V`).
+pub const ROCKET_WARHEAD_ROW: u32 = 48;
+
+/// Signal-Mortar rocket casing, tail (row 0) to nose (row 63): scorched
+/// nozzle collar, black-and-amber hazard band, riveted brushed steel with
+/// panel seams and a stencil block, then the red / amber chevron warhead band
+/// from [`ROCKET_WARHEAD_ROW`] (also sampled alone by the glowing warhead).
+pub fn rocket_body_texture() -> Canvas {
+    const SEAM: [u8; 3] = [26, 26, 30];
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let n = hash_noise(x, y, 142);
+        match y {
+            // Heat-blued nozzle collar.
+            0..=2 => shade([58, 60, 74], 0.8 + n * 0.4),
+            3 | 14 | 46 => SEAM,
+            // Hazard band: 8 px diagonals, four full periods around the casing.
+            4..=13 => shade(if ((x + y) / 8) % 2 == 0 { [246, 166, 18] } else { [20, 18, 20] }, 0.86 + n * 0.2),
+            15 | 47 => [208, 212, 220],
+            16..=45 => {
+                let brush = hash_noise(x, y / 16, 141);
+                let (px, ry) = (x % 32, y - 16);
+                if px == 0 {
+                    SEAM
+                } else if px == 1 {
+                    [198, 202, 210]
+                } else if x % 8 == 4 && (ry == 2 || ry == 27) {
+                    [236, 238, 242]
+                } else if x % 8 == 4 && (ry == 3 || ry == 28) {
+                    [44, 44, 50]
+                } else if (9..=15).contains(&ry) && (38..58).contains(&x) && x % 4 != 1 && hash_noise(x / 2, ry / 2, 143) > 0.3 {
+                    // Stencilled lot number.
+                    [30, 28, 28]
+                } else if (9..=14).contains(&ry) && (8..24).contains(&x) && (x - 8) % 4 < 2 && ry + (x - 8) / 4 >= 13 {
+                    // Signal-bars pictogram.
+                    [226, 60, 30]
+                } else {
+                    shade([146, 150, 158], 0.72 + brush * 0.26 + n * 0.08)
+                }
+            }
+            // Warhead: red field, amber chevrons pointing at the nose, hot tip.
+            _ => {
+                let dx = (x % 16).abs_diff(8);
+                if y >= 61 {
+                    mix([255, 196, 70], [255, 240, 180], (y - 61) as f32 / 2.0)
+                } else if y == 48 || y == 60 {
+                    SEAM
+                } else if (y + 16 - dx) % 6 < 2 {
+                    shade([255, 178, 30], 0.9 + n * 0.14)
+                } else {
+                    shade([198, 34, 20], 0.84 + n * 0.22)
+                }
+            }
+        }
+    });
+    c
+}
+
+/// Jagged retro exhaust streaks: white-gold core -> orange -> deep ember
+/// along `V` (rocket thruster plume, drawn with `AlphaMode::Add`).
+pub fn rocket_flame_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let v = y as f32 / 63.0;
+        let jag = hash_noise(x / 2, 0, 151);
+        let flick = hash_noise(x / 2, y / 4, 152);
+        let heat = 1.0 - v * (0.75 + jag * 0.5) + (flick - 0.5) * 0.3;
+        if heat < 0.12 {
+            [42, 8, 2]
+        } else {
+            ramp(&[[110, 14, 4], [232, 70, 10], [255, 150, 24], [255, 222, 110], [255, 250, 228]], heat)
+        }
+    });
+    c
+}
+
+/// Incandescent streaked tracer ribbon: white-gold core streaks fading to
+/// glowing amber-orange along `V` (shotgun pellet tracers).
+pub fn shotgun_tracer_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let streak = hash_noise(x / 2, 0, 161);
+        let seg = hash_noise(x / 2, y / 6, 162);
+        let n = hash_noise(x, y, 163);
+        let t = streak * 0.55 + seg * 0.35 + n * 0.1;
+        ramp(&[[150, 46, 8], [222, 104, 18], [255, 190, 70], [255, 244, 206]], t)
+    });
+    c
+}
+
+/// Blazing gold / white overdrive weave with radiant diamond & chevron bursts
+/// (parried bolts).
+pub fn parry_bolt_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let n = hash_noise(x, y, 171);
+        let dx = (x % 16) as i32 - 8;
+        let dy = (y % 16) as i32 - 8;
+        let d = dx.abs() + dy.abs();
+        let chevron = (y + dx.unsigned_abs()) % 16 < 3;
+        if d == 7 || d == 8 || d <= 1 {
+            [255, 255, 236]
+        } else if chevron {
+            mix([255, 214, 90], [255, 236, 150], n)
+        } else {
+            let weave = (x / 4 + y / 4) % 2 == 0;
+            shade(if weave { [226, 150, 28] } else { [178, 96, 14] }, 0.85 + n * 0.25)
+        }
+    });
+    c
+}
+
+/// Swirling hellfire: glowing yellow-orange fire cells split by dark volcanic
+/// slag fissures, with floating slag crusts (Imp / Baron / Carrier fireballs).
+pub fn hellfire_orb_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let (f1, f2, id) = worley(x, y, 8, 181);
+        let n = hash_noise(x, y, 183);
+        if f2 - f1 < 1.3 {
+            return shade([46, 16, 8], 0.8 + n * 0.4);
+        }
+        if hash_noise(id, 0, 184) > 0.88 {
+            // Floating slag crust with ember speckles.
+            return if n > 0.86 { [255, 120, 20] } else { shade([62, 26, 12], 0.8 + n * 0.3) };
+        }
+        let heat = 1.0 - (f1 / 7.0).clamp(0.0, 1.0) * 0.85 + (n - 0.5) * 0.15;
+        ramp(&[[150, 22, 4], [236, 86, 10], [255, 168, 30], [255, 236, 130]], heat)
+    });
+    c
+}
+
+/// Crackling cyan / violet bio-plasma cells with bright electric arcs and
+/// glowing nodes (Cacodemon twin orbs, boss EMP orbs).
+pub fn bio_plasma_orb_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let (f1, f2, _) = worley(x, y, 16, 191);
+        let n = hash_noise(x, y, 193);
+        if f1 < 1.6 {
+            [244, 255, 255]
+        } else if f2 - f1 < 1.2 {
+            mix([150, 248, 255], [230, 255, 255], n)
+        } else {
+            let t = (f1 / 10.0).clamp(0.0, 1.0);
+            let col = ramp(&[[60, 210, 255], [70, 110, 220], [96, 26, 150], [44, 8, 82]], t);
+            shade(col, 0.88 + n * 0.22)
+        }
+    });
+    c
+}
+
+/// Bubbling toxic acid-green / dark-emerald cellular core (`BurstColor::Green`).
+pub fn acid_orb_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let (f1, f2, id) = worley(x, y, 8, 201);
+        let n = hash_noise(x, y, 203);
+        let r = 2.0 + hash_noise(id, 1, 204) * 2.5;
+        if f2 - f1 < 1.0 {
+            [6, 34, 16]
+        } else if (f1 - r).abs() < 0.7 {
+            [200, 255, 120]
+        } else if f1 < r {
+            mix([120, 240, 50], [170, 255, 90], n)
+        } else {
+            mix([12, 70, 34], [40, 140, 40], (1.0 - f1 / 8.0) * 0.6 + n * 0.4)
+        }
+    });
+    c
+}
+
+/// High-voltage gold-white warning chevrons with a crackling electric arc
+/// (Relay Sniper rail lances; `V` runs along the flight axis).
+pub fn sniper_rail_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let v = y as f32 / 64.0;
+        let n = hash_noise(x, y, 211);
+        let arc_x = 32.0 + 9.0 * (v * TAU * 3.0).sin() + 4.0 * (v * TAU * 7.0).sin() + (hash_noise(0, y / 2, 212) - 0.5) * 3.0;
+        let dx = ((x % 16) as i32 - 8).unsigned_abs();
+        if (x as f32 - arc_x).abs() < 1.3 {
+            [255, 255, 255]
+        } else if y % 32 < 2 {
+            [70, 44, 10]
+        } else if (y + dx) % 16 < 4 {
+            mix([255, 240, 170], [255, 252, 228], n)
+        } else {
+            shade([214, 150, 30], 0.8 + n * 0.3)
+        }
+    });
+    c
+}
+
+/// Jagged high-contrast energy band (near-neutral so per-archetype
+/// `base_color` tints it): bright core band with ragged ember edges.
+pub fn energy_ring_texture() -> Canvas {
+    let mut c = Canvas::new(TEX_SIZE);
+    c.fill_with(|x, y| {
+        let n = hash_noise(x, y, 221);
+        let half = 6.0 + hash_noise(x / 2, 0, 222) * 14.0;
+        let d = (y as f32 - 31.5).abs();
+        if d < half * 0.35 {
+            [255, 255, 250]
+        } else if d < half {
+            shade([224, 218, 206], 0.7 + n * 0.3)
+        } else if n > 0.93 {
+            [200, 196, 186]
+        } else {
+            [24, 22, 22]
+        }
+    });
+    c
+}
+
+/// A named procedural texture builder.
+pub type TextureBuilder = (&'static str, fn() -> Canvas);
+
+/// Every projectile texture builder by name (tests, tools).
+pub const PROJECTILE_TEXTURES: [TextureBuilder; 10] = [
+    ("plasma_bolt", plasma_bolt_texture),
+    ("rocket_body", rocket_body_texture),
+    ("rocket_flame", rocket_flame_texture),
+    ("shotgun_tracer", shotgun_tracer_texture),
+    ("parry_bolt", parry_bolt_texture),
+    ("hellfire_orb", hellfire_orb_texture),
+    ("bio_plasma_orb", bio_plasma_orb_texture),
+    ("acid_orb", acid_orb_texture),
+    ("sniper_rail", sniper_rail_texture),
+    ("energy_ring", energy_ring_texture),
+];
+
+/// Shared 64x64 nearest-neighbour projectile textures, built once at
+/// `PreStartup` (before `FxAssets` / weapon projectile assets consume them).
+#[derive(Resource, Clone)]
+pub struct ProjectileTextures {
+    pub plasma_bolt: Handle<Image>,
+    pub rocket_body: Handle<Image>,
+    pub rocket_flame: Handle<Image>,
+    pub shotgun_tracer: Handle<Image>,
+    pub parry_bolt: Handle<Image>,
+    pub hellfire_orb: Handle<Image>,
+    pub bio_plasma_orb: Handle<Image>,
+    pub acid_orb: Handle<Image>,
+    pub sniper_rail: Handle<Image>,
+    pub energy_ring: Handle<Image>,
+}
+
+impl ProjectileTextures {
+    pub fn build(images: &mut Assets<Image>) -> Self {
+        let [plasma_bolt, rocket_body, rocket_flame, shotgun_tracer, parry_bolt, hellfire_orb, bio_plasma_orb, acid_orb, sniper_rail, energy_ring] =
+            PROJECTILE_TEXTURES.map(|(_, make)| images.add(make().into_image()));
+        ProjectileTextures { plasma_bolt, rocket_body, rocket_flame, shotgun_tracer, parry_bolt, hellfire_orb, bio_plasma_orb, acid_orb, sniper_rail, energy_ring }
+    }
+}
+
+/// `PreStartup`: build [`ProjectileTextures`] (consumers order `.after` this).
+pub fn init_projectile_textures(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    commands.insert_resource(ProjectileTextures::build(&mut images));
+}
+
 /// Multiply every pixel by an sRGB tint.
 pub fn tint_canvas(mut c: Canvas, tint: [f32; 3]) -> Canvas {
     for y in 0..c.size {
@@ -957,6 +1280,43 @@ mod tests {
             assert_eq!(a.data.len(), 64 * 64 * 4);
             assert_eq!(a.data, b.data);
             assert!(a.data.chunks(4).all(|p| p[3] == 255));
+        }
+    }
+
+    #[test]
+    fn projectile_textures_are_64x64_deterministic_varied_and_distinct() {
+        let built: Vec<(&str, Canvas)> = PROJECTILE_TEXTURES.iter().map(|(n, make)| (*n, make())).collect();
+        for (name, a) in &built {
+            assert_eq!(a.size, 64, "{name}");
+            assert_eq!(a.data.len(), 64 * 64 * 4, "{name}");
+            assert_eq!(a.data, PROJECTILE_TEXTURES.iter().find(|(n, _)| n == name).unwrap().1().data, "{name} deterministic");
+            assert!(a.data.chunks(4).all(|p| p[3] == 255), "{name} opaque");
+            let colors: std::collections::HashSet<[u8; 3]> = a.data.chunks(4).map(|p| [p[0], p[1], p[2]]).collect();
+            assert!(colors.len() >= 24, "{name} has only {} colours", colors.len());
+            let lum: Vec<f32> = a.data.chunks(4).map(|p| p[0] as f32 * 0.3 + p[1] as f32 * 0.59 + p[2] as f32 * 0.11).collect();
+            let mean = lum.iter().sum::<f32>() / lum.len() as f32;
+            let sd = (lum.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / lum.len() as f32).sqrt();
+            assert!(sd > 18.0, "{name} luminance stddev {sd} too flat");
+        }
+        for (i, (na, a)) in built.iter().enumerate() {
+            for (nb, b) in built.iter().skip(i + 1) {
+                assert_ne!(a.data, b.data, "{na} vs {nb}");
+            }
+        }
+    }
+
+    #[test]
+    fn projectile_textures_resource_holds_ten_unique_nearest_images() {
+        let mut images = Assets::<Image>::default();
+        let t = ProjectileTextures::build(&mut images);
+        let all = [&t.plasma_bolt, &t.rocket_body, &t.rocket_flame, &t.shotgun_tracer, &t.parry_bolt, &t.hellfire_orb, &t.bio_plasma_orb, &t.acid_orb, &t.sniper_rail, &t.energy_ring];
+        let ids: std::collections::HashSet<_> = all.iter().map(|h| h.id()).collect();
+        assert_eq!(ids.len(), 10);
+        for h in all {
+            let img = images.get(h).unwrap();
+            assert_eq!((img.width(), img.height()), (64, 64));
+            let ImageSampler::Descriptor(d) = &img.sampler else { panic!("explicit sampler") };
+            assert_eq!(d.mag_filter, bevy::image::ImageFilterMode::Nearest);
         }
     }
 

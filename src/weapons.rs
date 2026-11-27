@@ -10,6 +10,7 @@ use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::mouse::AccumulatedMouseScroll;
+use bevy::math::Affine2;
 use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
 use bevy::render::view::Msaa;
@@ -22,9 +23,10 @@ use crate::bot_input::BotControl;
 use crate::decals::{DecalKind, DecalQueue, DecalRequest};
 use crate::boss::{damage_pylon, pylon_ray_hit, BossPylon, PYLON_SPHERES};
 use crate::enemies::{damage_enemy, ray_sphere, Enemy, EnemyKind, PingMarked};
+use crate::assets_gen::ProjectileTextures;
 use crate::fx::{
-    additive_glow, overlay_layer, spawn_burst, spawn_ejected_shell, spawn_flash_light, spawn_mortar_casing, spawn_particles, spawn_plasma_vent,
-    spawn_shockwave, spawn_tracer, BurstColor, FxAssets, HudFeed, OVERLAY_LAYER,
+    additive_glow, textured_additive, textured_glow, overlay_layer, spawn_burst, spawn_ejected_shell, spawn_flash_light, spawn_mortar_casing, spawn_particles, spawn_plasma_vent,
+    spawn_shockwave, spawn_tracer, BurstColor, FxAssets, HudFeed, OVERLAY_LAYER, SHEATH_ALPHA,
 };
 use crate::hud::signal_color;
 use crate::level::{CullableLight, DemonJammer, ExplosiveBarrel, JammerCore, LevelEntity, LevelGrid};
@@ -2262,17 +2264,17 @@ pub struct BoltAssets {
     pub halo_mat: Handle<StandardMaterial>,
 }
 
-fn create_bolt_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
+fn create_bolt_assets(
+    mut commands: Commands,
+    tex: Res<ProjectileTextures>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     commands.insert_resource(BoltAssets {
         core_mesh: meshes.add(Capsule3d::new(0.045, 0.48)),
         halo_mesh: meshes.add(Capsule3d::new(0.11, 0.62)),
-        core_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.92, 1.0, 1.0),
-            emissive: LinearRgba::rgb(8.0, 18.0, 22.0),
-            unlit: true,
-            ..default()
-        }),
-        halo_mat: materials.add(additive_glow(Color::srgb(0.18, 0.9, 1.0), 0.55)),
+        core_mat: materials.add(textured_glow(&tex.plasma_bolt, Color::srgb(0.95, 1.0, 1.0), LinearRgba::rgb(2.4, 4.6, 5.4))),
+        halo_mat: materials.add(textured_additive(&tex.plasma_bolt, Color::srgb(0.18, 0.9, 1.0), SHEATH_ALPHA + 0.08)),
     });
 }
 
@@ -2283,19 +2285,24 @@ pub struct ParryAssets {
     pub halo_mesh: Handle<Mesh>,
     pub core_mat: Handle<StandardMaterial>,
     pub halo_mat: Handle<StandardMaterial>,
+    /// Orbiting energy ring (spins with the bolt's axial spin).
+    pub ring_mesh: Handle<Mesh>,
+    pub ring_mat: Handle<StandardMaterial>,
 }
 
-fn create_parry_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
+fn create_parry_assets(
+    mut commands: Commands,
+    tex: Res<ProjectileTextures>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     commands.insert_resource(ParryAssets {
         core_mesh: meshes.add(Sphere::new(0.16).mesh().uv(12, 8)),
         halo_mesh: meshes.add(Capsule3d::new(0.3, 0.9)),
-        core_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.98, 0.9),
-            emissive: LinearRgba::rgb(26.0, 20.0, 9.0),
-            unlit: true,
-            ..default()
-        }),
-        halo_mat: materials.add(additive_glow(Color::srgb(1.0, 0.78, 0.25), 0.6)),
+        core_mat: materials.add(textured_glow(&tex.parry_bolt, Color::srgb(1.0, 0.98, 0.9), LinearRgba::rgb(5.8, 4.6, 2.4))),
+        halo_mat: materials.add(textured_additive(&tex.parry_bolt, Color::srgb(1.0, 0.78, 0.25), SHEATH_ALPHA + 0.08)),
+        ring_mesh: meshes.add(Torus::new(0.26, 0.32)),
+        ring_mat: materials.add(textured_additive(&tex.energy_ring, Color::srgb(1.0, 0.85, 0.35), 0.9)),
     });
 }
 
@@ -2311,6 +2318,7 @@ pub fn spawn_parried_projectile(commands: &mut Commands, assets: &ParryAssets, s
             Transform::from_translation(start).with_rotation(Quat::from_rotation_arc(Vec3::Y, dir)),
             children![
                 (Mesh3d(assets.halo_mesh.clone()), MeshMaterial3d(assets.halo_mat.clone()), Transform::from_xyz(0.0, -0.25, 0.0)),
+                (Mesh3d(assets.ring_mesh.clone()), MeshMaterial3d(assets.ring_mat.clone()), Transform::from_rotation(Quat::from_rotation_x(0.45))),
                 (
                     CullableLight::for_range(9.0),
                     PointLight { color: Color::srgb(1.0, 0.85, 0.45), intensity: 260_000.0, range: 9.0, shadow_maps_enabled: false, ..default() },
@@ -2328,18 +2336,32 @@ pub struct RocketAssets {
     pub models: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
 }
 
-fn create_rocket_assets(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>, mut meshes: ResMut<Assets<Mesh>>) {
-    let casing = materials.add(StandardMaterial { base_color: Color::srgb(0.32, 0.34, 0.36), metallic: 0.85, perceptual_roughness: 0.35, ..default() });
-    let fins = materials.add(StandardMaterial { base_color: Color::srgb(0.12, 0.13, 0.14), metallic: 0.7, perceptual_roughness: 0.5, ..default() });
-    let core = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.7, 0.3),
-        emissive: LinearRgba::rgb(14.0, 5.5, 0.8),
-        unlit: true,
+fn create_rocket_assets(
+    mut commands: Commands,
+    tex: Res<ProjectileTextures>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let casing = materials.add(StandardMaterial {
+        base_color_texture: Some(tex.rocket_body.clone()),
+        // Mostly paint: a high metallic would leave the hazard stripes and
+        // warhead band with almost no diffuse response in the dark.
+        metallic: 0.4,
+        perceptual_roughness: 0.45,
         ..default()
     });
-    let flame = materials.add(additive_glow(Color::srgb(1.0, 0.45, 0.08), 0.7));
+    let fins = materials.add(StandardMaterial { base_color: Color::srgb(0.12, 0.13, 0.14), metallic: 0.7, perceptual_roughness: 0.5, ..default() });
+    // Glowing warhead: samples only the red / amber warhead rows of the body
+    // texture, so the seeker cone and its collar show crisp chevrons.
+    let core = materials.add(StandardMaterial {
+        uv_transform: rocket_warhead_uv(),
+        ..textured_glow(&tex.rocket_body, Color::srgb(1.0, 0.94, 0.82), LinearRgba::rgb(4.6, 3.0, 1.4))
+    });
+    let flame = materials.add(textured_additive(&tex.rocket_flame, Color::srgb(1.0, 0.55, 0.15), 0.8));
     let cyl = Mesh::from(Cylinder::new(1.0, 1.0));
-    let cone = Mesh::from(Cone::new(1.0, 1.0));
+    // Faceted cone with wrap-around UVs (`U` around, `V` base -> tip); Bevy's
+    // `Cone` projects its texture top-down, which smears banded textures.
+    let cone = crate::sculpt::tapered_prism(12, 1.0, 0.0, 1.0, true);
     let cube = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
     let sphere = Sphere::new(1.0).mesh().uv(12, 8);
     let mut b = MaterialBatches::new();
@@ -2353,6 +2375,13 @@ fn create_rocket_assets(mut commands: Commands, mut materials: ResMut<Assets<Sta
     b.add(&cone, &flame, Transform::from_xyz(0.0, -0.33, 0.0).with_rotation(Quat::from_rotation_x(std::f32::consts::PI)).with_scale(Vec3::new(0.06, 0.24, 0.06)));
     b.add(&sphere, &flame, t(Vec3::new(0.0, -0.24, 0.0), Vec3::splat(0.12)));
     commands.insert_resource(RocketAssets { models: b.finish(&mut meshes) });
+}
+
+/// UV window of the glowing warhead material: the warhead rows of
+/// [`crate::assets_gen::rocket_body_texture`], full wrap around.
+pub fn rocket_warhead_uv() -> Affine2 {
+    let v0 = crate::assets_gen::ROCKET_WARHEAD_ROW as f32 / crate::assets_gen::TEX_SIZE as f32;
+    Affine2::from_scale_angle_translation(Vec2::new(1.0, 1.0 - v0), 0.0, Vec2::new(0.0, v0))
 }
 
 /// World velocity of a freshly fired rocket: inherits half of the shooter's
@@ -2710,6 +2739,16 @@ fn fire_weapons(
     }
 }
 
+/// Axial spin (rad/s) of a player projectile around its local +Y flight axis:
+/// the plasma helix spirals, rockets rifle, parried bolts whirl.
+pub fn projectile_spin_rate(kind: ProjectileKind) -> f32 {
+    match kind {
+        ProjectileKind::Plasma => 22.0,
+        ProjectileKind::Rocket => 9.0,
+        ProjectileKind::Parried => 18.0,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn move_player_projectiles(
     mut commands: Commands,
@@ -2798,6 +2837,7 @@ pub(crate) fn move_player_projectiles(
         if let Some(spec) = BlastSpec::for_kind(b.kind, &mods) {
             if best.1 == HitTarget::Nothing && b.life > 0.0 {
                 tf.translation = from + step;
+                tf.rotate_local_y(dt * projectile_spin_rate(b.kind));
                 b.trail -= dt;
                 if b.trail <= 0.0 {
                     let tail = tf.translation - dir * 0.35;
@@ -2850,6 +2890,7 @@ pub(crate) fn move_player_projectiles(
                     commands.entity(e).try_despawn();
                 } else {
                     tf.translation = from + step;
+                    tf.rotate_local_y(dt * projectile_spin_rate(b.kind));
                 }
                 continue;
             }
@@ -3240,6 +3281,20 @@ impl Plugin for WeaponsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_projectile_spin_keeps_the_flight_axis() {
+        let dir = Vec3::new(0.3, 0.2, -1.0).normalize();
+        for kind in [ProjectileKind::Plasma, ProjectileKind::Rocket, ProjectileKind::Parried] {
+            assert!(projectile_spin_rate(kind) > 5.0, "{kind:?} visibly spins");
+            let mut tf = Transform::from_rotation(Quat::from_rotation_arc(Vec3::Y, dir));
+            for _ in 0..90 {
+                tf.rotate_local_y(projectile_spin_rate(kind) / 60.0);
+            }
+            assert!(tf.rotation.is_finite() && tf.rotation.is_normalized());
+            assert!((tf.rotation * Vec3::Y).dot(dir) > 0.999, "{kind:?}");
+        }
+    }
     use crate::level::Cell;
 
     fn corridor() -> LevelGrid {
