@@ -961,6 +961,16 @@ fn account_action(lb: &mut LeaderboardState, client: &mut LeaderboardClient) {
     }
 }
 
+/// SIGN IN / OUT: the main menu shows the switch too, so it is handled in every
+/// state, not only on the leaderboard screen.
+fn account_input(mut lb: ResMut<LeaderboardState>, mut client: ResMut<LeaderboardClient>) {
+    if !lb.pending.contains(&MenuAction::LbAccount) {
+        return;
+    }
+    lb.pending.retain(|a| *a != MenuAction::LbAccount);
+    account_action(&mut lb, &mut client);
+}
+
 /// Leaderboard switches routed from `hud::perform` + the screen's keys.
 #[allow(clippy::too_many_arguments)]
 fn leaderboard_input(
@@ -982,7 +992,6 @@ fn leaderboard_input(
             MenuAction::LbNextPage => lb.turn_page(1),
             MenuAction::LbRefresh => request_boards(&mut client, &mut lb),
             MenuAction::LbCallsign => toggle_callsign_edit(&mut lb, &mut store, &mut client),
-            MenuAction::LbAccount => account_action(&mut lb, &mut client),
             _ => {}
         }
     }
@@ -1083,7 +1092,7 @@ impl Plugin for LeaderboardPlugin {
             .add_systems(OnEnter(AppState::Victory), auto_submit.after(record_victory))
             .add_systems(OnEnter(AppState::Leaderboard), on_enter_leaderboard)
             .add_systems(OnExit(AppState::Leaderboard), on_exit_leaderboard)
-            .add_systems(PostUpdate, leaderboard_input.run_if(in_state(AppState::Leaderboard)));
+            .add_systems(PostUpdate, (account_input, leaderboard_input.run_if(in_state(AppState::Leaderboard))).chain());
     }
 }
 

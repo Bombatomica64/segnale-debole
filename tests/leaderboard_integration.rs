@@ -12,7 +12,7 @@ use bevy::prelude::*;
 
 use segnale_debole::bot_input::BotControl;
 use segnale_debole::gamepad::PadFocusLock;
-use segnale_debole::hud::HudPlugin;
+use segnale_debole::hud::{HudPlugin, MenuAction};
 use segnale_debole::leaderboard::{Account, Board, LbTab, LeaderboardClient, LeaderboardState, SubmitBadge, SubmitStatus};
 use segnale_debole::level::LevelGrid;
 use segnale_debole::meta::{ProfileStore, RunLoadout};
@@ -78,6 +78,16 @@ fn headless_app_never_touches_the_network_and_reports_offline() {
     assert!(client.sent >= 1, "MainMenu asked /auth/me once");
     assert_eq!(lb(&app).account, Account::Offline);
     assert!(lb(&app).me_requested);
+}
+
+#[test]
+fn main_menu_sign_in_is_handled_on_the_main_menu() {
+    let mut app = menu_app();
+    assert_eq!(app_state(&app), AppState::MainMenu);
+    app.world_mut().resource_mut::<LeaderboardState>().pending.push(MenuAction::LbAccount);
+    step(&mut app, 1);
+    assert!(lb(&app).pending.is_empty(), "the main-menu SIGN IN press is consumed, not parked until the leaderboard opens");
+    assert!(lb(&app).notice.is_some(), "offline: SIGN IN explains where to sign in");
 }
 
 #[test]
