@@ -77,6 +77,10 @@ bevy = { version = "0.20.1", default-features = false, features = ["custom_curso
 [target.'cfg(target_os = "android")'.dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["android-game-activity", "bevy_audio", "wav"] }
 
+# `_exit` for the second-Ctrl+C force quit in `src/main.rs`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Linux windowing backends (native only; never compiled into the web build).
 [target.'cfg(target_os = "linux")'.dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["x11", "wayland"] }
