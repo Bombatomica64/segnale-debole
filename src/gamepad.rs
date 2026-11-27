@@ -98,9 +98,14 @@ pub fn apply_look_curve(stick: Vec2, sensitivity: f32, invert_y: bool, dt: f32) 
 /// [`MOVE_AXIS_SNAP`]) so analog input keeps the keyboard's pure-strafe and
 /// air-control movement modes.
 pub fn stick_move_axes(stick: Vec2) -> Vec2 {
-    let v = apply_radial_deadzone(stick, MOVE_DEADZONE);
+    snap_move_axes(apply_radial_deadzone(stick, MOVE_DEADZONE))
+}
+
+/// Snap the minor component of an already-deadzoned movement vector to zero
+/// (see [`MOVE_AXIS_SNAP`]). Shared by the Left Stick and the touch stick.
+pub fn snap_move_axes(v: Vec2) -> Vec2 {
     let mag = v.length();
-    if mag <= f32::EPSILON {
+    if !v.is_finite() || mag <= f32::EPSILON {
         return Vec2::ZERO;
     }
     let snap = |c: f32| if c.abs() < mag * MOVE_AXIS_SNAP { 0.0 } else { c };
@@ -298,6 +303,9 @@ pub struct GamepadInput {
     pub punch: bool,
     /// D-Pad Up (gameplay): Camera Flash Strobe.
     pub flash: bool,
+    /// Direct weapon slot pick (Milestone 37: a tap on a touch weapon-deck
+    /// slot; a controller never sets it).
+    pub weapon_slot: Option<usize>,
 
     // One-shots (menus; directions repeat while held).
     pub nav_up: bool,
@@ -394,6 +402,7 @@ impl GamepadInput {
         self.inspect = hit(bits::DPAD_DOWN);
         self.punch = hit(bits::EAST);
         self.flash = hit(bits::DPAD_UP);
+        self.weapon_slot = None;
 
         self.confirm = hit(bits::SOUTH);
         self.back = hit(bits::EAST);
@@ -460,13 +469,17 @@ impl GamepadInput {
 /// The device the player used last: drives every on-screen prompt (keycaps,
 /// footers, HUD hints). Flips to [`InputMode::Gamepad`] on any stick / button
 /// input and back to [`InputMode::KeyboardMouse`] on any key, click or mouse
-/// motion (mirrors [`GamepadInput::active`]). Only written when it actually
-/// changes, so `is_changed()` means "the player switched devices".
+/// motion (mirrors [`GamepadInput::active`]). Milestone 37 adds
+/// [`InputMode::Touch`] (see [`crate::touch::resolve_input_mode`]). Only
+/// written when it actually changes, so `is_changed()` means "the player
+/// switched devices".
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InputMode {
     #[default]
     KeyboardMouse,
     Gamepad,
+    /// Touchscreen: the on-screen touch HUD drives the run.
+    Touch,
 }
 
 impl InputMode {
@@ -474,21 +487,48 @@ impl InputMode {
         self == InputMode::Gamepad
     }
 
-    /// `kbm` or `pad`, whichever matches this mode.
+    pub fn is_touch(self) -> bool {
+        self == InputMode::Touch
+    }
+
+    /// `kbm` or `pad`, whichever matches this mode (touch reads the mouse &
+    /// keyboard text: taps act like clicks).
     pub fn pick<'a>(self, kbm: &'a str, pad: &'a str) -> &'a str {
         if self.is_pad() { pad } else { kbm }
     }
+
+    /// `kbm`, `pad` or `touch`, whichever matches this mode.
+    pub fn pick3<'a>(self, kbm: &'a str, pad: &'a str, touch: &'a str) -> &'a str {
+        match self {
+            InputMode::KeyboardMouse => kbm,
+            InputMode::Gamepad => pad,
+            InputMode::Touch => touch,
+        }
+    }
 }
 
-/// Follow [`GamepadInput::active`] (runs right after [`update_gamepad_input`]).
-pub fn sync_input_mode(pad: Res<GamepadInput>, mut mode: ResMut<InputMode>) {
-    let want = pad.input_mode();
+/// Follow the last device (runs right after [`update_gamepad_input`] and the
+/// touch router): see [`crate::touch::resolve_input_mode`]. A touch clears
+/// [`GamepadInput::active`], so the pad must move again to win back.
+pub fn sync_input_mode(
+    mut pad: ResMut<GamepadInput>,
+    activity: Option<Res<crate::touch::TouchActivity>>,
+    store: Option<Res<ProfileStore>>,
+    mut mode: ResMut<InputMode>,
+) {
+    let touch_mode = live_settings(store.as_deref()).touch_mode;
+    let (touched, real_kbm) = activity.map_or((false, false), |a| (a.touched, a.real_kbm));
+    let want = crate::touch::resolve_input_mode(*mode, touch_mode, touched, pad.active, real_kbm);
+    if touched && touch_mode != crate::meta::TouchMode::Off && pad.active {
+        pad.active = false;
+    }
     if *mode != want {
         *mode = want;
     }
 }
 
-/// A label with a mouse & keyboard and a controller variant. On a `Text`
+/// A label with a mouse & keyboard and a controller variant (plus an optional
+/// touch variant, else touch shows the mouse & keyboard text). On a `Text`
 /// entity it rewrites that text; on a button (no `Text`) it rewrites the
 /// button's direct `Text` children. [`refresh_dual_prompts`] swaps it live
 /// whenever [`InputMode`] flips.
@@ -496,15 +536,25 @@ pub fn sync_input_mode(pad: Res<GamepadInput>, mut mode: ResMut<InputMode>) {
 pub struct DualPrompt {
     pub kbm: String,
     pub pad: String,
+    pub touch: Option<String>,
 }
 
 impl DualPrompt {
     pub fn new(kbm: impl Into<String>, pad: impl Into<String>) -> Self {
-        DualPrompt { kbm: kbm.into(), pad: pad.into() }
+        DualPrompt { kbm: kbm.into(), pad: pad.into(), touch: None }
+    }
+
+    /// With a dedicated touch label.
+    pub fn with_touch(mut self, touch: impl Into<String>) -> Self {
+        self.touch = Some(touch.into());
+        self
     }
 
     pub fn get(&self, mode: InputMode) -> &str {
-        mode.pick(&self.kbm, &self.pad)
+        match (&self.touch, mode) {
+            (Some(t), InputMode::Touch) => t,
+            _ => mode.pick(&self.kbm, &self.pad),
+        }
     }
 }
 
@@ -1026,6 +1076,13 @@ mod tests {
         assert_eq!(InputMode::KeyboardMouse.pick("[E]", "[X]"), "[E]");
         let p = DualPrompt::new("BACK  [ESC]", "BACK  [B]");
         assert_eq!((p.get(InputMode::KeyboardMouse), p.get(InputMode::Gamepad)), ("BACK  [ESC]", "BACK  [B]"));
+        // Touch: the mouse & keyboard text unless a touch label exists.
+        assert_eq!(p.get(InputMode::Touch), "BACK  [ESC]");
+        assert_eq!(p.clone().with_touch("BACK").get(InputMode::Touch), "BACK");
+        assert_eq!(InputMode::Touch.pick("[E]", "[X]"), "[E]");
+        assert_eq!(InputMode::Touch.pick3("[E]", "[X]", "TAP SOS"), "TAP SOS");
+        assert_eq!(InputMode::Gamepad.pick3("[E]", "[X]", "TAP SOS"), "[X]");
+        assert!(InputMode::Touch.is_touch() && !InputMode::Touch.is_pad());
     }
 
     #[test]

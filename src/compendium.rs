@@ -1063,17 +1063,15 @@ fn compendium_input(
 
 #[allow(clippy::type_complexity)]
 fn compendium_clicks(
-    window: Query<&Window, With<PrimaryWindow>>,
-    mouse: Res<ButtonInput<MouseButton>>,
+    ptr: Res<crate::touch::UiPointer>,
     mut buttons: Query<(&ComputedNode, &UiGlobalTransform, &CompAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>)>,
     mut labels: Query<&mut TextColor>,
     mut state: ResMut<CompendiumState>,
     mut next: ResMut<NextState<AppState>>,
 ) {
-    let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
     let mut clicked = None;
     for (node, tf, action, colors, mut bg, mut border, children) in &mut buttons {
-        let hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
+        let hovered = ptr.over(node, tf);
         let selected = match *action {
             CompAction::Tab(c) => c == state.category,
             CompAction::Select(id) => id == state.current(),
@@ -1096,7 +1094,7 @@ fn compendium_clicks(
                 }
             }
         }
-        if hovered && mouse.just_released(MouseButton::Left) {
+        if hovered && ptr.released {
             clicked = Some(*action);
         }
     }
@@ -1105,11 +1103,16 @@ fn compendium_clicks(
     }
 }
 
+/// Turntable spin (radians) of a pointer drag from `last` to `now` (logical px).
+pub fn turntable_drag_spin(last: Option<Vec2>, now: Vec2) -> f32 {
+    last.map_or(0.0, |l| (now.x - l.x) * DRAG_SPIN)
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn spin_turntable(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
+    ptr: Res<crate::touch::UiPointer>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut state: ResMut<CompendiumState>,
     mut table: Query<&mut Transform, (With<TurntableRoot>, Without<CompendiumCamera>)>,
@@ -1142,12 +1145,11 @@ fn spin_turntable(
         spin += x * MANUAL_SPIN * dt;
         manual = true;
     }
-    let cursor = window.single().ok().and_then(|w| w.cursor_position().map(|c| (c, w.width())));
-    match cursor {
-        Some((c, w)) if mouse.pressed(MouseButton::Left) && (c.x < w * 0.5 || state.drag_last.is_some()) => {
-            if let Some(last) = state.drag_last {
-                spin += (c.x - last.x) * DRAG_SPIN;
-            }
+    // Mouse drag or a finger drag (Milestone 37) on the turntable half.
+    let width = window.single().map_or(0.0, |w| w.width());
+    match ptr.logical {
+        Some(c) if ptr.pressed && (c.x < width * 0.5 || state.drag_last.is_some()) => {
+            spin += turntable_drag_spin(state.drag_last, c);
             state.drag_last = Some(c);
             manual = true;
         }

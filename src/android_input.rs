@@ -20,7 +20,14 @@
 //! need no bridge: winit maps Android key events to `KeyCode`s.
 //!
 //! Kotlin polls [`wants_pointer_capture`] to request / release Android
-//! pointer capture (relative mouse) while a run holds the cursor.
+//! pointer capture (relative mouse) while a run holds the cursor (never in
+//! touch mode: `CursorCaptured` is never set there).
+//!
+//! Milestone 37: real touchscreen fingers are left to GameActivity / winit,
+//! which deliver them as Bevy `Touches` (see `src/touch.rs`). Kotlin also
+//! forwards the system Back gesture ([`AndroidInputEvent::BackPressed`] ->
+//! `touch::BackRequest`) and the display-cutout insets
+//! ([`AndroidInputEvent::SafeArea`] -> `touch::SafeAreaInsets`).
 //!
 //! Everything except the JNI exports is platform-neutral and unit-tested on
 //! the desktop.
@@ -214,6 +221,10 @@ pub enum AndroidInputEvent {
     MouseScroll { x: f32, y: f32 },
     /// Focus loss / pause: release every held gamepad/mouse input and zero axes.
     ResetAll,
+    /// The system Back gesture / nav-bar Back (Milestone 37).
+    BackPressed,
+    /// Display-cutout insets in physical px (Milestone 37).
+    SafeArea { left: f32, top: f32, right: f32, bottom: f32 },
 }
 
 impl AndroidInputEvent {
@@ -239,7 +250,15 @@ pub fn push_event(ev: AndroidInputEvent) {
     let Ok(mut q) = QUEUE.lock() else { return };
     match ev {
         AndroidInputEvent::ResetAll => {
-            q.retain(|e| matches!(e, AndroidInputEvent::GamepadConnected { .. } | AndroidInputEvent::GamepadDisconnected { .. }));
+            q.retain(|e| {
+                matches!(
+                    e,
+                    AndroidInputEvent::GamepadConnected { .. }
+                        | AndroidInputEvent::GamepadDisconnected { .. }
+                        | AndroidInputEvent::SafeArea { .. }
+                        | AndroidInputEvent::BackPressed
+                )
+            });
             if q.len() >= MAX_QUEUE_LEN {
                 let drop_n = q.len() + 1 - MAX_QUEUE_LEN;
                 q.drain(..drop_n);
@@ -270,6 +289,13 @@ pub fn push_event(ev: AndroidInputEvent) {
                 && *last_dev == device
             {
                 *last_axes = axes;
+                return;
+            }
+        }
+        AndroidInputEvent::SafeArea { .. } => {
+            // Only the newest insets matter.
+            if let Some(slot) = q.iter_mut().rev().find(|e| matches!(e, AndroidInputEvent::SafeArea { .. })) {
+                *slot = ev;
                 return;
             }
         }
@@ -469,6 +495,7 @@ pub fn drain_android_input(
     mut bridge: ResMut<AndroidInputBridge>,
     mut out: BridgeWriters,
     mut windows: Query<(Entity, &mut Window), With<PrimaryWindow>>,
+    (mut back, mut insets): (Option<ResMut<crate::touch::BackRequest>>, Option<ResMut<crate::touch::SafeAreaInsets>>),
 ) {
     let mut events = std::mem::take(&mut bridge.scratch);
     take_events(&mut events);
@@ -567,6 +594,19 @@ pub fn drain_android_input(
                     out.wheel.write(MouseWheel { unit: MouseScrollUnit::Line, x, y, window: *entity, phase: TouchPhase::Moved });
                 }
             }
+            AndroidInputEvent::BackPressed => {
+                if let Some(b) = back.as_deref_mut() {
+                    b.request();
+                }
+            }
+            AndroidInputEvent::SafeArea { left, top, right, bottom } => {
+                if let Some(i) = insets.as_deref_mut() {
+                    let want = crate::touch::SafeAreaInsets::new(left, top, right, bottom);
+                    if *i != want {
+                        *i = want;
+                    }
+                }
+            }
             AndroidInputEvent::ResetAll => {
                 const HAT_BTNS: [GamepadButton; 4] =
                     [GamepadButton::DPadUp, GamepadButton::DPadDown, GamepadButton::DPadLeft, GamepadButton::DPadRight];
@@ -635,9 +675,16 @@ pub fn mouse_button_changes(before: i32, after: i32) -> impl Iterator<Item = (Mo
     MOUSE_BUTTONS.into_iter().filter(move |(bit, _)| (before ^ after) & bit != 0).map(move |(bit, b)| (b, after & bit != 0))
 }
 
+/// Whether Kotlin should hold Android pointer capture: the game holds the
+/// cursor and touch mode is off (touch never captures the pointer).
+pub fn pointer_capture_wanted(captured: bool, mode: crate::gamepad::InputMode) -> bool {
+    captured && !mode.is_touch()
+}
+
 /// Mirror [`CursorCaptured`] for Kotlin's pointer-capture poll.
-pub fn publish_pointer_capture(captured: Option<Res<CursorCaptured>>) {
-    WANTS_POINTER_CAPTURE.store(captured.is_some_and(|c| c.0), Ordering::Relaxed);
+pub fn publish_pointer_capture(captured: Option<Res<CursorCaptured>>, mode: Option<Res<crate::gamepad::InputMode>>) {
+    let want = pointer_capture_wanted(captured.is_some_and(|c| c.0), mode.map_or(crate::gamepad::InputMode::KeyboardMouse, |m| *m));
+    WANTS_POINTER_CAPTURE.store(want, Ordering::Relaxed);
 }
 
 /// Added by `GamePlugin` on Android only.
@@ -749,6 +796,26 @@ mod jni_exports {
     pub extern "system" fn Java_dev_bombatomica64_segnaledebole_MainActivity_nativeResetInputs(_env: Env, _this: Obj) {
         clear_rumble();
         push_event(AndroidInputEvent::ResetAll);
+    }
+
+    /// Kotlin `external fun nativeBackPressed()` (system Back gesture).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_dev_bombatomica64_segnaledebole_MainActivity_nativeBackPressed(_env: Env, _this: Obj) {
+        push_event(AndroidInputEvent::BackPressed);
+    }
+
+    /// Kotlin `external fun nativeSafeAreaInsets(l: Float, t: Float, r: Float, b: Float)`
+    /// (display-cutout insets, physical px).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_dev_bombatomica64_segnaledebole_MainActivity_nativeSafeAreaInsets(
+        _env: Env,
+        _this: Obj,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    ) {
+        push_event(AndroidInputEvent::SafeArea { left, top, right, bottom });
     }
 
     #[unsafe(no_mangle)]
@@ -942,6 +1009,49 @@ mod tests {
         app.insert_resource(CursorCaptured(false));
         app.update();
         assert!(!wants_pointer_capture());
+    }
+
+    #[test]
+    fn pointer_capture_is_never_wanted_in_touch_mode() {
+        use crate::gamepad::InputMode;
+        assert!(pointer_capture_wanted(true, InputMode::KeyboardMouse));
+        assert!(pointer_capture_wanted(true, InputMode::Gamepad));
+        assert!(!pointer_capture_wanted(true, InputMode::Touch), "touch never captures the pointer");
+        assert!(!pointer_capture_wanted(false, InputMode::KeyboardMouse));
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(CursorCaptured(true))
+            .insert_resource(InputMode::Touch)
+            .add_systems(Update, publish_pointer_capture);
+        app.update();
+        assert!(!wants_pointer_capture());
+        app.insert_resource(InputMode::KeyboardMouse);
+        app.update();
+        assert!(wants_pointer_capture());
+        app.insert_resource(CursorCaptured(false));
+        app.update();
+        assert!(!wants_pointer_capture());
+    }
+
+    #[test]
+    fn back_gesture_and_safe_area_reach_the_touch_layer() {
+        let _guard = BRIDGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::input::InputPlugin, AndroidInputPlugin))
+            .init_resource::<crate::touch::BackRequest>()
+            .init_resource::<crate::touch::SafeAreaInsets>();
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app.update();
+        push_event(AndroidInputEvent::SafeArea { left: 10.0, top: 0.0, right: 0.0, bottom: 0.0 });
+        push_event(AndroidInputEvent::SafeArea { left: 96.0, top: 0.0, right: 48.0, bottom: 0.0 });
+        push_event(AndroidInputEvent::BackPressed);
+        // A focus-loss reset never drops the Back or the insets.
+        push_event(AndroidInputEvent::ResetAll);
+        app.update();
+        let w = app.world();
+        assert!(w.resource::<crate::touch::BackRequest>().pending, "Back queued for the touch layer");
+        assert_eq!(*w.resource::<crate::touch::SafeAreaInsets>(), crate::touch::SafeAreaInsets::new(96.0, 0.0, 48.0, 0.0), "newest insets win");
     }
 
     #[test]

@@ -40,6 +40,7 @@ use crate::meta_ui::{
     end_loadout_line, loadout_tag_parts, unlock_reward_lines, MetaBox, MetaUiPlugin, NO_UNLOCKS_LINE,
 };
 use crate::player::{Player, DASH_COOLDOWN};
+use crate::touch::{overlay_visible, TouchInput, UiPointer};
 use crate::signal::SignalState;
 use crate::style_emblem::{EmblemAtlas, EmblemFrame, EMBLEM_BYTES, EMBLEM_PX};
 use crate::state::{complete_floor, continue_into_endless, AppState, GameSet, PlayerModifiers, RunMode, RunStats, SettingsReturn, FINAL_FLOOR};
@@ -320,6 +321,8 @@ impl Plugin for HudPlugin {
             // Live 3D Mars Signal Tower vista behind the main menu (render
             // cameras stay out of headless CoreGameplayPlugin tests).
             .add_plugins(crate::menu_scene::MenuScenePlugin)
+            // Milestone 37: the on-screen touch HUD (drawing; `touch.rs` routes).
+            .add_plugins(crate::touch_hud::TouchHudPlugin)
             .init_resource::<UiSfxGate>()
             .init_resource::<InputMode>()
             .add_systems(Startup, init_style_emblem)
@@ -361,6 +364,7 @@ impl Plugin for HudPlugin {
                     update_style_hud,
                     pause_input,
                     debug_skip_floor,
+                    touch_hud_relayout.after(update_style_hud),
                 )
                     .in_set(GameSet::Ui),
             );
@@ -451,7 +455,24 @@ pub const PAD_CONTROLS: [(&str, &[KeyBind]); 4] = [
     ("SYSTEM", &[(&["START"], "pause"), (&["A"], "select"), (&["B"], "back")]),
 ];
 
-/// One of the two field-manual bodies (shown for its [`InputMode`]).
+/// Touch field-manual rows (Milestone 37; same layout as [`CONTROLS`]).
+pub const TOUCH_CONTROLS: [(&str, &[KeyBind]); 4] = [
+    ("MOVE", &[(&["L-THUMB"], "floating stick (rim = auto-bhop)"), (&["R-DRAG"], "look"), (&["JUMP"], "jump / hold to bhop"), (&["DASH"], "airplane-mode dash")]),
+    ("FIGHT", &[(&["FIRE"], "fire (drag to aim)"), (&["SWAP", "1 2 3"], "next weapon / tap a deck slot")]),
+    (
+        "PHONE",
+        &[
+            (&["PUNCH"], "phone punch / parry (0 bars)"),
+            (&["PING"], "ping scan (1+ bar)"),
+            (&["FLASH"], "camera flash strobe (2+ bars)"),
+            (&["5G"], "5G overload EMP (3+ bars)"),
+            (&["SOS"], "SOS uplink at the tower"),
+        ],
+    ),
+    ("SYSTEM", &[(&["||", "BACK"], "pause"), (&["TAP"], "select"), (&["SETTINGS"], "touch layout & feel")]),
+];
+
+/// One of the field-manual bodies (shown for its [`InputMode`]).
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldManual(pub InputMode);
 
@@ -666,10 +687,12 @@ fn spawn_controls_overlay(commands: &mut Commands, root: Entity, state: AppState
     );
     commands.entity(manual).insert((BackgroundColor(INK_BLACK.with_alpha(0.92)), hard_shadow(8.0)));
     commands.spawn((ChildOf(head), Node { flex_grow: 1.0, ..default() }));
-    commands.spawn((ChildOf(head), DualPrompt::new("KEYBOARD & MOUSE", "CONTROLLER"), text(mode.pick("KEYBOARD & MOUSE", "CONTROLLER"), 11.0, ARC_CYAN.with_alpha(0.85))));
-    // Both manuals are built once; the active input mode picks which shows
+    let head_prompt = DualPrompt::new("KEYBOARD & MOUSE", "CONTROLLER").with_touch("TOUCH");
+    let head_label = head_prompt.get(mode).to_string();
+    commands.spawn((ChildOf(head), head_prompt, text(head_label, 11.0, ARC_CYAN.with_alpha(0.85))));
+    // Every manual is built once; the active input mode picks which shows
     // (switching devices mid-screen swaps them live).
-    for (m, rows) in [(InputMode::KeyboardMouse, CONTROLS), (InputMode::Gamepad, PAD_CONTROLS)] {
+    for (m, rows) in [(InputMode::KeyboardMouse, CONTROLS), (InputMode::Gamepad, PAD_CONTROLS), (InputMode::Touch, TOUCH_CONTROLS)] {
         let body = commands
             .spawn((
                 ChildOf(manual),
@@ -1188,8 +1211,7 @@ fn installed_list(run: &RunStats) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn upgrade_cards(
-    window: Query<&Window, With<PrimaryWindow>>,
-    mouse: Res<ButtonInput<MouseButton>>,
+    ptr: Res<UiPointer>,
     keys: Res<ButtonInput<KeyCode>>,
     choices: Res<UpgradeChoices>,
     mut cards: Query<(&ComputedNode, &UiGlobalTransform, &UpgradeCard, &mut BackgroundColor, &mut BorderColor)>,
@@ -1200,10 +1222,9 @@ fn upgrade_cards(
     mut next: ResMut<NextState<AppState>>,
     (pad, pad_card): (Res<GamepadInput>, Res<UpgradeFocus>),
 ) {
-    let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
     let mut chosen = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3].iter().position(|k| keys.just_pressed(*k));
     for (node, tf, card, mut bg, mut border) in &mut cards {
-        let pointer_hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
+        let pointer_hovered = ptr.over(node, tf);
         // Controller navigation owns the highlight until the mouse moves, but
         // mouse releases always activate the card under the actual pointer.
         let lit = if pad.active { card.0 == pad_card.0 } else { pointer_hovered };
@@ -1212,7 +1233,7 @@ fn upgrade_cards(
         if *border != want {
             *border = want;
         }
-        if pointer_hovered && mouse.just_released(MouseButton::Left) {
+        if pointer_hovered && ptr.released {
             chosen = Some(card.0);
         }
     }
@@ -1732,9 +1753,9 @@ pub fn pause_loadout_line(loadout: &RunLoadout, run: &RunStats) -> String {
     }
 }
 
-/// Android input requirement shown under the Main Menu and Pause actions.
-/// There are no touch controls: a controller or mouse & keyboard is required.
-pub const ANDROID_INPUT_HINT: &str = "CONTROLLER OR MOUSE & KEYBOARD REQUIRED // NO TOUCH CONTROLS";
+/// Android input hint shown under the Main Menu and Pause actions
+/// (Milestone 37: touch is first-class; a controller or mouse also works).
+pub const ANDROID_INPUT_HINT: &str = "TOUCH CONTROLS ON // CONTROLLER OR MOUSE & KEYBOARD ALSO WORK // BACK PAUSES";
 
 /// The platform's menu input hint (Android only; desktop and web menus stay
 /// uncluttered).
@@ -1902,8 +1923,7 @@ fn perform(
 fn menu_buttons(
     mut commands: Commands,
     players: Query<Entity, With<Player>>,
-    window: Query<&Window, With<PrimaryWindow>>,
-    mouse: Res<ButtonInput<MouseButton>>,
+    ptr: Res<UiPointer>,
     mut buttons: Query<
         (Entity, &ComputedNode, &UiGlobalTransform, &MenuAction, &PunkButtonColors, &mut BackgroundColor, &mut BorderColor, Option<&Children>),
         With<MenuButton>,
@@ -1919,10 +1939,10 @@ fn menu_buttons(
     (mut lb, mut controls): (ResMut<LeaderboardState>, ResMut<ControlsOverlayOpen>),
     (mut gate, mut sfx): (Option<ResMut<UiSfxGate>>, Option<ResMut<SfxQueue>>),
 ) {
-    let cursor = window.single().ok().and_then(|w| w.physical_cursor_position());
     for (e, node, tf, action, colors, mut bg, mut border, children) in &mut buttons {
-        // Controller navigation owns the highlight until the mouse moves.
-        let pointer_hovered = cursor.is_some_and(|c| node.contains_point(*tf, c));
+        // Controller navigation owns the highlight until the mouse moves (a
+        // finger lights its button only while it is down).
+        let pointer_hovered = ptr.over(node, tf);
         let hovered = if pad.active { focus.shows(&pad, e) } else { pointer_hovered };
         // Punk hover snap: solid accent fill, inverted label, bright frame.
         let want = colors.bg(hovered);
@@ -1941,7 +1961,7 @@ fn menu_buttons(
                 }
             }
         }
-        if (pointer_hovered && mouse.just_released(MouseButton::Left)) || focus.activate == Some(e) {
+        if (pointer_hovered && ptr.released) || focus.activate == Some(e) {
             // The controller path already blipped in `gamepad_menu_focus`;
             // the gate swallows the duplicate.
             if let (Some(g), Some(q)) = (gate.as_deref_mut(), sfx.as_deref_mut()) {
@@ -2716,7 +2736,7 @@ fn spawn_bar(commands: &mut Commands, parent: Entity, block: Node, label: &str, 
     commands.spawn((
         ChildOf(block),
         Node { width: Val::Percent(100.0), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::FlexEnd, ..default() },
-        children![(hud_text(label, fonts.0, label_color), DualPrompt::new(label, pad_bar_label(label))), (value, hud_text("", fonts.1, COLOR_TEXT))],
+        children![(hud_text(label, fonts.0, label_color), bar_prompt(label)), (value, hud_text("", fonts.1, COLOR_TEXT))],
     ));
     let track = commands.spawn((ChildOf(block), bar_track(Val::Percent(100.0), height, color, Display::Flex))).id();
     commands.spawn((ChildOf(track), fill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(color)));
@@ -2729,15 +2749,22 @@ fn spawn_bar(commands: &mut Commands, parent: Entity, block: Node, label: &str, 
 /// Stamina bar label per input mode (the dash key / button).
 pub const STAMINA_LABEL_KBM: &str = "STAMINA [SHIFT]";
 pub const STAMINA_LABEL_PAD: &str = "STAMINA [LB]";
+pub const STAMINA_LABEL_TOUCH: &str = "STAMINA [DASH]";
 
 /// Controller variant of a vitals bar label (only STAMINA names a key).
 fn pad_bar_label(label: &str) -> &str {
     if label == STAMINA_LABEL_KBM { STAMINA_LABEL_PAD } else { label }
 }
 
+/// A bar caption's prompt (the stamina keycap follows the input mode).
+fn bar_prompt(label: &str) -> DualPrompt {
+    let p = DualPrompt::new(label, pad_bar_label(label));
+    if label == STAMINA_LABEL_KBM { p.with_touch(STAMINA_LABEL_TOUCH) } else { p }
+}
+
 /// Tower SOS interact prompt per input mode.
 pub fn sos_prompt(mode: InputMode) -> &'static str {
-    mode.pick("PRESS [E] TO TRIGGER SOS UPLINK", "PRESS [X] TO TRIGGER SOS UPLINK")
+    mode.pick3("PRESS [E] TO TRIGGER SOS UPLINK", "PRESS [X] TO TRIGGER SOS UPLINK", "TAP [SOS] TO TRIGGER SOS UPLINK")
 }
 
 /// Weapon-deck keycap of slot `i` given the equipped slot: `1 2 3` on mouse
@@ -2799,6 +2826,98 @@ fn spawn_vel_plate(commands: &mut Commands, vitals: Entity) {
         BackgroundColor(Color::NONE),
         children![(HudText::VelValue, hud_text(speed_label(0.0), 14.0, BONE_TEXT))],
     ));
+}
+
+/// The weapon deck root (moves left of the vitals in touch mode, clearing the
+/// bottom-right corner for the FIRE arc; its slot tabs become tappable).
+#[derive(Component)]
+struct TouchDeck;
+
+/// The top-right split timer / killfeed column (drops under the touch PAUSE).
+#[derive(Component)]
+struct TouchTopRightColumn;
+
+/// Gap between the vitals cluster and the weapon deck in touch mode (px).
+const TOUCH_DECK_GAP: f32 = 12.0;
+/// Style meter top in touch mode (left edge, under the floor strip).
+pub const STYLE_TOUCH_TOP: f32 = 110.0;
+
+/// The weapon deck's horizontal anchoring: `(left, right, margin_left)`.
+/// Touch mode docks it left of the bottom-center vitals so the right-thumb
+/// action arc owns the bottom-right corner.
+pub fn deck_anchor(touch: bool) -> (Val, Val, Val) {
+    if touch {
+        (Val::Percent(50.0), Val::Auto, Val::Px(-(VITALS_WIDTH * 0.5 + TOUCH_DECK_GAP + DECK_WIDTH)))
+    } else {
+        (Val::Auto, Val::Px(HUD_GUTTER), Val::Px(0.0))
+    }
+}
+
+/// Touch mode re-layout of the in-run HUD: deck left of the vitals, style
+/// meter on the left edge (the phone-app row owns the right edge), the
+/// top-right column under the PAUSE button; publishes the deck's slot tabs
+/// (logical px) for the touch router.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn touch_hud_relayout(
+    (mode, store, state): (Option<Res<InputMode>>, Option<Res<ProfileStore>>, Res<State<AppState>>),
+    ui_scale: Res<UiScale>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut touch: ResMut<TouchInput>,
+    mut deck: Query<&mut Node, (With<TouchDeck>, Without<TouchTopRightColumn>, Without<StyleHud>)>,
+    mut column: Query<&mut Node, (With<TouchTopRightColumn>, Without<TouchDeck>, Without<StyleHud>)>,
+    mut style: Query<(&StyleHud, &mut Node), (Without<TouchDeck>, Without<TouchTopRightColumn>)>,
+    slots: Query<(&HudBox, &ComputedNode, &UiGlobalTransform)>,
+) {
+    let on = overlay_visible(*state.get(), live_settings(store.as_deref()).touch_mode, mode.map_or(InputMode::KeyboardMouse, |m| *m));
+    let (left, right, margin_left) = deck_anchor(on);
+    for mut n in &mut deck {
+        if n.left != left || n.right != right || n.margin.left != margin_left {
+            n.left = left;
+            n.right = right;
+            n.margin.left = margin_left;
+        }
+    }
+    let k = ui_scale.0.max(0.01);
+    let top = match touch.layout.button(crate::touch::TouchButton::Pause) {
+        Some(p) if on => Val::Px(HUD_TOP.max((p.rect().max.y + 8.0) / k)),
+        _ => Val::Px(HUD_TOP),
+    };
+    for mut n in &mut column {
+        if n.top != top {
+            n.top = top;
+        }
+    }
+    for (part, mut n) in &mut style {
+        if *part != StyleHud::Root {
+            continue;
+        }
+        let (left, right, top, align) = if on {
+            (Val::Px(HUD_GUTTER), Val::Auto, Val::Px(STYLE_TOUCH_TOP), AlignItems::FlexStart)
+        } else {
+            (Val::Auto, Val::Px(STYLE_HUD_RIGHT), Val::Px(STYLE_HUD_TOP), AlignItems::FlexEnd)
+        };
+        if n.left != left || n.right != right || n.top != top || n.align_items != align {
+            n.left = left;
+            n.right = right;
+            n.top = top;
+            n.align_items = align;
+        }
+    }
+    let mut rects = [None; 3];
+    if on {
+        let sf = windows.single().map_or(1.0, |w| w.scale_factor()).max(0.01);
+        for (b, node, tf) in &slots {
+            if let HudBox::SlotChip(i) = *b
+                && let Some(slot) = rects.get_mut(i as usize)
+                && node.size().x > 0.0
+            {
+                *slot = Some(Rect::from_center_size(tf.translation / sf, node.size() / sf));
+            }
+        }
+    }
+    if touch.slot_rects != rects {
+        touch.slot_rects = rects;
+    }
 }
 
 fn spawn_hud(mut commands: Commands, store: Option<Res<ProfileStore>>, run: Res<RunStats>, emblem_art: Option<Res<StyleEmblemArt>>) {
@@ -3016,6 +3135,7 @@ fn spawn_hud(mut commands: Commands, store: Option<Res<ProfileStore>>, run: Res<
     let column = commands
         .spawn((
             ChildOf(root),
+            TouchTopRightColumn,
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(HUD_GUTTER),
@@ -3080,6 +3200,7 @@ fn spawn_hud(mut commands: Commands, store: Option<Res<ProfileStore>>, run: Res<
     let deck = commands
         .spawn((
             ChildOf(root),
+            TouchDeck,
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(HUD_GUTTER),
@@ -4208,7 +4329,7 @@ mod tests {
     fn android_input_hint_only_on_android() {
         assert_eq!(platform_input_hint(false), None);
         assert_eq!(platform_input_hint(true), Some(ANDROID_INPUT_HINT));
-        assert!(ANDROID_INPUT_HINT.contains("NO TOUCH CONTROLS"));
+        assert!(ANDROID_INPUT_HINT.contains("TOUCH CONTROLS ON") && !ANDROID_INPUT_HINT.contains("NO TOUCH"));
         assert!(ANDROID_INPUT_HINT.is_ascii(), "default font glyphs only");
         assert_eq!(platform_input_hint(crate::perf::IS_ANDROID).is_some(), crate::perf::IS_ANDROID);
     }
@@ -4494,6 +4615,7 @@ mod tests {
         // HUD prompts.
         assert_eq!(sos_prompt(InputMode::KeyboardMouse), "PRESS [E] TO TRIGGER SOS UPLINK");
         assert_eq!(sos_prompt(InputMode::Gamepad), "PRESS [X] TO TRIGGER SOS UPLINK");
+        assert_eq!(sos_prompt(InputMode::Touch), "TAP [SOS] TO TRIGGER SOS UPLINK");
         assert_eq!(pad_bar_label(STAMINA_LABEL_KBM), STAMINA_LABEL_PAD);
         assert_eq!(pad_bar_label("HP"), "HP");
         let keys = |mode, cur| (0..3).map(|i| slot_key_label(mode, i, cur, 3)).collect::<String>();
@@ -4936,5 +5058,21 @@ mod tests {
         assert_eq!(style_feed_alpha(0, 0.0), 1.0);
         assert!(style_feed_alpha(1, 0.0) < 1.0 && style_feed_alpha(0, crate::style::FEED_SECS) == 0.0);
         assert!(style_feed_alpha(0, 2.0) < style_feed_alpha(0, 1.0));
+    }
+
+    #[test]
+    fn phone_viewports_fit_the_720p_composition() {
+        // 20:9 phones in landscape (logical dp): the whole 1280x720 layout
+        // scales uniformly and still fits both axes above the floor.
+        for (w, h) in [(915.0, 412.0), (844.0, 390.0), (800.0, 360.0)] {
+            let s = ui_scale_for(w, h);
+            assert!((UI_SCALE_MIN..1.0).contains(&s), "{w}x{h}: {s}");
+            assert!(UI_REFERENCE.1 * s <= h + 0.5 && UI_REFERENCE.0 * s <= w + 0.5, "{w}x{h} overflows at {s}");
+        }
+        // Touch mode docks the deck left of the vitals, clear of the right half.
+        let (left, right, margin) = deck_anchor(true);
+        assert_eq!((left, right), (Val::Percent(50.0), Val::Auto));
+        assert_eq!(margin, Val::Px(-(VITALS_WIDTH * 0.5 + TOUCH_DECK_GAP + DECK_WIDTH)));
+        assert_eq!(deck_anchor(false), (Val::Auto, Val::Px(HUD_GUTTER), Val::Px(0.0)));
     }
 }

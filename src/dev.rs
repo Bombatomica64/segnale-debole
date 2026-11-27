@@ -51,6 +51,12 @@
 //!   `05_hud_demon_rush.png` (the SOS uplink block and alert) and
 //!   `03_trial_signal_ghost.png` (the PB Signal Ghost on the Time Trial with
 //!   its live delta), then exits.
+//! - `SEGNALE_TOUCH_SHOTS=<dir>`: Milestone 37 touch tour on an in-memory
+//!   profile with `touch_mode = On` (pair it with `SEGNALE_WINDOW_SIZE=915x412`
+//!   for a 20:9 phone): `01_main_menu_touch.png`, `02_settings_general.png`,
+//!   `03_settings_touch.png`, `04_touch_hud_rest.png` (stick resting, plates
+//!   idle), `05_touch_hud_action.png` (virtual fingers: stick on the bhop rim,
+//!   FIRE held and dragging) and `06_pause_touch.png`, then exits.
 //! - `SEGNALE_COMPENDIUM_SHOTS=<dir>`: Milestone 21 tour on the in-memory
 //!   meta showcase profile: `01_main_menu_seed.png` (custom seed `MARS7`
 //!   armed + the Bestiary button), `02_bestiary_boss.png` (3D Carrier Daemon
@@ -153,6 +159,22 @@ impl Plugin for DevPlugin {
                 }
             }
             app.insert_resource(LayoutShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, layout_shots_tour.after(GameSet::Ui));
+            return;
+        }
+        if let Ok(dir) = std::env::var("SEGNALE_TOUCH_SHOTS") {
+            let mut profile = PlayerProfile::default();
+            profile.settings.touch_mode = crate::meta::TouchMode::On;
+            match app.world_mut().get_resource_mut::<ProfileStore>() {
+                Some(mut store) => {
+                    store.path = None;
+                    store.web_storage = false;
+                    store.profile = profile;
+                }
+                None => {
+                    app.insert_resource(ProfileStore::in_memory(profile));
+                }
+            }
+            app.insert_resource(TouchShots { dir, stage: 0, timer: 0.0 }).add_systems(Update, touch_shots_tour.after(GameSet::Ui));
             return;
         }
         if let Ok(dir) = std::env::var("SEGNALE_COMPENDIUM_SHOTS") {
@@ -1041,6 +1063,119 @@ fn layout_shots_tour(
             true
         }
         (19, AppState::Playing) if t > 1.5 => {
+            exit.write(AppExit::Success);
+            true
+        }
+        _ => false,
+    };
+    if advance {
+        cfg.stage += 1;
+        cfg.timer = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEGNALE_TOUCH_SHOTS (Milestone 37)
+// ---------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct TouchShots {
+    dir: String,
+    stage: u32,
+    timer: f32,
+}
+
+/// Main menu -> Settings (both pages) -> a run with the touch HUD at rest,
+/// then with virtual fingers (real `TouchInput` messages through the whole
+/// router) -> Pause.
+#[allow(clippy::too_many_arguments)]
+fn touch_shots_tour(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut cfg: ResMut<TouchShots>,
+    state: Res<State<AppState>>,
+    (mut run, mut mods, mut tab): (ResMut<RunStats>, ResMut<PlayerModifiers>, ResMut<crate::meta_ui::SettingsTab>),
+    touch: Res<crate::touch::TouchInput>,
+    windows: Query<Entity, With<bevy::window::PrimaryWindow>>,
+    mut fingers: MessageWriter<bevy::input::touch::TouchInput>,
+    mut players: Query<&mut Player>,
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use bevy::input::touch::{TouchInput as Finger, TouchPhase};
+    cfg.timer += time.delta_secs();
+    for mut p in &mut players {
+        p.invuln_timer = 999.0;
+        p.hp = p.max_hp;
+    }
+    let dir = cfg.dir.clone();
+    let t = cfg.timer;
+    let window = windows.single().unwrap_or(Entity::PLACEHOLDER);
+    let mut finger = |id: u64, phase: TouchPhase, position: Vec2| {
+        fingers.write(Finger { phase, position, window, force: None, id });
+    };
+    let layout = &touch.layout;
+    let fire = layout.button(crate::touch::TouchButton::Fire).map_or(Vec2::ZERO, |b| b.center);
+    let advance = match (cfg.stage, *state.get()) {
+        (0, AppState::MainMenu) if t > 1.5 => {
+            meta_shot(&mut commands, &dir, "01_main_menu_touch.png");
+            true
+        }
+        (1, AppState::MainMenu) if t > 0.5 => {
+            next.set(AppState::Settings);
+            true
+        }
+        (2, AppState::Settings) if t > 1.2 => {
+            meta_shot(&mut commands, &dir, "02_settings_general.png");
+            true
+        }
+        (3, AppState::Settings) if t > 0.5 => {
+            *tab = crate::meta_ui::SettingsTab::Touch;
+            true
+        }
+        (4, AppState::Settings) if t > 0.8 => {
+            meta_shot(&mut commands, &dir, "03_settings_touch.png");
+            true
+        }
+        (5, AppState::Settings) if t > 0.5 => {
+            next.set(AppState::MainMenu);
+            true
+        }
+        (6, AppState::MainMenu) if t > 0.5 => {
+            crate::state::start_run(&mut run, &mut mods, &mut next, 1234);
+            true
+        }
+        (7, AppState::Playing) if t > 2.5 => {
+            meta_shot(&mut commands, &dir, "04_touch_hud_rest.png");
+            true
+        }
+        (8, AppState::Playing) if t > 0.5 => {
+            let stick = layout.stick_rest + Vec2::new(10.0, -10.0);
+            finger(1, TouchPhase::Started, stick);
+            finger(2, TouchPhase::Started, fire);
+            true
+        }
+        (9, AppState::Playing) if t > 0.1 => {
+            let stick = layout.stick_rest + Vec2::new(10.0, -10.0) + Vec2::new(0.62, -0.78) * layout.stick_radius * 0.95;
+            finger(1, TouchPhase::Moved, stick);
+            finger(2, TouchPhase::Moved, fire + Vec2::new(-14.0, -6.0));
+            true
+        }
+        (10, AppState::Playing) if t > 0.12 => {
+            meta_shot(&mut commands, &dir, "05_touch_hud_action.png");
+            true
+        }
+        (11, AppState::Playing) if t > 0.3 => {
+            finger(1, TouchPhase::Ended, layout.stick_rest);
+            finger(2, TouchPhase::Ended, fire);
+            next.set(AppState::Paused);
+            true
+        }
+        (12, AppState::Paused) if t > 1.0 => {
+            meta_shot(&mut commands, &dir, "06_pause_touch.png");
+            true
+        }
+        (13, _) if t > 1.0 => {
             exit.write(AppExit::Success);
             true
         }

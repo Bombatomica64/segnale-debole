@@ -2,13 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>SEGNALE DEBOLE</title>
   <meta name="description" content="Roguelike boomer shooter in a dead Mars bunker: a cracked phone hunting one bar of signal in your left hand, a pump shotgun in your right. Bhop, kill the jammers, hold the SOS uplink, get out.">
   <meta name="theme-color" content="#080606">
   <!-- Link previews (Discord, itch.io, socials). -->
   <meta property="og:title" content="SEGNALE DEBOLE">
-  <meta property="og:description" content="Roguelike boomer shooter: hunt a single bar of signal through a demon-infested Mars bunker. Mouse &amp; keyboard or controller, right in the browser.">
+  <meta property="og:description" content="Roguelike boomer shooter: hunt a single bar of signal through a demon-infested Mars bunker. Touch, mouse &amp; keyboard or controller, right in the browser.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://signal.bombatomica64.dev/">
   <meta property="og:site_name" content="SEGNALE DEBOLE">
@@ -24,6 +24,11 @@
   <style>
     :root { --ink: #080606; --bone: #ebdec7; --ash: #8f7d70; --red: #ff2b1a; --acid: #40ff73; }
     html, body { margin: 0; height: 100%; overflow: hidden; background: var(--ink); }
+    /* Touch: no text selection, callouts, tap flashes or overscroll bounce. */
+    body, #bevy {
+      -webkit-user-select: none; -webkit-touch-callout: none; user-select: none;
+      -webkit-tap-highlight-color: transparent; overscroll-behavior: none;
+    }
     #bevy {
       width: 100vw; height: 100vh; display: block;
       background: var(--ink); outline: none; touch-action: none;
@@ -73,9 +78,9 @@
     <div class="title"><b>SEGNALE DEBOLE</b> // TUNING RF SIGNAL...</div>
     <div class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
     <div class="status">Downloading bunker uplink</div>
-    <div class="hint">Click to capture mouse or use a controller. Esc / Start pauses.</div>
+    <div class="hint">Touch: left thumb moves, right thumb aims &amp; fires. Mouse: click to capture. Or use a controller. Esc / Start / || pauses.</div>
   </div>
-  <div id="sound" role="button" aria-live="polite">Click or press a key to enable sound</div>
+  <div id="sound" role="button" aria-live="polite">Tap, click or press a key to enable sound</div>
   <script>
     (function () {
       var boot = document.getElementById("boot");
